@@ -44,6 +44,23 @@
             .Where(lt => string.Equals(lt.Code, "EXAM", StringComparison.OrdinalIgnoreCase)
                       || string.Equals(lt.Code, "CREDIT", StringComparison.OrdinalIgnoreCase))
             .ToList() ?? new();
+
+    private bool IsFinalAssessment(int? lessonTypeId)
+    {
+        if (lessonTypeId is not int ltId || _meta is null) return false;
+        var code = _meta.LessonTypes.FirstOrDefault(lt => lt.Id == ltId)?.Code;
+        return string.Equals(code, "EXAM", StringComparison.OrdinalIgnoreCase)
+               || string.Equals(code, "CREDIT", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void ClearTopicForFinalAssessment()
+    {
+        if (_edit is null) return;
+        if (IsFinalAssessment(_edit.LessonTypeId))
+        {
+            _edit = _edit with { ModuleTopicId = null };
+        }
+    }
     private DraftUpsertRequest? _edit;
     private bool _unrestrictedMode;
     private bool _isExporting;
@@ -301,6 +318,7 @@
         var currentAllowed = allowed.Any(lt => lt.Id == _edit.LessonTypeId);
         var targetId = currentAllowed ? _edit.LessonTypeId : allowed.First().Id;
         ApplyLessonType(targetId);
+        ClearTopicForFinalAssessment();
     }
 
     private void OnRoomChanged(ChangeEventArgs e)
@@ -335,6 +353,12 @@
         var moduleId = int.TryParse(e.Value?.ToString(), out var parsed) ? parsed : 0;
         await EnsureTopicsLoaded(moduleId);
         _edit = _edit with { ModuleId = moduleId, ModuleTopicId = null };
+        var shouldAttachTopic = !IsFinalAssessment(_edit.LessonTypeId);
+        if (!shouldAttachTopic)
+        {
+            return;
+        }
+
         var firstTopic = TopicsForModule(moduleId).FirstOrDefault();
         if (firstTopic is not null)
         {
@@ -348,6 +372,7 @@
         var topicId = int.TryParse(e.Value?.ToString(), out var parsed) ? parsed : (int?)null;
         await EnsureTopicsLoaded(_edit.ModuleId);
         ApplyTopicSelection(topicId);
+        ClearTopicForFinalAssessment();
     }
 
     private void OnLessonTypeChanged(ChangeEventArgs e)
@@ -358,9 +383,11 @@
         {
             var fallback = AllowedLessonTypes.FirstOrDefault()?.Id;
             ApplyLessonType(fallback);
+            ClearTopicForFinalAssessment();
             return;
         }
         ApplyLessonType(ltId);
+        ClearTopicForFinalAssessment();
     }
     private async Task StartEdit(TeacherDraftItemDto item)
     {
@@ -390,7 +417,7 @@
         EnsureAllowedLessonType();
         _extraAssignments.Clear();
     }
-    private async Task StartCreate(int dayNumber, string start, string end)
+    private async Task StartCreate(int dayNumber, string start, string end, int groupId)
     {
 
         _extraAssignments.Clear();
@@ -421,8 +448,8 @@
             return;
         }
 
-        var groupId = _groupId ?? _meta.Groups.FirstOrDefault()?.Id;
-        if (groupId is null)
+        var resolvedGroupId = groupId > 0 ? groupId : (_groupId ?? _meta.Groups.FirstOrDefault()?.Id);
+        if (resolvedGroupId is null)
         {
             _err = "Немає доступних груп для створення чернетки.";
             return;
@@ -443,7 +470,7 @@
             Date: date,
             TimeStart: start,
             TimeEnd: end,
-            GroupId: groupId.Value,
+            GroupId: resolvedGroupId.Value,
             ModuleId: module.Id,
             ModuleTopicId: defaultTopic?.Id,
             TeacherId: _teacherId,
@@ -1347,7 +1374,6 @@ else
                                     var wrapperCss = BuildCellContainerCss(cellCss, slotKey, item);
                                     var canDrag = CanDragItem(item);
                                     <td class="@tdCss"
-                                        @ondblclick="async () => await StartCreate(dayNumber, slot.Start, slot.End)"
                                         @ondragover="e => OnSlotDragOver(slotKey, item, e)" @ondragover:preventDefault
                                         @ondragenter="() => OnSlotDragEnter(slotKey, item)"
                                         @ondragleave="() => OnSlotDragLeave(slotKey)"
@@ -1367,7 +1393,14 @@ else
                                             }
                                             @if (item is null)
                                             {
-                                                <span class="td-empty">Вільно</span>
+                                                <div class="td-empty-box">
+                                                    <span class="td-empty">Вільно</span>
+                                                    <button type="button"
+                                                            class="btn btn-ghost btn-sm td-empty-add"
+                                                            @onclick="async () => await StartCreate(dayNumber, slot.Start, slot.End, group.Id)">
+                                                        Додати
+                                                    </button>
+                                                </div>
                                             }
                                             else if (IsBreak(item) || IsCanceled(item))
                                             {
@@ -1599,7 +1632,7 @@ else
                 </select>
             </div>
 
-            <div class="editor-field editor-field--align-right">
+            <div class="editor-field editor-field--wide editor-field--room-left">
                 <label>
                     Аудиторія
                 </label>
@@ -2140,6 +2173,20 @@ else
 
     .td-cell-actions { display: flex; justify-content: flex-end; gap: 8px; }
     .td-empty { font-weight: 500; user-select: none; -webkit-user-select: none; }
+    .td-empty-box {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 6px;
+        color: #94a3b8;
+    }
+    .td-empty-add {
+        padding: .3rem .7rem;
+        border-color: #d1d5db;
+        color: #1f2937;
+        background: #fff;
+    }
+    .td-empty-add:hover { background: #f8fafc; }
 
     .badge {
         display: inline-block;
@@ -2224,6 +2271,7 @@ else
     }
 
     .editor-field--wide { grid-column: span 2; }
+    .editor-field--room-left { grid-column: 1 / span 2; justify-self: start; }
     .editor-field--align-right { justify-self: end; }
 
     .editor-field label {
@@ -2271,6 +2319,7 @@ else
 
     @@media (max-width: 768px) {
         .editor-field--wide { grid-column: span 1; }
+        .editor-field--room-left { grid-column: span 1; }
         .editor-lock { justify-content: flex-start; }
     }
 
