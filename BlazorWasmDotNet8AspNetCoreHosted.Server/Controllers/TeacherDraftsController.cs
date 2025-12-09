@@ -1005,6 +1005,22 @@ public sealed class TeacherDraftsController : ControllerBase
             typeById.TryGetValue(lessonTypeId, out var lt)
             && string.Equals(lt.Code, "LECTURE", StringComparison.OrdinalIgnoreCase);
 
+        bool HasPendingLectureBeforeLunch(int gid)
+        {
+            foreach (var kvp in topicsByModule)
+            {
+                var mid = kvp.Key;
+                if (RemainingFor(gid, mid) <= 0) continue;
+
+                var topicCandidate = PeekNextTopic(gid, mid);
+                if (topicCandidate is not null && IsLectureType(topicCandidate.LessonTypeId))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         ModuleTopic? PeekNextTopic(int groupId, int moduleId)
         {
             if (!topicsByModule.TryGetValue(moduleId, out var list) || list.Count == 0)
@@ -1700,6 +1716,31 @@ public sealed class TeacherDraftsController : ControllerBase
                         {
                             slotIssues.Add($"Лекції слід ставити до обідньої перерви ({groupLunch.Start:HH\\:mm}), слот {slotLabel} пропущено.");
                             break;
+                        }
+
+                        bool isPreLunchSlot = groupLunch is not null && sl.End <= groupLunch.Start;
+                        if (isPreLunchSlot && !IsLectureType(ltypeId))
+                        {
+                            var hasLectureBefore = busy.Any(b =>
+                                b.GroupId == grp.Id
+                                && b.Date == date
+                                && IsLectureType(b.LessonTypeId)
+                                && b.EndTime <= groupLunch!.Start
+                                && b.StartTime < sl.Start);
+
+                            var lecturesPending = HasPendingLectureBeforeLunch(grp.Id);
+
+                            if (hasLectureBefore)
+                            {
+                                slotIssues.Add("Перед обідом уже розпочато блок лекцій, інші типи занять у цей час пропускаємо.");
+                                continue;
+                            }
+
+                            if (lecturesPending)
+                            {
+                                slotIssues.Add("До обіду залишаються незаплановані лекції, слот залишено під них.");
+                                continue;
+                            }
                         }
 
                         var requiresRoom = (typeById.TryGetValue(ltypeId, out var ltMeta) ? ltMeta.RequiresRoom : (bool?)null) ?? true;
