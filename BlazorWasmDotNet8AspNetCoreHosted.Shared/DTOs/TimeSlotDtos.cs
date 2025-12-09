@@ -9,4 +9,5 @@ public record class TimeSlotDto
     public string Start { get; set; } = "08:30";
     public string End { get; set; } = "10:00";
     public bool IsActive { get; set; } = true;
+    public bool IsLunch { get; set; } = false;
 }

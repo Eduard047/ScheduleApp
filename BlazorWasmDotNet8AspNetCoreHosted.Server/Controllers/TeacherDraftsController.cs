@@ -1001,6 +1001,10 @@ public sealed class TeacherDraftsController : ControllerBase
                    && !excludedTypeIds.Contains(lessonTypeId);
         }
 
+        bool IsLectureType(int lessonTypeId) =>
+            typeById.TryGetValue(lessonTypeId, out var lt)
+            && string.Equals(lt.Code, "LECTURE", StringComparison.OrdinalIgnoreCase);
+
         ModuleTopic? PeekNextTopic(int groupId, int moduleId)
         {
             if (!topicsByModule.TryGetValue(moduleId, out var list) || list.Count == 0)
@@ -1264,6 +1268,8 @@ public sealed class TeacherDraftsController : ControllerBase
 
         foreach (var grp in groups)
         {
+            var groupLunch = lunchesAll.FirstOrDefault(l => l.CourseId == grp.CourseId)
+                          ?? lunchesAll.FirstOrDefault(l => l.CourseId == null);
             var hasCourseSlots = await _db.TimeSlots.AsNoTracking().AnyAsync(s => s.CourseId == grp.CourseId && s.IsActive);
             var slots = await _db.TimeSlots.AsNoTracking()
                 .Where(s => s.IsActive && (hasCourseSlots ? s.CourseId == grp.CourseId : s.CourseId == null))
@@ -1397,65 +1403,59 @@ public sealed class TeacherDraftsController : ControllerBase
                 }
             }
 
-            if (typeBreakId.HasValue)
+            if (typeBreakId.HasValue && groupLunch is not null)
             {
-                var glunch = lunchesAll.FirstOrDefault(l => l.CourseId == grp.CourseId)
-                          ?? lunchesAll.FirstOrDefault(l => l.CourseId == null);
-
-                if (glunch is not null)
+                var anyModuleId = await _db.ModuleCourses
+                    .Where(mc => mc.CourseId == grp.CourseId)
+                    .Select(mc => mc.ModuleId)
+                    .FirstOrDefaultAsync();
+                if (anyModuleId != 0)
                 {
-                    var anyModuleId = await _db.ModuleCourses
-                        .Where(mc => mc.CourseId == grp.CourseId)
-                        .Select(mc => mc.ModuleId)
-                        .FirstOrDefaultAsync();
-                    if (anyModuleId != 0)
+                    var candidateSlots = slots
+                        .Where(sl => sl.Start <= groupLunch.Start && groupLunch.End <= sl.End)
+                        .ToList();
+
+                    if (candidateSlots.Count == 0)
                     {
-                        var candidateSlots = slots
-                            .Where(sl => sl.Start <= glunch.Start && glunch.End <= sl.End)
+                        candidateSlots = slots
+                            .Where(sl => sl.Start < groupLunch.End && groupLunch.Start < sl.End)
                             .ToList();
+                    }
 
-                        if (candidateSlots.Count == 0)
+                    for (int d = 0; d < 7; d++)
+                    {
+                        var date = weekStart.AddDays(d);
+                        if (!IsWorking(date, grp)) continue;
+
+                        foreach (var slot in candidateSlots)
                         {
-                            candidateSlots = slots
-                                .Where(sl => sl.Start < glunch.End && glunch.Start < sl.End)
-                                .ToList();
-                        }
+                            var s = slot.Start;
+                            var e = slot.End;
 
-                        for (int d = 0; d < 7; d++)
-                        {
-                            var date = weekStart.AddDays(d);
-                            if (!IsWorking(date, grp)) continue;
+                            var hasBreak = busy.Any(b =>
+                                b.GroupId == grp.Id &&
+                                b.Date == date &&
+                                b.StartTime == s &&
+                                b.EndTime == e &&
+                                b.LessonTypeId == typeBreakId.Value);
+                            if (hasBreak) continue;
 
-                            foreach (var slot in candidateSlots)
+                            var breakItem = new TeacherDraftItem
                             {
-                                var s = slot.Start;
-                                var e = slot.End;
+                                Date = date,
+                                DayOfWeek = date.ToDateTime(TimeOnly.MinValue).DayOfWeek,
+                                StartTime = s,
+                                EndTime = e,
+                                GroupId = grp.Id,
+                                ModuleId = anyModuleId,
+                                LessonTypeId = typeBreakId.Value,
+                                Status = DraftStatus.Draft,
+                                IsLocked = false
+                            };
 
-                                var hasBreak = busy.Any(b =>
-                                    b.GroupId == grp.Id &&
-                                    b.Date == date &&
-                                    b.StartTime == s &&
-                                    b.EndTime == e &&
-                                    b.LessonTypeId == typeBreakId.Value);
-                                if (hasBreak) continue;
+                            _db.TeacherDraftItems.Add(breakItem);
 
-                                var breakItem = new TeacherDraftItem
-                                {
-                                    Date = date,
-                                    DayOfWeek = date.ToDateTime(TimeOnly.MinValue).DayOfWeek,
-                                    StartTime = s,
-                                    EndTime = e,
-                                    GroupId = grp.Id,
-                                    ModuleId = anyModuleId,
-                                    LessonTypeId = typeBreakId.Value,
-                                    Status = DraftStatus.Draft,
-                                    IsLocked = false
-                                };
-
-                                _db.TeacherDraftItems.Add(breakItem);
-
-                                busy.Add(new BusySlot(grp.Id, null, null, date, s, e, null, anyModuleId, typeBreakId.Value));
-                            }
+                            busy.Add(new BusySlot(grp.Id, null, null, date, s, e, null, anyModuleId, typeBreakId.Value));
                         }
                     }
                 }
@@ -1694,6 +1694,12 @@ public sealed class TeacherDraftsController : ControllerBase
                                 slotIssues.Add($"Тип заняття \"{ltInfo.Name}\" виключено з автогенерації, тому слот {slotLabel} пропущено.");
                             }
                             continue;
+                        }
+
+                        if (groupLunch is not null && IsLectureType(ltypeId) && sl.End > groupLunch.Start)
+                        {
+                            slotIssues.Add($"Лекції слід ставити до обідньої перерви ({groupLunch.Start:HH\\:mm}), слот {slotLabel} пропущено.");
+                            break;
                         }
 
                         var requiresRoom = (typeById.TryGetValue(ltypeId, out var ltMeta) ? ltMeta.RequiresRoom : (bool?)null) ?? true;

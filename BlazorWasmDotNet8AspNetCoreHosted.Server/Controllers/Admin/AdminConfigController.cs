@@ -123,11 +123,22 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
         return TimeOnly.Parse(s, CultureInfo.InvariantCulture);
     }
 
+    private static bool SlotMatchesLunch(TimeOnly start, TimeOnly end, LunchConfig? lunch)
+        => lunch is not null && lunch.Start == start && lunch.End == end;
+
     
     [HttpGet("slots")]
     public async Task<IActionResult> GetEffectiveSlots([FromQuery] int? courseId)
     {
-        bool useCourse = (courseId is int cid) && await db.TimeSlots.AnyAsync(s => s.CourseId == cid);
+        var hasCourse = courseId is int;
+        bool useCourse = hasCourse && await db.TimeSlots.AnyAsync(s => s.CourseId == courseId);
+
+        LunchConfig? lunch = null;
+        if (courseId is int cidExact)
+        {
+            lunch = await db.LunchConfigs.AsNoTracking().FirstOrDefaultAsync(l => l.CourseId == cidExact);
+        }
+        lunch ??= await db.LunchConfigs.AsNoTracking().FirstOrDefaultAsync(l => l.CourseId == null);
 
         
         var rows = await db.TimeSlots.AsNoTracking()
@@ -143,7 +154,8 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
             Start = s.Start.ToString("HH:mm"),
             End = s.End.ToString("HH:mm"),
             SortOrder = s.SortOrder,
-            IsActive = s.IsActive
+            IsActive = s.IsActive,
+            IsLunch = SlotMatchesLunch(s.Start, s.End, lunch) && s.IsActive
         }).ToList();
 
         return Ok(new { courseId, usingCourseSpecific = useCourse, slots });
@@ -154,6 +166,13 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
     [HttpGet("slots/raw")]
     public async Task<IActionResult> GetRawSlots([FromQuery] int? courseId)
     {
+        var lunches = await db.LunchConfigs.AsNoTracking().ToListAsync();
+        LunchConfig? courseLunch = null;
+        if (courseId is int cidRaw)
+        {
+            courseLunch = lunches.FirstOrDefault(l => l.CourseId == cidRaw);
+        }
+        var globalLunch = lunches.FirstOrDefault(l => l.CourseId == null);
         
         var sel = db.TimeSlots.AsNoTracking().Select(s => new
         {
@@ -185,7 +204,8 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
             Start = ((TimeOnly)s.Start).ToString("HH:mm"),
             End = ((TimeOnly)s.End).ToString("HH:mm"),
             SortOrder = (int)s.SortOrder,
-            IsActive = (bool)s.IsActive
+            IsActive = (bool)s.IsActive,
+            IsLunch = SlotMatchesLunch((TimeOnly)s.Start, (TimeOnly)s.End, courseLunch) && (bool)s.IsActive
         }).ToList();
 
         List<TimeSlotDto> global = globalRows.Select(s => new TimeSlotDto
@@ -195,7 +215,8 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
             Start = s.Start.ToString("HH:mm"),
             End = s.End.ToString("HH:mm"),
             SortOrder = s.SortOrder,
-            IsActive = s.IsActive
+            IsActive = s.IsActive,
+            IsLunch = SlotMatchesLunch(s.Start, s.End, globalLunch) && s.IsActive
         }).ToList();
 
         return Ok(new { course, global });
@@ -219,9 +240,16 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
             Start = ParseTime(r.Start),
             End = ParseTime(r.End),
             IsActive = r.IsActive,
+            IsLunch = r.IsLunch,
             Sort = r.SortOrder <= 0 ? i + 1 : r.SortOrder
         })
         .OrderBy(x => x.Sort).ThenBy(x => x.Start).ToList();
+
+        var lunchCount = norm.Count(x => x.IsLunch);
+        if (lunchCount > 1)
+        {
+            return BadRequest(new { message = "Може бути лише один слот, позначений як обід." });
+        }
 
         
         for (int i = 0; i < norm.Count; i++)
@@ -234,6 +262,12 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
                 var prev = norm[i - 1];
                 if (s < prev.End) return BadRequest(new { message = $"Overlap between slot #{i} and #{i + 1}" });
             }
+        }
+
+        var lunchSlot = norm.FirstOrDefault(x => x.IsLunch);
+        if (lunchSlot is not null && !lunchSlot.IsActive)
+        {
+            return BadRequest(new { message = "Слот обіду має бути активним." });
         }
 
         await using var tx = await db.Database.BeginTransactionAsync();
@@ -250,6 +284,29 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
                 SortOrder = sort++,
                 IsActive = x.IsActive
             });
+        }
+
+        if (lunchSlot is not null)
+        {
+            var lunchRow = await db.LunchConfigs.FirstOrDefaultAsync(l => l.CourseId == courseId);
+            if (lunchRow is null)
+            {
+                db.LunchConfigs.Add(new LunchConfig
+                {
+                    CourseId = courseId,
+                    Start = lunchSlot.Start,
+                    End = lunchSlot.End
+                });
+            }
+            else
+            {
+                lunchRow.Start = lunchSlot.Start;
+                lunchRow.End = lunchSlot.End;
+            }
+        }
+        else
+        {
+            await db.LunchConfigs.Where(l => l.CourseId == courseId).ExecuteDeleteAsync();
         }
 
         await db.SaveChangesAsync();
