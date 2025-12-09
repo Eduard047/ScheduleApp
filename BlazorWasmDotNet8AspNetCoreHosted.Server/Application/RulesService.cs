@@ -65,8 +65,9 @@ public sealed class RulesService(AppDbContext db)
 
         var dow = r.Date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
         bool isWeekend = dow is DayOfWeek.Saturday or DayOfWeek.Sunday;
-        var cal = await db.CalendarExceptions.AsNoTracking().FirstOrDefaultAsync(x => x.Date == r.Date);
-        bool isWorking = !isWeekend || (cal?.IsWorkingDay == true);
+        var courseId = group?.CourseId;
+        var cal = await FindCalendarExceptionAsync(r.Date, courseId, r.GroupId);
+        bool isWorking = cal?.IsWorkingDay ?? !isWeekend;
         if (!isWorking && !r.OverrideNonWorkingDay)
             warnings.Add("Увага: заняття потрапляє на вихідний день.");
 
@@ -229,8 +230,9 @@ public sealed class RulesService(AppDbContext db)
 
         var dow = r.Date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
         bool isWeekend = dow is DayOfWeek.Saturday or DayOfWeek.Sunday;
-        var cal = await db.CalendarExceptions.AsNoTracking().FirstOrDefaultAsync(x => x.Date == r.Date);
-        bool isWorking = !isWeekend || (cal?.IsWorkingDay == true);
+        var courseId = group?.CourseId;
+        var cal = await FindCalendarExceptionAsync(r.Date, courseId, r.GroupId);
+        bool isWorking = cal?.IsWorkingDay ?? !isWeekend;
         if (!isWorking && !r.OverrideNonWorkingDay)
         {
             var reason = cal is not null ? cal.Name : (isWeekend ? "вихідний день" : "неробочий день");
@@ -377,6 +379,26 @@ public sealed class RulesService(AppDbContext db)
 
         var report = new DraftValidationReportDto(DateTimeOffset.UtcNow, issues);
         return new DraftValidationResult(errors, warnings, report);
+    }
+
+    private async Task<CalendarException?> FindCalendarExceptionAsync(DateOnly date, int? courseId, int? groupId)
+    {
+        var query = db.CalendarExceptions.AsNoTracking().Where(x => x.Date == date);
+
+        if (groupId is int gid && gid > 0)
+            query = query.Where(x => x.GroupId == gid || x.GroupId == null);
+        else
+            query = query.Where(x => x.GroupId == null);
+
+        if (courseId is int cid && cid > 0)
+            query = query.Where(x => x.CourseId == cid || x.CourseId == null);
+        else
+            query = query.Where(x => x.CourseId == null);
+
+        return await query
+            .OrderByDescending(x => x.GroupId != null)
+            .ThenByDescending(x => x.CourseId != null)
+            .FirstOrDefaultAsync();
     }
 }
 

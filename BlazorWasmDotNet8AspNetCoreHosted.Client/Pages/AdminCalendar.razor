@@ -18,20 +18,52 @@
 }
 
 <div class="card p-3 mb-3">
-    <div class="row g-2 align-items-end">
-        <div class="col-12 col-md-3">
+    <div class="row g-3 align-items-start">
+        <div class="col-12 col-md-4">
             <label class="form-label">Дата</label>
             <InputText class="form-control" type="date" @bind-Value="form.Date" />
         </div>
-        <div class="col-12 col-md-5">
+        <div class="col-12 col-md-4">
             <label class="form-label">Назва</label>
             <InputText class="form-control" @bind-Value="form.Name" />
         </div>
-        <div class="col-6 col-md-2">
-            <label class="form-label">Робочий?</label><br />
-            <input type="checkbox" class="form-check-input" @bind="form.IsWorkingDay" />
+        <div class="col-12 col-md-4">
+            <label class="form-label">Курс</label>
+            <select class="form-select" value="@form.CourseId" @onchange="OnCourseChanged">
+                <option value="">Оберіть курс</option>
+                @foreach (var c in courses)
+                {
+                    <option value="@c.Id">@c.Name</option>
+                }
+            </select>
+            <div class="form-text">Виняток діє в межах вибраного курсу.</div>
         </div>
-        <div class="col-6 col-md-2 d-grid">
+    </div>
+    <div class="row g-3 align-items-center mt-1">
+        <div class="col-12 col-lg-6">
+            <label class="form-label">Група (необов'язково)</label>
+            <select class="form-select"
+                    value="@form.GroupId"
+                    @onchange="OnGroupChanged"
+                    disabled="@(form.CourseId is null)">
+                <option value="">Усі групи курсу</option>
+                @foreach (var g in GroupsForCourse(form.CourseId))
+                {
+                    <option value="@g.Id">@g.Name</option>
+                }
+            </select>
+            <div class="form-text">Оберіть групу курсу, якщо виняток стосується лише її.</div>
+        </div>
+        <div class="col-12 col-lg-3 d-flex align-items-center justify-content-start justify-content-lg-center mt-2 mt-lg-0">
+            <div class="form-check form-switch mb-0 d-flex align-items-center gap-2">
+                <input type="checkbox"
+                       class="form-check-input"
+                       id="isWorkingSwitch"
+                       @bind="form.IsWorkingDay" />
+                <label class="form-check-label fw-semibold mb-0" for="isWorkingSwitch">Робочий день</label>
+            </div>
+        </div>
+        <div class="col-6 col-lg-3 d-grid">
             <button class="btn btn-primary" @onclick="Save">Зберегти</button>
         </div>
     </div>
@@ -42,7 +74,7 @@
         <div class="text-muted small">Показано: @SortedAndFiltered.Count() з @items.Count</div>
         <div class="input-group" style="max-width:320px;">
             <span class="input-group-text">Пошук</span>
-            <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / дата / назва / так/ні" />
+            <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / дата / назва / курс / група / так/ні" />
         </div>
     </div>
 
@@ -57,6 +89,14 @@
                     <th role="button" class="sortable-th"
                         @onclick="() => ToggleSort(nameof(CalendarExceptionEditDto.Date))">
                         Дата @HeaderIcon(nameof(CalendarExceptionEditDto.Date))
+                    </th>
+                    <th role="button" class="sortable-th"
+                        @onclick="() => ToggleSort(CourseNameField)">
+                        Курс @HeaderIcon(CourseNameField)
+                    </th>
+                    <th role="button" class="sortable-th"
+                        @onclick="() => ToggleSort(GroupNameField)">
+                        Група @HeaderIcon(GroupNameField)
                     </th>
                     <th role="button" class="sortable-th"
                         @onclick="() => ToggleSort(nameof(CalendarExceptionEditDto.Name))">
@@ -75,6 +115,8 @@
                     <tr>
                         <td>@x.Id</td>
                         <td>@x.Date</td>
+                        <td>@CourseLabel(x)</td>
+                        <td>@GroupLabel(x)</td>
                         <td>@x.Name</td>
                         <td>@(x.IsWorkingDay ? "Так" : "Ні")</td>
                         <td class="text-end">
@@ -96,6 +138,8 @@
     
     // Кешовані винятки календаря, завантажені з API.
     private List<CalendarExceptionEditDto> items = new();
+    private List<LookupDto> courses = new();
+    private List<GroupEditDto> groups = new();
 
     
     // Модель форми для створення або редагування запису.
@@ -104,11 +148,15 @@
         Id = null,
         Date = DateTime.Today.ToString("yyyy-MM-dd"),
         Name = "",
-        IsWorkingDay = false
+        IsWorkingDay = false,
+        CourseId = null,
+        GroupId = null
     };
 
     
     // Поточні параметри сортування та фільтрування.
+    private const string CourseNameField = "CourseName";
+    private const string GroupNameField = "GroupName";
     private string sortField = nameof(CalendarExceptionEditDto.Date);
     private bool sortAsc = true;
     private string? filter;
@@ -128,8 +176,59 @@
         {
             error = ok = null;
             items = await Admin.GetCalendar();
+            var meta = await Admin.GetMeta();
+            courses = meta.Courses ?? new();
+            groups = await Admin.GetGroups();
+
+            var hasCourse = form.CourseId is int cid && courses.Any(c => c.Id == cid);
+            if (!hasCourse) form.CourseId = null;
+
+            if (form.GroupId is int gid)
+            {
+                var grp = groups.FirstOrDefault(g => g.Id == gid);
+                if (grp is null || (form.CourseId is int c && grp.CourseId != c))
+                {
+                    form.GroupId = null;
+                }
+                else
+                {
+                    form.CourseId ??= grp.CourseId;
+                }
+            }
         }
         catch (Exception ex) { error = ex.Message; }
+    }
+
+    private string NameOfCourse(int? id)
+    {
+        if (id is int cid && cid > 0)
+            return courses.FirstOrDefault(c => c.Id == cid)?.Name ?? $"Курс #{cid}";
+        return "Усі курси";
+    }
+
+    private string NameOfGroup(int? id)
+    {
+        if (id is int gid && gid > 0)
+            return groups.FirstOrDefault(g => g.Id == gid)?.Name ?? $"Група #{gid}";
+        return "Усі групи курсу";
+    }
+
+    private IEnumerable<GroupEditDto> GroupsForCourse(int? courseId)
+    {
+        if (courseId is int cid && cid > 0)
+            return groups.Where(g => g.CourseId == cid).OrderBy(g => g.Name);
+
+        return Enumerable.Empty<GroupEditDto>();
+    }
+
+    private string CourseLabel(CalendarExceptionEditDto x) => NameOfCourse(x.CourseId);
+
+    private string GroupLabel(CalendarExceptionEditDto x)
+    {
+        if (x.GroupId is int gid && gid > 0)
+            return NameOfGroup(gid);
+
+        return "Усі групи курсу";
     }
 
     
@@ -137,20 +236,122 @@
     /// Переносить дані в форму для подальшого редагування.
     /// </summary>
     private void EditRow(CalendarExceptionEditDto x)
-        => form = new() { Id = x.Id, Date = x.Date, IsWorkingDay = x.IsWorkingDay, Name = x.Name };
+    {
+        form = new()
+        {
+            Id = x.Id,
+            Date = x.Date,
+            IsWorkingDay = x.IsWorkingDay,
+            Name = x.Name,
+            CourseId = x.CourseId,
+            GroupId = x.GroupId
+        };
+
+        if (form.GroupId is int gid)
+        {
+            var grp = groups.FirstOrDefault(g => g.Id == gid);
+            if (grp is null)
+            {
+                form.GroupId = null;
+            }
+            else
+            {
+                form.CourseId ??= grp.CourseId;
+            }
+        }
+    }
 
     
     /// <summary>
     /// Зберігає поточний запис і перезавантажує список.
     /// </summary>
+    private void OnCourseChanged(ChangeEventArgs e)
+    {
+        form.CourseId = null;
+        if (e?.Value is not null && int.TryParse(e.Value.ToString(), out var cid) && cid > 0)
+        {
+            form.CourseId = cid;
+        }
+
+        if (form.CourseId is null)
+        {
+            form.GroupId = null;
+            return;
+        }
+
+        if (form.GroupId is int gid)
+        {
+            var grp = groups.FirstOrDefault(g => g.Id == gid);
+            if (grp is null || (form.CourseId is int c && grp.CourseId != c))
+            {
+                form.GroupId = null;
+            }
+        }
+    }
+
+    private void OnGroupChanged(ChangeEventArgs e)
+    {
+        form.GroupId = null;
+        if (e?.Value is not null && int.TryParse(e.Value.ToString(), out var gid) && gid > 0)
+        {
+            var grp = groups.FirstOrDefault(g => g.Id == gid);
+            if (grp is not null && (form.CourseId is null || grp.CourseId == form.CourseId))
+            {
+                form.GroupId = gid;
+                form.CourseId ??= grp.CourseId;
+            }
+        }
+    }
+
     private async Task Save()
     {
         try
         {
+            error = ok = null;
+            if (form.CourseId is null || form.CourseId <= 0)
+            {
+                error = "Оберіть курс для винятку.";
+                return;
+            }
+
+            if (form.GroupId is int gid)
+            {
+                var targetGroup = groups.FirstOrDefault(g => g.Id == gid);
+                if (targetGroup is null)
+                {
+                    error = "Групу не знайдено.";
+                    return;
+                }
+
+                if (targetGroup.CourseId != form.CourseId)
+                {
+                    error = "Група не належить обраному курсу.";
+                    return;
+                }
+            }
+
+            form.Name = (form.Name ?? string.Empty).Trim();
+            form.Date = (form.Date ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(form.Date))
+            {
+                error = "Оберіть дату для винятку.";
+                return;
+            }
+
+            var keepCourse = form.CourseId;
+
             await Admin.UpsertCalendar(form);
             await Load();
             ok = "Збережено.";
-            form = new() { Id = null, Date = DateTime.Today.ToString("yyyy-MM-dd"), Name = "", IsWorkingDay = false };
+            form = new()
+            {
+                Id = null,
+                Date = DateTime.Today.ToString("yyyy-MM-dd"),
+                Name = "",
+                IsWorkingDay = false,
+                CourseId = keepCourse,
+                GroupId = null
+            };
         }
         catch (Exception ex) { error = ex.Message; }
     }
@@ -195,6 +396,8 @@
             (x.Id?.ToString().Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
             (x.Date?.Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
             (x.Name?.Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
+            CourseLabel(x).Contains(f, StringComparison.OrdinalIgnoreCase) ||
+            GroupLabel(x).Contains(f, StringComparison.OrdinalIgnoreCase) ||
             
             ((f.Equals("так", StringComparison.OrdinalIgnoreCase) && x.IsWorkingDay) ||
              (f.Equals("ні", StringComparison.OrdinalIgnoreCase) && !x.IsWorkingDay)))
@@ -214,6 +417,12 @@
 
             (nameof(CalendarExceptionEditDto.Date), true) => seq.OrderBy(x => DO(x.Date)),
             (nameof(CalendarExceptionEditDto.Date), false) => seq.OrderByDescending(x => DO(x.Date)),
+
+            (CourseNameField, true) => seq.OrderBy(CourseLabel),
+            (CourseNameField, false) => seq.OrderByDescending(CourseLabel),
+
+            (GroupNameField, true) => seq.OrderBy(GroupLabel),
+            (GroupNameField, false) => seq.OrderByDescending(GroupLabel),
 
             (nameof(CalendarExceptionEditDto.Name), true) => seq.OrderBy(x => x.Name),
             (nameof(CalendarExceptionEditDto.Name), false) => seq.OrderByDescending(x => x.Name),

@@ -189,7 +189,15 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         // Унікалізуємо винятки у календарі за датою.
         b.Entity<CalendarException>(e =>
         {
-            e.HasIndex(x => x.Date).IsUnique();
+            e.HasIndex(x => new { x.Date, x.CourseId, x.GroupId }).IsUnique();
+            e.HasOne(x => x.Course)
+                .WithMany()
+                .HasForeignKey(x => x.CourseId)
+                .OnDelete(DeleteBehavior.Cascade);
+            e.HasOne(x => x.Group)
+                .WithMany()
+                .HasForeignKey(x => x.GroupId)
+                .OnDelete(DeleteBehavior.Cascade);
         });
 
         // Вказуємо послідовність модулів у курсі.

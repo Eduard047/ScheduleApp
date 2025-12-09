@@ -709,16 +709,19 @@ public sealed class TeacherDraftsController : ControllerBase
             };
         }
 
-        var weekExceptions = await _db.CalendarExceptions
+        var calendar = await _db.CalendarExceptions
             .Where(c => c.Date >= weekStart && c.Date < weekEnd)
-            .ToDictionaryAsync(c => c.Date, c => c.IsWorkingDay);
+            .ToListAsync();
 
-        bool IsWorking(DateOnly d)
+        bool IsWorking(DateOnly d, Group grp)
         {
-            if (!DayAllowed(d.ToDateTime(TimeOnly.MinValue).DayOfWeek)) return false;
-            if (r.AllowOnDaysOff) return true;
-            if (weekExceptions.TryGetValue(d, out var isWork)) return isWork;
+            var scoped = ResolveCalendarOverride(calendar, d, grp.CourseId, grp.Id);
+            if (scoped.HasValue) return scoped.Value;
+
             var dow = d.ToDateTime(TimeOnly.MinValue).DayOfWeek;
+            if (!DayAllowed(dow) && !r.AllowOnDaysOff) return false;
+            if (r.AllowOnDaysOff) return true;
+
             return dow != DayOfWeek.Saturday && dow != DayOfWeek.Sunday;
         }
 
@@ -1421,7 +1424,7 @@ public sealed class TeacherDraftsController : ControllerBase
                         for (int d = 0; d < 7; d++)
                         {
                             var date = weekStart.AddDays(d);
-                            if (!IsWorking(date)) continue;
+                            if (!IsWorking(date, grp)) continue;
 
                             foreach (var slot in candidateSlots)
                             {
@@ -1863,7 +1866,7 @@ public sealed class TeacherDraftsController : ControllerBase
             for (int d = 0; d < 7; d++)
             {
                 var date = weekStart.AddDays(d);
-                if (!IsWorking(date)) continue;
+                if (!IsWorking(date, grp)) continue;
 
                 int maxPerDay = slots.Count;
                 if (maxPerDay == 0) continue;
@@ -2036,7 +2039,7 @@ public sealed class TeacherDraftsController : ControllerBase
 
         var calendar = await _db.CalendarExceptions.AsNoTracking()
             .Where(x => x.Date >= start && x.Date < end)
-            .ToDictionaryAsync(x => x.Date, x => x.IsWorkingDay);
+            .ToListAsync();
 
         int created = 0, skipped = 0;
         var warnings = new List<string>();
@@ -2047,11 +2050,9 @@ public sealed class TeacherDraftsController : ControllerBase
         foreach (var d in drafts)
         {
             var isWeekend = d.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday;
-            var isWorking = !isWeekend;
-            if (calendar.TryGetValue(d.Date, out var isWorkingDay))
-            {
-                isWorking = isWorkingDay;
-            }
+            var courseId = d.Group?.CourseId;
+            var scoped = ResolveCalendarOverride(calendar, d.Date, courseId, d.GroupId);
+            var isWorking = scoped ?? !isWeekend;
             var overrideNonWorking = !isWorking;
 
             var requiresRoom = lessonTypeRoomMap.TryGetValue(d.LessonTypeId, out var reqRoom) ? reqRoom : true;
@@ -2199,5 +2200,21 @@ public sealed class TeacherDraftsController : ControllerBase
         }
 
         await _db.SaveChangesAsync();
+    }
+
+    private static bool? ResolveCalendarOverride(IEnumerable<CalendarException> items, DateOnly date, int? courseId, int? groupId)
+    {
+        int? normCourse = (courseId is int cid && cid > 0) ? cid : null;
+        int? normGroup = (groupId is int gid && gid > 0) ? gid : null;
+
+        var match = items
+            .Where(x => x.Date == date)
+            .Where(x => normGroup != null ? (x.GroupId == normGroup || x.GroupId == null) : x.GroupId == null)
+            .Where(x => normCourse != null ? (x.CourseId == normCourse || x.CourseId == null) : x.CourseId == null)
+            .OrderByDescending(x => x.GroupId != null)
+            .ThenByDescending(x => x.CourseId != null)
+            .FirstOrDefault();
+
+        return match?.IsWorkingDay;
     }
 }

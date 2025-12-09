@@ -55,23 +55,47 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
     public async Task<IReadOnlyList<CalendarExceptionEditDto>> CalendarList()
         => await db.CalendarExceptions
             .OrderBy(x => x.Date)
-            .Select(x => new CalendarExceptionEditDto(x.Id, x.Date.ToString("yyyy-MM-dd"), x.IsWorkingDay, x.Name))
+            .Select(x => new CalendarExceptionEditDto(x.Id, x.Date.ToString("yyyy-MM-dd"), x.IsWorkingDay, x.Name, x.CourseId, x.GroupId))
             .ToListAsync();
 
     [HttpPost("calendar/upsert")]
     public async Task<ActionResult<int>> CalendarUpsert(CalendarExceptionEditDto dto)
     {
         var date = DateOnly.Parse(dto.Date);
+        int? courseId = dto.CourseId;
+        Group? group = null;
+
+        if (dto.GroupId is int gid && gid > 0)
+        {
+            group = await db.Groups.FindAsync(gid);
+            if (group is null) return BadRequest("Group not found");
+            courseId ??= group.CourseId;
+            if (courseId != group.CourseId) return BadRequest("Group does not belong to selected course");
+        }
+
+        if (courseId is int cid && await db.Courses.FindAsync(cid) is null)
+            return BadRequest("Course not found");
 
         if (dto.Id is int id && id > 0)
         {
             var x = await db.CalendarExceptions.FindAsync(id) ?? throw new ArgumentException("CalendarException not found");
-            x.Date = date; x.IsWorkingDay = dto.IsWorkingDay; x.Name = dto.Name;
+            x.Date = date;
+            x.IsWorkingDay = dto.IsWorkingDay;
+            x.Name = dto.Name;
+            x.CourseId = courseId;
+            x.GroupId = group?.Id ?? dto.GroupId;
             await db.SaveChangesAsync(); return Ok(x.Id);
         }
         else
         {
-            var x = new CalendarException { Date = date, IsWorkingDay = dto.IsWorkingDay, Name = dto.Name };
+            var x = new CalendarException
+            {
+                Date = date,
+                IsWorkingDay = dto.IsWorkingDay,
+                Name = dto.Name,
+                CourseId = courseId,
+                GroupId = group?.Id ?? dto.GroupId
+            };
             db.CalendarExceptions.Add(x); await db.SaveChangesAsync(); return Ok(x.Id);
         }
     }
