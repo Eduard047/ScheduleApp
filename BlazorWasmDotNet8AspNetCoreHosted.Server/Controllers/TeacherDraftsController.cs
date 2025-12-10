@@ -909,11 +909,27 @@ public sealed class TeacherDraftsController : ControllerBase
         }
 
         var moduleIdsForPlans = activePlans.Select(p => p.ModuleId).Distinct().ToList();
-        var topicsRaw = await _db.ModuleTopics
-            .Where(t => moduleIdsForPlans.Contains(t.ModuleId) && !t.IsInterAssembly)
+        var moduleTitles = await _db.Modules.AsNoTracking()
+            .Where(m => moduleIdsForPlans.Contains(m.Id))
+            .ToDictionaryAsync(
+                m => m.Id,
+                m => string.IsNullOrWhiteSpace(m.Title) ? $"#{m.Id}" : m.Title.Trim());
+        string ModuleTitleLabel(int moduleId) =>
+            moduleTitles.TryGetValue(moduleId, out var title) ? title : $"#{moduleId}";
+
+        var topicsAll = await _db.ModuleTopics
+            .Where(t => moduleIdsForPlans.Contains(t.ModuleId))
             .OrderBy(t => t.Order)
             .ThenBy(t => t.TopicCode)
             .ToListAsync();
+        var interAssemblyOnlyModules = topicsAll
+            .GroupBy(t => t.ModuleId)
+            .Where(g => g.Any() && g.All(x => x.IsInterAssembly))
+            .Select(g => g.Key)
+            .ToHashSet();
+        var topicsRaw = topicsAll
+            .Where(t => !t.IsInterAssembly)
+            .ToList();
         var allowedTopicIds = topicsRaw.Select(t => t.Id).ToHashSet();
         var flaggedSelfStudyTopicIds = topicsRaw
             .Where(t => t.SelfStudyBySupervisor && t.SelfStudyHours > 0)
@@ -1260,6 +1276,19 @@ public sealed class TeacherDraftsController : ControllerBase
         {
             if (!allGroupsByCourse.TryGetValue(plan.CourseId, out var courseGroups) || courseGroups.Count == 0)
                 continue;
+
+            if (interAssemblyOnlyModules.Contains(plan.ModuleId))
+            {
+                foreach (var grpRow in courseGroups)
+                {
+                    remainingByGroupModule[(grpRow.Id, plan.ModuleId)] = 0;
+                }
+
+                var moduleLabel = ModuleTitleLabel(plan.ModuleId);
+                var groupList = string.Join(", ", courseGroups.Select(g => g.Name));
+                warnings.Add($"Модуль \"{moduleLabel}\" містить лише міжзборові теми, тому автогенерація пропускає його для груп: {groupList}.");
+                continue;
+            }
 
             var excludedSelfStudy = topicsByModule.TryGetValue(plan.ModuleId, out var tlist)
                 ? tlist.Where(t => t.SelfStudyHours > 0 && !t.SelfStudyBySupervisor).Sum(t => Math.Max(0, t.SelfStudyHours))
