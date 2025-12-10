@@ -36,6 +36,10 @@
 {
     <div class="alert alert-danger">@_error</div>
 }
+@if (_ok is not null)
+{
+    <div class="alert alert-success">@_ok</div>
+}
 
 <div class="card">
     <div class="card-body">
@@ -55,6 +59,7 @@
                     <th style="width:90px">№</th>
                     <th style="width:140px">Старт</th>
                     <th style="width:140px">Фініш</th>
+                    <th style="width:120px">Обід</th>
                     <th style="width:140px">Активен</th>
                     <th></th>
                 </tr>
@@ -81,6 +86,10 @@
                                 <input class="form-control form-control-sm" style="width:120px"
                                        placeholder="09:45" @bind="r.End" />
                             </td>
+                            <td class="text-center">
+                                <input class="form-check-input" type="checkbox" checked="@r.IsLunch"
+                                       @onchange="e => ToggleLunch(r, e.Value is true)" />
+                            </td>
                             <td>
                                 <input class="form-check-input" type="checkbox" @bind="r.IsActive" />
                             </td>
@@ -94,8 +103,7 @@
         </table>
 
         <div class="form-text">
-            Порада: Тримайте тривалості однаковими (наприклад, 45 хвилин), тоді обід краще задавати окремим слотом (наприклад 12:00–13:00),
-            щоб він займав місце пари автоматично.
+            Порада: Тримайте тривалості однаковими (наприклад, 45 хвилин). Оберіть один із слотів як обід — він займе місце пари автоматично.
         </div>
     </div>
 </div>
@@ -111,6 +119,7 @@
     private List<LookupDto> _courses = new();
     private List<TimeSlotDto> _rows = new();
     private string? _error;
+    private string? _ok;
 
     protected override async Task OnInitializedAsync()
     {
@@ -121,14 +130,14 @@
 
     private async Task LoadRaw()
     {
-        _error = null;
+        _error = _ok = null;
         if (_scope == Scope.Course && _courseId is null) { _error = "Вибери курс."; return; }
         _rows = await Api.GetRawAsync(_scope == Scope.Global ? null : _courseId);
     }
 
     private async Task LoadEffective()
     {
-        _error = null;
+        _error = _ok = null;
         if (_scope == Scope.Course && _courseId is null) { _error = "Вибери курс."; return; }
         _rows = await Api.GetEffectiveAsync(_scope == Scope.Global ? null : _courseId);
     }
@@ -170,6 +179,25 @@
 
     private static bool TryTime(string s, out TimeOnly t) => TimeOnly.TryParseExact(s, "HH:mm", out t);
 
+    private void ToggleLunch(TimeSlotDto slot, bool value)
+    {
+        if (value)
+        {
+            foreach (var r in _rows)
+            {
+                r.IsLunch = ReferenceEquals(r, slot);
+            }
+            if (!slot.IsActive)
+            {
+                slot.IsActive = true;
+            }
+        }
+        else
+        {
+            slot.IsLunch = false;
+        }
+    }
+
     private string? Validate()
     {
         
@@ -192,15 +220,21 @@
                 if (overlap) return $"Перекриття між слотами {a.SortOrder} і {b.SortOrder}.";
             }
 
+        var lunch = _rows.Where(x => x.IsLunch).ToList();
+        if (lunch.Count > 1) return "Може бути лише один слот, позначений як обід.";
+        if (lunch.Count == 1 && !lunch[0].IsActive) return "Слот обіду має бути активним.";
+
         return null;
     }
 
     private async Task Save()
     {
+        _error = _ok = null;
         _error = Validate();
         if (_error is not null) return;
         await Api.SaveAsync(_scope == Scope.Global ? null : _courseId, _rows);
         
         await LoadRaw();
+        _ok = "Збережено.";
     }
 }

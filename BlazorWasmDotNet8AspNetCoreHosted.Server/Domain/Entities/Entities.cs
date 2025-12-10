@@ -192,6 +192,8 @@ public class ModuleTopic
     public int TotalHours { get; set; }
     public int AuditoriumHours { get; set; }
     public int SelfStudyHours { get; set; }
+    public bool IsInterAssembly { get; set; }
+    public bool SelfStudyBySupervisor { get; set; }
 }
 
 
@@ -276,6 +278,10 @@ public class CalendarException
     public DateOnly Date { get; set; }
     public bool IsWorkingDay { get; set; } 
     public string Name { get; set; } = default!;
+    public int? CourseId { get; set; }
+    public Course? Course { get; set; }
+    public int? GroupId { get; set; }
+    public Group? Group { get; set; }
 }
 
 public class ModuleSequenceItem

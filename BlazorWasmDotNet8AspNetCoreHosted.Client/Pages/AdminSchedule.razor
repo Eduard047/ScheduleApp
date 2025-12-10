@@ -380,6 +380,7 @@ else
         }
 
         _calendarLookup = meta.Calendar
+            .Where(c => c.CourseId is null && c.GroupId is null)
             .Select(c => new { Date = DateOnly.ParseExact(c.Date, "yyyy-MM-dd", CultureInfo.InvariantCulture), c.IsWorkingDay })
             .GroupBy(x => x.Date)
             .ToDictionary(g => g.Key, g => g.First().IsWorkingDay);

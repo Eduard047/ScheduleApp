@@ -70,160 +70,234 @@ else
 
 @if (edit != null)
 {
-    <hr />
-    <h4>@(edit.Id is null ? "Створення викладача" : $"Редагування #{edit.Id}")</h4>
-
-    <div class="row g-3">
-        <div class="col-md-6">
-            <label class="form-label">ПІБ</label>
-            <input class="form-control" @bind="edit.FullName" />
-        </div>
-
-        <div class="col-md-3">
-            <label class="form-label">Науковий ступінь</label>
-            <input class="form-control" @bind="edit.ScientificDegree" />
-        </div>
-
-        <div class="col-md-3">
-            <label class="form-label">Наукове звання</label>
-            <input class="form-control" @bind="edit.AcademicTitle" />
-        </div>
-
-        <div class="col-md-12">
-            <div class="d-flex justify-content-between align-items-center mb-1">
-                <label class="form-label mb-0">Допустимі модулі</label>
-                <button type="button"
-                        class="btn btn-sm btn-outline-primary"
-                        @onclick="SelectAllModules">
-                    Вибрати всі
-                </button>
+    <div class="editor-overlay" @onclick="Cancel">
+        <div class="editor editor-modal teacher-editor" role="dialog" aria-modal="true" @onclick:stopPropagation="true">
+            <div class="editor-modal-head">
+                <div>
+                    <div class="editor-title">@(edit.Id is null ? "Створення викладача" : $"Редагування #{edit.Id}")</div>
+                    <div class="editor-subtitle">Заповніть дані викладача, дозвольте потрібні модулі та робочі вікна.</div>
+                </div>
+                <button type="button" class="btn btn-outline-secondary editor-close" title="Закрити" @onclick="Cancel">×</button>
             </div>
-            <div class="row row-cols-1 row-cols-md-2 row-cols-lg-3 g-2">
-                @foreach (var m in meta.Modules)
-                {
-                    var checkedFlag = edit.ModuleIds.Contains(m.Id);
-                    var checkboxId = $"teacher_module_{m.Id}";
-                    <div class="col">
-                        <div class="form-check align-items-start">
-                            <input type="checkbox"
-                                   class="form-check-input"
-                                   id="@checkboxId"
-                                   checked="@checkedFlag"
-                                   @onchange="e => ToggleModule(m.Id, AsBool(e.Value))" />
-                            <label class="form-check-label ms-2" for="@checkboxId">
-                                <span class="d-block fw-semibold">@m.Name</span>
-                                <span class="d-block text-muted small">@m.CourseName</span>
-                            </label>
-                        </div>
+
+            <div class="teacher-editor-body">
+                <div class="row g-3">
+                    <div class="col-md-6">
+                        <label class="form-label">ПІБ</label>
+                        <input class="form-control" @bind="edit.FullName" />
                     </div>
-                }
-            </div>
-        </div>
 
-        <div class="col-md-12">
-            <div class="d-flex justify-content-between align-items-center mb-1">
-                <label class="form-label mb-0">Керівництво самостійними роботами</label>
-                <button type="button"
-                        class="btn btn-sm btn-outline-primary"
-                        @onclick="SelectAllSupervisorModules">
-                    Вибрати всі
-                </button>
-            </div>
-            <div class="row row-cols-1 row-cols-md-2 row-cols-lg-3 g-2">
-                @foreach (var m in meta.Modules)
-                {
-                    var checkedFlag = edit.SupervisorModuleIds.Contains(m.Id);
-                    var checkboxId = $"teacher_sup_module_{m.Id}";
-                    <div class="col">
-                        <div class="form-check align-items-start">
-                            <input type="checkbox"
-                                   class="form-check-input"
-                                   id="@checkboxId"
-                                   checked="@checkedFlag"
-                                   @onchange="e => ToggleSupervisorModule(m.Id, AsBool(e.Value))" />
-                            <label class="form-check-label ms-2" for="@checkboxId">
-                                <span class="d-block fw-semibold">@m.Name</span>
-                                <span class="d-block text-muted small">@m.CourseName</span>
-                            </label>
-                        </div>
+                    <div class="col-md-3">
+                        <label class="form-label">Науковий ступінь</label>
+                        <input class="form-control" @bind="edit.ScientificDegree" />
                     </div>
-                }
-            </div>
-        </div>
 
-        <div class="col-md-12">
-            <h5>Навантаження по курсам</h5>
-            <table class="table table-sm">
-                <thead>
-                    <tr>
-                        <th>Курс</th>
-                        <th style="width:200px">Заплановано годин</th>
-                        <th style="width:120px">Активне</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    @foreach (var c in meta.Courses)
-                    {
-                        var row = GetLoad(c.Id);
-                        <tr>
-                            <td>@c.Name</td>
-                            <td>
-                                <span class="badge bg-secondary">@row.ScheduledHours</span>
-                            </td>
-                            <td>
-                                <input type="checkbox" class="form-check-input"
-                                       checked="@row.IsActive"
-                                       @onchange="e => UpdateLoadActive(c.Id, AsBool(e.Value))" />
-                            </td>
-                        </tr>
-                    }
-                </tbody>
-            </table>
-        </div>
+                    <div class="col-md-3">
+                        <label class="form-label">Наукове звання</label>
+                        <input class="form-control" @bind="edit.AcademicTitle" />
+                    </div>
+                </div>
 
-        <div class="col-md-12">
-            <h5>Робочі вікна</h5>
-            <div class="row row-cols-1 row-cols-md-3 g-2">
-                @for (int uiDay = 0; uiDay < 7; uiDay++)
-                {
-                    var serverDay = (uiDay + 1) % 7; 
-                    var row = edit.WorkingHours.FirstOrDefault(x => x.DayOfWeek == serverDay);
-                    bool enabled = row is not null;
-                    string start = row?.Start ?? "09:00";
-                    string end = row?.End ?? "17:00";
-
-                    <div class="col">
-                        <div class="card p-2">
-                            <div class="d-flex justify-content-between align-items-center">
-                                <div class="fw-semibold">@DayName(uiDay)</div>
-                                <div class="form-check">
-                                    <input type="checkbox" class="form-check-input"
-                                           checked="@enabled"
-                                           @onchange="e => ToggleDay(serverDay, AsBool(e.Value))" />
-                                    <label class="form-check-label">Працює</label>
+                <div class="editor-card">
+                    <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+                        <div class="fw-semibold">Допустимі модулі</div>
+                        <button type="button"
+                                class="btn btn-sm btn-outline-primary"
+                                @onclick="SelectAllModules">
+                            Вибрати всі
+                        </button>
+                    </div>
+                    <div class="row row-cols-1 row-cols-md-2 row-cols-lg-3 g-2">
+                        @foreach (var m in meta.Modules)
+                        {
+                            var checkedFlag = edit.ModuleIds.Contains(m.Id);
+                            var checkboxId = $"teacher_module_{m.Id}";
+                            <div class="col">
+                                <div class="form-check align-items-start">
+                                    <input type="checkbox"
+                                           class="form-check-input"
+                                           id="@checkboxId"
+                                           checked="@checkedFlag"
+                                           @onchange="e => ToggleModule(m.Id, AsBool(e.Value))" />
+                                    <label class="form-check-label ms-2" for="@checkboxId">
+                                        <span class="d-block fw-semibold">@m.Name</span>
+                                        <span class="d-block text-muted small">@m.CourseName</span>
+                                    </label>
                                 </div>
                             </div>
-                            <div class="d-flex align-items-center gap-2 mt-1">
-                                <input class="form-control form-control-sm" type="time" value="@start"
-                                       disabled="@(!enabled)"
-                                       @onchange="e => SetWhStart(serverDay, e.Value?.ToString())" />
-                                <span>—</span>
-                                <input class="form-control form-control-sm" type="time" value="@end"
-                                       disabled="@(!enabled)"
-                                       @onchange="e => SetWhEnd(serverDay, e.Value?.ToString())" />
-                            </div>
-                        </div>
+                        }
                     </div>
-                }
-            </div>
-        </div>
+                </div>
 
-        <div class="col-12 d-flex gap-2">
-            <button class="btn btn-success" @onclick="Save">Зберегти</button>
-            <button class="btn btn-outline-secondary" @onclick="Cancel">Скасувати</button>
+                <div class="editor-card">
+                    <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+                        <div class="fw-semibold">Керівництво самостійними роботами</div>
+                        <button type="button"
+                                class="btn btn-sm btn-outline-primary"
+                                @onclick="SelectAllSupervisorModules">
+                            Вибрати всі
+                        </button>
+                    </div>
+                    <div class="row row-cols-1 row-cols-md-2 row-cols-lg-3 g-2">
+                        @foreach (var m in meta.Modules)
+                        {
+                            var checkedFlag = edit.SupervisorModuleIds.Contains(m.Id);
+                            var checkboxId = $"teacher_sup_module_{m.Id}";
+                            <div class="col">
+                                <div class="form-check align-items-start">
+                                    <input type="checkbox"
+                                           class="form-check-input"
+                                           id="@checkboxId"
+                                           checked="@checkedFlag"
+                                           @onchange="e => ToggleSupervisorModule(m.Id, AsBool(e.Value))" />
+                                    <label class="form-check-label ms-2" for="@checkboxId">
+                                        <span class="d-block fw-semibold">@m.Name</span>
+                                        <span class="d-block text-muted small">@m.CourseName</span>
+                                    </label>
+                                </div>
+                            </div>
+                        }
+                    </div>
+                </div>
+
+                <div class="editor-card">
+                    <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+                        <h5 class="mb-0">Навантаження по курсам</h5>
+                        <span class="text-muted small">Години readonly — синхронізуються з чернетками.</span>
+                    </div>
+                    <div class="table-responsive">
+                        <table class="table table-sm align-middle mb-0">
+                            <thead>
+                                <tr>
+                                    <th>Курс</th>
+                                    <th style="width:200px">Заплановано годин</th>
+                                    <th style="width:120px">Активне</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var c in meta.Courses)
+                                {
+                                    var row = GetLoad(c.Id);
+                                    <tr>
+                                        <td>@c.Name</td>
+                                        <td>
+                                            <span class="badge bg-secondary">@row.ScheduledHours</span>
+                                        </td>
+                                        <td>
+                                            <input type="checkbox" class="form-check-input"
+                                                   checked="@row.IsActive"
+                                                   @onchange="e => UpdateLoadActive(c.Id, AsBool(e.Value))" />
+                                        </td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="editor-card">
+                    <h5 class="mb-2">Робочі вікна</h5>
+                    <div class="row row-cols-1 row-cols-md-3 g-2">
+                        @for (int uiDay = 0; uiDay < 7; uiDay++)
+                        {
+                            var serverDay = (uiDay + 1) % 7; 
+                            var row = edit.WorkingHours.FirstOrDefault(x => x.DayOfWeek == serverDay);
+                            bool enabled = row is not null;
+                            string start = row?.Start ?? "09:00";
+                            string end = row?.End ?? "17:00";
+
+                            <div class="col">
+                                <div class="card p-2 h-100">
+                                    <div class="d-flex justify-content-between align-items-center">
+                                        <div class="fw-semibold">@DayName(uiDay)</div>
+                                        <div class="form-check">
+                                            <input type="checkbox" class="form-check-input"
+                                                   checked="@enabled"
+                                                   @onchange="e => ToggleDay(serverDay, AsBool(e.Value))" />
+                                            <label class="form-check-label">Працює</label>
+                                        </div>
+                                    </div>
+                                    <div class="d-flex align-items-center gap-2 mt-2">
+                                        <input class="form-control form-control-sm" type="time" value="@start"
+                                               disabled="@(!enabled)"
+                                               @onchange="e => SetWhStart(serverDay, e.Value?.ToString())" />
+                                        <span>—</span>
+                                        <input class="form-control form-control-sm" type="time" value="@end"
+                                               disabled="@(!enabled)"
+                                               @onchange="e => SetWhEnd(serverDay, e.Value?.ToString())" />
+                                    </div>
+                                </div>
+                            </div>
+                        }
+                    </div>
+                </div>
+            </div>
+
+            <div class="editor-actions">
+                <button class="btn btn-success" @onclick="Save">Зберегти</button>
+                <button class="btn btn-outline-secondary" @onclick="Cancel">Скасувати</button>
+            </div>
         </div>
     </div>
 }
+
+<style>
+    .editor-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(15, 23, 42, 0.5);
+        backdrop-filter: blur(2px);
+        display: flex;
+        justify-content: center;
+        align-items: flex-start;
+        padding: 72px 18px 24px;
+        overflow-y: auto;
+        z-index: 2500;
+    }
+
+    .editor {
+        margin-top: 14px;
+        background: #fff;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 14px;
+        width: min(1200px, 100%);
+        box-shadow: 0 20px 50px rgba(15, 23, 42, 0.25);
+    }
+
+    .editor-modal-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+    }
+
+    .editor-title { font-weight: 800; font-size: 1.1rem; }
+    .editor-subtitle { color: #475569; font-size: .92rem; margin-top: 4px; }
+    .editor-close { min-width: 44px; height: 44px; font-size: 1.3rem; padding: 0 .6rem; }
+
+    .teacher-editor-body {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+    }
+
+    .editor-card {
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 12px;
+        background: #f8fafc;
+    }
+
+    .editor-actions {
+        margin-top: 14px;
+        display: flex;
+        gap: 10px;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+    }
+</style>
 
 @code {
     

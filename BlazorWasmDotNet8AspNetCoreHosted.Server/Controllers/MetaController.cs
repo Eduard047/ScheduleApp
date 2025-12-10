@@ -67,7 +67,11 @@ public class MetaController(AppDbContext db) : ControllerBase
         {
             var end = s.AddDays(7);
             var xs = await db.CalendarExceptions.AsNoTracking().Where(x => x.Date >= s && x.Date < end).ToListAsync();
-            cal = xs.Select(x => new CalendarExceptionDto(x.Date.ToString("yyyy-MM-dd"), x.IsWorkingDay, x.Name)).ToList();
+            cal = xs.Select(x => new CalendarExceptionDto(x.Date.ToString("yyyy-MM-dd"), x.IsWorkingDay, x.Name)
+            {
+                CourseId = x.CourseId,
+                GroupId = x.GroupId
+            }).ToList();
         }
 
         return new MetaResponseDto(courses, groups, teachers, rooms, buildings, lessonTypes, lunches)

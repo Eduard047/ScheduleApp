@@ -17,23 +17,13 @@
     <div class="alert alert-success">@ok</div>
 }
 
-<div class="card p-3 mb-3">
-    <div class="row g-2 align-items-end">
-        <div class="col-12 col-md-3">
-            <label class="form-label">Дата</label>
-            <InputText class="form-control" type="date" @bind-Value="form.Date" />
-        </div>
-        <div class="col-12 col-md-5">
-            <label class="form-label">Назва</label>
-            <InputText class="form-control" @bind-Value="form.Name" />
-        </div>
-        <div class="col-6 col-md-2">
-            <label class="form-label">Робочий?</label><br />
-            <input type="checkbox" class="form-check-input" @bind="form.IsWorkingDay" />
-        </div>
-        <div class="col-6 col-md-2 d-grid">
-            <button class="btn btn-primary" @onclick="Save">Зберегти</button>
-        </div>
+<div class="d-flex justify-content-between align-items-start align-items-md-center flex-column flex-md-row gap-2 mb-3">
+    <div>
+        <h5 class="mb-1">Керування винятками</h5>
+        <div class="text-muted small">Редагування та створення відкриваються у вікні поверх таблиці.</div>
+    </div>
+    <div class="d-flex flex-wrap gap-2">
+        <button class="btn btn-primary" @onclick="OpenCreate">Додати виняток</button>
     </div>
 </div>
 
@@ -42,7 +32,7 @@
         <div class="text-muted small">Показано: @SortedAndFiltered.Count() з @items.Count</div>
         <div class="input-group" style="max-width:320px;">
             <span class="input-group-text">Пошук</span>
-            <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / дата / назва / так/ні" />
+            <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / дата / назва / курс / група / так/ні" />
         </div>
     </div>
 
@@ -57,6 +47,14 @@
                     <th role="button" class="sortable-th"
                         @onclick="() => ToggleSort(nameof(CalendarExceptionEditDto.Date))">
                         Дата @HeaderIcon(nameof(CalendarExceptionEditDto.Date))
+                    </th>
+                    <th role="button" class="sortable-th"
+                        @onclick="() => ToggleSort(CourseNameField)">
+                        Курс @HeaderIcon(CourseNameField)
+                    </th>
+                    <th role="button" class="sortable-th"
+                        @onclick="() => ToggleSort(GroupNameField)">
+                        Група @HeaderIcon(GroupNameField)
                     </th>
                     <th role="button" class="sortable-th"
                         @onclick="() => ToggleSort(nameof(CalendarExceptionEditDto.Name))">
@@ -75,6 +73,8 @@
                     <tr>
                         <td>@x.Id</td>
                         <td>@x.Date</td>
+                        <td>@CourseLabel(x)</td>
+                        <td>@GroupLabel(x)</td>
                         <td>@x.Name</td>
                         <td>@(x.IsWorkingDay ? "Так" : "Ні")</td>
                         <td class="text-end">
@@ -88,6 +88,223 @@
     </div>
 </div>
 
+@if (editorOpen)
+{
+    <div class="editor-overlay" @onclick="CloseEditor">
+        <div class="editor editor-modal calendar-editor" role="dialog" aria-modal="true" @onclick:stopPropagation="true">
+            <div class="editor-modal-head">
+                <div>
+                    <div class="editor-title">@EditorTitle</div>
+                    <div class="editor-subtitle">Укажіть дату, курс, за потреби групу та статус робочого дня.</div>
+                </div>
+                <button type="button" class="btn btn-outline-secondary editor-close" title="Закрити" @onclick="CloseEditor">×</button>
+            </div>
+
+            <div class="calendar-editor-grid">
+                <div class="calendar-editor-field">
+                    <label class="form-label">Дата</label>
+                    <InputText class="form-control" type="date" @bind-Value="form.Date" />
+                </div>
+
+                <div class="calendar-editor-field">
+                    <label class="form-label">Назва</label>
+                    <InputText class="form-control" @bind-Value="form.Name" />
+                </div>
+
+                <div class="calendar-editor-field">
+                    <label class="form-label">Курс</label>
+                    <select class="form-select" value="@form.CourseId" @onchange="OnCourseChanged">
+                        <option value="">Оберіть курс</option>
+                        @foreach (var c in courses)
+                        {
+                            <option value="@c.Id">@c.Name</option>
+                        }
+                    </select>
+                    <div class="form-text">Виняток діє в межах вибраного курсу.</div>
+                </div>
+
+                <div class="calendar-editor-field">
+                    <label class="form-label">Група (необов'язково)</label>
+                    <select class="form-select"
+                            value="@form.GroupId"
+                            @onchange="OnGroupChanged"
+                            disabled="@(form.CourseId is null)">
+                        <option value="">Усі групи курсу</option>
+                        @foreach (var g in GroupsForCourse(form.CourseId))
+                        {
+                            <option value="@g.Id">@g.Name</option>
+                        }
+                    </select>
+                    <div class="form-text">Оберіть групу, якщо виняток стосується лише її.</div>
+                </div>
+
+                <div class="calendar-editor-field calendar-editor-switch">
+                    <div class="switch-caption">
+                        <div class="switch-title">Статус дня</div>
+                        <div class="switch-hint">Перемикач робочого/вихідного дня.</div>
+                    </div>
+                    <label class="toggle" for="isWorkingSwitch">
+                        <input type="checkbox"
+                               class="toggle-input"
+                               id="isWorkingSwitch"
+                               @bind="form.IsWorkingDay" />
+                        <span class="toggle-track">
+                            <span class="toggle-thumb"></span>
+                            <span class="toggle-text toggle-text--on">Робочий</span>
+                            <span class="toggle-text toggle-text--off">Вихідний</span>
+                        </span>
+                    </label>
+                </div>
+            </div>
+
+            <div class="editor-actions">
+                <button class="btn btn-primary" @onclick="Save">Зберегти</button>
+                <button class="btn btn-outline-secondary" @onclick="CloseEditor">Скасувати</button>
+            </div>
+        </div>
+    </div>
+}
+
+<style>
+    .editor-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(15, 23, 42, 0.5);
+        backdrop-filter: blur(2px);
+        display: flex;
+        justify-content: center;
+        align-items: flex-start;
+        padding: 72px 18px 24px;
+        overflow-y: auto;
+        z-index: 2500;
+    }
+
+    .editor {
+        margin-top: 14px;
+        background: #fff;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 14px;
+        width: min(900px, 100%);
+        box-shadow: 0 20px 50px rgba(15, 23, 42, 0.25);
+    }
+
+    .editor-modal-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+    }
+
+    .editor-title { font-weight: 800; font-size: 1.1rem; }
+    .editor-subtitle { color: #475569; font-size: .92rem; margin-top: 4px; }
+    .editor-close { min-width: 44px; height: 44px; font-size: 1.3rem; padding: 0 .6rem; }
+
+    .calendar-editor-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+        gap: 12px;
+    }
+
+    .calendar-editor-field {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        min-width: 0;
+    }
+
+    .calendar-editor-switch {
+        flex-direction: row;
+        align-items: center;
+        justify-content: flex-start;
+        gap: 14px;
+        padding: 12px;
+        border: 1px solid #e5e7eb;
+        border-radius: 10px;
+        background: #f8fafc;
+        flex-wrap: wrap;
+        width: 100%;
+        box-sizing: border-box;
+        grid-column: auto;
+        align-self: end;
+        min-width: 260px;
+    }
+
+    .switch-caption { display: flex; flex-direction: column; gap: 4px; }
+    .switch-title { font-weight: 700; }
+    .switch-hint { color: #64748b; font-size: .88rem; }
+
+    .toggle { display: inline-flex; align-items: center; cursor: pointer; position: relative; }
+    .toggle-input {
+        position: absolute;
+        opacity: 0;
+        pointer-events: none;
+        width: 1px;
+        height: 1px;
+    }
+    .toggle-track {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        width: 260px;
+        max-width: 100%;
+        padding: 8px;
+        border-radius: 999px;
+        border: 1px solid #dbeafe;
+        background: linear-gradient(135deg, #eef2ff, #e0f2fe);
+        color: #64748b;
+        font-weight: 600;
+        min-width: 0;
+        transition: all .2s ease;
+        box-shadow: 0 6px 18px rgba(15, 23, 42, .08);
+        box-sizing: border-box;
+    }
+    .toggle-thumb {
+        position: absolute;
+        left: 8px;
+        right: auto;
+        top: 50%;
+        width: 50%;
+        height: 30px;
+        border-radius: 999px;
+        background: #fff;
+        border: 1px solid #cbd5e1;
+        box-shadow: 0 2px 8px rgba(15, 23, 42, .16);
+        transition: transform .2s ease, border-color .2s ease, background .2s ease;
+        transform: translate(0, -50%);
+        z-index: 0;
+    }
+    .toggle-text { font-size: .92rem; flex: 1; text-align: center; user-select: none; position: relative; z-index: 2; }
+    .toggle-text--on { color: #10b981; padding-right: 6px; }
+    .toggle-text--off { color: #ef4444; padding-left: 6px; }
+
+    .toggle-input:checked + .toggle-track {
+        background: linear-gradient(135deg, #dbeafe, #e0f2fe);
+        border-color: #bfdbfe;
+        color: #0f172a;
+    }
+    .toggle-input:checked + .toggle-track .toggle-thumb {
+        left: auto;
+        right: 8px;
+        transform: translate(0, -50%);
+        border-color: #2563eb;
+        background: #1d4ed8;
+    }
+    .toggle-input:not(:checked) + .toggle-track .toggle-text--on { color: #94a3b8; }
+    .toggle-input:checked + .toggle-track .toggle-text--off { color: #9ca3af; }
+
+    .editor-actions {
+        margin-top: 14px;
+        display: flex;
+        gap: 10px;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+    }
+</style>
+
 @code {
     
     // Зберігаємо повідомлення про помилки та успішні дії.
@@ -96,6 +313,8 @@
     
     // Кешовані винятки календаря, завантажені з API.
     private List<CalendarExceptionEditDto> items = new();
+    private List<LookupDto> courses = new();
+    private List<GroupEditDto> groups = new();
 
     
     // Модель форми для створення або редагування запису.
@@ -104,11 +323,16 @@
         Id = null,
         Date = DateTime.Today.ToString("yyyy-MM-dd"),
         Name = "",
-        IsWorkingDay = false
+        IsWorkingDay = false,
+        CourseId = null,
+        GroupId = null
     };
+    private bool editorOpen;
 
     
     // Поточні параметри сортування та фільтрування.
+    private const string CourseNameField = "CourseName";
+    private const string GroupNameField = "GroupName";
     private string sortField = nameof(CalendarExceptionEditDto.Date);
     private bool sortAsc = true;
     private string? filter;
@@ -128,29 +352,197 @@
         {
             error = ok = null;
             items = await Admin.GetCalendar();
+            var meta = await Admin.GetMeta();
+            courses = meta.Courses ?? new();
+            groups = await Admin.GetGroups();
+            NormalizeFormWithMeta();
         }
         catch (Exception ex) { error = ex.Message; }
     }
 
+    private string NameOfCourse(int? id)
+    {
+        if (id is int cid && cid > 0)
+            return courses.FirstOrDefault(c => c.Id == cid)?.Name ?? $"Курс #{cid}";
+        return "Усі курси";
+    }
+
+    private string NameOfGroup(int? id)
+    {
+        if (id is int gid && gid > 0)
+            return groups.FirstOrDefault(g => g.Id == gid)?.Name ?? $"Група #{gid}";
+        return "Усі групи курсу";
+    }
+
+    private IEnumerable<GroupEditDto> GroupsForCourse(int? courseId)
+    {
+        if (courseId is int cid && cid > 0)
+            return groups.Where(g => g.CourseId == cid).OrderBy(g => g.Name);
+
+        return Enumerable.Empty<GroupEditDto>();
+    }
+
+    private string CourseLabel(CalendarExceptionEditDto x) => NameOfCourse(x.CourseId);
+
+    private string GroupLabel(CalendarExceptionEditDto x)
+    {
+        if (x.GroupId is int gid && gid > 0)
+            return NameOfGroup(gid);
+
+        return "Усі групи курсу";
+    }
+
+    private void NormalizeFormWithMeta()
+    {
+        var hasCourse = form.CourseId is int cid && courses.Any(c => c.Id == cid);
+        if (!hasCourse) form.CourseId = null;
+
+        if (form.GroupId is int gid)
+        {
+            var grp = groups.FirstOrDefault(g => g.Id == gid);
+            if (grp is null || (form.CourseId is int c && grp.CourseId != c))
+            {
+                form.GroupId = null;
+            }
+            else
+            {
+                form.CourseId ??= grp.CourseId;
+            }
+        }
+    }
+
+    private CalendarExceptionEditDto NewBlankForm(int? preferredCourse)
+        => new()
+        {
+            Id = null,
+            Date = DateTime.Today.ToString("yyyy-MM-dd"),
+            Name = "",
+            IsWorkingDay = false,
+            CourseId = preferredCourse,
+            GroupId = null
+        };
+
+    private string EditorTitle => form.Id is null ? "Створення винятку" : $"Редагування #{form.Id}";
+
     
+    private void OpenCreate()
+    {
+        form = NewBlankForm(form.CourseId);
+        NormalizeFormWithMeta();
+        editorOpen = true;
+    }
+
+    private void CloseEditor()
+    {
+        editorOpen = false;
+        form = NewBlankForm(form.CourseId);
+        NormalizeFormWithMeta();
+    }
+
     /// <summary>
     /// Переносить дані в форму для подальшого редагування.
     /// </summary>
     private void EditRow(CalendarExceptionEditDto x)
-        => form = new() { Id = x.Id, Date = x.Date, IsWorkingDay = x.IsWorkingDay, Name = x.Name };
+    {
+        form = new()
+        {
+            Id = x.Id,
+            Date = x.Date,
+            IsWorkingDay = x.IsWorkingDay,
+            Name = x.Name,
+            CourseId = x.CourseId,
+            GroupId = x.GroupId
+        };
+
+        NormalizeFormWithMeta();
+        editorOpen = true;
+    }
 
     
     /// <summary>
     /// Зберігає поточний запис і перезавантажує список.
     /// </summary>
+    private void OnCourseChanged(ChangeEventArgs e)
+    {
+        form.CourseId = null;
+        if (e?.Value is not null && int.TryParse(e.Value.ToString(), out var cid) && cid > 0)
+        {
+            form.CourseId = cid;
+        }
+
+        if (form.CourseId is null)
+        {
+            form.GroupId = null;
+            return;
+        }
+
+        if (form.GroupId is int gid)
+        {
+            var grp = groups.FirstOrDefault(g => g.Id == gid);
+            if (grp is null || (form.CourseId is int c && grp.CourseId != c))
+            {
+                form.GroupId = null;
+            }
+        }
+    }
+
+    private void OnGroupChanged(ChangeEventArgs e)
+    {
+        form.GroupId = null;
+        if (e?.Value is not null && int.TryParse(e.Value.ToString(), out var gid) && gid > 0)
+        {
+            var grp = groups.FirstOrDefault(g => g.Id == gid);
+            if (grp is not null && (form.CourseId is null || grp.CourseId == form.CourseId))
+            {
+                form.GroupId = gid;
+                form.CourseId ??= grp.CourseId;
+            }
+        }
+    }
+
     private async Task Save()
     {
         try
         {
+            error = ok = null;
+            if (form.CourseId is null || form.CourseId <= 0)
+            {
+                error = "Оберіть курс для винятку.";
+                return;
+            }
+
+            if (form.GroupId is int gid)
+            {
+                var targetGroup = groups.FirstOrDefault(g => g.Id == gid);
+                if (targetGroup is null)
+                {
+                    error = "Групу не знайдено.";
+                    return;
+                }
+
+                if (targetGroup.CourseId != form.CourseId)
+                {
+                    error = "Група не належить обраному курсу.";
+                    return;
+                }
+            }
+
+            form.Name = (form.Name ?? string.Empty).Trim();
+            form.Date = (form.Date ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(form.Date))
+            {
+                error = "Оберіть дату для винятку.";
+                return;
+            }
+
+            var keepCourse = form.CourseId;
+
             await Admin.UpsertCalendar(form);
             await Load();
             ok = "Збережено.";
-            form = new() { Id = null, Date = DateTime.Today.ToString("yyyy-MM-dd"), Name = "", IsWorkingDay = false };
+            form = NewBlankForm(keepCourse);
+            NormalizeFormWithMeta();
+            editorOpen = false;
         }
         catch (Exception ex) { error = ex.Message; }
     }
@@ -171,6 +563,10 @@
             await Admin.DeleteCalendar(id);
             await Load();
             ok = "Видалено.";
+            if (editorOpen && form.Id == id)
+            {
+                CloseEditor();
+            }
         }
         catch (Exception ex) { error = ex.Message; }
     }
@@ -195,6 +591,8 @@
             (x.Id?.ToString().Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
             (x.Date?.Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
             (x.Name?.Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
+            CourseLabel(x).Contains(f, StringComparison.OrdinalIgnoreCase) ||
+            GroupLabel(x).Contains(f, StringComparison.OrdinalIgnoreCase) ||
             
             ((f.Equals("так", StringComparison.OrdinalIgnoreCase) && x.IsWorkingDay) ||
              (f.Equals("ні", StringComparison.OrdinalIgnoreCase) && !x.IsWorkingDay)))
@@ -214,6 +612,12 @@
 
             (nameof(CalendarExceptionEditDto.Date), true) => seq.OrderBy(x => DO(x.Date)),
             (nameof(CalendarExceptionEditDto.Date), false) => seq.OrderByDescending(x => DO(x.Date)),
+
+            (CourseNameField, true) => seq.OrderBy(CourseLabel),
+            (CourseNameField, false) => seq.OrderByDescending(CourseLabel),
+
+            (GroupNameField, true) => seq.OrderBy(GroupLabel),
+            (GroupNameField, false) => seq.OrderByDescending(GroupLabel),
 
             (nameof(CalendarExceptionEditDto.Name), true) => seq.OrderBy(x => x.Name),
             (nameof(CalendarExceptionEditDto.Name), false) => seq.OrderByDescending(x => x.Name),

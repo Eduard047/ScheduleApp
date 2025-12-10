@@ -174,13 +174,15 @@ public record class LunchConfigEditDto
 public record class CalendarExceptionEditDto
 {
     public CalendarExceptionEditDto() { }
-    public CalendarExceptionEditDto(int? id, string date, bool isWorkingDay, string name)
-    { Id = id; Date = date; IsWorkingDay = isWorkingDay; Name = name; }
+    public CalendarExceptionEditDto(int? id, string date, bool isWorkingDay, string name, int? courseId = null, int? groupId = null)
+    { Id = id; Date = date; IsWorkingDay = isWorkingDay; Name = name; CourseId = courseId; GroupId = groupId; }
 
     public int? Id { get; set; }
     public string Date { get; set; } = "2025-01-01";
     public bool IsWorkingDay { get; set; }
     public string Name { get; set; } = "";
+    public int? CourseId { get; set; }
+    public int? GroupId { get; set; }
 }
 
 public record class LessonTypeEditDto

@@ -304,163 +304,183 @@
 
 @if (plansModuleId is not null)
 {
-    <div class="card p-3">
-        <div class="d-flex flex-wrap justify-content-between align-items-center gap-3">
-            <div>
-                <h5 class="mb-0">
-                    План модуля: <span class="fw-semibold">@plansModuleTitle</span>
-                </h5>
-                <div class="d-flex align-items-center gap-2 mt-2">
-                    <label class="form-label mb-0 small">Курс</label>
-                    <select class="form-select form-select-sm"
-                            value="@selectedPlanCourseId"
-                            @onchange="OnPlanCourseChanged"
-                            disabled="@(!planCourseIds.Any())">
-                        @foreach (var cid in planCourseIds)
-                        {
-                            <option value="@cid">@NameOfCourse(cid)</option>
-                        }
-                    </select>
-                </div>
-            </div>
-            <div class="d-flex gap-2">
-                <button class="btn btn-sm btn-outline-secondary" @onclick="ClosePlans">Закрити</button>
-                <button class="btn btn-sm btn-primary" @onclick="SavePlans" disabled="@(selectedPlanCourseId <= 0)">Зберегти план</button>
-            </div>
-        </div>
-
-        
-        <div class="row g-3 mt-3">
-            <div class="col-12 col-md-4">
-                <label class="form-label">Обсяг кредитів (за планом)</label>
-                <input type="number" min="0" step="0.1" class="form-control" @bind="planCourse.Credits" />
-                <div class="form-text">≈ @Math.Round(planCourse.Credits * 30M) год.</div>
-            </div>
-            <div class="col-12 col-md-4">
-                <label class="form-label">Розкладено</label>
-                <input type="number" class="form-control" value="@planCourse.ScheduledHours" disabled />
-            </div>
-            <div class="col-12 col-md-4 d-flex align-items-end">
-                <div class="form-check">
-                    <input class="form-check-input" type="checkbox" id="planActive" @bind="planCourse.IsActive" />
-                    <label class="form-check-label" for="planActive">Активний</label>
-                </div>
-            </div>
-        </div>
-
-        <div class="small text-muted mt-2">
-            * Зміни набувають чинності після натискання кнопки <b>Зберегти план</b> та повторного перезавантаження модуля.
-        </div>
-
-        <hr />
-        
-        <div class="card module-topics-card p-3 mb-3">
-            <div class="module-topics-header">
-
-                <h6 class="mb-0">Керування заняттями</h6>
-
-                <p class="small text-muted mb-0">Вкажіть код у форматі <code>1.1.1.1</code> та заповніть інші поля.</p>
-
-            </div>
-            <div class="row g-3 align-items-end">
-                <div class="col-12 col-lg-4">
-                    <label class="form-label text-nowrap">Код заняття</label>
-                    <input class="form-control" @bind="topicCodeInput" />
-                </div>
-                <div class="col-12 col-lg-3">
-                    <label class="form-label text-nowrap">Тип заняття</label>
-                    <select class="form-select" @bind="topicForm.LessonTypeId">
-                        <option value="0">- Оберіть тип заняття -</option>
-                        @foreach (var lt in lessonTypes)
-                        {
-                            <option value="@lt.Id">@lt.Name</option>
-                        }
-                    </select>
-                </div>
-                <div class="col-12 col-sm-4 col-lg-2">
-                    <label class="form-label text-nowrap">Годин аудиторних</label>
-                    <input type="number" min="0" class="form-control" @bind="topicForm.AuditoriumHours" @bind:after="SyncTotalHours" />
-                </div>
-                <div class="col-12 col-sm-4 col-lg-2">
-                    <label class="form-label text-nowrap">Годин самостійних</label>
-                    <input type="number" min="0" class="form-control" @bind="topicForm.SelfStudyHours" @bind:after="SyncTotalHours" />
-                </div>
-                <div class="col-12 col-sm-4 col-lg-1">
-                    <label class="form-label text-nowrap">Всього</label>
-                    <input type="number" min="0" class="form-control" value="@topicForm.TotalHours" readonly />
-                </div>
-            </div>
-            <div class="module-topics-actions d-flex flex-wrap gap-2 mt-3">
-                <button type="button" class="btn btn-sm btn-primary" @onclick="SaveTopic" disabled="@(!plansModuleId.HasValue)">Зберегти заняття</button>
-                <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="ClearTopicForm" disabled="@(!plansModuleId.HasValue)">Очистити поля</button>
-            </div>
-            <div class="table-responsive mt-3">
-                <table class="table table-sm align-middle module-topics-table">
-                    <thead>
-                        <tr>
-                            <th class="text-nowrap">Код</th>
-                            <th class="text-nowrap">Тип</th>
-                            <th class="text-nowrap">Годин всього</th>
-                            <th class="text-nowrap">Годин аудиторних</th>
-                            <th class="text-nowrap">Годин самостійних</th>
-                            <th class="module-topics-col-groups">Заплановані групи</th>
-                            <th class="module-topics-col-groups">Відпрацьовані групи</th>
-                            <th class="module-topics-col-actions"></th>
-
-                        </tr>
-
-                    </thead>
-                    <tbody>
-                        @if (moduleTopics.Count == 0)
-                        {
-                            <tr>
-                                <td colspan="8" class="text-muted text-center">Немає записів.</td>
-                            </tr>
-                        }
-                        else
-                        {
-                            foreach (var topic in moduleTopics)
+    <div class="plan-modal-overlay">
+        <div class="plan-modal-backdrop" @onclick="ClosePlans"></div>
+        <div class="plan-modal-dialog">
+            <div class="plan-modal-header">
+                <div>
+                    <h5 class="mb-0">
+                        План модуля: <span class="fw-semibold">@plansModuleTitle</span>
+                    </h5>
+                    <div class="d-flex align-items-center gap-2 mt-2">
+                        <label class="form-label mb-0 small">Курс</label>
+                        <select class="form-select form-select-sm"
+                                value="@selectedPlanCourseId"
+                                @onchange="OnPlanCourseChanged"
+                                disabled="@(!planCourseIds.Any())">
+                            @foreach (var cid in planCourseIds)
                             {
-                                <tr>
-                                    <td>@topic.TopicCode</td>
-                                    <td>@topic.LessonTypeName</td>
-                                    <td>@topic.TotalHours</td>
-                                    <td>@topic.AuditoriumHours</td>
-                                    <td>@topic.SelfStudyHours</td>
-                                    <td class="module-topics-col-groups">
-                                        <span>@GroupsHoursCaption(topic.PlannedGroupsHours ?? new())</span>
-                                    </td>
-
-                                    <td class="module-topics-col-groups">
-                                        <span>@GroupsHoursCaption(topic.CompletedGroupsHours ?? new())</span>
-                                    </td>
-
-                                    <td class="module-topics-col-actions text-end">
-                                        <div class="btn-group btn-group-sm me-1 mb-1 mb-sm-0">
-                                            <button class="btn btn-outline-secondary" @onclick="() => EditTopic(topic)">Редагувати</button>
-                                            <button class="btn btn-outline-danger" @onclick="() => DeleteTopic(topic.Id)">Видалити</button>
-                                        </div>
-                                    </td>
-                                </tr>
+                                <option value="@cid">@NameOfCourse(cid)</option>
                             }
-                        }
+                        </select>
+                    </div>
+                </div>
+                <div class="d-flex gap-2">
+                    <button class="btn btn-sm btn-outline-secondary" @onclick="ClosePlans">Закрити</button>
+                    <button class="btn btn-sm btn-primary" @onclick="SavePlans" disabled="@(selectedPlanCourseId <= 0)">Зберегти план</button>
+                </div>
+            </div>
 
-                    </tbody>
-                    @if (moduleTopics.Any())
-                    {
+            <div class="plan-modal-body">
+                
+                <div class="row g-3 mt-3">
+                    <div class="col-12 col-md-4">
+                        <label class="form-label">Обсяг кредитів (за планом)</label>
+                        <input type="number" min="0" step="0.1" class="form-control" @bind="planCourse.Credits" />
+                        <div class="form-text">≈ @Math.Round(planCourse.Credits * 30M) год.</div>
+                    </div>
+                    <div class="col-12 col-md-4">
+                        <label class="form-label">Розкладено</label>
+                        <input type="number" class="form-control" value="@planCourse.ScheduledHours" disabled />
+                    </div>
+                    <div class="col-12 col-md-4 d-flex align-items-end">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="planActive" @bind="planCourse.IsActive" />
+                            <label class="form-check-label" for="planActive">Активний</label>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="small text-muted mt-2">
+                    * Зміни набувають чинності після натискання кнопки <b>Зберегти план</b> та повторного перезавантаження модуля.
+                </div>
+
+                <hr />
+                
+                <div class="card module-topics-card p-3 mb-3">
+                    <div class="module-topics-header">
+
+                        <h6 class="mb-0">Керування заняттями</h6>
+
+                        <p class="small text-muted mb-0">Вкажіть код у форматі <code>1.1.1.1</code> та заповніть інші поля.</p>
+
+                    </div>
+                    <div class="row g-3 align-items-end">
+                        <div class="col-12 col-lg-3">
+                            <label class="form-label text-nowrap">Код заняття</label>
+                            <input class="form-control" @bind="topicCodeInput" />
+                        </div>
+                        <div class="col-12 col-lg-3">
+                            <label class="form-label text-nowrap">Тип заняття</label>
+                            <select class="form-select" @bind="topicForm.LessonTypeId">
+                                <option value="0">- Оберіть тип заняття -</option>
+                                @foreach (var lt in lessonTypes)
+                                {
+                                    <option value="@lt.Id">@lt.Name</option>
+                                }
+                            </select>
+                        </div>
+                        <div class="col-12 col-sm-4 col-lg-2">
+                            <label class="form-label text-nowrap">Годин аудиторних</label>
+                            <input type="number" min="0" class="form-control" @bind="topicForm.AuditoriumHours" @bind:after="SyncTotalHours" />
+                        </div>
+                        <div class="col-12 col-sm-4 col-lg-2">
+                            <label class="form-label text-nowrap">Годин самостійних</label>
+                            <input type="number" min="0" class="form-control" @bind="topicForm.SelfStudyHours" @bind:after="SyncTotalHours" />
+                        </div>
+                        <div class="col-12 col-sm-4 col-lg-2">
+                            <label class="form-label text-nowrap">Всього</label>
+                            <input type="number" min="0" class="form-control" value="@topicForm.TotalHours" readonly />
+                        </div>
+                    </div>
+                    <div class="module-topics-actions d-flex flex-wrap gap-2 mt-3">
+                        <button type="button" class="btn btn-sm btn-primary" @onclick="SaveTopic" disabled="@(!plansModuleId.HasValue)">Зберегти заняття</button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="ClearTopicForm" disabled="@(!plansModuleId.HasValue)">Очистити поля</button>
+                    </div>
+                    <div class="table-responsive mt-3">
+                        <table class="table table-sm align-middle module-topics-table">
+                            <thead>
+                                <tr>
+                                    <th class="text-nowrap">Код</th>
+                                    <th class="text-nowrap">Тип</th>
+                                    <th class="text-nowrap text-center">Міжзборові заходи</th>
+                                    <th class="text-nowrap text-center">Самостійні години</th>
+                                    <th class="text-nowrap">Годин всього</th>
+                                    <th class="text-nowrap">Годин аудиторних</th>
+                                    <th class="text-nowrap">Годин самостійних</th>
+                                    <th class="module-topics-col-groups">Заплановані групи</th>
+                                    <th class="module-topics-col-groups">Відпрацьовані групи</th>
+                                    <th class="module-topics-col-actions"></th>
+
+                                </tr>
+
+                            </thead>
+                            <tbody>
+                                @if (moduleTopics.Count == 0)
+                                {
+                                    <tr>
+                                        <td colspan="10" class="text-muted text-center">Немає записів.</td>
+                                    </tr>
+                                }
+                                else
+                                {
+                                    foreach (var topic in moduleTopics)
+                                    {
+                                        <tr>
+                                            <td>@topic.TopicCode</td>
+                                            <td>@topic.LessonTypeName</td>
+                                            <td class="text-center">
+                                <input class="form-check-input" type="checkbox" checked="@topic.IsInterAssembly"
+                                       @onchange="e => ToggleTopicInterAssembly(topic, e)"
+                                       aria-label="Міжзборові заходи" />
+                                            </td>
+                                            <td class="text-center">
+                                                <button type="button"
+                                                        class="btn btn-sm topic-flag-btn @(topic.SelfStudyBySupervisor ? "btn-success" : "btn-outline-secondary")"
+                                                        title="Самостійні години цієї теми ставляться у розклад"
+                                                        @onclick="() => ToggleTopicSupervisorSelfStudy(topic)">
+                                                    @(topic.SelfStudyBySupervisor ? "У розкладі" : "Не розкладати")
+                                                </button>
+                                            </td>
+                                            <td>@topic.TotalHours</td>
+                                            <td>@topic.AuditoriumHours</td>
+                                            <td>@topic.SelfStudyHours</td>
+                                            <td class="module-topics-col-groups">
+                                                <span>@GroupsHoursCaption(topic.PlannedGroupsHours ?? new())</span>
+                                            </td>
+
+                                            <td class="module-topics-col-groups">
+                                                <span>@GroupsHoursCaption(topic.CompletedGroupsHours ?? new())</span>
+                                            </td>
+
+                                            <td class="module-topics-col-actions text-end">
+                                                <div class="btn-group btn-group-sm me-1 mb-1 mb-sm-0">
+                                                    <button class="btn btn-outline-secondary" @onclick="() => EditTopic(topic)">Редагувати</button>
+                                                    <button class="btn btn-outline-danger" @onclick="() => DeleteTopic(topic.Id)">Видалити</button>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    }
+                                }
+
+                            </tbody>
+                            @if (moduleTopics.Any())
+                            {
                         var totals = CalculateModuleTopicTotals();
                         <tfoot class="table-light">
                             <tr class="fw-semibold">
-                                <td colspan="2" class="text-end pe-3">Всього за модуль</td>
+                                <td colspan="4" class="text-end pe-3">Всього за модуль</td>
                                 <td>@totals.total</td>
                                 <td>@totals.auditorium</td>
                                 <td>@totals.self</td>
                                 <td colspan="2"></td>
                                 <td></td>
-                            </tr>
-                        </tfoot>
-                    }
-                </table>
+                                    </tr>
+                                </tfoot>
+                            }
+                        </table>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -899,6 +919,79 @@ private PlanCourseVM planCourse = new();
 
     }
 
+    /// <summary>
+    /// Перемикає прапорець міжзборових заходів для теми і зберігає зміни.
+    /// </summary>
+    private async Task ToggleTopicInterAssembly(ModuleTopicViewDto topic, ChangeEventArgs e)
+    {
+        if (plansModuleId is null) return;
+        if (e?.Value is null) return;
+
+        var newValue = e.Value is bool b && b;
+
+        try
+        {
+            var payload = new ModuleTopicDto(
+                topic.Id,
+                topic.ModuleId,
+                topic.Order,
+                topic.TopicCode,
+                topic.LessonTypeId,
+                topic.TotalHours,
+                topic.AuditoriumHours,
+                topic.SelfStudyHours,
+                newValue,
+                topic.SelfStudyBySupervisor
+            );
+
+            await Admin.UpsertModuleTopic(plansModuleId.Value, payload);
+            await LoadTopics(plansModuleId.Value);
+            ok = newValue
+                ? "Тему позначено як міжзборову, вона не увійде в автогенерацію."
+                : "Міжзборову позначку знято.";
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+        }
+    }
+
+    /// <summary>
+    /// Перемикає позначку, що самостійні години веде керівник, і виключає їх з розкладу.
+    /// </summary>
+    private async Task ToggleTopicSupervisorSelfStudy(ModuleTopicViewDto topic)
+    {
+        if (plansModuleId is null) return;
+
+        var newValue = !topic.SelfStudyBySupervisor;
+
+        try
+        {
+            var payload = new ModuleTopicDto(
+                topic.Id,
+                topic.ModuleId,
+                topic.Order,
+                topic.TopicCode,
+                topic.LessonTypeId,
+                topic.TotalHours,
+                topic.AuditoriumHours,
+                topic.SelfStudyHours,
+                topic.IsInterAssembly,
+                newValue
+            );
+
+            await Admin.UpsertModuleTopic(plansModuleId.Value, payload);
+            await LoadTopics(plansModuleId.Value);
+            ok = newValue
+                ? "Самостійні години теми будуть розкладатися під керівником."
+                : "Самостійні години теми виключено з розкладу.";
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+        }
+    }
+
 
 
     ///
@@ -1083,6 +1176,9 @@ private PlanCourseVM planCourse = new();
             AuditoriumHours = 0,
 
             SelfStudyHours = 0,
+
+            IsInterAssembly = false,
+            SelfStudyBySupervisor = false,
         };
 
 
@@ -1102,6 +1198,13 @@ private PlanCourseVM planCourse = new();
         topicForm.AuditoriumHours = safeAuditorium;
         topicForm.SelfStudyHours = safeSelf;
         topicForm.TotalHours = safeAuditorium + safeSelf;
+    }
+    /// <summary>
+    /// Перемикає режим «веде керівник» для самостійних годин у формі.
+    /// </summary>
+    private void ToggleFormSupervisorFlag()
+    {
+        topicForm.SelfStudyBySupervisor = !topicForm.SelfStudyBySupervisor;
     }
     /// <summary>
     /// Очищає форму теми та встановлює значення за замовчуванням.
@@ -1167,6 +1270,9 @@ private PlanCourseVM planCourse = new();
             AuditoriumHours = topic.AuditoriumHours,
 
             SelfStudyHours = topic.SelfStudyHours,
+
+            IsInterAssembly = topic.IsInterAssembly,
+            SelfStudyBySupervisor = topic.SelfStudyBySupervisor,
         };
 
         topicCodeInput = topicForm.TopicCode;
@@ -1271,7 +1377,10 @@ private PlanCourseVM planCourse = new();
 
                 auditoriumHours,
 
-                selfStudyHours);
+                selfStudyHours,
+
+                topicForm.IsInterAssembly,
+                topicForm.SelfStudyBySupervisor);
 
 
 
@@ -1492,57 +1601,36 @@ private PlanCourseVM planCourse = new();
 
     private static int CompareTopicCodes(string? left, string? right)
     {
-        var (lp, ln) = ParseTopicCode(left);
-        var (rp, rn) = ParseTopicCode(right);
+        var leftParts = TopicCodeSegments(left);
+        var rightParts = TopicCodeSegments(right);
+        var maxLength = Math.Max(leftParts.Count, rightParts.Count);
 
-        var prefixDiff = string.Compare(lp, rp, System.StringComparison.OrdinalIgnoreCase);
-        if (prefixDiff != 0) return prefixDiff;
-
-        var maxLen = Math.Max(ln.Count, rn.Count);
-        for (var i = 0; i < maxLen; i++)
+        for (var i = 0; i < maxLength; i++)
         {
-            var l = i < ln.Count ? ln[i] : 0;
-            var r = i < rn.Count ? rn[i] : 0;
-            var diff = l.CompareTo(r);
-            if (diff != 0) return diff;
+            var leftValue = i < leftParts.Count ? leftParts[i] : 0;
+            var rightValue = i < rightParts.Count ? rightParts[i] : 0;
+            var diff = leftValue.CompareTo(rightValue);
+            if (diff != 0)
+            {
+                return diff;
+            }
         }
 
         return string.Compare(left ?? string.Empty, right ?? string.Empty, System.StringComparison.Ordinal);
     }
-
-    private static (string prefix, IReadOnlyList<int> numbers) ParseTopicCode(string? code)
+    /// <summary>
+    /// Розбиває код теми на числові сегменти для сортування.
+    /// </summary>
+    private static IReadOnlyList<int> TopicCodeSegments(string? code)
     {
-        if (string.IsNullOrWhiteSpace(code)) return (string.Empty, System.Array.Empty<int>());
-
-        var parts = code.Split('.', StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length == 0) return (string.Empty, System.Array.Empty<int>());
-
-        var first = parts[0];
-        var match = Regex.Match(first, @"^([A-Za-zА-Яа-яІіЇїЄєҐґ]+)?(\d+)?$");
-
-        var prefix = match.Success ? match.Groups[1].Value : string.Empty;
-        var numbers = new List<int>(parts.Length);
-
-        if (match.Success && match.Groups[2].Success && int.TryParse(match.Groups[2].Value, out var headNum))
+        if (string.IsNullOrWhiteSpace(code))
         {
-            numbers.Add(headNum);
-        }
-        else if (int.TryParse(first, out var numericFirst))
-        {
-            numbers.Add(numericFirst);
-        }
-        else
-        {
-            // якщо не вдалося розібрати — ставимо MaxValue, щоб такі коди йшли наприкінці
-            numbers.Add(int.MaxValue);
+            return System.Array.Empty<int>();
         }
 
-        foreach (var p in parts.Skip(1))
-        {
-            numbers.Add(int.TryParse(p, out var val) ? val : int.MaxValue);
-        }
-
-        return (prefix, numbers);
+        return code.Split('.', StringSplitOptions.RemoveEmptyEntries)
+            .Select(part => int.TryParse(part, out var value) ? value : int.MaxValue)
+            .ToArray();
     }
 
 
@@ -1576,6 +1664,10 @@ private PlanCourseVM planCourse = new();
         public int? AuditoriumHours { get; set; }
 
         public int? SelfStudyHours { get; set; }
+
+        public bool IsInterAssembly { get; set; }
+
+        public bool SelfStudyBySupervisor { get; set; }
 
     }
 
@@ -1638,6 +1730,66 @@ private PlanCourseVM planCourse = new();
     .module-topics-col-actions {
         width: 200px;
         white-space: nowrap;
+    }
+
+    .topic-flag-btn {
+        min-width: 140px;
+        font-weight: 600;
+    }
+
+    /* Стилі модального вікна для плану модуля */
+    .plan-modal-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 1080;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 2rem 1rem;
+    }
+
+    .plan-modal-backdrop {
+        position: absolute;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.55);
+    }
+
+    .plan-modal-dialog {
+        position: relative;
+        width: 100%;
+        max-width: 1100px;
+        max-height: 90vh;
+        background: #fff;
+        border-radius: 12px;
+        box-shadow: 0 20px 45px rgba(0, 0, 0, 0.25);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+    }
+
+    .plan-modal-header {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        padding: 1rem 1.25rem;
+        background: #fff;
+        border-bottom: 1px solid #e5e7eb;
+    }
+
+    .plan-modal-body {
+        padding: 1.25rem;
+        overflow: auto;
+    }
+
+    @@media (max-width: 576px) {
+        .plan-modal-header {
+            flex-direction: column;
+            align-items: flex-start;
+        }
     }
 
 

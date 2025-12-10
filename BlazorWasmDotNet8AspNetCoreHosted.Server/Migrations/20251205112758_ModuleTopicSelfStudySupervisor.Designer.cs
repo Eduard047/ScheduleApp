@@ -4,6 +4,7 @@ using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 #nullable disable
@@ -11,9 +12,11 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
 {
     [DbContext(typeof(AppDbContext))]
-    partial class AppDbContextModelSnapshot : ModelSnapshot
+    [Migration("20251205112758_ModuleTopicSelfStudySupervisor")]
+    partial class ModuleTopicSelfStudySupervisor
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -77,14 +80,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
 
                     MySqlPropertyBuilderExtensions.UseMySqlIdentityColumn(b.Property<int>("Id"));
 
-                    b.Property<int?>("CourseId")
-                        .HasColumnType("int");
-
                     b.Property<DateOnly>("Date")
                         .HasColumnType("date");
-
-                    b.Property<int?>("GroupId")
-                        .HasColumnType("int");
 
                     b.Property<bool>("IsWorkingDay")
                         .HasColumnType("tinyint(1)");
@@ -95,11 +92,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("CourseId");
-
-                    b.HasIndex("GroupId");
-
-                    b.HasIndex("Date", "CourseId", "GroupId")
+                    b.HasIndex("Date")
                         .IsUnique();
 
                     b.ToTable("CalendarExceptions");
@@ -790,23 +783,6 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                     b.Navigation("From");
 
                     b.Navigation("To");
-                });
-
-            modelBuilder.Entity("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.CalendarException", b =>
-                {
-                    b.HasOne("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.Course", "Course")
-                        .WithMany()
-                        .HasForeignKey("CourseId")
-                        .OnDelete(DeleteBehavior.Cascade);
-
-                    b.HasOne("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.Group", "Group")
-                        .WithMany()
-                        .HasForeignKey("GroupId")
-                        .OnDelete(DeleteBehavior.Cascade);
-
-                    b.Navigation("Course");
-
-                    b.Navigation("Group");
                 });
 
             modelBuilder.Entity("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.Group", b =>

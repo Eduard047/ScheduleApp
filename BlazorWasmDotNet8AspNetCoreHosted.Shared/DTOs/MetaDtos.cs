@@ -13,7 +13,11 @@ public record ModuleMetaDto(int Id, string Code, string Name, int CourseId, stri
 }
 
 public record LunchConfigDto(int? CourseId, string Start, string End);
-public record CalendarExceptionDto(string Date, bool IsWorkingDay, string Name);
+public record CalendarExceptionDto(string Date, bool IsWorkingDay, string Name)
+{
+    public int? CourseId { get; init; }
+    public int? GroupId { get; init; }
+}
 
 public record MetaResponseDto(
     List<LookupDto> Courses,
