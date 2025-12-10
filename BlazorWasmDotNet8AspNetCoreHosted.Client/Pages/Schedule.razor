@@ -9,6 +9,8 @@
 
 @code {
     
+    private const string AppVersion = "1.0.0"; // Оновлюйте перед релізом
+
     private MetaResponseDto? _meta;
 
     private int? _groupId;
@@ -206,6 +208,11 @@
     }
 }
 
+<div class="app-version">
+    <span>Версія застосунку:</span>
+    <span class="app-version__number">@AppVersion</span>
+</div>
+
 <h3 class="page-title">Розклад <span class="weak">(тиждень @_weekStart.ToString("yyyy-MM-dd"))</span></h3>
 
 
@@ -389,7 +396,7 @@ else
     </div>
 
     
-    <div class="week-nav">
+<div class="week-nav">
         <button class="btn btn-ghost" @onclick="PrevWeek">‹ Попередній тиждень</button>
         <div class="week-label">@WeekRangeLabel</div>
         <button class="btn btn-ghost" @onclick="NextWeek">Наступний тиждень ›</button>
@@ -399,7 +406,7 @@ else
 <style>
     
     .page-title {
-        margin: .5rem 0 1rem;
+        margin: .3rem 0 .8rem;
     }
 
         .page-title .weak {
@@ -411,9 +418,9 @@ else
     .toolbar {
         display: flex;
         flex-wrap: wrap;
-        gap: .5rem;
+        gap: .35rem;
         align-items: center;
-        margin-bottom: 12px;
+        margin-bottom: 8px;
     }
 
     .select {
@@ -492,6 +499,7 @@ else
             text-align: center;
             border-bottom: 1px solid #e5e7eb;
             border-right: 1px solid #e5e7eb;
+            border-top: 1px solid #e5e7eb; // Закриваємо верхню лінію шапки
         }
 
             table.schedule thead th:first-child {
@@ -674,8 +682,8 @@ else
         align-items: center;
         justify-content: center;
         gap: 14px;
-        margin-top: 16px;
-        padding: 14px;
+        margin-top: 10px;
+        padding: 10px;
         background: #fff;
         border: 1px solid #e5e7eb;
         border-radius: 16px;
@@ -758,5 +766,24 @@ else
     .td-edit-icon {
         font-size: .9rem;
         line-height: 1;
+    }
+
+    .app-version {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin: 6px 0 4px;
+        padding: 6px 8px;
+        border-radius: 10px;
+        background: #f8fafc;
+        color: #6b7280;
+        font-weight: 600;
+        font-size: .85rem;
+    }
+
+    .app-version__number {
+        color: #0f172a;
+        font-weight: 700;
+        letter-spacing: .01em;
     }
 </style>
