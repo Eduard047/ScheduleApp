@@ -1,7 +1,10 @@
 // DTO для метаданих розкладу та довідників
 namespace BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 
-public record LookupDto(int Id, string Name);
+public record LookupDto(int Id, string Name)
+{
+    public int? CourseId { get; init; }
+}
 public record IdCodeNameDto(int Id, string Code, string Name)
 {
     public bool RequiresRoom { get; init; } = true;
@@ -31,4 +34,3 @@ public record MetaResponseDto(
     public List<ModuleMetaDto> Modules { get; init; } = new();
     public List<CalendarExceptionDto> Calendar { get; init; } = new();
 }
-

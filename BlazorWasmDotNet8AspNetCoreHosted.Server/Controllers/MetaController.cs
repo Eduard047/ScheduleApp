@@ -13,7 +13,9 @@ public class MetaController(AppDbContext db) : ControllerBase
     public async Task<MetaResponseDto> Get([FromQuery] DateOnly? weekStart)
     {
         var courses = await db.Courses.AsNoTracking().Select(x => new LookupDto(x.Id, x.Name)).ToListAsync();
-        var groups = await db.Groups.AsNoTracking().Select(x => new LookupDto(x.Id, x.Name)).ToListAsync();
+        var groups = await db.Groups.AsNoTracking()
+            .Select(x => new LookupDto(x.Id, x.Name) { CourseId = x.CourseId })
+            .ToListAsync();
         var teachers = await db.Teachers.AsNoTracking().Select(x => new LookupDto(x.Id, x.FullName)).ToListAsync();
         var rooms = await db.Rooms.AsNoTracking().Select(x => new LookupDto(x.Id, x.Name)).ToListAsync();
         var buildings = await db.Buildings.AsNoTracking().Select(x => new LookupDto(x.Id, x.Name)).ToListAsync();
@@ -81,5 +83,4 @@ public class MetaController(AppDbContext db) : ControllerBase
         };
     }
 }
-
 
