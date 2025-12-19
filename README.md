@@ -14,6 +14,7 @@
 ## Попередні вимоги
 
 - Встановлений .NET SDK 8.0.100 або новіший (`dotnet --list-sdks`).
+- Інструмент `dotnet-ef` (потрібен для міграцій EF Core): `dotnet tool install --global dotnet-ef`.
 - Доступ до локального екземпляра MySQL 8.x (або сумісного керованого сервісу).
 - Node.js/npm знадобиться лише за умови зміни фронтенд-інструментів; для запуску поточного рішення не є обов’язковим.
 
@@ -55,6 +56,7 @@
 
 ## Робота з Entity Framework Core
 
+- Якщо команда `dotnet ef` недоступна, встановіть `dotnet-ef`: `dotnet tool install --global dotnet-ef`.
 - Додати міграцію:
   ```
   dotnet ef migrations add <MigrationName> --project BlazorWasmDotNet8AspNetCoreHosted.Server

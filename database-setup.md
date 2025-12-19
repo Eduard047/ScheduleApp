@@ -38,6 +38,7 @@
 
 ## Застосування міграцій
 
+- Якщо команда `dotnet ef` недоступна, встановіть `dotnet-ef`: `dotnet tool install --global dotnet-ef`.
 - Створення нової міграції:
   ```
   dotnet ef migrations add <НазваМіграції> --project BlazorWasmDotNet8AspNetCoreHosted.Server
