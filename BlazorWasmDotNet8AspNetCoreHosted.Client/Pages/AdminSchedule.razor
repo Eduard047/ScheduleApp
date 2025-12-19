@@ -100,12 +100,17 @@ else
                     <div class="small text-muted">@GetGenerationRangeDescription()</div>
                 </div>
                 <div class="d-flex flex-wrap gap-2 align-items-stretch">
-                    <select class="form-select flex-grow-1 flex-md-grow-0" style="min-width: 220px;" @bind="_generationScope">
-                        <option value="@GenerationScope.Week">Генерація на тиждень</option>
-                        <option value="@GenerationScope.Month">Генерація на місяць</option>
-                        <option value="@GenerationScope.Course">Генерація на курс</option>
+                    <select class="form-select flex-grow-1 flex-md-grow-0"
+                            style="min-width: 220px;"
+                            @bind="_selectedCourseId"
+                            @bind:after="OnSelectedCourseChanged">
+                        <option value="">Оберіть курс</option>
+                        @foreach (var course in meta.Courses.OrderBy(c => c.Name))
+                        {
+                            <option value="@course.Id">@course.Name</option>
+                        }
                     </select>
-                    <button class="btn btn-outline-primary" @onclick="AutoGenDrafts">
+                    <button class="btn btn-outline-primary" @onclick="AutoGenDrafts" disabled="@(!CanAutoGen)">
                         Автогенерація (у чернетки)
                     </button>
                     <button class="btn btn-outline-danger" @onclick="ClearWeekForCurrent">
@@ -115,26 +120,64 @@ else
                         Очистити тиждень (розклад, всі групи)
                     </button>
                 </div>
-                @if (_generationScope is GenerationScope.Course)
-                {
-                    <div class="d-flex flex-wrap gap-2 mt-2">
-                        <div class="course-range-picker">
-                            <label class="form-label mb-1">Початок курсу</label>
-                            <input type="date"
-                                   class="form-control"
-                                   value="@FormatDateForInput(_courseFromDate)"
-                                   @onchange="OnCourseFromChanged" />
-                        </div>
-                        <div class="course-range-picker">
-                            <label class="form-label mb-1">Кінець курсу</label>
-                            <input type="date"
-                                   class="form-control"
-                                   value="@FormatDateForInput(_courseToDate)"
-                                   @onchange="OnCourseToChanged" />
-                        </div>
-                    </div>
-                }
             </div>
+            @if (_selectedCourseId is int)
+            {
+                <div class="mt-3">
+                    <div class="fw-semibold mb-2">Модулі та години на тиждень</div>
+                    <div class="table-responsive">
+                        <table class="table table-sm align-middle mb-0">
+                            <thead>
+                                <tr>
+                                    <th style="width: 60px;" class="text-center">✓</th>
+                                    <th>Модуль</th>
+                                    <th style="width: 140px;" class="text-center">Годин</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var row in _moduleWeekRows)
+                                {
+                                    <tr>
+                                        <td class="text-center">
+                                            <input class="form-check-input"
+                                                   type="checkbox"
+                                                   @bind="row.Selected"
+                                                   @bind:after="PersistAutoGenConfigAsync" />
+                                        </td>
+                                        <td>@row.Caption</td>
+                                        <td class="text-center">
+                                            <input type="number"
+                                                   class="form-control form-control-sm text-center"
+                                                   min="0"
+                                                   step="1"
+                                                   @bind="row.Hours"
+                                                   @bind:after="PersistAutoGenConfigAsync"
+                                                   disabled="@(!row.Selected)" />
+                                        </td>
+                                    </tr>
+                                }
+                                @if (_moduleWeekRows.Count == 0)
+                                {
+                                    <tr>
+                                        <td colspan="3" class="text-center text-muted py-2">
+                                            Для цього курсу немає доступних модулів.
+                                        </td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="small text-muted mt-2">
+                        Вкажіть, які модулі мають бути на поточному тижні, і скільки годин потрібно згенерувати для всіх груп курсу.
+                    </div>
+                </div>
+            }
+            else
+            {
+                <div class="small text-muted mt-2">
+                    Оберіть курс, щоб налаштувати модулі та години для автогенерації тижня.
+                </div>
+            }
             <div class="small text-muted mt-2">
                 Чернетки оновлюються одразу для всіх груп тижня. Закріплені елементи залишаються без змін.<br />
                 Розклад очищується окремо і не зачіпає закріплені заняття.
@@ -321,14 +364,9 @@ else
 
     private DateOnly _selectedDate = DateOnly.FromDateTime(DateTime.Today);
     private WeekPreset _daysPreset = WeekPreset.MonFri;
-    
-    private GenerationScope _generationScope = GenerationScope.Week;
-    
-    private DateOnly? _calendarFirstDate;
-    private DateOnly? _calendarLastDate;
-    
-    private DateOnly? _courseFromDate;
-    private DateOnly? _courseToDate;
+
+    private int? _selectedCourseId;
+    private readonly List<ModuleWeekRow> _moduleWeekRows = new();
 
     private string? ok;
     private string? error;
@@ -337,6 +375,8 @@ else
     private List<AutoGenGapDetail> _latestGapDetails = new();
     private const string AutoGenStatusStorageKey = "adminSchedule.autoGenStatus.v1";
     private const string AutoGenStatusLocalStorageKey = "adminSchedule.autoGenStatus.local.v1";
+    private const string AutoGenConfigStorageKey = "adminSchedule.autoGenConfig.v1";
+    private const string AutoGenConfigLocalStorageKey = "adminSchedule.autoGenConfig.local.v1";
     private static readonly JsonSerializerOptions AutoGenStatusJsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -384,14 +424,13 @@ else
             .Select(c => new { Date = DateOnly.ParseExact(c.Date, "yyyy-MM-dd", CultureInfo.InvariantCulture), c.IsWorkingDay })
             .GroupBy(x => x.Date)
             .ToDictionary(g => g.Key, g => g.First().IsWorkingDay);
-        if (_calendarLookup.Count > 0)
+
+        await RestorePersistedAutoGenConfigAsync(restoreCourseSelection: true);
+
+        if (_selectedCourseId is null && meta.Courses.Count == 1)
         {
-            
-            _calendarFirstDate = _calendarLookup.Keys.Min();
-            _calendarLastDate = _calendarLookup.Keys.Max();
-            
-            _courseFromDate = _calendarFirstDate;
-            _courseToDate = _calendarLastDate;
+            _selectedCourseId = meta.Courses[0].Id;
+            BuildModuleWeekRows();
         }
 
         breakTypeId = meta.LessonTypes.FirstOrDefault(x => x.Code == "BREAK")?.Id ?? 0;
@@ -407,70 +446,43 @@ else
     private bool IsBreak(int lessonTypeId) => lessonTypeId == breakTypeId;
     private bool IsCanceled(int lessonTypeId) => lessonTypeId == canceledTypeId;
 
-    
-    private static string FormatDateForInput(DateOnly? value)
-        => value is { } d ? d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) : string.Empty;
 
-    private async Task OnCourseFromChanged(ChangeEventArgs e)
+    private bool CanAutoGen
+        => _selectedCourseId is int
+           && _moduleWeekRows.Any(row => row.Selected && row.Hours > 0);
+
+    private async Task OnSelectedCourseChanged()
     {
-        if (DateOnly.TryParse(e.Value?.ToString(), out var parsed))
-        {
-            _courseFromDate = parsed;
-            if (_courseToDate is { } to && parsed > to)
-            {
-                _courseToDate = parsed;
-            }
-        }
-        else
-        {
-            _courseFromDate = null;
-        }
+        BuildModuleWeekRows();
 
-        await InvokeAsync(StateHasChanged);
+        await RestorePersistedAutoGenConfigAsync(restoreCourseSelection: false);
+        await PersistAutoGenConfigAsync();
     }
 
-    private async Task OnCourseToChanged(ChangeEventArgs e)
+    private void BuildModuleWeekRows()
     {
-        if (DateOnly.TryParse(e.Value?.ToString(), out var parsed))
+        _moduleWeekRows.Clear();
+        if (meta is null || _selectedCourseId is not int courseId)
         {
-            _courseToDate = parsed;
-            if (_courseFromDate is { } from && parsed < from)
-            {
-                _courseFromDate = parsed;
-            }
-        }
-        else
-        {
-            _courseToDate = null;
+            return;
         }
 
-        await InvokeAsync(StateHasChanged);
+        var modules = meta.Modules
+            .Where(m => m.CourseId == courseId || m.CourseIds.Contains(courseId))
+            .OrderBy(m => m.Code)
+            .ThenBy(m => m.Name)
+            .Select(m => new ModuleWeekRow(m.Id, $"{m.Code} — {m.Name}"))
+            .ToList();
+
+        _moduleWeekRows.AddRange(modules);
     }
 
     
     private string GetGenerationRangeDescription()
     {
-        switch (_generationScope)
-        {
-            case GenerationScope.Week:
-                var weekStart = GetMonday(_selectedDate);
-                var weekEnd = weekStart.AddDays(6);
-                return $"Тиждень: {weekStart:dd.MM.yyyy} – {weekEnd:dd.MM.yyyy}";
-            case GenerationScope.Month:
-                var monthStart = new DateOnly(_selectedDate.Year, _selectedDate.Month, 1);
-                var monthEnd = monthStart.AddMonths(1).AddDays(-1);
-                return $"Місяць: {monthStart:dd.MM.yyyy} – {monthEnd:dd.MM.yyyy}";
-            case GenerationScope.Course:
-                if (_courseFromDate is { } cf && _courseToDate is { } ct)
-                {
-                    return $"Курс: {cf:dd.MM.yyyy} – {ct:dd.MM.yyyy}";
-                }
-                return "Курс: межі не визначені";
-            default:
-                var fallbackStart = GetMonday(_selectedDate);
-                var fallbackEnd = fallbackStart.AddDays(6);
-                return $"Тиждень: {fallbackStart:dd.MM.yyyy} – {fallbackEnd:dd.MM.yyyy}";
-        }
+        var weekStart = GetMonday(_selectedDate);
+        var weekEnd = weekStart.AddDays(6);
+        return $"Тиждень: {weekStart:dd.MM.yyyy} – {weekEnd:dd.MM.yyyy}";
     }
 
     private async Task ResetStatusAsync(bool clearPersisted = true)
@@ -630,73 +642,196 @@ else
         await SetOkMessageAsync(payload.Message, payload.Warnings, payload.GapDetails, persist: false);
     }
 
+    private async Task PersistAutoGenConfigAsync()
+    {
+        try
+        {
+            var configs = await LoadPersistedAutoGenConfigsAsync();
+            configs.TryGetValue(CurrentWeekKey, out var weekConfig);
+
+            var selectedCourseId = _selectedCourseId;
+            weekConfig ??= new PersistedWeekAutoGenConfig(
+                SelectedCourseId: selectedCourseId,
+                Courses: new Dictionary<int, PersistedCourseAutoGenConfig>()
+            );
+
+            if (weekConfig.SelectedCourseId != selectedCourseId)
+            {
+                weekConfig = weekConfig with { SelectedCourseId = selectedCourseId };
+            }
+
+            if (selectedCourseId is int courseId)
+            {
+                var moduleConfig = _moduleWeekRows
+                    .Where(row => row.Selected || row.Hours > 0)
+                    .GroupBy(row => row.ModuleId)
+                    .ToDictionary(
+                        g => g.Key,
+                        g =>
+                        {
+                            var row = g.First();
+                            return new PersistedModuleSelection(
+                                Selected: row.Selected,
+                                Hours: row.Hours
+                            );
+                        }
+                    );
+
+                weekConfig.Courses[courseId] = new PersistedCourseAutoGenConfig(Modules: moduleConfig);
+            }
+
+            configs[CurrentWeekKey] = weekConfig;
+            await SavePersistedAutoGenConfigsAsync(configs);
+        }
+        catch (JSException)
+        {
+        }
+    }
+
+    private async Task RestorePersistedAutoGenConfigAsync(bool restoreCourseSelection)
+    {
+        if (meta is null)
+            return;
+
+        var configs = await LoadPersistedAutoGenConfigsAsync();
+        if (!configs.TryGetValue(CurrentWeekKey, out var weekConfig))
+            return;
+
+        if (restoreCourseSelection && weekConfig.SelectedCourseId is int persistedCourseId)
+        {
+            if (meta.Courses.Any(c => c.Id == persistedCourseId))
+            {
+                _selectedCourseId = persistedCourseId;
+                BuildModuleWeekRows();
+            }
+        }
+
+        if (_selectedCourseId is not int courseId)
+        {
+            return;
+        }
+
+        if (_moduleWeekRows.Count == 0)
+        {
+            BuildModuleWeekRows();
+        }
+
+        if (!weekConfig.Courses.TryGetValue(courseId, out var courseConfig))
+        {
+            return;
+        }
+
+        foreach (var row in _moduleWeekRows)
+        {
+            row.Selected = false;
+            row.Hours = 0;
+            if (courseConfig.Modules.TryGetValue(row.ModuleId, out var persisted))
+            {
+                row.Selected = persisted.Selected;
+                row.Hours = persisted.Hours;
+            }
+        }
+    }
+
+    private async Task<Dictionary<string, PersistedWeekAutoGenConfig>> LoadPersistedAutoGenConfigsAsync()
+    {
+        try
+        {
+            var stored = await ReadStorageAsync(AutoGenConfigStorageKey, useLocal: false);
+            if (string.IsNullOrWhiteSpace(stored))
+            {
+                stored = await ReadStorageAsync(AutoGenConfigLocalStorageKey, useLocal: true);
+            }
+
+            if (string.IsNullOrWhiteSpace(stored))
+                return new();
+
+            var configs = JsonSerializer.Deserialize<Dictionary<string, PersistedWeekAutoGenConfig>>(stored, AutoGenStatusJsonOptions);
+            return configs ?? new();
+        }
+        catch (JSException)
+        {
+            await ClearPersistedAutoGenConfigStorageAsync();
+            return new();
+        }
+        catch (JsonException)
+        {
+            await ClearPersistedAutoGenConfigStorageAsync();
+            return new();
+        }
+    }
+
+    private async Task SavePersistedAutoGenConfigsAsync(Dictionary<string, PersistedWeekAutoGenConfig> configs)
+    {
+        if (configs.Count == 0)
+        {
+            await ClearPersistedAutoGenConfigStorageAsync();
+            return;
+        }
+
+        var json = JsonSerializer.Serialize(configs, AutoGenStatusJsonOptions);
+        try
+        {
+            await SetStorageAsync(AutoGenConfigStorageKey, json, useLocal: false);
+            await SetStorageAsync(AutoGenConfigLocalStorageKey, json, useLocal: true);
+        }
+        catch (JSException)
+        {
+        }
+    }
+
+    private async Task ClearPersistedAutoGenConfigStorageAsync()
+    {
+        try
+        {
+            await RemoveStorageAsync(AutoGenConfigStorageKey, useLocal: false);
+            await RemoveStorageAsync(AutoGenConfigLocalStorageKey, useLocal: true);
+        }
+        catch (JSException)
+        {
+        }
+    }
+
     
     private async Task AutoGenDrafts()
     {
         await ResetStatusAsync();
         try
         {
-            AutoGenResult? res = null;
-            string summary = string.Empty;
-            switch (_generationScope)
+            if (_selectedCourseId is not int courseId)
             {
-                case GenerationScope.Week:
-                    var weekStart = GetMonday(_selectedDate);
-                    var weekEnd = weekStart.AddDays(6);
-                    res = await Drafts.AutogenCourse(new AutogenCourseRequest(
-                        From: weekStart,
-                        To: weekEnd,
-                        CourseId: null,
-                        GroupId: null,
-                        TeacherId: null,
-                        AllowOnDaysOff: AllowDaysOffForPreset(),
-                        Days: _daysPreset
-                    ));
-                    summary = $"Автогенерація тижня у чернетки: створено {res.Created}, пропущено {res.Skipped}.";
-                    break;
-                case GenerationScope.Month:
-                    var monthStart = new DateOnly(_selectedDate.Year, _selectedDate.Month, 1);
-                    var monthEnd = monthStart.AddMonths(1).AddDays(-1);
-                    res = await Drafts.AutogenMonth(new AutogenMonthRequest(
-                        MonthStart: monthStart,
-                        CourseId: null,
-                        GroupId: null,
-                        TeacherId: null,
-                        AllowOnDaysOff: AllowDaysOffForPreset(),
-                        Days: _daysPreset
-                    ));
-                    summary = $"Автогенерація місяця у чернетки ({monthStart:dd.MM.yyyy} – {monthEnd:dd.MM.yyyy}): створено {res.Created}, пропущено {res.Skipped}.";
-                    break;
-                case GenerationScope.Course:
-                    if (_courseFromDate is null || _courseToDate is null)
-                    {
-                        error = "Межі курсу не визначені.";
-                        return;
-                    }
-                    var courseFrom = _courseFromDate.Value;
-                    var courseTo = _courseToDate.Value;
-                    res = await Drafts.AutogenCourse(new AutogenCourseRequest(
-                        From: courseFrom,
-                        To: courseTo,
-                        CourseId: null,
-                        GroupId: null,
-                        TeacherId: null,
-                        AllowOnDaysOff: AllowDaysOffForPreset(),
-                        Days: _daysPreset
-                    ));
-                    summary = $"Автогенерація курсу у чернетки ({courseFrom:dd.MM.yyyy} – {courseTo:dd.MM.yyyy}): створено {res.Created}, пропущено {res.Skipped}.";
-                    break;
-                default:
-                    throw new InvalidOperationException("Невідомий режим генерації.");
-            }
-
-            if (res is null)
-            {
+                error = "Оберіть курс для автогенерації.";
                 return;
             }
 
-            await SetOkMessageAsync(summary, res.Warnings, res.GapDetails);
+            var moduleHours = _moduleWeekRows
+                .Where(row => row.Selected && row.Hours > 0)
+                .GroupBy(row => row.ModuleId)
+                .ToDictionary(g => g.Key, g => g.First().Hours);
 
+            if (moduleHours.Count == 0)
+            {
+                error = "Оберіть хоча б один модуль і вкажіть години > 0.";
+                return;
+            }
+
+            await PersistAutoGenConfigAsync();
+
+            var weekStart = GetMonday(_selectedDate);
+            var res = await Drafts.AutogenWeek(new AutoGenRequest(
+                WeekStart: weekStart,
+                ClearExisting: true,
+                CourseId: courseId,
+                GroupId: null,
+                AllowOnDaysOff: AllowDaysOffForPreset(),
+                Days: _daysPreset,
+                ModuleHours: moduleHours
+            ));
+
+            var courseName = meta?.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
+            var summary = $"Автогенерація тижня у чернетки (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}.";
+
+            await SetOkMessageAsync(summary, res.Warnings, res.GapDetails);
             await LoadWeek();
         }
         catch (ApiErrorException ex)
@@ -940,6 +1075,7 @@ else
         {
             _selectedDate = value;
             await ResetStatusAsync(clearPersisted: false);
+            await RestorePersistedAutoGenConfigAsync(restoreCourseSelection: true);
             await LoadWeek();
             await RestorePersistedAutoGenStatusAsync();
         }
@@ -1072,13 +1208,27 @@ else
             _ => status.ToString()
         };
 
-    
-    private enum GenerationScope
+    private sealed class ModuleWeekRow(int moduleId, string caption)
     {
-        Week,
-        Month,
-        Course
+        public int ModuleId { get; } = moduleId;
+        public string Caption { get; } = caption;
+        public bool Selected { get; set; }
+        public int Hours { get; set; }
     }
+
+    private sealed record PersistedWeekAutoGenConfig(
+        int? SelectedCourseId,
+        Dictionary<int, PersistedCourseAutoGenConfig> Courses
+    );
+
+    private sealed record PersistedCourseAutoGenConfig(
+        Dictionary<int, PersistedModuleSelection> Modules
+    );
+
+    private sealed record PersistedModuleSelection(
+        bool Selected,
+        int Hours
+    );
 
     private sealed class ConflictDetails
     {

@@ -41,7 +41,8 @@ public sealed class TeacherDraftsController : ControllerBase
         int? GroupId = null,
         int? TeacherId = null,
         bool AllowOnDaysOff = false,
-        WeekPreset Days = WeekPreset.MonFri
+        WeekPreset Days = WeekPreset.MonFri,
+        Dictionary<int, int>? ModuleHours = null
     );
 
     public sealed record ApproveWeekRequest(DateOnly WeekStart, int TeacherId);
@@ -737,6 +738,19 @@ public sealed class TeacherDraftsController : ControllerBase
 
         int? courseId = (r.CourseId > 0) ? r.CourseId : null;
         int? groupId = (r.GroupId > 0) ? r.GroupId : null;
+        var moduleHoursByModuleId = r.ModuleHours?
+            .Where(kv => kv.Value > 0)
+            .ToDictionary(kv => kv.Key, kv => kv.Value)
+            ?? new Dictionary<int, int>();
+        bool hasModuleHourOverrides = moduleHoursByModuleId.Count > 0;
+        var initWarnings = new List<string>();
+        if (hasModuleHourOverrides && courseId is null)
+        {
+            return BadRequest(new
+            {
+                message = "Для генерації за модулями потрібно обрати курс."
+            });
+        }
 
         var groups = await _db.Groups
             .Include(x => x.Course)
@@ -746,6 +760,37 @@ public sealed class TeacherDraftsController : ControllerBase
 
         if (groups.Count == 0)
             return Ok(new AutoGenResult(0, 0, new() { "Групи не знайдено." }));
+
+        if (hasModuleHourOverrides)
+        {
+            var cid = courseId!.Value;
+            var allowedModuleIds = await _db.Modules
+                .AsNoTracking()
+                .Where(m => m.CourseId == cid || m.ModuleCourses.Any(mc => mc.CourseId == cid))
+                .Select(m => m.Id)
+                .ToListAsync();
+            var allowedSet = allowedModuleIds.ToHashSet();
+            var invalidModuleIds = moduleHoursByModuleId.Keys
+                .Where(mid => !allowedSet.Contains(mid))
+                .OrderBy(mid => mid)
+                .ToList();
+            if (invalidModuleIds.Count > 0)
+            {
+                foreach (var mid in invalidModuleIds)
+                {
+                    moduleHoursByModuleId.Remove(mid);
+                }
+                initWarnings.Add($"Ігноровано модулі, що не належать курсу #{cid}: {string.Join(", ", invalidModuleIds)}.");
+            }
+
+            if (moduleHoursByModuleId.Count == 0)
+            {
+                return BadRequest(new
+                {
+                    message = "Потрібно вибрати хоча б один модуль з годинами > 0."
+                });
+            }
+        }
 
         if (r.ClearExisting)
         {
@@ -909,6 +954,13 @@ public sealed class TeacherDraftsController : ControllerBase
         }
 
         var moduleIdsForPlans = activePlans.Select(p => p.ModuleId).Distinct().ToList();
+        if (hasModuleHourOverrides)
+        {
+            moduleIdsForPlans = moduleIdsForPlans
+                .Concat(moduleHoursByModuleId.Keys)
+                .Distinct()
+                .ToList();
+        }
         var moduleTitles = await _db.Modules.AsNoTracking()
             .Where(m => moduleIdsForPlans.Contains(m.Id))
             .ToDictionaryAsync(
@@ -1076,6 +1128,10 @@ public sealed class TeacherDraftsController : ControllerBase
         var missingModulesNotified = new HashSet<int>();
         int created = 0, skipped = 0;
         var warnings = new List<string>();
+        if (initWarnings.Count > 0)
+        {
+            warnings.AddRange(initWarnings);
+        }
         var gapDetails = new List<AutoGenGapDetail>();
         var gapWarnings = new HashSet<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End)>();
         var slotFailureReasons = new Dictionary<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End), HashSet<string>>();
@@ -1272,7 +1328,60 @@ public sealed class TeacherDraftsController : ControllerBase
 
         var selfStudyRemainingByGroupModule = new Dictionary<(int GroupId, int ModuleId), int>();
         var selfStudyTopicRemaining = new Dictionary<(int GroupId, int ModuleId, int TopicId), int>();
-        foreach (var plan in activePlans)
+        if (hasModuleHourOverrides)
+        {
+            var orderedSelectedModules = moduleHoursByModuleId.Keys.OrderBy(mid => mid).ToList();
+            var selectedGroups = groups.OrderBy(g => g.Id).ToList();
+
+            foreach (var moduleId in orderedSelectedModules)
+            {
+                if (interAssemblyOnlyModules.Contains(moduleId))
+                {
+                    foreach (var grpRow in selectedGroups)
+                    {
+                        remainingByGroupModule[(grpRow.Id, moduleId)] = 0;
+                    }
+
+                    var moduleLabel = ModuleTitleLabel(moduleId);
+                    var groupList = string.Join(", ", selectedGroups.Select(g => g.Name));
+                    warnings.Add($"Модуль \"{moduleLabel}\" містить лише міжзборові теми, тому автогенерація пропускає його для груп: {groupList}.");
+                    continue;
+                }
+
+                var hours = moduleHoursByModuleId[moduleId];
+                foreach (var grpRow in selectedGroups)
+                {
+                    remainingByGroupModule[(grpRow.Id, moduleId)] = Math.Max(0, hours);
+                }
+
+                if (!selfStudyTopicsByModule.TryGetValue(moduleId, out var ssTopics) || ssTopics.Count == 0)
+                    continue;
+
+                foreach (var grpRow in selectedGroups)
+                {
+                    var total = 0;
+                    foreach (var topic in ssTopics)
+                    {
+                        var key = (grpRow.Id, moduleId, topic.Id);
+                        var factPerTopic = selfStudyTopicAssignments.TryGetValue(key, out var used) ? used : 0;
+                        var remaining = Math.Max(0, topic.SelfStudyHours - factPerTopic);
+                        if (remaining > 0)
+                        {
+                            selfStudyTopicRemaining[key] = remaining;
+                            total += remaining;
+                        }
+                    }
+
+                    if (total > 0)
+                    {
+                        selfStudyRemainingByGroupModule[(grpRow.Id, moduleId)] = total;
+                    }
+                }
+            }
+        }
+        else
+        {
+            foreach (var plan in activePlans)
         {
             if (!allGroupsByCourse.TryGetValue(plan.CourseId, out var courseGroups) || courseGroups.Count == 0)
                 continue;
@@ -1333,6 +1442,7 @@ public sealed class TeacherDraftsController : ControllerBase
                     selfStudyRemainingByGroupModule[(grpRow.Id, plan.ModuleId)] = total;
                 }
             }
+        }
         }
         int RemainingFor(int gid, int mid) =>
             remainingByGroupModule.TryGetValue((gid, mid), out var left) ? left : 0;
@@ -1667,7 +1777,13 @@ public sealed class TeacherDraftsController : ControllerBase
                 }
             }
 
-            var modules = activePlans.Where(p => p.CourseId == grp.CourseId).Select(p => p.ModuleId).Distinct().ToList();
+            var modules = hasModuleHourOverrides
+                ? remainingByGroupModule
+                    .Where(kv => kv.Key.GroupId == grp.Id && kv.Value > 0)
+                    .Select(kv => kv.Key.ModuleId)
+                    .Distinct()
+                    .ToList()
+                : activePlans.Where(p => p.CourseId == grp.CourseId).Select(p => p.ModuleId).Distinct().ToList();
             var orderedModules = BuildCourseModuleOrder(grp.CourseId, modules);
             fillerByCourse.TryGetValue(grp.CourseId, out var fillerSetRaw);
             var fillerLookup = fillerSetRaw is not null

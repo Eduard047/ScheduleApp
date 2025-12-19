@@ -17,7 +17,8 @@ public record AutoGenRequest(
     int? CourseId = null,
     int? GroupId = null,
     bool AllowOnDaysOff = false,
-    WeekPreset Days = WeekPreset.MonFri
+    WeekPreset Days = WeekPreset.MonFri,
+    Dictionary<int, int>? ModuleHours = null
 );
 
 public record AutoGenGapDetail(
