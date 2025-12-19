@@ -237,10 +237,36 @@
             {
                 _edit = _edit with { ModuleTopicId = tId };
                 ApplyLessonType(topic.LessonTypeId);
+
+                if (!_unrestrictedMode
+                    && topic.DepartmentId is int depId
+                    && depId > 0
+                    && _edit.TeacherId is int teacherId
+                    && _meta?.Teachers.FirstOrDefault(x => x.Id == teacherId)?.DepartmentId != depId)
+                {
+                    _edit = _edit with { TeacherId = null };
+                    _err = "Обраний викладач не належить до кафедри цієї теми, тому його вибір скинуто.";
+                }
+
                 return;
             }
         }
         _edit = _edit with { ModuleTopicId = null };
+    }
+
+    private List<LookupDto> AllowedTeachersForTopic(ModuleTopicViewDto? topic)
+    {
+        if (_meta is null) return new List<LookupDto>();
+        if (_unrestrictedMode) return _meta.Teachers;
+
+        if (topic?.DepartmentId is not int depId || depId <= 0)
+        {
+            return _meta.Teachers;
+        }
+
+        return _meta.Teachers
+            .Where(t => t.DepartmentId == depId)
+            .ToList();
     }
 
     private bool RoomExists(int roomId) => _meta?.Rooms.Any(r => r.Id == roomId) == true;
@@ -1599,6 +1625,7 @@ else
                 var selectedTopic = _edit!.ModuleTopicId is int topicId
                     ? moduleTopics.FirstOrDefault(t => t.Id == topicId)
                     : null;
+                var teacherOptions = AllowedTeachersForTopic(selectedTopic);
                 var lessonTypes = AllowedLessonTypes;
                 var selectedLessonType = lessonTypes.FirstOrDefault(lt => lt.Id == _edit!.LessonTypeId) ?? lessonTypes.FirstOrDefault();
             }
@@ -1638,7 +1665,7 @@ else
                 <label>Викладач</label>
                 <select class="select" @onchange="e => _edit = _edit! with { TeacherId = int.TryParse((string?)e.Value, out var v) ? v : (int?)null }">
                     <option value="">(без викладача)</option>
-                    @foreach (var t in _meta.Teachers)
+                    @foreach (var t in teacherOptions)
                     {
                         <option value="@t.Id" selected="@(@t.Id == _edit!.TeacherId)">@t.Name</option>
                     }
@@ -1751,7 +1778,7 @@ else
                             <label>Обрати додаткового вчителя</label>
                             <select class="select" @onchange="e => extra.TeacherId = int.TryParse((string?)e.Value, out var t) ? t : (int?)null">
                                 <option value="">(залишити основного)</option>
-                                @foreach (var t in _meta.Teachers)
+                                @foreach (var t in teacherOptions)
                                 {
                                     <option value="@t.Id" selected="@(@t.Id == extra.TeacherId)">@t.Name</option>
                                 }

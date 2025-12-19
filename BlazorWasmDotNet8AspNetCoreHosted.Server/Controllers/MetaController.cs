@@ -16,7 +16,12 @@ public class MetaController(AppDbContext db) : ControllerBase
         var groups = await db.Groups.AsNoTracking()
             .Select(x => new LookupDto(x.Id, x.Name) { CourseId = x.CourseId })
             .ToListAsync();
-        var teachers = await db.Teachers.AsNoTracking().Select(x => new LookupDto(x.Id, x.FullName)).ToListAsync();
+        var departments = await db.Departments.AsNoTracking()
+            .Select(x => new LookupDto(x.Id, x.Name))
+            .ToListAsync();
+        var teachers = await db.Teachers.AsNoTracking()
+            .Select(x => new LookupDto(x.Id, x.FullName) { DepartmentId = x.DepartmentId })
+            .ToListAsync();
         var rooms = await db.Rooms.AsNoTracking().Select(x => new LookupDto(x.Id, x.Name)).ToListAsync();
         var buildings = await db.Buildings.AsNoTracking().Select(x => new LookupDto(x.Id, x.Name)).ToListAsync();
         var moduleRows = await db.Modules
@@ -79,8 +84,8 @@ public class MetaController(AppDbContext db) : ControllerBase
         return new MetaResponseDto(courses, groups, teachers, rooms, buildings, lessonTypes, lunches)
         {
             Modules = modules,
-            Calendar = cal
+            Calendar = cal,
+            Departments = departments
         };
     }
 }
-

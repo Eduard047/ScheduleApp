@@ -43,12 +43,24 @@ public class Group
     public Course Course { get; set; } = default!;
 }
 
+public class Department
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = default!;
+    public bool IsActive { get; set; } = true;
+
+    public ICollection<Teacher> Teachers { get; set; } = new List<Teacher>();
+    public ICollection<ModuleTopic> ModuleTopics { get; set; } = new List<ModuleTopic>();
+}
+
 public class Teacher
 {
     public int Id { get; set; }
     public string FullName { get; set; } = default!;
     public string? ScientificDegree { get; set; } 
     public string? AcademicTitle { get; set; } 
+    public int? DepartmentId { get; set; }
+    public Department? Department { get; set; }
 
     public ICollection<TeacherModule> TeacherModules { get; set; } = new List<TeacherModule>();
     public ICollection<ModuleSupervisor> ModuleSupervisions { get; set; } = new List<ModuleSupervisor>();
@@ -189,6 +201,8 @@ public class ModuleTopic
     public string TopicCode { get; set; } = string.Empty;
     public int LessonTypeId { get; set; }
     public LessonTypeRef LessonType { get; set; } = default!;
+    public int? DepartmentId { get; set; }
+    public Department? Department { get; set; }
     public int TotalHours { get; set; }
     public int AuditoriumHours { get; set; }
     public int SelfStudyHours { get; set; }

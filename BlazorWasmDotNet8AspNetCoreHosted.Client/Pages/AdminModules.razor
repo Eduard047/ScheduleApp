@@ -380,6 +380,18 @@
                                 }
                             </select>
                         </div>
+                        <div class="col-12 col-lg-3">
+                            <label class="form-label text-nowrap">Кафедра</label>
+                            <select class="form-select"
+                                    value="@topicForm.DepartmentId"
+                                    @onchange="e => topicForm.DepartmentId = int.TryParse(e.Value?.ToString(), out var v) && v > 0 ? v : (int?)null">
+                                <option value="">— Не вказано —</option>
+                                @foreach (var dep in departments.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase))
+                                {
+                                    <option value="@dep.Id" selected="@(topicForm.DepartmentId == dep.Id)">@dep.Name</option>
+                                }
+                            </select>
+                        </div>
                         <div class="col-12 col-sm-4 col-lg-2">
                             <label class="form-label text-nowrap">Годин аудиторних</label>
                             <input type="number" min="0" class="form-control" @bind="topicForm.AuditoriumHours" @bind:after="SyncTotalHours" />
@@ -403,6 +415,7 @@
                                 <tr>
                                     <th class="text-nowrap">Код</th>
                                     <th class="text-nowrap">Тип</th>
+                                    <th class="text-nowrap">Кафедра</th>
                                     <th class="text-nowrap text-center">Міжзборові заходи</th>
                                     <th class="text-nowrap text-center">Самостійні години</th>
                                     <th class="text-nowrap">Годин всього</th>
@@ -419,7 +432,7 @@
                                 @if (moduleTopics.Count == 0)
                                 {
                                     <tr>
-                                        <td colspan="10" class="text-muted text-center">Немає записів.</td>
+                                        <td colspan="11" class="text-muted text-center">Немає записів.</td>
                                     </tr>
                                 }
                                 else
@@ -429,6 +442,7 @@
                                         <tr>
                                             <td>@topic.TopicCode</td>
                                             <td>@topic.LessonTypeName</td>
+                                            <td>@(string.IsNullOrWhiteSpace(topic.DepartmentName) ? "—" : topic.DepartmentName)</td>
                                             <td class="text-center">
                                 <input class="form-check-input" type="checkbox" checked="@topic.IsInterAssembly"
                                        @onchange="e => ToggleTopicInterAssembly(topic, e)"
@@ -469,7 +483,7 @@
                         var totals = CalculateModuleTopicTotals();
                         <tfoot class="table-light">
                             <tr class="fw-semibold">
-                                <td colspan="4" class="text-end pe-3">Всього за модуль</td>
+                                <td colspan="5" class="text-end pe-3">Всього за модуль</td>
                                 <td>@totals.total</td>
                                 <td>@totals.auditorium</td>
                                 <td>@totals.self</td>
@@ -513,6 +527,7 @@
     };
 
     private List<LookupDto> courses = new();
+    private List<LookupDto> departments = new();
     private IEnumerable<string> SelectedCourseNames
         => CurrentCourseIds()
             .Select(NameOfCourse)
@@ -655,6 +670,7 @@ private PlanCourseVM planCourse = new();
             var meta = await Admin.GetMeta();
             courses = meta.Courses ?? new();
             lessonTypes = meta.LessonTypes ?? new();
+            departments = meta.Departments ?? new();
 
             allRooms = await Admin.GetRooms() ?? new();
             buildings = await Admin.GetBuildings();
@@ -937,6 +953,7 @@ private PlanCourseVM planCourse = new();
                 topic.Order,
                 topic.TopicCode,
                 topic.LessonTypeId,
+                topic.DepartmentId,
                 topic.TotalHours,
                 topic.AuditoriumHours,
                 topic.SelfStudyHours,
@@ -973,6 +990,7 @@ private PlanCourseVM planCourse = new();
                 topic.Order,
                 topic.TopicCode,
                 topic.LessonTypeId,
+                topic.DepartmentId,
                 topic.TotalHours,
                 topic.AuditoriumHours,
                 topic.SelfStudyHours,
@@ -1170,6 +1188,7 @@ private PlanCourseVM planCourse = new();
             TopicCode = string.Empty,
 
             LessonTypeId = defaultLessonType > 0 ? defaultLessonType : null,
+            DepartmentId = null,
 
             TotalHours = 0,
 
@@ -1264,6 +1283,7 @@ private PlanCourseVM planCourse = new();
             TopicCode = topic.TopicCode ?? string.Empty,
 
             LessonTypeId = topic.LessonTypeId,
+            DepartmentId = topic.DepartmentId,
 
             TotalHours = topic.TotalHours,
 
@@ -1372,6 +1392,8 @@ private PlanCourseVM planCourse = new();
                 rawCode,
 
                 lessonTypeId,
+
+                topicForm.DepartmentId,
 
                 totalHours,
 
@@ -1658,6 +1680,8 @@ private PlanCourseVM planCourse = new();
         public string TopicCode { get; set; } = string.Empty;
 
         public int? LessonTypeId { get; set; }
+
+        public int? DepartmentId { get; set; }
 
         public int TotalHours { get; set; }
 
