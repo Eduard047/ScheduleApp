@@ -11,6 +11,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     public DbSet<Course> Courses => Set<Course>();
     public DbSet<Group> Groups => Set<Group>();
     public DbSet<Module> Modules => Set<Module>();
+    public DbSet<Department> Departments => Set<Department>();
     public DbSet<Teacher> Teachers => Set<Teacher>();
     public DbSet<TeacherModule> TeacherModules => Set<TeacherModule>();
     public DbSet<ModuleSupervisor> ModuleSupervisors => Set<ModuleSupervisor>();
@@ -48,6 +49,15 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         // Фіксуємо таблицю довідника типів занять.
         b.Entity<LessonTypeRef>().ToTable("LessonTypes");
 
+        // Довідник кафедр.
+        b.Entity<Department>(e =>
+        {
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Name).HasMaxLength(256).IsRequired();
+            e.Property(x => x.IsActive).HasDefaultValue(true);
+            e.HasIndex(x => x.Name).IsUnique();
+        });
+
         // Створюємо складені ключі для таблиць зі зв'язками багато-до-багатьох.
         b.Entity<TeacherModule>().HasKey(x => new { x.TeacherId, x.ModuleId });
         b.Entity<ModuleSupervisor>().HasKey(x => new { x.TeacherId, x.ModuleId });
@@ -61,6 +71,16 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             .WithMany(c => c.Groups)
             .HasForeignKey(g => g.CourseId)
             .OnDelete(DeleteBehavior.Restrict);
+
+        // Прив'язка викладачів до кафедри.
+        b.Entity<Teacher>(e =>
+        {
+            e.HasOne(t => t.Department)
+                .WithMany(d => d.Teachers)
+                .HasForeignKey(t => t.DepartmentId)
+                .OnDelete(DeleteBehavior.Restrict);
+            e.HasIndex(t => t.DepartmentId);
+        });
 
         // Забезпечуємо залежність модулів від курсу та налаштовуємо числові поля.
         b.Entity<Module>(e =>
@@ -267,12 +287,17 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
                 .WithMany()
                 .HasForeignKey(x => x.LessonTypeId)
                 .OnDelete(DeleteBehavior.Restrict);
+            e.HasOne(x => x.Department)
+                .WithMany(d => d.ModuleTopics)
+                .HasForeignKey(x => x.DepartmentId)
+                .OnDelete(DeleteBehavior.Restrict);
             e.Property(x => x.Order).HasDefaultValue(0);
             e.Property(x => x.TopicCode).HasMaxLength(64).IsRequired();
             e.Property(x => x.IsInterAssembly).HasDefaultValue(false);
             e.Property(x => x.SelfStudyBySupervisor).HasDefaultValue(false);
             e.HasIndex(x => new { x.ModuleId, x.Order }).IsUnique();
             e.HasIndex(x => new { x.ModuleId, x.TopicCode }).IsUnique();
+            e.HasIndex(x => x.DepartmentId);
         });
     }
 }

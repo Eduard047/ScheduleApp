@@ -1,5 +1,6 @@
 ﻿@* Сторінка адміністрування викладачів *@
 @page "/admin/teachers"
+@using System.Net
 @using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
 @inject HttpClient Http
 @inject IJSRuntime JS
@@ -17,7 +18,7 @@ else
 
         <div class="input-group" style="max-width:360px;">
             <span class="input-group-text">Пошук</span>
-            <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / ПІБ / ступінь / звання / модуль" />
+            <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / ПІБ / кафедра / курс / ступінь / звання / модуль" />
         </div>
     </div>
 
@@ -35,6 +36,10 @@ else
                     ПІБ @HeaderIcon(nameof(TeacherViewDto.FullName))
                 </th>
                 <th class="sortable-th" role="button"
+                    @onclick="() => ToggleSort(DepartmentField)">
+                    Кафедра @HeaderIcon(DepartmentField)
+                </th>
+                <th class="sortable-th" role="button"
                     @onclick="() => ToggleSort(nameof(TeacherViewDto.ScientificDegree))">
                     Науковий ступінь @HeaderIcon(nameof(TeacherViewDto.ScientificDegree))
                 </th>
@@ -46,6 +51,10 @@ else
                     @onclick="() => ToggleSort(ModulesField)">
                     Модулі @HeaderIcon(ModulesField)
                 </th>
+                <th class="sortable-th" role="button"
+                    @onclick="() => ToggleSort(ActiveCoursesField)">
+                    Активні @HeaderIcon(ActiveCoursesField)
+                </th>
                 <th></th>
             </tr>
         </thead>
@@ -55,9 +64,11 @@ else
                 <tr>
                     <td>@t.Id</td>
                     <td>@t.FullName</td>
+                    <td>@DepartmentCaption(t.DepartmentId)</td>
                     <td>@t.ScientificDegree</td>
                     <td>@t.AcademicTitle</td>
                     <td>@ModulesCaption(t)</td>
+                    <td>@ActiveCoursesMarkup(t)</td>
                     <td class="text-end">
                         <button class="btn btn-sm btn-secondary me-1" @onclick="() => Edit(t.Id)">Редагувати</button>
                         <button class="btn btn-sm btn-danger" @onclick="() => Delete(t.Id)">Видалити</button>
@@ -82,17 +93,30 @@ else
 
             <div class="teacher-editor-body">
                 <div class="row g-3">
-                    <div class="col-md-6">
+                    <div class="col-md-5">
                         <label class="form-label">ПІБ</label>
                         <input class="form-control" @bind="edit.FullName" />
                     </div>
 
                     <div class="col-md-3">
+                        <label class="form-label">Кафедра</label>
+                        <select class="form-select"
+                                value="@edit.DepartmentId"
+                                @onchange="e => edit.DepartmentId = int.TryParse(e.Value?.ToString(), out var v) && v > 0 ? v : (int?)null">
+                            <option value="">— Не вказано —</option>
+                            @foreach (var d in meta.Departments.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase))
+                            {
+                                <option value="@d.Id" selected="@(d.Id == edit.DepartmentId)">@d.Name</option>
+                            }
+                        </select>
+                    </div>
+
+                    <div class="col-md-2">
                         <label class="form-label">Науковий ступінь</label>
                         <input class="form-control" @bind="edit.ScientificDegree" />
                     </div>
 
-                    <div class="col-md-3">
+                    <div class="col-md-2">
                         <label class="form-label">Наукове звання</label>
                         <input class="form-control" @bind="edit.AcademicTitle" />
                     </div>
@@ -163,7 +187,6 @@ else
                 <div class="editor-card">
                     <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
                         <h5 class="mb-0">Навантаження по курсам</h5>
-                        <span class="text-muted small">Години readonly — синхронізуються з чернетками.</span>
                     </div>
                     <div class="table-responsive">
                         <table class="table table-sm align-middle mb-0">
@@ -311,7 +334,9 @@ else
     private bool loading = true;
 
     
+    private const string DepartmentField = "Department";
     private const string ModulesField = "ModulesCount";
+    private const string ActiveCoursesField = "ActiveCourses";
     private string sortField = nameof(TeacherViewDto.FullName);
     private bool sortAsc = true;
 
@@ -350,14 +375,15 @@ else
             .ToList();
 
         edit = new TeacherEditDto(
-            null,
-            "",
-            null,   
-            null,   
-            new List<int>(),
-            new List<int>(),
-            new List<TeacherLoadDto>(),
-            defaultWorkingHours
+            id: null,
+            fullName: "",
+            scientificDegree: null,
+            academicTitle: null,
+            departmentId: null,
+            moduleIds: new List<int>(),
+            supervisorModuleIds: new List<int>(),
+            loads: new List<TeacherLoadDto>(),
+            workingHours: defaultWorkingHours
         );
     }
 
@@ -402,7 +428,32 @@ else
         return course is null ? module.Name : $"{module.Name} ({course})";
     }
 
+    private string DepartmentCaption(int? departmentId)
+        => departmentId is int id && id > 0
+            ? (meta.Departments.FirstOrDefault(x => x.Id == id)?.Name ?? $"#{id}")
+            : "—";
+
     private string ModulesCaption(TeacherViewDto t) => string.Join(", ", t.ModuleIds.Select(ModuleCaption));
+
+    private string CourseCaption(int courseId)
+        => meta.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
+
+    private List<int> ActiveCourseIds(TeacherViewDto t) =>
+        (t.Loads ?? new())
+            .Where(x => x.IsActive)
+            .Select(x => x.CourseId)
+            .Distinct()
+            .OrderBy(x => CourseCaption(x), StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    private MarkupString ActiveCoursesMarkup(TeacherViewDto t)
+    {
+        var ids = ActiveCourseIds(t);
+        if (ids.Count == 0) return new MarkupString("<span class=\"text-muted\">—</span>");
+
+        var html = string.Join("", ids.Select(cid => $"<span class=\"badge bg-success me-1\">{WebUtility.HtmlEncode(CourseCaption(cid))}</span>"));
+        return new MarkupString(html);
+    }
 
     private void ToggleModule(int moduleId, bool isChecked)
     {
@@ -517,6 +568,8 @@ else
         return seq.Where(t =>
             t.Id.ToString().Contains(f, StringComparison.OrdinalIgnoreCase) ||
             (t.FullName?.Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
+            DepartmentCaption(t.DepartmentId).Contains(f, StringComparison.OrdinalIgnoreCase) ||
+            string.Join(", ", ActiveCourseIds(t).Select(CourseCaption)).Contains(f, StringComparison.OrdinalIgnoreCase) ||
             (t.ScientificDegree?.Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
             (t.AcademicTitle?.Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
             ModulesCaption(t).Contains(f, StringComparison.OrdinalIgnoreCase)
@@ -539,8 +592,14 @@ else
             (nameof(TeacherViewDto.AcademicTitle), true) => seq.OrderBy(x => x.AcademicTitle),
             (nameof(TeacherViewDto.AcademicTitle), false) => seq.OrderByDescending(x => x.AcademicTitle),
 
+            (DepartmentField, true) => seq.OrderBy(x => DepartmentCaption(x.DepartmentId)).ThenBy(x => x.FullName),
+            (DepartmentField, false) => seq.OrderByDescending(x => DepartmentCaption(x.DepartmentId)).ThenByDescending(x => x.FullName),
+
             (ModulesField, true) => seq.OrderBy(x => x.ModuleIds?.Count ?? 0).ThenBy(x => ModulesCaption(x)),
             (ModulesField, false) => seq.OrderByDescending(x => x.ModuleIds?.Count ?? 0).ThenByDescending(x => ModulesCaption(x)),
+
+            (ActiveCoursesField, true) => seq.OrderBy(x => string.Join(", ", ActiveCourseIds(x).Select(CourseCaption))).ThenBy(x => x.FullName),
+            (ActiveCoursesField, false) => seq.OrderByDescending(x => string.Join(", ", ActiveCourseIds(x).Select(CourseCaption))).ThenByDescending(x => x.FullName),
 
             _ => seq
         };
@@ -557,6 +616,3 @@ else
     private MarkupString HeaderIcon(string field)
         => new(sortField == field ? $"<span class=\"ms-1\">{(sortAsc ? "▲" : "▼")}</span>" : "");
 }
-
-
-

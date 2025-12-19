@@ -13,7 +13,10 @@
 @inject ITeacherDraftsApi DraftsApi
 @inject IJSRuntime JS
 
-<h3 class="page-title">Графік викладачів<span class="weak">(тиждень @_weekStart.ToString("yyyy-MM-dd"))</span></h3>
+<h3 class="page-title">
+    Графік викладачів <span class="draft-pill">Чернетка</span>
+    <span class="weak">(тиждень @_weekStart.ToString("yyyy-MM-dd"))</span>
+</h3>
 
 <div class="week-nav">
     <button class="btn btn-ghost" @onclick="PrevWeek">&lt; Попередній тиждень</button>
@@ -30,6 +33,7 @@
     private int? _teacherId;
     private int? _groupId;
     private int? _roomId;
+    private int? _courseId;
     private DateOnly _weekStart = FirstMonday(DateOnly.FromDateTime(DateTime.Today));
 
     private List<TeacherDraftItemDto> _items = new();
@@ -89,13 +93,14 @@
     private SlotKey? _dragHover;
     private bool _isProcessingDrop;
 
-    private string CurrentConflictKey => $"{_weekStart:yyyy-MM-dd}|t:{_teacherId?.ToString() ?? "all"}|g:{_groupId?.ToString() ?? "all"}|r:{_roomId?.ToString() ?? "all"}";
+    private string CurrentConflictKey => $"{_weekStart:yyyy-MM-dd}|t:{_teacherId?.ToString() ?? "all"}|g:{_groupId?.ToString() ?? "all"}|r:{_roomId?.ToString() ?? "all"}|c:{_courseId?.ToString() ?? "all"}";
 
     private IEnumerable<TeacherDraftItemDto> Filtered =>
         _items.Where(i =>
             (_teacherId is null || i.TeacherId == _teacherId) &&
             (_groupId is null || i.GroupId == _groupId) &&
-            (_roomId is null || i.RoomId == _roomId)
+            (_roomId is null || i.RoomId == _roomId) &&
+            ModuleMatchesCourse(i.ModuleId, _courseId)
         );
 
     protected override async Task OnInitializedAsync()
@@ -232,10 +237,36 @@
             {
                 _edit = _edit with { ModuleTopicId = tId };
                 ApplyLessonType(topic.LessonTypeId);
+
+                if (!_unrestrictedMode
+                    && topic.DepartmentId is int depId
+                    && depId > 0
+                    && _edit.TeacherId is int teacherId
+                    && _meta?.Teachers.FirstOrDefault(x => x.Id == teacherId)?.DepartmentId != depId)
+                {
+                    _edit = _edit with { TeacherId = null };
+                    _err = "Обраний викладач не належить до кафедри цієї теми, тому його вибір скинуто.";
+                }
+
                 return;
             }
         }
         _edit = _edit with { ModuleTopicId = null };
+    }
+
+    private List<LookupDto> AllowedTeachersForTopic(ModuleTopicViewDto? topic)
+    {
+        if (_meta is null) return new List<LookupDto>();
+        if (_unrestrictedMode) return _meta.Teachers;
+
+        if (topic?.DepartmentId is not int depId || depId <= 0)
+        {
+            return _meta.Teachers;
+        }
+
+        return _meta.Teachers
+            .Where(t => t.DepartmentId == depId)
+            .ToList();
     }
 
     private bool RoomExists(int roomId) => _meta?.Rooms.Any(r => r.Id == roomId) == true;
@@ -506,20 +537,42 @@
         }
 
         var ids = filtered.Select(i => i.GroupId).Distinct().ToHashSet();
-        var source = ids.Count > 0
-            ? _meta.Groups.Where(g => ids.Contains(g.Id))
-            : _meta.Groups.AsEnumerable();
+        if (ids.Count == 0)
+        {
+            if (_courseId is int cid)
+            {
+                return _meta.Groups
+                    .Where(g => g.CourseId == cid)
+                    .OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase)
+                    .ToList();
+            }
+
+            return _meta.Groups.OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
+        }
+
+        var source = _meta.Groups.Where(g => ids.Contains(g.Id));
 
         return source
             .OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase)
             .ToList();
     }
 
+    private ModuleMetaDto? FindModule(int moduleId) => _meta?.Modules.FirstOrDefault(m => m.Id == moduleId);
+
+    private int? ModuleCourseId(int moduleId) => FindModule(moduleId)?.CourseId;
+
+    private bool ModuleMatchesCourse(int moduleId, int? courseId)
+    {
+        if (courseId is null) return true;
+        var module = FindModule(moduleId);
+        if (module is null) return false;
+        if (module.CourseId == courseId) return true;
+        return module.CourseIds.Contains(courseId.Value);
+    }
+
     private string ModuleCourseCaption(int moduleId)
     {
-        if (_meta is null) return string.Empty;
-        var module = _meta.Modules.FirstOrDefault(m => m.Id == moduleId);
-        var course = module?.CourseName;
+        var course = FindModule(moduleId)?.CourseName;
         return string.IsNullOrWhiteSpace(course) ? string.Empty : course!;
     }
 
@@ -529,6 +582,33 @@
         var title = codePart is null ? module.Name : $"{codePart} {module.Name}";
         var course = string.IsNullOrWhiteSpace(module.CourseName) ? null : module.CourseName.Trim();
         return course is null ? title : $"{title} - {course}";
+    }
+
+    private IEnumerable<LookupDto> CourseScopedGroups()
+    {
+        if (_meta is null) return Enumerable.Empty<LookupDto>();
+        if (_courseId is null)
+        {
+            return _meta.Groups.OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
+        }
+
+        var matchedByCourse = _meta.Groups
+            .Where(g => g.CourseId == _courseId)
+            .OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase)
+            .ToList();
+
+        if (matchedByCourse.Count > 0) return matchedByCourse;
+
+        var ids = _items
+            .Where(i => ModuleMatchesCourse(i.ModuleId, _courseId))
+            .Select(i => i.GroupId)
+            .Distinct()
+            .ToHashSet();
+
+        return _meta.Groups
+            .Where(g => ids.Contains(g.Id))
+            .OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase)
+            .ToList();
     }
 
     private static string TopicOptionCaption(ModuleTopicViewDto topic)
@@ -1129,7 +1209,11 @@ static string CssByCode(string code) => code switch
 
     private Task PrevWeek() { _weekStart = _weekStart.AddDays(-7); return Reload(); }
     private Task NextWeek() { _weekStart = _weekStart.AddDays(+7); return Reload(); }
-    private void ResetFilters() { _teacherId = _groupId = _roomId = null; StateHasChanged(); }
+    private void ResetFilters()
+    {
+        _teacherId = _groupId = _roomId = _courseId = null;
+        StateHasChanged();
+    }
 
     private DraftValidationReportDto? ParseWarningReport(string? raw)
     {
@@ -1182,43 +1266,53 @@ static string CssByCode(string code) => code switch
 
 
 <div class="toolbar">
-    <select class="select select--narrow" @bind="_teacherId">
-        <option value="">Обрати викладача</option>
-        @if (_meta is not null)
-        {
-            foreach (var t in _meta.Teachers)
+    <div class="toolbar-filters">
+        <select class="select select--narrow" @bind="_teacherId">
+            <option value="">Обрати викладача</option>
+            @if (_meta is not null)
             {
-                <option value="@t.Id">@t.Name</option>
+                foreach (var t in _meta.Teachers)
+                {
+                    <option value="@t.Id">@t.Name</option>
+                }
             }
-        }
-    </select>
+        </select>
 
-    <select class="select" @bind="_groupId">
-        <option value="">Обрати групу</option>
-        @if (_meta is not null)
-        {
-            foreach (var g in _meta.Groups)
+        <select class="select" @bind="_groupId">
+            <option value="">Обрати групу</option>
+            @foreach (var g in CourseScopedGroups())
             {
                 <option value="@g.Id">@g.Name</option>
             }
-        }
-    </select>
+        </select>
 
-    <select class="select" @bind="_roomId">
-        <option value="">Обрати аудиторію</option>
-        @if (_meta is not null)
-        {
-            foreach (var r in _meta.Rooms)
+        <select class="select" @bind="_roomId">
+            <option value="">Обрати аудиторію</option>
+            @if (_meta is not null)
             {
-                <option value="@r.Id">@r.Name</option>
+                foreach (var r in _meta.Rooms)
+                {
+                    <option value="@r.Id">@r.Name</option>
+                }
             }
-        }
-    </select>
+        </select>
 
-    <input type="date"
-           class="select"
-           value="@_weekStart.ToString("yyyy-MM-dd")"
-           @onchange="e => _weekStart = FirstMonday(DateOnly.Parse((string)e.Value!))" />
+        <select class="select" @bind="_courseId">
+            <option value="">Обрати курс</option>
+            @if (_meta is not null)
+            {
+                foreach (var c in _meta.Courses)
+                {
+                    <option value="@c.Id">@c.Name</option>
+                }
+            }
+        </select>
+
+        <input type="date"
+               class="select"
+               value="@_weekStart.ToString("yyyy-MM-dd")"
+               @onchange="e => _weekStart = FirstMonday(DateOnly.Parse((string)e.Value!))" />
+    </div>
 
     <div class="toolbar-actions">
         <button class="btn btn-primary" @onclick="Reload">Оновити</button>
@@ -1531,6 +1625,7 @@ else
                 var selectedTopic = _edit!.ModuleTopicId is int topicId
                     ? moduleTopics.FirstOrDefault(t => t.Id == topicId)
                     : null;
+                var teacherOptions = AllowedTeachersForTopic(selectedTopic);
                 var lessonTypes = AllowedLessonTypes;
                 var selectedLessonType = lessonTypes.FirstOrDefault(lt => lt.Id == _edit!.LessonTypeId) ?? lessonTypes.FirstOrDefault();
             }
@@ -1570,7 +1665,7 @@ else
                 <label>Викладач</label>
                 <select class="select" @onchange="e => _edit = _edit! with { TeacherId = int.TryParse((string?)e.Value, out var v) ? v : (int?)null }">
                     <option value="">(без викладача)</option>
-                    @foreach (var t in _meta.Teachers)
+                    @foreach (var t in teacherOptions)
                     {
                         <option value="@t.Id" selected="@(@t.Id == _edit!.TeacherId)">@t.Name</option>
                     }
@@ -1683,7 +1778,7 @@ else
                             <label>Обрати додаткового вчителя</label>
                             <select class="select" @onchange="e => extra.TeacherId = int.TryParse((string?)e.Value, out var t) ? t : (int?)null">
                                 <option value="">(залишити основного)</option>
-                                @foreach (var t in _meta.Teachers)
+                                @foreach (var t in teacherOptions)
                                 {
                                     <option value="@t.Id" selected="@(@t.Id == extra.TeacherId)">@t.Name</option>
                                 }
@@ -1723,19 +1818,41 @@ else
         font-weight: 400;
     }
 
+    .draft-pill {
+        display: inline-flex;
+        align-items: center;
+        margin-left: .4rem;
+        padding: .18rem .6rem;
+        border-radius: 999px;
+        background: #fef3c7;
+        color: #92400e;
+        font-weight: 700;
+        font-size: .78rem;
+        text-transform: uppercase;
+        letter-spacing: .02em;
+    }
+
     .toolbar {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: .5rem;
+        align-items: center;
+        margin-bottom: 12px;
+    }
+
+    .toolbar-filters {
         display: flex;
         flex-wrap: wrap;
         gap: .5rem;
         align-items: center;
-        margin-bottom: 12px;
     }
 
     .toolbar-actions {
         display: flex;
         align-items: center;
         gap: .5rem;
-        margin-left: auto;
+        flex-wrap: nowrap;
+        justify-content: flex-end;
     }
 
     .select {
@@ -1749,6 +1866,26 @@ else
     .select--narrow {
         width: 240px;
         max-width: 240px;
+    }
+
+    .toolbar .select {
+        height: 44px;
+    }
+
+    .toolbar .btn {
+        height: 44px;
+        display: inline-flex;
+        align-items: center;
+    }
+
+    @@media (max-width: 1100px) {
+        .toolbar {
+            grid-template-columns: 1fr;
+        }
+
+        .toolbar-actions {
+            justify-content: flex-start;
+        }
     }
 
     .actions {

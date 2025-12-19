@@ -41,7 +41,8 @@ public sealed class TeacherDraftsController : ControllerBase
         int? GroupId = null,
         int? TeacherId = null,
         bool AllowOnDaysOff = false,
-        WeekPreset Days = WeekPreset.MonFri
+        WeekPreset Days = WeekPreset.MonFri,
+        Dictionary<int, int>? ModuleHours = null
     );
 
     public sealed record ApproveWeekRequest(DateOnly WeekStart, int TeacherId);
@@ -737,6 +738,19 @@ public sealed class TeacherDraftsController : ControllerBase
 
         int? courseId = (r.CourseId > 0) ? r.CourseId : null;
         int? groupId = (r.GroupId > 0) ? r.GroupId : null;
+        var moduleHoursByModuleId = r.ModuleHours?
+            .Where(kv => kv.Value > 0)
+            .ToDictionary(kv => kv.Key, kv => kv.Value)
+            ?? new Dictionary<int, int>();
+        bool hasModuleHourOverrides = moduleHoursByModuleId.Count > 0;
+        var initWarnings = new List<string>();
+        if (hasModuleHourOverrides && courseId is null)
+        {
+            return BadRequest(new
+            {
+                message = "Для генерації за модулями потрібно обрати курс."
+            });
+        }
 
         var groups = await _db.Groups
             .Include(x => x.Course)
@@ -746,6 +760,37 @@ public sealed class TeacherDraftsController : ControllerBase
 
         if (groups.Count == 0)
             return Ok(new AutoGenResult(0, 0, new() { "Групи не знайдено." }));
+
+        if (hasModuleHourOverrides)
+        {
+            var cid = courseId!.Value;
+            var allowedModuleIds = await _db.Modules
+                .AsNoTracking()
+                .Where(m => m.CourseId == cid || m.ModuleCourses.Any(mc => mc.CourseId == cid))
+                .Select(m => m.Id)
+                .ToListAsync();
+            var allowedSet = allowedModuleIds.ToHashSet();
+            var invalidModuleIds = moduleHoursByModuleId.Keys
+                .Where(mid => !allowedSet.Contains(mid))
+                .OrderBy(mid => mid)
+                .ToList();
+            if (invalidModuleIds.Count > 0)
+            {
+                foreach (var mid in invalidModuleIds)
+                {
+                    moduleHoursByModuleId.Remove(mid);
+                }
+                initWarnings.Add($"Ігноровано модулі, що не належать курсу #{cid}: {string.Join(", ", invalidModuleIds)}.");
+            }
+
+            if (moduleHoursByModuleId.Count == 0)
+            {
+                return BadRequest(new
+                {
+                    message = "Потрібно вибрати хоча б один модуль з годинами > 0."
+                });
+            }
+        }
 
         if (r.ClearExisting)
         {
@@ -844,12 +889,22 @@ public sealed class TeacherDraftsController : ControllerBase
         var teachersForModule = await _db.TeacherModules.AsNoTracking().ToListAsync();
         var supervisorsForModule = await _db.ModuleSupervisors.AsNoTracking().ToListAsync();
 
-        var teacherNames = await _db.Teachers
+        var teachersMeta = await _db.Teachers
             .AsNoTracking()
-            .ToDictionaryAsync(
-                t => t.Id,
-                t => string.IsNullOrWhiteSpace(t.FullName) ? $"#{t.Id}" : t.FullName!
-            );
+            .Select(t => new
+            {
+                t.Id,
+                Name = string.IsNullOrWhiteSpace(t.FullName) ? $"#{t.Id}" : t.FullName!,
+                t.DepartmentId
+            })
+            .ToListAsync();
+
+        var teacherNames = teachersMeta.ToDictionary(x => x.Id, x => x.Name);
+        var teacherDepartmentById = teachersMeta.ToDictionary(x => x.Id, x => x.DepartmentId);
+
+        var departmentNames = await _db.Departments
+            .AsNoTracking()
+            .ToDictionaryAsync(d => d.Id, d => string.IsNullOrWhiteSpace(d.Name) ? $"#{d.Id}" : d.Name!);
 
         var teacherWorkingHours = await _db.TeacherWorkingHours.AsNoTracking()
             .Select(w => new { w.TeacherId, w.DayOfWeek, w.Start, w.End })
@@ -909,6 +964,13 @@ public sealed class TeacherDraftsController : ControllerBase
         }
 
         var moduleIdsForPlans = activePlans.Select(p => p.ModuleId).Distinct().ToList();
+        if (hasModuleHourOverrides)
+        {
+            moduleIdsForPlans = moduleIdsForPlans
+                .Concat(moduleHoursByModuleId.Keys)
+                .Distinct()
+                .ToList();
+        }
         var moduleTitles = await _db.Modules.AsNoTracking()
             .Where(m => moduleIdsForPlans.Contains(m.Id))
             .ToDictionaryAsync(
@@ -1076,6 +1138,10 @@ public sealed class TeacherDraftsController : ControllerBase
         var missingModulesNotified = new HashSet<int>();
         int created = 0, skipped = 0;
         var warnings = new List<string>();
+        if (initWarnings.Count > 0)
+        {
+            warnings.AddRange(initWarnings);
+        }
         var gapDetails = new List<AutoGenGapDetail>();
         var gapWarnings = new HashSet<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End)>();
         var slotFailureReasons = new Dictionary<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End), HashSet<string>>();
@@ -1272,7 +1338,60 @@ public sealed class TeacherDraftsController : ControllerBase
 
         var selfStudyRemainingByGroupModule = new Dictionary<(int GroupId, int ModuleId), int>();
         var selfStudyTopicRemaining = new Dictionary<(int GroupId, int ModuleId, int TopicId), int>();
-        foreach (var plan in activePlans)
+        if (hasModuleHourOverrides)
+        {
+            var orderedSelectedModules = moduleHoursByModuleId.Keys.OrderBy(mid => mid).ToList();
+            var selectedGroups = groups.OrderBy(g => g.Id).ToList();
+
+            foreach (var moduleId in orderedSelectedModules)
+            {
+                if (interAssemblyOnlyModules.Contains(moduleId))
+                {
+                    foreach (var grpRow in selectedGroups)
+                    {
+                        remainingByGroupModule[(grpRow.Id, moduleId)] = 0;
+                    }
+
+                    var moduleLabel = ModuleTitleLabel(moduleId);
+                    var groupList = string.Join(", ", selectedGroups.Select(g => g.Name));
+                    warnings.Add($"Модуль \"{moduleLabel}\" містить лише міжзборові теми, тому автогенерація пропускає його для груп: {groupList}.");
+                    continue;
+                }
+
+                var hours = moduleHoursByModuleId[moduleId];
+                foreach (var grpRow in selectedGroups)
+                {
+                    remainingByGroupModule[(grpRow.Id, moduleId)] = Math.Max(0, hours);
+                }
+
+                if (!selfStudyTopicsByModule.TryGetValue(moduleId, out var ssTopics) || ssTopics.Count == 0)
+                    continue;
+
+                foreach (var grpRow in selectedGroups)
+                {
+                    var total = 0;
+                    foreach (var topic in ssTopics)
+                    {
+                        var key = (grpRow.Id, moduleId, topic.Id);
+                        var factPerTopic = selfStudyTopicAssignments.TryGetValue(key, out var used) ? used : 0;
+                        var remaining = Math.Max(0, topic.SelfStudyHours - factPerTopic);
+                        if (remaining > 0)
+                        {
+                            selfStudyTopicRemaining[key] = remaining;
+                            total += remaining;
+                        }
+                    }
+
+                    if (total > 0)
+                    {
+                        selfStudyRemainingByGroupModule[(grpRow.Id, moduleId)] = total;
+                    }
+                }
+            }
+        }
+        else
+        {
+            foreach (var plan in activePlans)
         {
             if (!allGroupsByCourse.TryGetValue(plan.CourseId, out var courseGroups) || courseGroups.Count == 0)
                 continue;
@@ -1334,12 +1453,13 @@ public sealed class TeacherDraftsController : ControllerBase
                 }
             }
         }
+        }
         int RemainingFor(int gid, int mid) =>
             remainingByGroupModule.TryGetValue((gid, mid), out var left) ? left : 0;
         int SelfStudyRemaining(int gid, int mid) =>
             selfStudyRemainingByGroupModule.TryGetValue((gid, mid), out var left) ? left : 0;
 
-        ModuleTopic? NextSelfStudyTopic(int gid, int mid)
+        ModuleTopic? PeekSelfStudyTopic(int gid, int mid)
         {
             if (!selfStudyTopicsByModule.TryGetValue(mid, out var list) || list.Count == 0)
                 return null;
@@ -1349,7 +1469,6 @@ public sealed class TeacherDraftsController : ControllerBase
                 var key = (gid, mid, t.Id);
                 if (selfStudyTopicRemaining.TryGetValue(key, out var left) && left > 0)
                 {
-                    selfStudyTopicRemaining[key] = Math.Max(0, left - 1);
                     return t;
                 }
             }
@@ -1667,7 +1786,13 @@ public sealed class TeacherDraftsController : ControllerBase
                 }
             }
 
-            var modules = activePlans.Where(p => p.CourseId == grp.CourseId).Select(p => p.ModuleId).Distinct().ToList();
+            var modules = hasModuleHourOverrides
+                ? remainingByGroupModule
+                    .Where(kv => kv.Key.GroupId == grp.Id && kv.Value > 0)
+                    .Select(kv => kv.Key.ModuleId)
+                    .Distinct()
+                    .ToList()
+                : activePlans.Where(p => p.CourseId == grp.CourseId).Select(p => p.ModuleId).Distinct().ToList();
             var orderedModules = BuildCourseModuleOrder(grp.CourseId, modules);
             fillerByCourse.TryGetValue(grp.CourseId, out var fillerSetRaw);
             var fillerLookup = fillerSetRaw is not null
@@ -1755,7 +1880,7 @@ public sealed class TeacherDraftsController : ControllerBase
                         int altLtId;
                         if (altSelfStudy)
                         {
-                            altTopic = NextSelfStudyTopic(grp.Id, altModuleId);
+                            altTopic = PeekSelfStudyTopic(grp.Id, altModuleId);
                             altLtId = altTopic?.LessonTypeId ?? PickLessonType(grp.Id, grp.CourseId, altModuleId, date).LessonTypeId;
                         }
                         else
@@ -1763,6 +1888,13 @@ public sealed class TeacherDraftsController : ControllerBase
                             var pick = PickLessonType(grp.Id, grp.CourseId, altModuleId, date);
                             altLtId = pick.LessonTypeId;
                             altTopic = pick.Topic;
+                        }
+
+                        if (altTopic?.DepartmentId is int altDepId
+                            && altDepId > 0
+                            && (!teacherDepartmentById.TryGetValue(tid, out var teacherDep) || teacherDep != altDepId))
+                        {
+                            continue;
                         }
 
                         if (!TypeAllowed(altLtId)) continue;
@@ -1995,7 +2127,78 @@ public sealed class TeacherDraftsController : ControllerBase
                         continue;
                     }
 
-                    foreach (var tidCandidate in tids)
+                    var isSelfStudyPlacement = placeSelfStudy && SelfStudyRemaining(grp.Id, moduleId) > 0;
+                    ModuleTopic? topicSelection = null;
+                    int ltypeId = 0;
+                    if (isSelfStudyPlacement)
+                    {
+                        topicSelection = PeekSelfStudyTopic(grp.Id, moduleId);
+                        if (topicSelection is null)
+                        {
+                            selfStudyRemainingByGroupModule[remainingKey] = 0;
+                            isSelfStudyPlacement = false;
+                        }
+                        else
+                        {
+                            ltypeId = topicSelection.LessonTypeId;
+                        }
+                    }
+
+                    if (!isSelfStudyPlacement)
+                    {
+                        var pickResult = PickLessonType(grp.Id, grp.CourseId, moduleId, date);
+                        ltypeId = pickResult.LessonTypeId;
+                        topicSelection = pickResult.Topic;
+                    }
+
+                    if (!TypeAllowed(ltypeId))
+                    {
+                        string reason;
+                        if (!typeById.TryGetValue(ltypeId, out var ltInfo))
+                        {
+                            reason = $"Тип заняття #{ltypeId} не знайдено, тому слот {slotLabel} пропущено.";
+                        }
+                        else if (!ltInfo.IsActive)
+                        {
+                            reason = $"Тип заняття \"{ltInfo.Name}\" неактивний, тому слот {slotLabel} пропущено.";
+                        }
+                        else if (!ltInfo.CountInPlan)
+                        {
+                            reason = $"Тип заняття \"{ltInfo.Name}\" не враховується у плані (CountInPlan=false), тому слот {slotLabel} пропущено.";
+                        }
+                        else if (excludedTypeIds.Contains(ltypeId))
+                        {
+                            reason = $"Тип заняття \"{ltInfo.Name}\" виключено з автогенерації, тому слот {slotLabel} пропущено.";
+                        }
+                        else
+                        {
+                            reason = $"Тип заняття #{ltypeId} недоступний для автогенерації, тому слот {slotLabel} пропущено.";
+                        }
+
+                        RecordSlotFailureReason(date, sl, reason);
+                        continue;
+                    }
+
+                    var filteredTeacherIds = tids;
+                    if (topicSelection?.DepartmentId is int departmentId && departmentId > 0)
+                    {
+                        filteredTeacherIds = tids
+                            .Where(tid => teacherDepartmentById.TryGetValue(tid, out var depId) && depId == departmentId)
+                            .ToList();
+
+                        if (filteredTeacherIds.Count == 0)
+                        {
+                            var depName = departmentNames.TryGetValue(departmentId, out var dn) ? dn : $"#{departmentId}";
+                            var topicCode = string.IsNullOrWhiteSpace(topicSelection.TopicCode) ? null : topicSelection.TopicCode.Trim();
+                            var reason = topicCode is null
+                                ? $"Для модуля <{ModuleLabel()}> обрано кафедру \"{depName}\", але немає доступних викладачів цієї кафедри."
+                                : $"Для модуля <{ModuleLabel()}> (тема {topicCode}) обрано кафедру \"{depName}\", але немає доступних викладачів цієї кафедри.";
+                            RecordSlotFailureReason(date, sl, reason);
+                            continue;
+                        }
+                    }
+
+                    foreach (var tidCandidate in filteredTeacherIds)
                     {
                         if (!TeacherFitsWorkingHours(tidCandidate, date, s, e))
                         {
@@ -2009,46 +2212,6 @@ public sealed class TeacherDraftsController : ControllerBase
                         if (peopleBusy)
                         {
                             slotIssues.Add($"Група {grp.Name} або викладач {TeacherLabel(tidCandidate)} зайняті у слоті {slotLabel}.");
-                            continue;
-                        }
-
-                        var isSelfStudyPlacement = placeSelfStudy && SelfStudyRemaining(grp.Id, moduleId) > 0;
-                        ModuleTopic? topicSelection = null;
-                        int ltypeId;
-                        if (isSelfStudyPlacement)
-                        {
-                            topicSelection = NextSelfStudyTopic(grp.Id, moduleId);
-                            if (topicSelection is null)
-                            {
-                                selfStudyRemainingByGroupModule[remainingKey] = 0;
-                                continue;
-                            }
-                            ltypeId = topicSelection?.LessonTypeId ?? PickLessonType(grp.Id, grp.CourseId, moduleId, date).LessonTypeId;
-                        }
-                        else
-                        {
-                            var pickResult = PickLessonType(grp.Id, grp.CourseId, moduleId, date);
-                            ltypeId = pickResult.LessonTypeId;
-                            topicSelection = pickResult.Topic;
-                        }
-                        if (!TypeAllowed(ltypeId))
-                        {
-                            if (!typeById.TryGetValue(ltypeId, out var ltInfo))
-                            {
-                                slotIssues.Add($"Тип заняття #{ltypeId} не знайдено, тому слот {slotLabel} пропущено.");
-                            }
-                            else if (!ltInfo.IsActive)
-                            {
-                                slotIssues.Add($"Тип заняття \"{ltInfo.Name}\" неактивний, тому слот {slotLabel} пропущено.");
-                            }
-                            else if (!ltInfo.CountInPlan)
-                            {
-                                slotIssues.Add($"Тип заняття \"{ltInfo.Name}\" не враховується у плані (CountInPlan=false), тому слот {slotLabel} пропущено.");
-                            }
-                            else if (excludedTypeIds.Contains(ltypeId))
-                            {
-                                slotIssues.Add($"Тип заняття \"{ltInfo.Name}\" виключено з автогенерації, тому слот {slotLabel} пропущено.");
-                            }
                             continue;
                         }
 
@@ -2249,6 +2412,14 @@ public sealed class TeacherDraftsController : ControllerBase
                 if (best.IsSelfStudy && selfStudyRemainingByGroupModule.TryGetValue(remainingKey, out var ssLeft) && ssLeft > 0)
                 {
                     selfStudyRemainingByGroupModule[remainingKey] = Math.Max(0, ssLeft - 1);
+                }
+                if (best.IsSelfStudy && selectedTopic is not null)
+                {
+                    var topicKey = (grp.Id, moduleId, selectedTopic.Id);
+                    if (selfStudyTopicRemaining.TryGetValue(topicKey, out var leftByTopic) && leftByTopic > 0)
+                    {
+                        selfStudyTopicRemaining[topicKey] = Math.Max(0, leftByTopic - 1);
+                    }
                 }
                 if (remainingByGroupModule.TryGetValue(remainingKey, out var leftRemaining) && leftRemaining > 0)
                 {

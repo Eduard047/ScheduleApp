@@ -33,6 +33,7 @@ public class AdminTeachersController(AppDbContext db) : ControllerBase
             FullName = t.FullName,
             ScientificDegree = t.ScientificDegree,
             AcademicTitle = t.AcademicTitle,
+            DepartmentId = t.DepartmentId,
             ModuleIds = t.TeacherModules.Select(tm => tm.ModuleId).ToList(),
             SupervisorModuleIds = supervisorModuleIds,
             Loads = loads
@@ -54,6 +55,7 @@ public class AdminTeachersController(AppDbContext db) : ControllerBase
             fullName: t.FullName,
             scientificDegree: t.ScientificDegree,
             academicTitle: t.AcademicTitle,
+            departmentId: t.DepartmentId,
             moduleIds: moduleIds,
             supervisorModuleIds: supervisorModuleIds,
             loads: loads.Select(l => new TeacherLoadDto(l.CourseId, l.IsActive, l.ScheduledHours)).ToList(),
@@ -133,6 +135,14 @@ public class AdminTeachersController(AppDbContext db) : ControllerBase
         if (string.IsNullOrWhiteSpace(dto.FullName))
             return BadRequest(new { message = "ПІБ є обовʼязковим" });
 
+        var normalizedDepartmentId = dto.DepartmentId is int depId && depId > 0 ? depId : (int?)null;
+        if (normalizedDepartmentId is int departmentId)
+        {
+            var departmentExists = await db.Departments.AnyAsync(x => x.Id == departmentId);
+            if (!departmentExists)
+                return BadRequest(new { message = $"Кафедру {departmentId} не знайдено" });
+        }
+
         Teacher entity;
 
         if (dto.Id is int id && id > 0)
@@ -149,6 +159,7 @@ public class AdminTeachersController(AppDbContext db) : ControllerBase
             entity.FullName = dto.FullName;
             entity.ScientificDegree = dto.ScientificDegree;
             entity.AcademicTitle = dto.AcademicTitle;
+            entity.DepartmentId = normalizedDepartmentId;
 
             
             db.TeacherModules.RemoveRange(entity.TeacherModules);
@@ -171,7 +182,8 @@ public class AdminTeachersController(AppDbContext db) : ControllerBase
             {
                 FullName = dto.FullName,
                 ScientificDegree = dto.ScientificDegree,
-                AcademicTitle = dto.AcademicTitle
+                AcademicTitle = dto.AcademicTitle,
+                DepartmentId = normalizedDepartmentId
             };
             db.Teachers.Add(entity);
             await db.SaveChangesAsync(); 

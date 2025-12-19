@@ -11,6 +11,7 @@ public record ModuleTopicDto(
     int Order,
     string TopicCode,
     int LessonTypeId,
+    int? DepartmentId,
     int TotalHours,
     int AuditoriumHours,
     int SelfStudyHours,
@@ -43,5 +44,7 @@ public record ModuleTopicViewDto(
     bool IsInterAssembly,
     bool SelfStudyBySupervisor,
     List<TopicGroupHoursDto>? PlannedGroupsHours = null,
-    List<TopicGroupHoursDto>? CompletedGroupsHours = null
+    List<TopicGroupHoursDto>? CompletedGroupsHours = null,
+    int? DepartmentId = null,
+    string? DepartmentName = null
 );

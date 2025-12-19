@@ -1,8 +1,10 @@
 @* Основний макет застосунку *@
 @inherits LayoutComponentBase
 
-<TopNav />
+<div class="layout-root">
+    <TopNav />
 
-<main class="container py-3">
-    @Body
-</main>
+    <main class="container py-3 layout-main">
+        @Body
+    </main>
+</div>

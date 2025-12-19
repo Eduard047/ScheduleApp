@@ -281,6 +281,7 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
         var topics = await db.ModuleTopics
             .Where(t => t.ModuleId == moduleId)
             .Include(t => t.LessonType)
+            .Include(t => t.Department)
             .ToListAsync();
 
         topics.Sort((a, b) => CompareTopicCodes(a.TopicCode, b.TopicCode));
@@ -439,7 +440,9 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
                 t.IsInterAssembly,
                 t.SelfStudyBySupervisor,
                 plannedHours,
-                completedHours
+                completedHours,
+                DepartmentId: t.DepartmentId,
+                DepartmentName: t.Department?.Name
             );
         }).ToList();
 
@@ -456,6 +459,13 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
 
         var lessonTypeExists = await db.LessonTypes.AnyAsync(lt => lt.Id == dto.LessonTypeId);
         if (!lessonTypeExists) return BadRequest("Lesson type not found");
+
+        var normalizedDepartmentId = dto.DepartmentId is int depId && depId > 0 ? depId : (int?)null;
+        if (normalizedDepartmentId is int departmentId)
+        {
+            var departmentExists = await db.Departments.AnyAsync(x => x.Id == departmentId);
+            if (!departmentExists) return BadRequest("Department not found");
+        }
 
         var topicsQuery = db.ModuleTopics.Where(t => t.ModuleId == moduleId);
         var trimmedTopicCode = dto.TopicCode?.Trim() ?? string.Empty;
@@ -495,6 +505,7 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
         entity.Order = desiredOrder;
         entity.TopicCode = normalizedTopicCode;
         entity.LessonTypeId = dto.LessonTypeId;
+        entity.DepartmentId = normalizedDepartmentId;
 
         var safeAuditorium = Math.Max(0, dto.AuditoriumHours);
         var safeSelfStudy = Math.Max(0, dto.SelfStudyHours);

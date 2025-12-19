@@ -56,13 +56,20 @@ public record class ModuleEditDto
 public record class TeacherEditDto
 {
     public TeacherEditDto() { }
-    public TeacherEditDto(int? id, string fullName, string? scientificDegree, string? academicTitle)
-    { Id = id; FullName = fullName; ScientificDegree = scientificDegree; AcademicTitle = academicTitle; }
+    public TeacherEditDto(int? id, string fullName, string? scientificDegree, string? academicTitle, int? departmentId = null)
+    {
+        Id = id;
+        FullName = fullName;
+        ScientificDegree = scientificDegree;
+        AcademicTitle = academicTitle;
+        DepartmentId = departmentId;
+    }
 
-    public TeacherEditDto(int? id, string fullName, string? scientificDegree, string? academicTitle,
+    public TeacherEditDto(int? id, string fullName, string? scientificDegree, string? academicTitle, int? departmentId,
         List<int> moduleIds, List<int> supervisorModuleIds, List<TeacherLoadDto> loads, List<TeacherWorkingHourDto> workingHours)
     {
         Id = id; FullName = fullName; ScientificDegree = scientificDegree; AcademicTitle = academicTitle;
+        DepartmentId = departmentId;
         ModuleIds = moduleIds ?? new();
         SupervisorModuleIds = supervisorModuleIds ?? new();
         Loads = loads ?? new();
@@ -73,6 +80,7 @@ public record class TeacherEditDto
     public string FullName { get; set; } = "";
     public string? ScientificDegree { get; set; }
     public string? AcademicTitle { get; set; }
+    public int? DepartmentId { get; set; }
     public List<int> ModuleIds { get; set; } = new();
     public List<int> SupervisorModuleIds { get; set; } = new();
     public List<TeacherLoadDto> Loads { get; set; } = new();
@@ -107,6 +115,7 @@ public record class TeacherViewDto
     public string FullName { get; set; } = "";
     public string? ScientificDegree { get; set; }
     public string? AcademicTitle { get; set; }
+    public int? DepartmentId { get; set; }
     public List<int> ModuleIds { get; set; } = new();
     public List<int> SupervisorModuleIds { get; set; } = new();
     public List<TeacherLoadDto> Loads { get; set; } = new();
