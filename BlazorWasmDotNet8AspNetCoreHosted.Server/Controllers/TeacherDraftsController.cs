@@ -1019,21 +1019,18 @@ public sealed class TeacherDraftsController : ControllerBase
                     .Sum(t => Math.Max(0, t.SelfStudyHours)));
         var selfStudyAssignmentsDraft = await _db.TeacherDraftItems
             .Where(di => di.IsSelfStudy
-                         && di.Date < weekStart
                          && courseIds.Contains(di.Group.CourseId)
                          && (di.ModuleTopicId == null || flaggedSelfStudyTopicIds.Contains(di.ModuleTopicId.Value)))
             .Select(di => new { di.GroupId, di.ModuleId })
             .ToListAsync();
         var selfStudyAssignmentsSchedule = await _db.ScheduleItems
             .Where(si => si.IsSelfStudy
-                         && si.Date < weekStart
                          && courseIds.Contains(si.Group.CourseId)
                          && (si.ModuleTopicId == null || flaggedSelfStudyTopicIds.Contains(si.ModuleTopicId.Value)))
             .Select(si => new { si.GroupId, si.ModuleId })
             .ToListAsync();
         var selfStudyTopicAssignmentsDraft = await _db.TeacherDraftItems
             .Where(di => di.IsSelfStudy
-                         && di.Date < weekStart
                          && di.ModuleTopicId != null
                          && flaggedSelfStudyTopicIds.Contains(di.ModuleTopicId!.Value)
                          && courseIds.Contains(di.Group.CourseId))
@@ -1042,7 +1039,6 @@ public sealed class TeacherDraftsController : ControllerBase
             .ToListAsync();
         var selfStudyTopicAssignmentsSchedule = await _db.ScheduleItems
             .Where(si => si.IsSelfStudy
-                         && si.Date < weekStart
                          && si.ModuleTopicId != null
                          && flaggedSelfStudyTopicIds.Contains(si.ModuleTopicId!.Value)
                          && courseIds.Contains(si.Group.CourseId))
@@ -1059,14 +1055,12 @@ public sealed class TeacherDraftsController : ControllerBase
             .ToDictionary(g => g.Key, g => g.Sum(x => x.C));
         var topicAssignmentsDraft = await _db.TeacherDraftItems
             .Where(di => di.ModuleTopicId != null
-                         && di.Date < weekStart
                          && courseIds.Contains(di.Group.CourseId)
                          && allowedTopicIds.Contains(di.ModuleTopicId!.Value))
             .Select(di => new { di.GroupId, di.ModuleId, TopicId = di.ModuleTopicId!.Value })
             .ToListAsync();
         var topicAssignmentsSchedule = await _db.ScheduleItems
             .Where(si => si.ModuleTopicId != null
-                         && si.Date < weekStart
                          && courseIds.Contains(si.Group.CourseId)
                          && allowedTopicIds.Contains(si.ModuleTopicId!.Value))
             .Select(si => new { si.GroupId, si.ModuleId, TopicId = si.ModuleTopicId!.Value })
@@ -2712,11 +2706,10 @@ public sealed class TeacherDraftsController : ControllerBase
         await tx.CommitAsync();
         return Ok(new PublishWeekResults(created, skipped, warnings));
     }
+
     /// <summary>
     /// Перераховує агреговані плани та навантаження після змін у чернетках.
     /// </summary>
-
-
     private async Task RecalcAggregatesAsync(
         IEnumerable<(int CourseId, int ModuleId)> plans,
         IEnumerable<(int TeacherId, int CourseId)> loads)
