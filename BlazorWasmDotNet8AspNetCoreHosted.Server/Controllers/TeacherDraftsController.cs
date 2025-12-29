@@ -1005,7 +1005,6 @@ public sealed class TeacherDraftsController : ControllerBase
                 kvp => kvp.Key,
                 kvp => kvp.Value
                     .Where(t => t.SelfStudyBySupervisor && t.SelfStudyHours > 0)
-                    .OrderBy(t => t.TopicCode, StringComparer.Ordinal)
                     .ToList());
         var topicUsageLimitById = topicsRaw
             .ToDictionary(t => t.Id, t => Math.Max(0, t.AuditoriumHours));
@@ -1084,48 +1083,31 @@ public sealed class TeacherDraftsController : ControllerBase
         {
             SeedTopicAssignment(entry.GroupId, entry.ModuleId, entry.TopicId);
         }
-        var topicUsageGlobal = new Dictionary<int, int>();
-        foreach (var kvp in topicAssignments)
-        {
-            foreach (var topicEntry in kvp.Value)
-            {
-                topicUsageGlobal[topicEntry.Key] = topicUsageGlobal.TryGetValue(topicEntry.Key, out var used)
-                    ? used + topicEntry.Value
-                    : topicEntry.Value;
-            }
-        }
 
         int GetTopicUsageLimit(ModuleTopic topic)
             => topicUsageLimitById.TryGetValue(topic.Id, out var limit) ? limit : Math.Max(0, topic.AuditoriumHours);
 
-        ModuleTopic? SelectLeastUsedTopic(int groupId, int moduleId)
+        ModuleTopic? SelectNextTopicInOrder(int groupId, int moduleId)
         {
             if (!topicsByModule.TryGetValue(moduleId, out var list) || list.Count == 0)
                 return null;
 
             topicAssignments.TryGetValue((groupId, moduleId), out var assigned);
 
-            var candidates = list
-                .Select(t =>
-                {
-                    var limit = GetTopicUsageLimit(t);
-                    var usedByGroup = (assigned != null && assigned.TryGetValue(t.Id, out var usedGroupVal)) ? usedGroupVal : 0;
-                    var usedGlobal = topicUsageGlobal.TryGetValue(t.Id, out var usedGlobalVal) ? usedGlobalVal : 0;
-                    return new
-                    {
-                        Topic = t,
-                        Limit = limit,
-                        UsedByGroup = usedByGroup,
-                        UsedGlobal = usedGlobal
-                    };
-                })
-                .Where(x => x.Limit > 0 && x.UsedByGroup < x.Limit)
-                .OrderBy(x => x.UsedGlobal)
-                .ThenBy(x => x.Topic.Order)
-                .ThenBy(x => x.Topic.TopicCode, StringComparer.Ordinal)
-                .FirstOrDefault();
+            // Вибираємо наступну тему строго за порядком (Order/TopicCode) і не "перестрибуємо" вперед.
+            foreach (var t in list)
+            {
+                var limit = GetTopicUsageLimit(t);
+                if (limit <= 0) continue;
 
-            return candidates?.Topic;
+                var usedByGroup = (assigned != null && assigned.TryGetValue(t.Id, out var usedGroupVal)) ? usedGroupVal : 0;
+                if (usedByGroup < limit)
+                {
+                    return t;
+                }
+            }
+
+            return null;
         }
 
         var topicsExhaustedNotified = new HashSet<(int GroupId, int ModuleId)>();
@@ -1160,7 +1142,7 @@ public sealed class TeacherDraftsController : ControllerBase
                 var mid = kvp.Key;
                 if (RemainingFor(gid, mid) <= 0) continue;
 
-                var topicCandidate = SelectLeastUsedTopic(gid, mid);
+                var topicCandidate = SelectNextTopicInOrder(gid, mid);
                 if (topicCandidate is not null && IsLectureType(topicCandidate.LessonTypeId))
                 {
                     return true;
@@ -1180,10 +1162,6 @@ public sealed class TeacherDraftsController : ControllerBase
 
             assigned.TryGetValue(topic.Id, out var used);
             assigned[topic.Id] = used + 1;
-
-            topicUsageGlobal[topic.Id] = topicUsageGlobal.TryGetValue(topic.Id, out var usedGlobal)
-                ? usedGlobal + 1
-                : 1;
         }
 
         bool TopicsDepleted(int groupIdCheck, int moduleIdCheck)
@@ -1214,7 +1192,7 @@ public sealed class TeacherDraftsController : ControllerBase
 
         (int LessonTypeId, ModuleTopic? Topic) PickLessonType(int groupIdPick, int courseIdPick, int moduleIdPick, DateOnly date)
         {
-            var topicCandidate = SelectLeastUsedTopic(groupIdPick, moduleIdPick);
+            var topicCandidate = SelectNextTopicInOrder(groupIdPick, moduleIdPick);
             if (topicCandidate is not null && TypeAllowed(topicCandidate.LessonTypeId))
             {
                 return (topicCandidate.LessonTypeId, topicCandidate);
@@ -1488,8 +1466,55 @@ public sealed class TeacherDraftsController : ControllerBase
                 continue;
             }
 
+            var slotIndexByTime = slots
+                .Select((slot, index) => new { slot, index })
+                .ToDictionary(x => (x.slot.Start, x.slot.End), x => x.index);
+
             bool SlotFilled(DateOnly date, TimeSlot slot) =>
                 busy.Any(b => b.GroupId == grp.Id && b.Date == date && b.StartTime == slot.Start && b.EndTime == slot.End);
+
+            int? GetAdjacentSameModuleTeacherId(DateOnly date, TimeSlot slot, int moduleId)
+            {
+                if (!slotIndexByTime.TryGetValue((slot.Start, slot.End), out var slotIndex))
+                    return null;
+
+                int? prevTeacherId = null;
+                if (slotIndex > 0)
+                {
+                    var prevSlot = slots[slotIndex - 1];
+                    prevTeacherId = busy
+                        .Where(b => b.GroupId == grp.Id
+                                    && b.Date == date
+                                    && b.ModuleId == moduleId
+                                    && b.StartTime == prevSlot.Start
+                                    && b.EndTime == prevSlot.End
+                                    && b.TeacherId != null
+                                    && !excludedTypeIds.Contains(b.LessonTypeId))
+                        .Select(b => b.TeacherId)
+                        .FirstOrDefault();
+                }
+
+                int? nextTeacherId = null;
+                if (slotIndex + 1 < slots.Count)
+                {
+                    var nextSlot = slots[slotIndex + 1];
+                    nextTeacherId = busy
+                        .Where(b => b.GroupId == grp.Id
+                                    && b.Date == date
+                                    && b.ModuleId == moduleId
+                                    && b.StartTime == nextSlot.Start
+                                    && b.EndTime == nextSlot.End
+                                    && b.TeacherId != null
+                                    && !excludedTypeIds.Contains(b.LessonTypeId))
+                        .Select(b => b.TeacherId)
+                        .FirstOrDefault();
+                }
+
+                if (prevTeacherId is int pt && nextTeacherId is int nt && pt == nt)
+                    return pt;
+
+                return prevTeacherId ?? nextTeacherId;
+            }
 
             bool DayHasGaps(DateOnly date, out TimeSlot? firstGap)
             {
@@ -1801,10 +1826,36 @@ public sealed class TeacherDraftsController : ControllerBase
                 .GroupBy(b => b.RoomId!.Value)
                 .ToDictionary(g => g.Key, g => g.Count());
 
+            // Ваги штрафів/пріоритетів для вибору найкращої комбінації у слоті.
+            // Чим більше значення штрафу — тим сильніше автогенерація уникає ситуації; 0 вимикає вплив.
+
+            // Штраф за повторення того ж модуля у попередній день.
+            // Збільшуйте, якщо потрібно рідше ставити модуль у сусідні дні; зменшуйте/0 — щоб дозволяти частіше.
             const double penaltySameModulePrevDay = 10.0;
+
+            // Штраф за 3-тю і наступні пари того ж модуля в один день (за 1-шу/2-гу не застосовується).
+            // Збільшуйте, якщо потрібно уникати надмірної концентрації; зменшуйте/0 — щоб дозволяти більше пар в день.
             const double penaltyExtraSameDay = 6.0;
+
+            // Штраф за нелекційне заняття у слоті до обіду, якщо є (або очікуються) лекції до обідньої перерви.
+            // Збільшуйте, якщо потрібно сильніше резервувати "дообідні" слоти під лекції; зменшуйте/0 — послабити.
             const double penaltyNonLecturePreLunch = 2.0;
+
+            // Штраф за повтор одного й того ж часу (StartTime) для цього модуля в інші дні тижня.
+            // Збільшуйте, якщо потрібен більш різноманітний розклад по годинах; зменшуйте/0 — дозволяти повтори.
             const double penaltySameSlotPattern = 1.5;
+
+            // Пріоритет зберігати одного викладача для двох послідовних слотів одного модуля.
+            // Якщо найкращий варіант з "тим самим викладачем" гірший за глобально найкращий більш ніж на це значення — дозволяємо зміну.
+            // Збільшуйте, якщо хочете частіше отримувати "один викладач на дві пари підряд"; 0 — вимкнути пріоритет.
+            const double maxExtraPenaltyPreferSameTeacherForConsecutiveModule = 6.0;
+
+            // Пріоритет для типу занять, позначеного як "Бажано першим у тижні".
+            // Для цього типу: штрафуємо пізніші слоти (щоб частіше ставився раніше у день).
+            // Для інших типів (коли пріоритетний тип ще можна поставити цього дня): штрафуємо ранні слоти (щоб частіше ставилися після нього).
+            // Збільшуйте, якщо потрібно сильніше наблизитися до "спочатку пріоритетний тип, потім інші"; зменшуйте/0 — вимкнути вплив.
+            const double penaltyPreferredFirstTypeLateSlot = 1.5;
+            const double penaltyNonPreferredEarlySlotWhilePreferredPending = 1.5;
             double TeacherLoadPenalty(int teacherId) =>
                 TeacherLoadScore(teacherId, grp.CourseId) * 0.25;
 
@@ -2011,6 +2062,29 @@ public sealed class TeacherDraftsController : ControllerBase
                 var remainingKey = (grp.Id, moduleId);
                 bool isFiller = fillerLookup.Contains(moduleId);
                 string? moduleTitle = null;
+                bool preferredFirstEnabled = preferredFirstTypeId != 0 && TypeAllowed(preferredFirstTypeId);
+                bool preferredFirstPendingToday = false;
+
+                if (preferredFirstEnabled && (penaltyPreferredFirstTypeLateSlot > 0 || penaltyNonPreferredEarlySlotWhilePreferredPending > 0))
+                {
+                    foreach (var mid in orderedModules)
+                    {
+                        if (RemainingFor(grp.Id, mid) <= 0) continue;
+                        var savedLtIndex = ltIndex;
+                        try
+                        {
+                            if (PickLessonType(grp.Id, grp.CourseId, mid, date).LessonTypeId == preferredFirstTypeId)
+                            {
+                                preferredFirstPendingToday = true;
+                                break;
+                            }
+                        }
+                        finally
+                        {
+                            ltIndex = savedLtIndex;
+                        }
+                    }
+                }
 
                 async Task<bool> EnsureModuleTitleAsync()
                 {
@@ -2105,6 +2179,8 @@ public sealed class TeacherDraftsController : ControllerBase
                     var slotLabel = $"{s:HH\\:mm}-{e:HH\\:mm}";
                     var slotIssues = new HashSet<string>();
                     var slotCandidates = new List<PlacementCandidate>();
+                    int slotIndex = slotIndexByTime.TryGetValue((s, e), out var si) ? si : 0;
+                    var preferredAdjacentTeacherId = GetAdjacentSameModuleTeacherId(date, sl, moduleId);
 
                     bool slotBreak = busy.Any(b => b.GroupId == grp.Id && b.Date == date
                                                    && b.LessonTypeId == typeBreakId && b.StartTime == s && b.EndTime == e);
@@ -2173,6 +2249,19 @@ public sealed class TeacherDraftsController : ControllerBase
                         continue;
                     }
 
+                    if (preferredFirstEnabled
+                        && groupLunch is not null
+                        && ltypeId == preferredFirstTypeId
+                        && sl.End > groupLunch.Start)
+                    {
+                        var ltLabel = typeById.TryGetValue(ltypeId, out var lt)
+                            ? $"\"{lt.Name}\" ({lt.Code})"
+                            : $"#{ltypeId}";
+                        var reason = $"Тип занять {ltLabel} позначено як \"Бажано першим у тижні\", тому ставимо його лише до обідньої перерви ({groupLunch.Start:HH\\:mm}); слот {slotLabel} пропущено.";
+                        RecordSlotFailureReason(date, sl, reason);
+                        continue;
+                    }
+
                     var filteredTeacherIds = tids;
                     if (topicSelection?.DepartmentId is int departmentId && departmentId > 0)
                     {
@@ -2211,6 +2300,18 @@ public sealed class TeacherDraftsController : ControllerBase
 
                         var penalties = new List<string>();
                         double penaltyScore = 0;
+
+                        if (preferredFirstEnabled)
+                        {
+                            if (ltypeId == preferredFirstTypeId && penaltyPreferredFirstTypeLateSlot > 0)
+                            {
+                                penaltyScore += slotIndex * penaltyPreferredFirstTypeLateSlot;
+                            }
+                            else if (preferredFirstPendingToday && penaltyNonPreferredEarlySlotWhilePreferredPending > 0)
+                            {
+                                penaltyScore += (slots.Count - 1 - slotIndex) * penaltyNonPreferredEarlySlotWhilePreferredPending;
+                            }
+                        }
 
                         var sameDayCount = CountModuleForDay(grp.Id, date, moduleId);
                         if (sameDayCount >= 2)
@@ -2318,10 +2419,26 @@ public sealed class TeacherDraftsController : ControllerBase
 
                     if (slotCandidates.Count > 0)
                     {
-                        var localBest = slotCandidates
+                        var bestAny = slotCandidates
                             .OrderBy(c => c.Penalty)
                             .ThenBy(c => groupRandom.Next())
                             .First();
+
+                        var localBest = bestAny;
+                        if (preferredAdjacentTeacherId is int pt && maxExtraPenaltyPreferSameTeacherForConsecutiveModule > 0)
+                        {
+                            var bestPreferred = slotCandidates
+                                .Where(c => c.TeacherId == pt)
+                                .OrderBy(c => c.Penalty)
+                                .ThenBy(c => groupRandom.Next())
+                                .FirstOrDefault();
+
+                            if (bestPreferred is not null
+                                && bestPreferred.Penalty <= bestAny.Penalty + maxExtraPenaltyPreferSameTeacherForConsecutiveModule)
+                            {
+                                localBest = bestPreferred;
+                            }
+                        }
                         if (best is null || localBest.Penalty < best.Penalty)
                         {
                             best = localBest;
@@ -2401,7 +2518,10 @@ public sealed class TeacherDraftsController : ControllerBase
 
                 created++;
                 Inc(grp.Id, date);
-                hasPreferred.Add((grp.Id, moduleId));
+                if (preferredFirstTypeId != 0 && selectedLessonTypeId == preferredFirstTypeId)
+                {
+                    hasPreferred.Add((grp.Id, moduleId));
+                }
 
                 if (best.IsSelfStudy && selfStudyRemainingByGroupModule.TryGetValue(remainingKey, out var ssLeft) && ssLeft > 0)
                 {
