@@ -1819,6 +1819,23 @@ public sealed class TeacherDraftsController : ControllerBase
                 : new HashSet<int>();
             var fillerModulesOrdered = fillerLookup.OrderBy(x => x).ToList();
             var mainModulesOrdered = orderedModules.Where(mid => !fillerLookup.Contains(mid)).ToList();
+            var firstMainModuleId = mainModulesOrdered.Count > 0 ? mainModulesOrdered[0] : 0;
+            var hasCompletedMainModules = mainModulesOrdered.Any(mid =>
+                factMap.TryGetValue((grp.Id, mid), out var completed) && completed > 0);
+            // Для першої генерації курсу фіксуємо старт із першого головного модуля.
+            bool forceFirstMainModule = firstMainModuleId != 0
+                && !hasCompletedMainModules
+                && RemainingFor(grp.Id, firstMainModuleId) > 0;
+            bool firstMainPlaced = !forceFirstMainModule;
+            DateOnly? firstMainDate = null;
+            TimeOnly? firstMainStart = null;
+
+            bool IsBeforeFirstMain(DateOnly date, TimeOnly start)
+            {
+                if (!firstMainDate.HasValue || !firstMainStart.HasValue) return false;
+                if (date < firstMainDate.Value) return true;
+                return date == firstMainDate.Value && start < firstMainStart.Value;
+            }
 
             var groupRandom = new Random(HashCode.Combine(weekStart.DayNumber, grp.Id, grp.CourseId));
             var groupRoomUsage = busy
@@ -2032,6 +2049,11 @@ public sealed class TeacherDraftsController : ControllerBase
             {
                 if (mainModulesOrdered.Count == 0) return null;
 
+                if (forceFirstMainModule && !firstMainPlaced && RemainingFor(grp.Id, firstMainModuleId) > 0)
+                {
+                    return firstMainModuleId;
+                }
+
                 var preferredPrimary = mainModulesOrdered
                     .FirstOrDefault(mid => RemainingFor(grp.Id, mid) > 0 && !UsedLastWeek(grp.Id, mid));
                 if (preferredPrimary != 0)
@@ -2054,9 +2076,12 @@ public sealed class TeacherDraftsController : ControllerBase
                 return null;
             }
 
-            async Task<bool> TryPlaceModuleAsync(int moduleId, DateOnly date, bool isPrimary, bool allowRepeatPreviousDay = false, bool allowExtraSameDay = false, bool relaxed = false)
+            async Task<bool> TryPlaceModuleAsync(int moduleId, DateOnly date, bool isPrimary, bool allowRepeatPreviousDay = false, bool allowExtraSameDay = false, bool relaxed = false, bool preferEarliestSlot = false)
             {
                 if (CountFor(grp.Id, date) >= slots.Count)
+                    return false;
+
+                if (forceFirstMainModule && !firstMainPlaced && moduleId != firstMainModuleId)
                     return false;
 
                 var remainingKey = (grp.Id, moduleId);
@@ -2181,6 +2206,12 @@ public sealed class TeacherDraftsController : ControllerBase
                     var slotCandidates = new List<PlacementCandidate>();
                     int slotIndex = slotIndexByTime.TryGetValue((s, e), out var si) ? si : 0;
                     var preferredAdjacentTeacherId = GetAdjacentSameModuleTeacherId(date, sl, moduleId);
+
+                    if (forceFirstMainModule && firstMainPlaced && moduleId != firstMainModuleId && IsBeforeFirstMain(date, s))
+                    {
+                        RecordSlotFailureReason(date, sl, "Слот до першого головного модуля заблоковано.");
+                        continue;
+                    }
 
                     bool slotBreak = busy.Any(b => b.GroupId == grp.Id && b.Date == date
                                                    && b.LessonTypeId == typeBreakId && b.StartTime == s && b.EndTime == e);
@@ -2439,6 +2470,11 @@ public sealed class TeacherDraftsController : ControllerBase
                                 localBest = bestPreferred;
                             }
                         }
+                        if (preferEarliestSlot)
+                        {
+                            best = localBest;
+                            break;
+                        }
                         if (best is null || localBest.Penalty < best.Penalty)
                         {
                             best = localBest;
@@ -2541,6 +2577,13 @@ public sealed class TeacherDraftsController : ControllerBase
                     remainingByGroupModule[remainingKey] = Math.Max(0, leftRemaining);
                 }
 
+                if (forceFirstMainModule && !firstMainPlaced && moduleId == firstMainModuleId)
+                {
+                    firstMainPlaced = true;
+                    firstMainDate = date;
+                    firstMainStart = startTime;
+                }
+
                 if (isPrimary && mainModulesOrdered.Count > 0)
                 {
                     var currentIdx = mainModulesOrdered.FindIndex(mid => mid == moduleId);
@@ -2598,7 +2641,10 @@ public sealed class TeacherDraftsController : ControllerBase
                 if (primaryModuleId.HasValue)
                 {
                     modulesAttemptedToday.Add(primaryModuleId.Value);
-                    placedPrimary = await TryPlaceModuleAsync(primaryModuleId.Value, date, isPrimary: true);
+                    var preferEarliestPrimarySlot = forceFirstMainModule
+                        && !firstMainPlaced
+                        && primaryModuleId.Value == firstMainModuleId;
+                    placedPrimary = await TryPlaceModuleAsync(primaryModuleId.Value, date, isPrimary: true, preferEarliestSlot: preferEarliestPrimarySlot);
                     if (placedPrimary
                         && RemainingFor(grp.Id, primaryModuleId.Value) > 0
                         && CountModuleForDay(grp.Id, date, primaryModuleId.Value) < 2
