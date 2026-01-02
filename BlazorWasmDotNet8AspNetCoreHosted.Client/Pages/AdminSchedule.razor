@@ -113,6 +113,9 @@ else
                     <button class="btn btn-outline-primary" @onclick="AutoGenDrafts" disabled="@(!CanAutoGen)">
                         Автогенерація (у чернетки)
                     </button>
+                    <button class="btn btn-outline-secondary" @onclick="FillWeekDrafts" disabled="@(!CanAutoGen)">
+                        Заповнити порожні слоти
+                    </button>
                     <button class="btn btn-outline-danger" @onclick="ClearWeekForCurrent">
                         Очистити тиждень (чернетки, всі групи)
                     </button>
@@ -830,6 +833,58 @@ else
 
             var courseName = meta?.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
             var summary = $"Автогенерація тижня у чернетки (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}.";
+
+            await SetOkMessageAsync(summary, res.Warnings, res.GapDetails);
+            await LoadWeek();
+        }
+        catch (ApiErrorException ex)
+        {
+            await HandleApiError(ex);
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+        }
+    }
+
+    private async Task FillWeekDrafts()
+    {
+        await ResetStatusAsync();
+        try
+        {
+            if (_selectedCourseId is not int courseId)
+            {
+                error = "Оберіть курс для заповнення порожніх слотів.";
+                return;
+            }
+
+            var moduleHours = _moduleWeekRows
+                .Where(row => row.Selected && row.Hours > 0)
+                .GroupBy(row => row.ModuleId)
+                .ToDictionary(g => g.Key, g => g.First().Hours);
+
+            if (moduleHours.Count == 0)
+            {
+                error = "Оберіть хоча б один модуль і вкажіть години > 0.";
+                return;
+            }
+
+            await PersistAutoGenConfigAsync();
+
+            var weekStart = GetMonday(_selectedDate);
+            var res = await Drafts.AutogenWeek(new AutoGenRequest(
+                WeekStart: weekStart,
+                ClearExisting: false,
+                CourseId: courseId,
+                GroupId: null,
+                AllowOnDaysOff: AllowDaysOffForPreset(),
+                Days: _daysPreset,
+                ModuleHours: moduleHours,
+                SoftFill: true
+            ));
+
+            var courseName = meta?.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
+            var summary = $"Заповнення порожніх слотів тижня (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}.";
 
             await SetOkMessageAsync(summary, res.Warnings, res.GapDetails);
             await LoadWeek();

@@ -42,7 +42,8 @@ public sealed class TeacherDraftsController : ControllerBase
         int? TeacherId = null,
         bool AllowOnDaysOff = false,
         WeekPreset Days = WeekPreset.MonFri,
-        Dictionary<int, int>? ModuleHours = null
+        Dictionary<int, int>? ModuleHours = null,
+        bool SoftFill = false
     );
 
     public sealed record ApproveWeekRequest(DateOnly WeekStart, int TeacherId);
@@ -708,6 +709,7 @@ public sealed class TeacherDraftsController : ControllerBase
 
         var weekStart = r.WeekStart;
         var weekEnd = weekStart.AddDays(7);
+        var softFill = r.SoftFill;
 
         bool DayAllowed(DayOfWeek dow)
         {
@@ -792,7 +794,7 @@ public sealed class TeacherDraftsController : ControllerBase
             }
         }
 
-        if (r.ClearExisting)
+        if (r.ClearExisting && !softFill)
         {
             var gids = groups.Select(g => g.Id).ToList();
             await _db.TeacherDraftItems
@@ -981,9 +983,9 @@ public sealed class TeacherDraftsController : ControllerBase
 
         var topicsAll = await _db.ModuleTopics
             .Where(t => moduleIdsForPlans.Contains(t.ModuleId))
-            .OrderBy(t => t.Order)
-            .ThenBy(t => t.TopicCode)
             .ToListAsync();
+        // Сортуємо теми за кодом, щоб автоген відповідав порядку у плані модуля.
+        topicsAll.Sort((a, b) => CompareTopicCodes(a.TopicCode, b.TopicCode));
         var interAssemblyOnlyModules = topicsAll
             .GroupBy(t => t.ModuleId)
             .Where(g => g.Any() && g.All(x => x.IsInterAssembly))
@@ -1094,7 +1096,7 @@ public sealed class TeacherDraftsController : ControllerBase
 
             topicAssignments.TryGetValue((groupId, moduleId), out var assigned);
 
-            // Вибираємо наступну тему строго за порядком (Order/TopicCode) і не "перестрибуємо" вперед.
+            // Вибираємо наступну тему строго за порядком коду і не "перестрибуємо" вперед.
             foreach (var t in list)
             {
                 var limit = GetTopicUsageLimit(t);
@@ -2280,17 +2282,22 @@ public sealed class TeacherDraftsController : ControllerBase
                         continue;
                     }
 
+                    string? preferredFirstAfterLunchNote = null;
                     if (preferredFirstEnabled
                         && groupLunch is not null
                         && ltypeId == preferredFirstTypeId
                         && sl.End > groupLunch.Start)
                     {
-                        var ltLabel = typeById.TryGetValue(ltypeId, out var lt)
-                            ? $"\"{lt.Name}\" ({lt.Code})"
-                            : $"#{ltypeId}";
-                        var reason = $"Тип занять {ltLabel} позначено як \"Бажано першим у тижні\", тому ставимо його лише до обідньої перерви ({groupLunch.Start:HH\\:mm}); слот {slotLabel} пропущено.";
-                        RecordSlotFailureReason(date, sl, reason);
-                        continue;
+                        if (!relaxed)
+                        {
+                            var ltLabel = typeById.TryGetValue(ltypeId, out var lt)
+                                ? $"\"{lt.Name}\" ({lt.Code})"
+                                : $"#{ltypeId}";
+                            var reason = $"Тип занять {ltLabel} позначено як \"Бажано першим у тижні\", тому ставимо його лише до обідньої перерви ({groupLunch.Start:HH\\:mm}); слот {slotLabel} пропущено.";
+                            RecordSlotFailureReason(date, sl, reason);
+                            continue;
+                        }
+                        preferredFirstAfterLunchNote = "Бажаний перший тип поставлено після обіду (relaxed)";
                     }
 
                     var filteredTeacherIds = tids;
@@ -2331,6 +2338,10 @@ public sealed class TeacherDraftsController : ControllerBase
 
                         var penalties = new List<string>();
                         double penaltyScore = 0;
+                        if (!string.IsNullOrWhiteSpace(preferredFirstAfterLunchNote))
+                        {
+                            penalties.Add(preferredFirstAfterLunchNote);
+                        }
 
                         if (preferredFirstEnabled)
                         {
@@ -2644,13 +2655,26 @@ public sealed class TeacherDraftsController : ControllerBase
                     var preferEarliestPrimarySlot = forceFirstMainModule
                         && !firstMainPlaced
                         && primaryModuleId.Value == firstMainModuleId;
-                    placedPrimary = await TryPlaceModuleAsync(primaryModuleId.Value, date, isPrimary: true, preferEarliestSlot: preferEarliestPrimarySlot);
+                    placedPrimary = await TryPlaceModuleAsync(
+                        primaryModuleId.Value,
+                        date,
+                        isPrimary: true,
+                        allowRepeatPreviousDay: softFill,
+                        allowExtraSameDay: softFill,
+                        relaxed: softFill,
+                        preferEarliestSlot: preferEarliestPrimarySlot);
                     if (placedPrimary
                         && RemainingFor(grp.Id, primaryModuleId.Value) > 0
                         && CountModuleForDay(grp.Id, date, primaryModuleId.Value) < 2
                         && CountFor(grp.Id, date) < maxPerDay)
                     {
-                        await TryPlaceModuleAsync(primaryModuleId.Value, date, isPrimary: true);
+                        await TryPlaceModuleAsync(
+                            primaryModuleId.Value,
+                            date,
+                            isPrimary: true,
+                            allowRepeatPreviousDay: softFill,
+                            allowExtraSameDay: softFill,
+                            relaxed: softFill);
                     }
                 }
 
@@ -2692,7 +2716,13 @@ public sealed class TeacherDraftsController : ControllerBase
                         }
 
                         modulesAttemptedToday.Add(fillerModuleId);
-                        var placedFiller = await TryPlaceModuleAsync(fillerModuleId, date, isPrimary: false);
+                        var placedFiller = await TryPlaceModuleAsync(
+                            fillerModuleId,
+                            date,
+                            isPrimary: false,
+                            allowRepeatPreviousDay: softFill,
+                            allowExtraSameDay: softFill,
+                            relaxed: softFill);
                         if (!placedFiller)
                         {
                             fillerAttempts++;
@@ -2717,19 +2747,29 @@ public sealed class TeacherDraftsController : ControllerBase
                     }
                 }
 
-                if (CountFor(grp.Id, date) < maxPerDay)
+                if (softFill)
                 {
-                    await FillWithRemainingModulesAsync();
+                    if (CountFor(grp.Id, date) < maxPerDay)
+                    {
+                        await FillWithRemainingModulesAsync(allowRepeatPreviousDay: true, allowExtraSameDay: true, relaxed: true);
+                    }
                 }
-
-                if (CountFor(grp.Id, date) < maxPerDay)
+                else
                 {
-                    await FillWithRemainingModulesAsync(allowRepeatPreviousDay: false, allowExtraSameDay: true);
-                }
+                    if (CountFor(grp.Id, date) < maxPerDay)
+                    {
+                        await FillWithRemainingModulesAsync();
+                    }
 
-                if (CountFor(grp.Id, date) < maxPerDay)
-                {
-                    await FillWithRemainingModulesAsync(allowRepeatPreviousDay: true, allowExtraSameDay: true, relaxed: true);
+                    if (CountFor(grp.Id, date) < maxPerDay)
+                    {
+                        await FillWithRemainingModulesAsync(allowRepeatPreviousDay: false, allowExtraSameDay: true);
+                    }
+
+                    if (CountFor(grp.Id, date) < maxPerDay)
+                    {
+                        await FillWithRemainingModulesAsync(allowRepeatPreviousDay: true, allowExtraSameDay: true, relaxed: true);
+                    }
                 }
 
                 TryShiftGaps(date);
@@ -2948,6 +2988,38 @@ public sealed class TeacherDraftsController : ControllerBase
         }
 
         await _db.SaveChangesAsync();
+    }
+
+    private static int CompareTopicCodes(string? left, string? right)
+    {
+        var leftParts = ParseTopicCodeSegments(left);
+        var rightParts = ParseTopicCodeSegments(right);
+        var maxLength = Math.Max(leftParts.Count, rightParts.Count);
+
+        for (var i = 0; i < maxLength; i++)
+        {
+            var leftValue = i < leftParts.Count ? leftParts[i] : 0;
+            var rightValue = i < rightParts.Count ? rightParts[i] : 0;
+            var diff = leftValue.CompareTo(rightValue);
+            if (diff != 0)
+            {
+                return diff;
+            }
+        }
+
+        return string.Compare(left ?? string.Empty, right ?? string.Empty, StringComparison.Ordinal);
+    }
+
+    private static IReadOnlyList<int> ParseTopicCodeSegments(string? code)
+    {
+        if (string.IsNullOrWhiteSpace(code))
+        {
+            return Array.Empty<int>();
+        }
+
+        return code.Split('.', StringSplitOptions.RemoveEmptyEntries)
+            .Select(part => int.TryParse(part, out var value) ? value : int.MaxValue)
+            .ToArray();
     }
 
     private static bool? ResolveCalendarOverride(IEnumerable<CalendarException> items, DateOnly date, int? courseId, int? groupId)
