@@ -18,6 +18,7 @@ var serverVersion = new MySqlServerVersion(new Version(8, 0, 0));
 builder.Services.AddDbContextPool<AppDbContext>(opt => opt.UseMySql(cs, serverVersion));
 
 builder.Services.AddScoped<RulesService>();
+builder.Services.AddScoped<AggregatesService>();
 builder.Services.AddScoped<TeacherDraftsQueryService>();
 builder.Services.AddScoped<TeacherDraftsExportService>();
 builder.Services.AddScoped<TeacherDraftsAutogenService>();

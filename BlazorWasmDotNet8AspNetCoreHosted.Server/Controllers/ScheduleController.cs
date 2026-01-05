@@ -18,11 +18,13 @@ public class ScheduleController : ControllerBase
 {
     private readonly AppDbContext _db;
     private readonly RulesService _rules;
+    private readonly AggregatesService _aggregates;
 
-    public ScheduleController(AppDbContext db, RulesService rules)
+    public ScheduleController(AppDbContext db, RulesService rules, AggregatesService aggregates)
     {
         _db = db;
         _rules = rules;
+        _aggregates = aggregates;
     }
 
     
@@ -124,7 +126,7 @@ public class ScheduleController : ControllerBase
             }
 
             var newCourseId = await _db.Groups.Where(g => g.Id == r.GroupId).Select(g => g.CourseId).FirstAsync();
-            await RecalcAggregatesAsync(
+            await _aggregates.RecalcAsync(
                 plans: new[] { (newCourseId, r.ModuleId) },
                 loads: new[]
                 {
@@ -160,7 +162,7 @@ public class ScheduleController : ControllerBase
             await _db.SaveChangesAsync();
 
             var courseId = await _db.Groups.Where(g => g.Id == r.GroupId).Select(g => g.CourseId).FirstAsync();
-            await RecalcAggregatesAsync(
+            await _aggregates.RecalcAsync(
                 plans: new[] { (courseId, r.ModuleId) },
                 loads: (r.TeacherId is int t) ? new[] { (t, courseId) } : null
             );
@@ -362,7 +364,7 @@ public class ScheduleController : ControllerBase
 
         await _db.ScheduleItems.Where(x => x.Id == id).ExecuteDeleteAsync();
 
-        await RecalcAggregatesAsync(
+        await _aggregates.RecalcAsync(
             plans: new[] { (info.CourseId, info.ModuleId) },
             loads: (info.TeacherId is int t) ? new[] { (t, info.CourseId) } : null
         );
@@ -394,7 +396,7 @@ public class ScheduleController : ControllerBase
 
         var deleted = await q.ExecuteDeleteAsync();
 
-        await RecalcAggregatesAsync(
+        await _aggregates.RecalcAsync(
             plans: affectedPlans.Select(a => (a.CourseId, a.ModuleId)),
             loads: affectedLoads.Select(a => (a.TeacherId!.Value, a.CourseId))
         );
@@ -405,133 +407,6 @@ public class ScheduleController : ControllerBase
     
     
     
-    private async Task RecalcAggregatesAsync(
-        IEnumerable<(int CourseId, int ModuleId)>? plans = null,
-        IEnumerable<(int TeacherId, int CourseId)>? loads = null)
-    {
-        var lessonTypes = await _db.LessonTypes
-            .Select(lt => new { lt.Id, lt.Code, lt.CountInPlan, lt.CountInLoad })
-            .ToListAsync();
-
-        var excludePlanIds = lessonTypes
-            .Where(lt =>
-                !lt.CountInPlan
-                || string.Equals(lt.Code, "CANCELED", System.StringComparison.OrdinalIgnoreCase)
-                || string.Equals(lt.Code, "RESCHEDULED", System.StringComparison.OrdinalIgnoreCase))
-            .Select(lt => lt.Id)
-            .ToHashSet();
-
-        
-        var excludeLoadIds = lessonTypes
-            .Where(lt =>
-                !lt.CountInLoad
-                || string.Equals(lt.Code, "CANCELED", System.StringComparison.OrdinalIgnoreCase)
-                || string.Equals(lt.Code, "RESCHEDULED", System.StringComparison.OrdinalIgnoreCase))
-            .Select(lt => lt.Id)
-            .ToHashSet();
-
-        
-        if (plans is null)
-        {
-            var allPlans = await _db.ModulePlans.ToListAsync();
-            var cIds = allPlans.Select(p => p.CourseId).Distinct().ToList();
-            var mIds = allPlans.Select(p => p.ModuleId).Distinct().ToList();
-
-            var counts = await _db.ScheduleItems
-                .Include(si => si.Group)
-                .Where(si => !excludePlanIds.Contains(si.LessonTypeId)
-                             && cIds.Contains(si.Group.CourseId)
-                             && mIds.Contains(si.ModuleId))
-                .GroupBy(si => new { CourseId = si.Group.CourseId, si.ModuleId })
-                .Select(g => new { g.Key.CourseId, g.Key.ModuleId, C = g.Count() })
-                .ToListAsync();
-
-            foreach (var p in allPlans)
-                p.ScheduledHours = counts.FirstOrDefault(c => c.CourseId == p.CourseId && c.ModuleId == p.ModuleId)?.C ?? 0;
-        }
-        else
-        {
-            var keys = plans.Distinct().ToList();
-            if (keys.Count > 0)
-            {
-                var cIds = keys.Select(k => k.CourseId).Distinct().ToList();
-                var mIds = keys.Select(k => k.ModuleId).Distinct().ToList();
-
-                var counts = await _db.ScheduleItems
-                    .Include(si => si.Group)
-                    .Where(si => !excludePlanIds.Contains(si.LessonTypeId)
-                                 && cIds.Contains(si.Group.CourseId)
-                                 && mIds.Contains(si.ModuleId))
-                    .GroupBy(si => new { CourseId = si.Group.CourseId, si.ModuleId })
-                    .Select(g => new { g.Key.CourseId, g.Key.ModuleId, C = g.Count() })
-                    .ToListAsync();
-
-                var plansToUpdate = await _db.ModulePlans
-                    .Where(mp => cIds.Contains(mp.CourseId) && mIds.Contains(mp.ModuleId))
-                    .ToListAsync();
-
-                foreach (var p in plansToUpdate)
-                    p.ScheduledHours = counts.FirstOrDefault(c => c.CourseId == p.CourseId && c.ModuleId == p.ModuleId)?.C ?? 0;
-            }
-        }
-
-        
-        if (loads is null)
-        {
-            var activeLoads = await _db.TeacherCourseLoads.Where(l => l.IsActive).ToListAsync();
-            var tIds = activeLoads.Select(l => l.TeacherId).Distinct().ToList();
-            var cIds = activeLoads.Select(l => l.CourseId).Distinct().ToList();
-
-            var counts = await _db.ScheduleItems
-                .Include(si => si.Group)
-                .Where(si => si.TeacherId != null
-                             && !excludeLoadIds.Contains(si.LessonTypeId)
-                             && tIds.Contains(si.TeacherId!.Value)
-                             && cIds.Contains(si.Group.CourseId))
-                .GroupBy(si => new { TeacherId = si.TeacherId!.Value, si.Group.CourseId })
-                .Select(g => new { g.Key.TeacherId, g.Key.CourseId, C = g.Count() })
-                .ToListAsync();
-
-            foreach (var l in activeLoads)
-                l.ScheduledHours = counts.FirstOrDefault(c => c.TeacherId == l.TeacherId && c.CourseId == l.CourseId)?.C ?? 0;
-
-            var inactive = await _db.TeacherCourseLoads.Where(l => !l.IsActive).ToListAsync();
-            foreach (var l in inactive) l.ScheduledHours = 0;
-        }
-        else
-        {
-            var keys = loads.Distinct().ToList();
-            if (keys.Count > 0)
-            {
-                var tIds = keys.Select(k => k.TeacherId).Distinct().ToList();
-                var cIds = keys.Select(k => k.CourseId).Distinct().ToList();
-
-                var counts = await _db.ScheduleItems
-                    .Include(si => si.Group)
-                    .Where(si => si.TeacherId != null
-                                 && !excludeLoadIds.Contains(si.LessonTypeId)
-                                 && tIds.Contains(si.TeacherId!.Value)
-                                 && cIds.Contains(si.Group.CourseId))
-                    .GroupBy(si => new { TeacherId = si.TeacherId!.Value, si.Group.CourseId })
-                    .Select(g => new { g.Key.TeacherId, g.Key.CourseId, C = g.Count() })
-                    .ToListAsync();
-
-                var loadsToUpdate = await _db.TeacherCourseLoads
-                    .Where(l => l.IsActive && tIds.Contains(l.TeacherId) && cIds.Contains(l.CourseId))
-                    .ToListAsync();
-
-                foreach (var l in loadsToUpdate)
-                    l.ScheduledHours = counts.FirstOrDefault(c => c.TeacherId == l.TeacherId && c.CourseId == l.CourseId)?.C ?? 0;
-
-                var inactive = await _db.TeacherCourseLoads
-                    .Where(l => !l.IsActive && tIds.Contains(l.TeacherId) && cIds.Contains(l.CourseId))
-                    .ToListAsync();
-                foreach (var l in inactive) l.ScheduledHours = 0;
-            }
-        }
-
-        await _db.SaveChangesAsync();
-    }
 }
 
 

@@ -16,11 +16,13 @@ public sealed class TeacherDraftsPublishService
 {
     private readonly AppDbContext _db;
     private readonly RulesService _rules;
+    private readonly AggregatesService _aggregates;
 
-    public TeacherDraftsPublishService(AppDbContext db, RulesService rules)
+    public TeacherDraftsPublishService(AppDbContext db, RulesService rules, AggregatesService aggregates)
     {
         _db = db;
         _rules = rules;
+        _aggregates = aggregates;
     }
 
     public async Task<IActionResult> ApproveWeekAsync(ApproveWeekRequest r)
@@ -136,83 +138,10 @@ public sealed class TeacherDraftsPublishService
             .Distinct()
             .Select(x => (x.TeacherId, x.CourseId));
 
-        await RecalcAggregatesAsync(affectedPlans, affectedLoads);
+        await _aggregates.RecalcAsync(affectedPlans, affectedLoads);
 
         await tx.CommitAsync();
         return new OkObjectResult(new PublishWeekResults(created, skipped, warnings));
     }
 
-    private async Task RecalcAggregatesAsync(
-        IEnumerable<(int CourseId, int ModuleId)> plans,
-        IEnumerable<(int TeacherId, int CourseId)> loads)
-    {
-        var lessonTypes = await _db.LessonTypes
-            .Select(lt => new { lt.Id, lt.Code, lt.CountInPlan, lt.CountInLoad })
-            .ToListAsync();
-
-        var excludePlanIds = lessonTypes
-            .Where(lt =>
-                !lt.CountInPlan
-                || string.Equals(lt.Code, "CANCELED", System.StringComparison.OrdinalIgnoreCase)
-                || string.Equals(lt.Code, "RESCHEDULED", System.StringComparison.OrdinalIgnoreCase))
-            .Select(lt => lt.Id)
-            .ToHashSet();
-
-        var excludeLoadIds = lessonTypes
-            .Where(lt =>
-                !lt.CountInLoad
-                || string.Equals(lt.Code, "CANCELED", System.StringComparison.OrdinalIgnoreCase)
-                || string.Equals(lt.Code, "RESCHEDULED", System.StringComparison.OrdinalIgnoreCase))
-            .Select(lt => lt.Id)
-            .ToHashSet();
-
-        var planKeys = plans.Distinct().ToList();
-        if (planKeys.Count > 0)
-        {
-            var cIds = planKeys.Select(k => k.CourseId).Distinct().ToList();
-            var mIds = planKeys.Select(k => k.ModuleId).Distinct().ToList();
-
-            var counts = await _db.ScheduleItems
-                .Include(si => si.Group)
-                .Where(si => !excludePlanIds.Contains(si.LessonTypeId)
-                             && cIds.Contains(si.Group.CourseId)
-                             && mIds.Contains(si.ModuleId))
-                .GroupBy(si => new { CourseId = si.Group.CourseId, si.ModuleId })
-                .Select(g => new { g.Key.CourseId, g.Key.ModuleId, GCount = g.Count() })
-                .ToListAsync();
-
-            var plansToUpdate = await _db.ModulePlans
-                .Where(mp => cIds.Contains(mp.CourseId) && mIds.Contains(mp.ModuleId))
-                .ToListAsync();
-
-            foreach (var p in plansToUpdate)
-                p.ScheduledHours = counts.FirstOrDefault(c => c.CourseId == p.CourseId && c.ModuleId == p.ModuleId)?.GCount ?? 0;
-        }
-
-        var loadKeys = loads.Distinct().ToList();
-        if (loadKeys.Count > 0)
-        {
-            var tIds = loadKeys.Select(k => k.TeacherId).Distinct().ToList();
-            var cIds = loadKeys.Select(k => k.CourseId).Distinct().ToList();
-
-            var counts = await _db.ScheduleItems
-                .Include(si => si.Group)
-                .Where(si => si.TeacherId != null
-                             && !excludeLoadIds.Contains(si.LessonTypeId)
-                             && tIds.Contains(si.TeacherId!.Value)
-                             && cIds.Contains(si.Group.CourseId))
-                .GroupBy(si => new { TeacherId = si.TeacherId!.Value, si.Group.CourseId })
-                .Select(g => new { g.Key.TeacherId, g.Key.CourseId, GCount = g.Count() })
-                .ToListAsync();
-
-            var loadsToUpdate = await _db.TeacherCourseLoads
-                .Where(l => l.IsActive && tIds.Contains(l.TeacherId) && cIds.Contains(l.CourseId))
-                .ToListAsync();
-
-            foreach (var l in loadsToUpdate)
-                l.ScheduledHours = counts.FirstOrDefault(c => c.TeacherId == l.TeacherId && c.CourseId == l.CourseId)?.GCount ?? 0;
-        }
-
-        await _db.SaveChangesAsync();
-    }
 }
