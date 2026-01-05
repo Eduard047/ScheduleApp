@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using Pomelo.EntityFrameworkCore.MySql.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure.Seed;
 
 // Точка входу для налаштування серверного застосунку
@@ -17,6 +18,10 @@ var serverVersion = new MySqlServerVersion(new Version(8, 0, 0));
 builder.Services.AddDbContextPool<AppDbContext>(opt => opt.UseMySql(cs, serverVersion));
 
 builder.Services.AddScoped<RulesService>();
+builder.Services.AddScoped<TeacherDraftsQueryService>();
+builder.Services.AddScoped<TeacherDraftsExportService>();
+builder.Services.AddScoped<TeacherDraftsAutogenService>();
+builder.Services.AddScoped<TeacherDraftsPublishService>();
 
 var app = builder.Build();
 
