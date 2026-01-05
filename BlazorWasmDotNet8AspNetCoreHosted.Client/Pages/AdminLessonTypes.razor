@@ -87,7 +87,7 @@
                 <div class="col"><div class="form-check"><input class="form-check-input" type="checkbox" @bind="form.BlocksTeacher" /> <label class="form-check-label">Блокує викладача</label></div></div>
                 <div class="col"><div class="form-check"><input class="form-check-input" type="checkbox" @bind="form.CountInPlan" /> <label class="form-check-label">Рахується у плані</label></div></div>
                 <div class="col"><div class="form-check"><input class="form-check-input" type="checkbox" @bind="form.CountInLoad" /> <label class="form-check-label">Рахується у навант.</label></div></div>
-                <div class="col"><div class="form-check"><input class="form-check-input" type="checkbox" @bind="form.PreferredFirstInWeek" /> <label class="form-check-label">Бажано першим у тижні</label></div></div>
+                <div class="col"><div class="form-check"><input class="form-check-input" type="checkbox" @bind="form.PreferredFirstInWeek" disabled="@PreferredFirstInWeekLocked" /> <label class="form-check-label">Бажано першим у тижні</label></div></div>
             </div>
 
             <div class="mt-3 d-grid">
@@ -363,6 +363,10 @@
     }
 
     private IEnumerable<LessonTypeEditDto> SortedItems => ApplySort(ApplyFilter(items));
+
+    private bool PreferredFirstInWeekLocked
+        => !form.PreferredFirstInWeek
+           && items.Any(x => x.PreferredFirstInWeek && x.Id != form.Id);
 
     private void ToggleSort(string field)
     {

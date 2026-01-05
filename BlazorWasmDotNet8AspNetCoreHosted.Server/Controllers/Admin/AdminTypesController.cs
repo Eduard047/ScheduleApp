@@ -139,6 +139,23 @@ public class AdminTypesController(AppDbContext db) : ControllerBase
         e.BlocksTeacher = dto.BlocksTeacher;
         e.CountInPlan = dto.CountInPlan;
         e.CountInLoad = dto.CountInLoad;
+
+        if (dto.PreferredFirstInWeek)
+        {
+            var taken = await db.LessonTypes
+                .AsNoTracking()
+                .Where(x => x.PreferredFirstInWeek && x.Id != e.Id)
+                .Select(x => new { x.Id, x.Code, x.Name })
+                .FirstOrDefaultAsync();
+
+            if (taken is not null)
+            {
+                var label = string.IsNullOrWhiteSpace(taken.Code)
+                    ? $"#{taken.Id}"
+                    : $"{taken.Code} (#{taken.Id})";
+                return Conflict(new { message = $"Прапорець \"Бажано першим у тижні\" вже встановлено для типу {label}. Спочатку зніміть його там." });
+            }
+        }
         e.PreferredFirstInWeek = dto.PreferredFirstInWeek;
 
         await db.SaveChangesAsync();
