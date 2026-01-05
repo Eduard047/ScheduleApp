@@ -116,6 +116,7 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
     
     public sealed record BulkTimeSlotsSaveDto(int? CourseId, List<TimeSlotDto> Slots);
     public sealed record CloneRequest(int CourseId);
+    private sealed record SlotRow(int Id, int? CourseId, TimeOnly Start, TimeOnly End, int SortOrder, bool IsActive);
 
     private static TimeOnly ParseTime(string s)
     {
@@ -174,22 +175,15 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
         }
         var globalLunch = lunches.FirstOrDefault(l => l.CourseId == null);
         
-        var sel = db.TimeSlots.AsNoTracking().Select(s => new
-        {
-            s.Id,
-            s.CourseId,
-            s.Start,
-            s.End,
-            s.SortOrder,
-            s.IsActive
-        });
+        var sel = db.TimeSlots.AsNoTracking()
+            .Select(s => new SlotRow(s.Id, s.CourseId, s.Start, s.End, s.SortOrder, s.IsActive));
 
-        List<dynamic> courseRowsDyn = new();
+        List<SlotRow> courseRows = new();
         if (courseId is int cid)
         {
-            courseRowsDyn = await sel.Where(s => s.CourseId == cid)
-                                     .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
-                                     .ToListAsync<dynamic>();
+            courseRows = await sel.Where(s => s.CourseId == cid)
+                                  .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
+                                  .ToListAsync();
         }
 
         var globalRows = await sel.Where(s => s.CourseId == null)
@@ -197,15 +191,15 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
                                   .ToListAsync();
 
         
-        List<TimeSlotDto> course = courseRowsDyn.Select(s => new TimeSlotDto
+        List<TimeSlotDto> course = courseRows.Select(s => new TimeSlotDto
         {
-            Id = (int)s.Id,
-            CourseId = (int?)s.CourseId,
-            Start = ((TimeOnly)s.Start).ToString("HH:mm"),
-            End = ((TimeOnly)s.End).ToString("HH:mm"),
-            SortOrder = (int)s.SortOrder,
-            IsActive = (bool)s.IsActive,
-            IsLunch = SlotMatchesLunch((TimeOnly)s.Start, (TimeOnly)s.End, courseLunch) && (bool)s.IsActive
+            Id = s.Id,
+            CourseId = s.CourseId,
+            Start = s.Start.ToString("HH:mm"),
+            End = s.End.ToString("HH:mm"),
+            SortOrder = s.SortOrder,
+            IsActive = s.IsActive,
+            IsLunch = SlotMatchesLunch(s.Start, s.End, courseLunch) && s.IsActive
         }).ToList();
 
         List<TimeSlotDto> global = globalRows.Select(s => new TimeSlotDto

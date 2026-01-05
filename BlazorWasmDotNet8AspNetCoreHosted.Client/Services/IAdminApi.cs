@@ -48,7 +48,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         Task<List<BuildingTravelEditDto>> GetBuildingTravels();
         Task<int> UpsertBuilding(BuildingEditDto dto);
         Task DeleteBuilding(int id);
-        Task<int> UpsertBuildingTravel(BuildingTravelEditDto dto);
+        Task UpsertBuildingTravel(BuildingTravelEditDto dto);
         Task DeleteBuildingTravel(int fromId, int toId);
 
         
