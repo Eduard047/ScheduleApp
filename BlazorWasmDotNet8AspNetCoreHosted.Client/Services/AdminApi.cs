@@ -128,11 +128,10 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         }
         public async Task DeleteBuilding(int id)
             => await Ensure(await _http.DeleteAsync(WithConfirm($"api/admin/buildings/{id}")));
-        public async Task<int> UpsertBuildingTravel(BuildingTravelEditDto dto)
+        public async Task UpsertBuildingTravel(BuildingTravelEditDto dto)
         {
             var resp = await _http.PostAsJsonAsync("api/admin/buildings/travel/upsert", dto);
             await Ensure(resp);
-            return 0;
         }
         public async Task DeleteBuildingTravel(int fromId, int toId)
             => await Ensure(await _http.PostAsJsonAsync(

@@ -2,7 +2,6 @@ using System.Linq;
 
 using System.Collections.Generic;
 
-using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Infrastructure;
@@ -10,6 +9,7 @@ using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 using Microsoft.AspNetCore.Http;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Admin;
@@ -315,7 +315,7 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
                 .ToListAsync();
 
             var reschedSourceIds = draftRows
-                .Select(r => TeacherDraftsController.ParseRescheduleBatchKey(r.BatchKey))
+                .Select(r => TeacherDraftsHelpers.ParseRescheduleBatchKey(r.BatchKey))
                 .Where(info => info.isRescheduled && info.sourceItemId is int)
                 .Select(info => info.sourceItemId!.Value)
                 .Distinct()
@@ -338,7 +338,7 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
                 int? resolvedTopicId = row.ModuleTopicId;
                 if (resolvedTopicId is null)
                 {
-                    var info = TeacherDraftsController.ParseRescheduleBatchKey(row.BatchKey);
+                    var info = TeacherDraftsHelpers.ParseRescheduleBatchKey(row.BatchKey);
                     if (info.isRescheduled && info.sourceItemId is int sid && reschedSourceTopics.TryGetValue(sid, out var topicIdFromSource))
                     {
                         resolvedTopicId = topicIdFromSource;
