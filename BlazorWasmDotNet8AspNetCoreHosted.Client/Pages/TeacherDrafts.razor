@@ -29,17 +29,14 @@
 
 @code {
     private MetaResponseDto? _meta;
-
     private int? _teacherId;
     private int? _groupId;
     private int? _roomId;
     private int? _courseId;
     private DateOnly _weekStart = FirstMonday(DateOnly.FromDateTime(DateTime.Today));
-
     private List<TeacherDraftItemDto> _items = new();
     private List<TimeSlotDto> _slots = new();
     private readonly List<ExtraDraftSelection> _extraAssignments = new();
-
     private readonly Dictionary<int, List<ModuleTopicViewDto>> _topicsCache = new();
     private readonly Dictionary<int, int?> _lessonTypeRoomCache = new();
     private List<ModuleTopicViewDto> TopicsForModule(int moduleId) => _topicsCache.TryGetValue(moduleId, out var list) ? list : new List<ModuleTopicViewDto>();
@@ -48,7 +45,7 @@
             .Where(lt => string.Equals(lt.Code, "EXAM", StringComparison.OrdinalIgnoreCase)
                       || string.Equals(lt.Code, "CREDIT", StringComparison.OrdinalIgnoreCase))
             .ToList() ?? new();
-
+    // Перевіряє, чи тип заняття є підсумковим контролем.
     private bool IsFinalAssessment(int? lessonTypeId)
     {
         if (lessonTypeId is not int ltId || _meta is null) return false;
@@ -56,7 +53,7 @@
         return string.Equals(code, "EXAM", StringComparison.OrdinalIgnoreCase)
                || string.Equals(code, "CREDIT", StringComparison.OrdinalIgnoreCase);
     }
-
+    // Для підсумкових контролів тема модуля не потрібна.
     private void ClearTopicForFinalAssessment()
     {
         if (_edit is null) return;
@@ -74,7 +71,6 @@
     {
         PropertyNameCaseInsensitive = true
     };
-
     private string? _ok, _err;
     private ConflictDetails? _currentConflict;
     private Dictionary<string, ConflictDetails> _conflictStorage = new();
@@ -84,17 +80,14 @@
         PropertyNameCaseInsensitive = true
     };
     private const string ConflictStorageKey = "teacherDrafts.conflicts.v1";
-
     private record SlotRow(string Start, string End) { public string Label => $"{Start}-{End}"; }
     private List<SlotRow> _rows = new();
     private static readonly string[] UkrainianDayNames = { "Неділя", "Понеділок", "Вівторок", "Середа", "Четвер", "П'ятниця", "Субота" };
-
     private DragPayload? _dragPayload;
     private SlotKey? _dragHover;
     private bool _isProcessingDrop;
-
     private string CurrentConflictKey => $"{_weekStart:yyyy-MM-dd}|t:{_teacherId?.ToString() ?? "all"}|g:{_groupId?.ToString() ?? "all"}|r:{_roomId?.ToString() ?? "all"}|c:{_courseId?.ToString() ?? "all"}";
-
+    // Фільтрує чернетки за поточними параметрами відбору.
     private IEnumerable<TeacherDraftItemDto> Filtered =>
         _items.Where(i =>
             (_teacherId is null || i.TeacherId == _teacherId) &&
@@ -102,25 +95,21 @@
             (_roomId is null || i.RoomId == _roomId) &&
             ModuleMatchesCourse(i.ModuleId, _courseId)
         );
-
+    // Початкове завантаження метаданих, конфліктів та чернеток.
     protected override async Task OnInitializedAsync()
     {
         _meta = await Http.GetFromJsonAsync<MetaResponseDto>("api/meta");
         await LoadConflictsAsync();
         await Reload();
     }
-
+    // Перезавантажує чернетки, попередження та тайм-слоти для поточного тижня.
     private async Task Reload()
     {
         await LoadConflictsAsync();
-
-
         _ok = _err = null;
         _edit = null;
         _extraAssignments.Clear();
         _topicsCache.Clear();
-
-
         _items = await DraftsApi.GetWeek(_weekStart, _teacherId);
         _warningReports.Clear();
         foreach (var draft in _items)
@@ -136,27 +125,22 @@
             }
         }
         _expandedWarningSlots.RemoveWhere(id => !_warningReports.ContainsKey(id));
-
-
         var eff = await Http.GetFromJsonAsync<EffectiveSlotsResponse>("api/admin/config/slots");
         _slots = eff?.slots ?? new();
-
         _rows = _slots
             .Select(s => new SlotRow(s.Start, s.End))
             .GroupBy(x => (x.Start, x.End))
             .Select(g => g.First())
             .OrderBy(x => x.Start)
             .ToList();
-
         SyncCurrentConflict();
     }
-
+    // Експортує поточний тиждень у формат Excel.
     private async Task ExportScheduleAsync()
     {
         if (_isExporting) return;
         _isExporting = true;
         _err = null;
-
         try
         {
             var bytes = await DraftsApi.ExportWeek(_weekStart, _teacherId, _groupId, _roomId);
@@ -165,7 +149,6 @@
                 _err = "Не вдалося сформувати файл Excel.";
                 return;
             }
-
             var fileName = $"Rozklad-{_weekStart:yyyyMMdd}.xlsx";
             await using var module = await JS.InvokeAsync<IJSObjectReference>("import", "./js/download.js");
             await module.InvokeVoidAsync("downloadFromBytes", fileName, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", bytes);
@@ -179,18 +162,16 @@
             _isExporting = false;
         }
     }
-
+    // Публікує чернетку тижня до основного розкладу.
     private async Task PublishWeek()
     {
         _ok = _err = null;
         try
         {
-
             await DraftsApi.PublishWeek(new PublishWeekRequest(
                 WeekStart: _weekStart,
                 TeacherId: null
             ));
-
             _ok = "Опубліковано (перевір правила): створені пари додані у загальний розклад, невідповідні — пропущені.";
             await Reload();
         }
@@ -203,8 +184,7 @@
             _err = ex.Message;
         }
     }
-
-
+    // Ліниво завантажує та кешує теми модуля.
     private async Task EnsureTopicsLoaded(int moduleId)
     {
         if (moduleId <= 0) return;
@@ -220,13 +200,12 @@
             _topicsCache[moduleId] = new List<ModuleTopicViewDto>();
         }
     }
-
     private ModuleTopicViewDto? FindTopic(int moduleId, int? topicId)
     {
         if (moduleId <= 0 || topicId is null) return null;
         return TopicsForModule(moduleId).FirstOrDefault(t => t.Id == topicId);
     }
-
+    // Застосовує вибір теми й синхронізує залежні поля (тип заняття, викладач).
     private void ApplyTopicSelection(int? topicId)
     {
         if (_edit is null) return;
@@ -237,7 +216,6 @@
             {
                 _edit = _edit with { ModuleTopicId = tId };
                 ApplyLessonType(topic.LessonTypeId);
-
                 if (!_unrestrictedMode
                     && topic.DepartmentId is int depId
                     && depId > 0
@@ -247,30 +225,26 @@
                     _edit = _edit with { TeacherId = null };
                     _err = "Обраний викладач не належить до кафедри цієї теми, тому його вибір скинуто.";
                 }
-
                 return;
             }
         }
         _edit = _edit with { ModuleTopicId = null };
     }
-
+    // Формує список доступних викладачів з урахуванням кафедри.
     private List<LookupDto> AllowedTeachersForTopic(ModuleTopicViewDto? topic)
     {
         if (_meta is null) return new List<LookupDto>();
         if (_unrestrictedMode) return _meta.Teachers;
-
         if (topic?.DepartmentId is not int depId || depId <= 0)
         {
             return _meta.Teachers;
         }
-
         return _meta.Teachers
             .Where(t => t.DepartmentId == depId)
             .ToList();
     }
-
     private bool RoomExists(int roomId) => _meta?.Rooms.Any(r => r.Id == roomId) == true;
-
+    // Визначає, чи вимагає тип заняття аудиторію.
     private bool LessonTypeRequiresRoom(int lessonTypeId)
     {
         if (lessonTypeId <= 0) return true;
@@ -279,43 +253,35 @@
         {
             return metaType.RequiresRoom;
         }
-
         var draft = _items.FirstOrDefault(i => i.LessonTypeId == lessonTypeId);
         return draft?.RequiresRoom ?? true;
     }
-
     private void RememberRoom(int lessonTypeId, int? roomId)
     {
         if (lessonTypeId <= 0 || roomId is not int rid || !RoomExists(rid)) return;
         _lessonTypeRoomCache[lessonTypeId] = rid;
     }
-
     private int? ResolveRoomForType(int lessonTypeId, bool requiresRoom, bool sameType)
     {
         if (!requiresRoom) return null;
-
         if (sameType && _edit?.RoomId is int current && RoomExists(current))
         {
             return current;
         }
-
         if (_lessonTypeRoomCache.TryGetValue(lessonTypeId, out var cached) && cached is int cachedRoom && RoomExists(cachedRoom))
         {
             return cachedRoom;
         }
-
         if (_roomId is int filtered && RoomExists(filtered))
         {
             return filtered;
         }
-
         return _meta?.Rooms.FirstOrDefault()?.Id;
     }
-
+    // Оновлює тип заняття та підбирає аудиторію відповідно до правил.
     private void ApplyLessonType(int? lessonTypeId)
     {
         if (_edit is null) return;
-
         if (lessonTypeId is not int ltId)
         {
             var requiresRoomFallback = LessonTypeRequiresRoom(_edit.LessonTypeId);
@@ -323,16 +289,13 @@
             _edit = _edit with { RequiresRoom = requiresRoomFallback, RoomId = roomFallback };
             return;
         }
-
         if (_edit.LessonTypeId != ltId && _edit.RequiresRoom && _edit.RoomId is int previousRoom)
         {
             RememberRoom(_edit.LessonTypeId, previousRoom);
         }
-
         var requiresRoom = LessonTypeRequiresRoom(ltId);
         var sameType = _edit.LessonTypeId == ltId;
         var resolvedRoom = ResolveRoomForType(ltId, requiresRoom, sameType);
-
         _edit = _edit with
         {
             LessonTypeId = ltId,
@@ -340,7 +303,7 @@
             RoomId = resolvedRoom
         };
     }
-
+    // Гарантує, що обраний тип заняття дозволений для поточного режиму.
     private void EnsureAllowedLessonType()
     {
         if (_edit is null) return;
@@ -351,7 +314,6 @@
         ApplyLessonType(targetId);
         ClearTopicForFinalAssessment();
     }
-
     private void OnRoomChanged(ChangeEventArgs e)
     {
         if (_edit is null) return;
@@ -363,7 +325,7 @@
             RememberRoom(_edit.LessonTypeId, rid);
         }
     }
-
+    // Нормалізує запит з урахуванням правил щодо аудиторій.
     private DraftUpsertRequest NormalizeRequest(DraftUpsertRequest request)
     {
         var actualRequiresRoom = LessonTypeRequiresRoom(request.LessonTypeId);
@@ -374,10 +336,8 @@
             RoomId = normalizedRoomId
         };
     }
-
     private static string DraftLessonModeLabel(bool requiresRoom)
         => requiresRoom ? "Аудиторна година" : "Без аудиторії";
-
     private async Task OnModuleChanged(ChangeEventArgs e)
     {
         if (_edit is null) return;
@@ -389,14 +349,12 @@
         {
             return;
         }
-
         var firstTopic = TopicsForModule(moduleId).FirstOrDefault();
         if (firstTopic is not null)
         {
             ApplyTopicSelection(firstTopic.Id);
         }
     }
-
     private async Task OnTopicChanged(ChangeEventArgs e)
     {
         if (_edit is null) return;
@@ -405,7 +363,6 @@
         ApplyTopicSelection(topicId);
         ClearTopicForFinalAssessment();
     }
-
     private void OnLessonTypeChanged(ChangeEventArgs e)
     {
         if (_edit is null) return;
@@ -420,6 +377,7 @@
         ApplyLessonType(ltId);
         ClearTopicForFinalAssessment();
     }
+    // Готує форму редагування для існуючої чернетки.
     private async Task StartEdit(TeacherDraftItemDto item)
     {
         await EnsureTopicsLoaded(item.ModuleId);
@@ -448,17 +406,15 @@
         EnsureAllowedLessonType();
         _extraAssignments.Clear();
     }
+    // Готує форму створення нової чернетки з типовими значеннями.
     private async Task StartCreate(int dayNumber, string start, string end, int groupId)
     {
-
         _extraAssignments.Clear();
-
         if (_meta is null)
         {
             _err = "Метадані не завантажені для створення чернетки.";
             return;
         }
-
         var date = DayToDate(dayNumber);
         var module = _meta.Modules.FirstOrDefault();
         if (module is null)
@@ -466,11 +422,9 @@
             _err = "Немає доступних модулів для створення чернетки.";
             return;
         }
-
         await EnsureTopicsLoaded(module.Id);
         var topics = TopicsForModule(module.Id);
         var defaultTopic = topics.FirstOrDefault();
-
         var preservedLessonType = _edit?.LessonTypeId ?? _meta.LessonTypes.FirstOrDefault()?.Id;
         var lessonTypeId = defaultTopic?.LessonTypeId ?? preservedLessonType;
         if (lessonTypeId is null)
@@ -478,14 +432,12 @@
             _err = "Немає доступних типів занять для створення чернетки.";
             return;
         }
-
         var resolvedGroupId = groupId > 0 ? groupId : (_groupId ?? _meta.Groups.FirstOrDefault()?.Id);
         if (resolvedGroupId is null)
         {
             _err = "Немає доступних груп для створення чернетки.";
             return;
         }
-
         var requiresRoom = LessonTypeRequiresRoom(lessonTypeId.Value);
         var resolvedRoomId = ResolveRoomForType(lessonTypeId.Value, requiresRoom, sameType: false);
         if (requiresRoom && resolvedRoomId is null)
@@ -493,9 +445,7 @@
             _err = "Немає доступних аудиторій для цього типу заняття.";
             return;
         }
-
         RememberRoom(lessonTypeId.Value, resolvedRoomId);
-
         var draftRequest = new DraftUpsertRequest(
             Id: null,
             Date: date,
@@ -514,28 +464,23 @@
             IgnoreValidationErrors: _unrestrictedMode,
             IsSelfStudy: false
         );
-
         _edit = NormalizeRequest(draftRequest);
         ApplyLessonType(_edit.LessonTypeId);
         ApplyTopicSelection(defaultTopic?.Id);
         EnsureAllowedLessonType();
     }
-
     private List<DateOnly> GetWeekDates()
         => Enumerable.Range(0, 7)
             .Select(offset => _weekStart.AddDays(offset))
             .ToList();
-
     private List<LookupDto> ResolveGroups(List<TeacherDraftItemDto> filtered)
     {
         if (_meta is null) return new List<LookupDto>();
-
         if (_groupId is int gid)
         {
             var match = _meta.Groups.FirstOrDefault(g => g.Id == gid);
             return match is null ? new List<LookupDto>() : new List<LookupDto> { match };
         }
-
         var ids = filtered.Select(i => i.GroupId).Distinct().ToHashSet();
         if (ids.Count == 0)
         {
@@ -546,21 +491,15 @@
                     .OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase)
                     .ToList();
             }
-
             return _meta.Groups.OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
         }
-
         var source = _meta.Groups.Where(g => ids.Contains(g.Id));
-
         return source
             .OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase)
             .ToList();
     }
-
     private ModuleMetaDto? FindModule(int moduleId) => _meta?.Modules.FirstOrDefault(m => m.Id == moduleId);
-
     private int? ModuleCourseId(int moduleId) => FindModule(moduleId)?.CourseId;
-
     private bool ModuleMatchesCourse(int moduleId, int? courseId)
     {
         if (courseId is null) return true;
@@ -569,13 +508,11 @@
         if (module.CourseId == courseId) return true;
         return module.CourseIds.Contains(courseId.Value);
     }
-
     private string ModuleCourseCaption(int moduleId)
     {
         var course = FindModule(moduleId)?.CourseName;
         return string.IsNullOrWhiteSpace(course) ? string.Empty : course!;
     }
-
     private static string ModuleOptionCaption(ModuleMetaDto module)
     {
         var codePart = string.IsNullOrWhiteSpace(module.Code) ? null : module.Code.Trim();
@@ -583,7 +520,6 @@
         var course = string.IsNullOrWhiteSpace(module.CourseName) ? null : module.CourseName.Trim();
         return course is null ? title : $"{title} - {course}";
     }
-
     private IEnumerable<LookupDto> CourseScopedGroups()
     {
         if (_meta is null) return Enumerable.Empty<LookupDto>();
@@ -591,26 +527,21 @@
         {
             return _meta.Groups.OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
         }
-
         var matchedByCourse = _meta.Groups
             .Where(g => g.CourseId == _courseId)
             .OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase)
             .ToList();
-
         if (matchedByCourse.Count > 0) return matchedByCourse;
-
         var ids = _items
             .Where(i => ModuleMatchesCourse(i.ModuleId, _courseId))
             .Select(i => i.GroupId)
             .Distinct()
             .ToHashSet();
-
         return _meta.Groups
             .Where(g => ids.Contains(g.Id))
             .OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase)
             .ToList();
     }
-
     private static string TopicOptionCaption(ModuleTopicViewDto topic)
     {
         var codePart = string.IsNullOrWhiteSpace(topic.TopicCode) ? null : topic.TopicCode.Trim();
@@ -621,34 +552,26 @@
         }
         return caption;
     }
-
+    // Будує словник для швидкого пошуку елементів у таблиці.
     private static Dictionary<(int DayNumber, string Start, string End, int GroupId), TeacherDraftItemDto> BuildLookup(IEnumerable<TeacherDraftItemDto> items)
         => items
             .GroupBy(i => (i.DayNumber, i.TimeStart, i.TimeEnd, i.GroupId))
             .ToDictionary(g => g.Key, g => g.First());
-
     private static TeacherDraftItemDto? FindItem(Dictionary<(int DayNumber, string Start, string End, int GroupId), TeacherDraftItemDto> lookup, int dayNumber, SlotRow slot, int groupId)
         => lookup.TryGetValue((dayNumber, slot.Start, slot.End, groupId), out var value) ? value : null;
-
-
     private readonly record struct SlotKey(int DayNumber, string Start, string End, int GroupId);
     private sealed record DragPayload(int ItemId, SlotKey Origin, TeacherDraftItemDto Snapshot);
-
     private static int DayNumberFromDate(DateOnly date) => date.DayOfWeek switch
     {
         DayOfWeek.Sunday => 0,
         _ => (int)date.DayOfWeek
     };
-
     private static string GetDayName(DateOnly date) => UkrainianDayNames[(int)date.DayOfWeek];
-
     private static bool IsBreak(TeacherDraftItemDto item) => string.Equals(item.LessonTypeCode, "BREAK", StringComparison.OrdinalIgnoreCase);
     private static bool IsCanceled(TeacherDraftItemDto item) => string.Equals(item.LessonTypeCode, "CANCELED", StringComparison.OrdinalIgnoreCase);
-
     private static string GetCellCss(TeacherDraftItemDto? item)
     {
         if (item is null) return "td-cell-body td-cell-body--empty";
-
         var classes = new List<string> { "td-cell-body" };
         var tone = string.IsNullOrWhiteSpace(item.LessonTypeCss)
             ? CssByCode(item.LessonTypeCode)
@@ -677,16 +600,12 @@
         {
             classes.Add("td-cell-body--res");
         }
-
         return string.Join(' ', classes);
     }
-
     private bool CanDragItem(TeacherDraftItemDto? item)
         => item is { IsLocked: false };
-
     private bool CanDeleteItem(TeacherDraftItemDto item)
         => !item.IsLocked || _unrestrictedMode;
-
     private string GetCellFrameCss(SlotKey key, TeacherDraftItemDto? item)
     {
         var css = "td-cell";
@@ -694,20 +613,16 @@
         {
             css += " td-cell--drag-source";
         }
-
         if (_dragHover is { } hover && hover == key)
         {
             css += item is null ? " td-cell--drop-free" : " td-cell--drop-swap";
         }
-
         if (item?.IsLocked == true)
         {
             css += " td-cell--locked";
         }
-
         return css;
     }
-
     private string BuildCellContainerCss(string baseCss, SlotKey key, TeacherDraftItemDto? item)
     {
         var css = baseCss;
@@ -715,25 +630,18 @@
         {
             css += " td-cell-body--draggable";
         }
-
         if (_dragPayload?.ItemId == item?.Id)
         {
             css += " td-cell-body--dragging";
         }
-
         if (_dragHover is { } hover && hover == key)
         {
             css += item is null ? " td-cell-body--drop-free" : " td-cell-body--drop-swap";
         }
-
         return css;
     }
-
-
     private SlotKey BuildSlotKey(TeacherDraftItemDto item)
         => new(item.DayNumber, item.TimeStart, item.TimeEnd, item.GroupId);
-
-
     private DraftUpsertRequest BuildUpsertRequest(TeacherDraftItemDto item, SlotKey slot, bool ignoreValidation)
         => NormalizeRequest(new(
             Id: item.Id,
@@ -752,26 +660,22 @@
             IsLocked: item.IsLocked,
             IgnoreValidationErrors: ignoreValidation
         ));
-
+    // Старт перетягування елемента розкладу.
     private void OnItemDragStart(SlotKey origin, TeacherDraftItemDto? item, DragEventArgs e)
     {
         if (!CanDragItem(item) || _isProcessingDrop)
         {
             return;
         }
-
         var snapshot = item! with { };
         _dragPayload = new DragPayload(item.Id, origin, snapshot);
         _dragHover = origin;
-
         if (e.DataTransfer is not null)
         {
-
             e.DataTransfer.DropEffect = "move";
             e.DataTransfer.EffectAllowed = "move";
         }
     }
-
     private void OnItemDragEnd()
     {
         _dragPayload = null;
@@ -779,26 +683,22 @@
         _isProcessingDrop = false;
         StateHasChanged();
     }
-
     private void OnSlotDragEnter(SlotKey key, TeacherDraftItemDto? target)
     {
         if (_dragPayload is null || _isProcessingDrop)
         {
             return;
         }
-
         if (target?.IsLocked == true && target.Id != _dragPayload.ItemId)
         {
             return;
         }
-
         if (_dragHover != key)
         {
             _dragHover = key;
             StateHasChanged();
         }
     }
-
     private void OnSlotDragLeave(SlotKey key)
     {
         if (_dragHover is { } hover && hover == key)
@@ -807,44 +707,38 @@
             StateHasChanged();
         }
     }
-
     private void OnSlotDragOver(SlotKey key, TeacherDraftItemDto? target, DragEventArgs e)
     {
         if (_dragPayload is null || _isProcessingDrop)
         {
             return;
         }
-
         if (target?.IsLocked == true && target.Id != _dragPayload.ItemId)
         {
             return;
         }
-
         if (e.DataTransfer is not null)
         {
             e.DataTransfer.DropEffect = "move";
         }
-
         if (_dragHover != key)
         {
             _dragHover = key;
             StateHasChanged();
         }
     }
-
+    // Обробляє скидання у слот (переміщення або обмін).
     private async Task OnSlotDropAsync(SlotKey targetKey, TeacherDraftItemDto? targetItem)
     {
         if (_dragPayload is null || _isProcessingDrop)
         {
             return;
         }
-
         var sourceItem = _items.FirstOrDefault(x => x.Id == _dragPayload.ItemId) ?? _dragPayload.Snapshot;
         if (sourceItem is null)
         {
             return;
         }
-
         if (targetItem?.IsLocked == true && targetItem.Id != sourceItem.Id)
         {
             _err = "Неможливо перенести пару у заблокований слот.";
@@ -852,16 +746,13 @@
             StateHasChanged();
             return;
         }
-
         if (_dragPayload.Origin == targetKey || targetItem?.Id == sourceItem.Id)
         {
             return;
         }
-
         _ok = null;
         _err = null;
         _isProcessingDrop = true;
-
         try
         {
             if (targetItem is null)
@@ -872,7 +763,6 @@
             {
                 await SwapItemsAsync(sourceItem, targetItem, targetKey);
             }
-
             await Reload();
         }
         catch (ApiErrorException ex)
@@ -891,32 +781,26 @@
             StateHasChanged();
         }
     }
-
     private async Task MoveItemAsync(TeacherDraftItemDto sourceItem, SlotKey targetKey)
     {
         var request = BuildUpsertRequest(sourceItem, targetKey, ignoreValidation: _unrestrictedMode);
         await DraftsApi.Upsert(request);
     }
-
     private async Task SwapItemsAsync(TeacherDraftItemDto sourceItem, TeacherDraftItemDto targetItem, SlotKey targetKey)
     {
         var originKey = _dragPayload?.Origin ?? BuildSlotKey(sourceItem);
         var targetOrigin = BuildSlotKey(targetItem);
-
         var moveSourceRequest = BuildUpsertRequest(sourceItem, targetKey, ignoreValidation: true);
         var moveTargetRequest = BuildUpsertRequest(targetItem, originKey, ignoreValidation: _unrestrictedMode);
         var revalidateSourceRequest = BuildUpsertRequest(sourceItem, targetKey, ignoreValidation: _unrestrictedMode);
         var revertSourceRequest = BuildUpsertRequest(sourceItem, originKey, ignoreValidation: true);
         var revertTargetRequest = BuildUpsertRequest(targetItem, targetOrigin, ignoreValidation: true);
-
         var targetMoved = false;
-
         try
         {
             await DraftsApi.Upsert(moveSourceRequest);
             await DraftsApi.Upsert(moveTargetRequest);
             targetMoved = true;
-
             if (!_unrestrictedMode)
             {
                 await DraftsApi.Upsert(revalidateSourceRequest);
@@ -928,24 +812,21 @@
             {
                 await DraftsApi.Upsert(revertTargetRequest);
             }
-
             await DraftsApi.Upsert(revertSourceRequest);
             throw;
         }
     }
-
     private static string GetStatusBadgeCss(DraftStatusDto status) => status switch
     {
         DraftStatusDto.Published => "badge-published",
         _ => "badge-draft"
     };
-
     private static string FormatStatus(DraftStatusDto status) => status switch
     {
         DraftStatusDto.Published => "Опубліковано",
         _ => "Чернетка"
     };
-
+    // Зберігає поточну чернетку та додаткові дублікати.
     private async Task SaveEdit()
     {
         if (_edit is null) return;
@@ -957,11 +838,9 @@
             var resolvedBatchKey = hasExtras
                 ? (payload.BatchKey ?? $"clone-{Guid.NewGuid():N}")
                 : payload.BatchKey;
-
             var primaryRequest = NormalizeRequest(payload with { BatchKey = resolvedBatchKey });
             var id = await DraftsApi.Upsert(primaryRequest);
             var cloneIds = new List<int>();
-
             if (hasExtras && !string.IsNullOrWhiteSpace(resolvedBatchKey))
             {
                 foreach (var extra in _extraAssignments.ToList())
@@ -972,21 +851,17 @@
                     {
                         continue;
                     }
-
                     var cloneRequest = NormalizeRequest(primaryRequest with
                     {
                         Id = null,
                         GroupId = groupId,
                         TeacherId = teacherId
                     });
-
                     var cloneId = await DraftsApi.Upsert(cloneRequest);
                     cloneIds.Add(cloneId);
                 }
             }
-
             var suffix = cloneIds.Count > 0 ? $" (+{cloneIds.Count} дубль.)" : string.Empty;
-
             _ok = $"Збережено (Id = {id}){suffix}.";
             _extraAssignments.Clear();
             await Reload();
@@ -1000,17 +875,16 @@
             _err = ex.Message;
         }
     }
+    // Видаляє активну чернетку.
     private async Task DeleteEdit()
     {
         if (_edit?.Id is not int id) { _err = "Виберіть чернетку для видалення."; return; }
         await DeleteByIdAsync(id);
     }
-
     private async Task DeleteItemAsync(TeacherDraftItemDto item)
     {
         await DeleteByIdAsync(item.Id);
     }
-
     private async Task DeleteByIdAsync(int id)
     {
         var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити пару #{id}? Цю дію неможливо скасувати.");
@@ -1032,18 +906,16 @@
             _err = ex.Message;
         }
     }
-
+    // Узгоджене відображення помилок API та конфліктів.
     private async Task HandleApiError(ApiErrorException ex)
     {
         var headline = ComposeErrorHeadline(ex);
         _err = headline;
-
         if (ex.StatusCode == HttpStatusCode.Conflict && (ex.Errors.Count > 0 || ex.Warnings.Count > 0))
         {
             var expanded = _conflictStorage.TryGetValue(CurrentConflictKey, out var existing)
                 ? existing.Expanded
                 : true;
-
             var details = new ConflictDetails
             {
                 Message = headline,
@@ -1057,16 +929,13 @@
             await PersistConflictsAsync();
         }
     }
-
     private static string ComposeErrorHeadline(ApiErrorException ex)
     {
         var parts = new List<string>();
-
         if (!string.IsNullOrWhiteSpace(ex.Message))
         {
             parts.Add(ex.Message.Trim());
         }
-
         var firstError = ex.Errors.FirstOrDefault(e => !string.IsNullOrWhiteSpace(e));
         if (!string.IsNullOrWhiteSpace(firstError))
         {
@@ -1080,20 +949,17 @@
                 parts.Add(firstWarning!.Trim());
             }
         }
-
         if (parts.Count == 0)
         {
             return "Сталася помилка.";
         }
-
         return parts.Count == 1 ? parts[0] : string.Join(": ", parts.Distinct(StringComparer.Ordinal));
     }
-
+    // Завантажує інформацію про конфлікти з локального сховища.
     private async Task LoadConflictsAsync()
     {
         if (_conflictsLoaded) return;
         _conflictsLoaded = true;
-
         try
         {
             var json = await JS.InvokeAsync<string?>("localStorage.getItem", ConflictStorageKey);
@@ -1111,7 +977,7 @@
             _conflictStorage = new();
         }
     }
-
+    // Зберігає конфлікти у локальне сховище браузера.
     private async Task PersistConflictsAsync()
     {
         try
@@ -1128,15 +994,13 @@
         }
         catch
         {
-
         }
     }
-
     private void SyncCurrentConflict()
     {
         _conflictStorage.TryGetValue(CurrentConflictKey, out _currentConflict);
     }
-
+    // Перемикає видимість деталей конфлікту.
     private async Task ToggleConflictDetails()
     {
         if (_currentConflict is null) return;
@@ -1144,7 +1008,7 @@
         _conflictStorage[CurrentConflictKey] = _currentConflict;
         await PersistConflictsAsync();
     }
-
+    // Очищає збережений конфлікт для поточного фільтра.
     private async Task ClearConflictDetails()
     {
         if (_conflictStorage.Remove(CurrentConflictKey))
@@ -1153,40 +1017,35 @@
             await PersistConflictsAsync();
         }
     }
+    // Скидає стан редактора.
     private void CancelEdit()
     {
         _edit = null;
         _extraAssignments.Clear();
     }
-
+    // Додає додаткове призначення для дублювання заняття.
     private void AddExtraAssignment()
     {
         _extraAssignments.Add(new ExtraDraftSelection());
     }
-
     private void RemoveExtraAssignment(ExtraDraftSelection item)
     {
         _extraAssignments.Remove(item);
     }
-
     private sealed class ExtraDraftSelection
     {
         public int? GroupId { get; set; }
         public int? TeacherId { get; set; }
     }
-
     private static DateOnly FirstMonday(DateOnly d)
         => d.AddDays(-(((int)d.DayOfWeek + 6) % 7));
-
     private DateOnly DayToDate(int dayNumber)
     {
-
         var dow = (DayOfWeek)dayNumber;
         var currentMonday = FirstMonday(_weekStart);
         var byDow = (int)dow == 0 ? 6 : ((int)dow - 1);
         return currentMonday.AddDays(byDow);
     }
-
     private sealed class ConflictDetails
     {
         public string Message { get; init; } = string.Empty;
@@ -1196,7 +1055,6 @@
         public bool Expanded { get; set; } = true;
         public string ToggleLabel => Expanded ? "Згорнути" : "Розгорнути";
     }
-
     private sealed record EffectiveSlotsResponse(int? courseId, bool usingCourseSpecific, List<TimeSlotDto> slots);
 
 static string CssByCode(string code) => code switch
@@ -1206,7 +1064,6 @@ static string CssByCode(string code) => code switch
         "BREAK" => "brk",
         _ => ""
     };
-
     private Task PrevWeek() { _weekStart = _weekStart.AddDays(-7); return Reload(); }
     private Task NextWeek() { _weekStart = _weekStart.AddDays(+7); return Reload(); }
     private void ResetFilters()
@@ -1214,10 +1071,8 @@ static string CssByCode(string code) => code switch
         _teacherId = _groupId = _roomId = _courseId = null;
         StateHasChanged();
     }
-
     private DraftValidationReportDto? ParseWarningReport(string? raw)
     {
-
         if (string.IsNullOrWhiteSpace(raw)) return null;
         try
         {
@@ -1228,27 +1083,22 @@ static string CssByCode(string code) => code switch
             return null;
         }
     }
-
     private static (int errors, int warnings) CountIssues(DraftValidationReportDto report)
     {
-
         var errors = report.Issues.Count(i => string.Equals(i.Severity, "error", StringComparison.OrdinalIgnoreCase));
         var warnings = report.Issues.Count(i => string.Equals(i.Severity, "warning", StringComparison.OrdinalIgnoreCase));
         return (errors, warnings);
     }
-
     private void ToggleWarningPanel(int itemId)
     {
-
         if (_expandedWarningSlots.Contains(itemId))
             _expandedWarningSlots.Remove(itemId);
         else
             _expandedWarningSlots.Add(itemId);
     }
-
+    // Перемикає режим редагування без обмежень.
     private void HandleUnrestrictedChange(ChangeEventArgs e)
     {
-
         var enabled = e.Value switch
         {
             bool b => b,
@@ -1264,7 +1114,6 @@ static string CssByCode(string code) => code switch
 
 }
 
-
 <div class="toolbar">
     <div class="toolbar-filters">
         <select class="select select--narrow" @bind="_teacherId">
@@ -1277,7 +1126,6 @@ static string CssByCode(string code) => code switch
                 }
             }
         </select>
-
         <select class="select" @bind="_groupId">
             <option value="">Обрати групу</option>
             @foreach (var g in CourseScopedGroups())
@@ -1285,7 +1133,6 @@ static string CssByCode(string code) => code switch
                 <option value="@g.Id">@g.Name</option>
             }
         </select>
-
         <select class="select" @bind="_roomId">
             <option value="">Обрати аудиторію</option>
             @if (_meta is not null)
@@ -1296,7 +1143,6 @@ static string CssByCode(string code) => code switch
                 }
             }
         </select>
-
         <select class="select" @bind="_courseId">
             <option value="">Обрати курс</option>
             @if (_meta is not null)
@@ -1307,13 +1153,11 @@ static string CssByCode(string code) => code switch
                 }
             }
         </select>
-
         <input type="date"
                class="select"
                value="@_weekStart.ToString("yyyy-MM-dd")"
                @onchange="e => _weekStart = FirstMonday(DateOnly.Parse((string)e.Value!))" />
     </div>
-
     <div class="toolbar-actions">
         <button class="btn btn-primary" @onclick="Reload">Оновити</button>
         <button class="btn btn-ghost" @onclick="ResetFilters">Скинути</button>
@@ -1323,7 +1167,6 @@ static string CssByCode(string code) => code switch
     </div>
 </div>
 
-
 <div class="actions">
     <div class="group">
         <div class="caption">Публікація</div>
@@ -1331,11 +1174,8 @@ static string CssByCode(string code) => code switch
             <button class="btn btn-primary" @onclick="PublishWeek">Опублікувати тиждень у розклад</button>
         </div>
         <div class="hint">Публікуються всі чернетки за обраний тиждень (по всіх викладачах).</div>
-
     </div>
 </div>
-
-
 
 <div class="unrestricted-toggle">
     <label class="unrestricted-check">
@@ -1368,7 +1208,6 @@ static string CssByCode(string code) => code switch
                 <button class="btn btn-ghost btn-sm" type="button" @onclick="ClearConflictDetails">Очистити</button>
             </div>
         </div>
-
         @if (_currentConflict.Expanded && _currentConflict.Errors.Count > 0)
         {
             <ul class="conflict-list">
@@ -1378,7 +1217,6 @@ static string CssByCode(string code) => code switch
                 }
             </ul>
         }
-
         @if (_currentConflict.Expanded && _currentConflict.Warnings.Count > 0)
         {
             <div class="conflict-warnings">
@@ -1407,7 +1245,6 @@ else
     var lookup = BuildLookup(filtered);
     var monday = _weekStart;
     var isoWeek = ISOWeek.GetWeekOfYear(monday.ToDateTime(TimeOnly.MinValue));
-
     if (groups.Count == 0)
     {
         <div class="alert alert-info">Немає груп для відображення. Виберіть параметри через фільтри.</div>
@@ -1422,7 +1259,6 @@ else
             <div class="teacher-drafts-print-title">Розклад навчальних занять (чернетка)</div>
             <div class="teacher-drafts-print-dates">Тиждень № @isoWeek | @monday.ToString("dd.MM.yyyy") - @monday.AddDays(6).ToString("dd.MM.yyyy")</div>
         </div>
-
         <div class="teacher-drafts-table-wrapper">
             <table class="teacher-drafts-table">
                 <thead>
@@ -1526,7 +1362,6 @@ else
                                                 {
                                                 <div class="td-topic text-muted">@item.TopicCode</div>
                                                 }
-
                                                 @if (item.TeacherNames is { Count: > 0 })
                                                 {
                                                     <div class="td-cell-teacher">
@@ -1636,21 +1471,18 @@ else
                        value="@_edit!.Date.ToString("yyyy-MM-dd")"
                        @onchange="e => _edit = _edit! with { Date = DateOnly.Parse((string)e.Value!) }" />
             </div>
-
             <div class="editor-field">
                 <label>Початок</label>
                 <input type="time" class="select"
                        value="@_edit!.TimeStart"
                        @onchange="e => _edit = _edit! with { TimeStart = (string)e.Value! }" />
             </div>
-
             <div class="editor-field">
                 <label>Кінець</label>
                 <input type="time" class="select"
                        value="@_edit!.TimeEnd"
                        @onchange="e => _edit = _edit! with { TimeEnd = (string)e.Value! }" />
             </div>
-
             <div class="editor-field">
                 <label>Група</label>
                 <select class="select" @onchange="e => _edit = _edit! with { GroupId = int.Parse((string)e.Value!) }">
@@ -1660,7 +1492,6 @@ else
                     }
                 </select>
             </div>
-
             <div class="editor-field">
                 <label>Викладач</label>
                 <select class="select" @onchange="e => _edit = _edit! with { TeacherId = int.TryParse((string?)e.Value, out var v) ? v : (int?)null }">
@@ -1671,7 +1502,6 @@ else
                     }
                 </select>
             </div>
-
             <div class="editor-field editor-field--wide">
                 <label>
                     Модуль
@@ -1714,7 +1544,6 @@ else
                     }
                 </select>
             </div>
-
             <div class="editor-field">
                 <label>Тип заняття</label>
                 <select class="select" @onchange="OnLessonTypeChanged">
@@ -1726,7 +1555,6 @@ else
                     }
                 </select>
             </div>
-
             <div class="editor-field editor-field--wide editor-field--room-left">
                 <label>
                     Аудиторія
@@ -1739,7 +1567,6 @@ else
                     }
                 </select>
             </div>
-
             <div class="editor-field editor-field--full editor-lock">
                 <label class="ck">
                     <input type="checkbox" checked="@_edit.IsLocked"
@@ -1748,10 +1575,8 @@ else
                 </label>
             </div>
         </div>
-
         @if (_edit?.Id is null)
         {
-            
             <div class="extra-duplicates">
                 <div class="extra-duplicates-header">Дублювання пари</div>
                 <p class="extra-duplicates-hint">Вкажіть додаткові групи та викладачів, щоб автоматично створити копії під час збереження.</p>
@@ -1759,7 +1584,6 @@ else
                 {
                     <div class="extra-duplicates-empty">Додаткові дублікати не вибрані.</div>
                 }
-
                 @foreach (var extra in _extraAssignments)
                 {
                     <div class="extra-duplicates-row" @key="extra">
@@ -1773,7 +1597,6 @@ else
                                 }
                             </select>
                         </div>
-
                         <div>
                             <label>Обрати додаткового вчителя</label>
                             <select class="select" @onchange="e => extra.TeacherId = int.TryParse((string?)e.Value, out var t) ? t : (int?)null">
@@ -1784,18 +1607,15 @@ else
                                 }
                             </select>
                         </div>
-
                         <button type="button"
                                 class="btn btn-ghost extra-duplicates-remove"
                                 title="Прибрати дубль"
                                 @onclick="() => RemoveExtraAssignment(extra)">×</button>
                     </div>
                 }
-
                 <button type="button" class="btn btn-secondary extra-duplicates-add" @onclick="AddExtraAssignment">Додати дубль</button>
             </div>
         }
-
         <div class="editor-actions">
             <button class="btn btn-primary" @onclick="SaveEdit">Зберегти</button>
             @if (_edit?.Id is int)
@@ -1812,12 +1632,10 @@ else
     .page-title {
         margin: .5rem 0 1rem;
     }
-
     .page-title .weak {
         color: #64748b;
         font-weight: 400;
     }
-
     .draft-pill {
         display: inline-flex;
         align-items: center;
@@ -1831,7 +1649,6 @@ else
         text-transform: uppercase;
         letter-spacing: .02em;
     }
-
     .toolbar {
         display: grid;
         grid-template-columns: 1fr auto;
@@ -1839,14 +1656,12 @@ else
         align-items: center;
         margin-bottom: 12px;
     }
-
     .toolbar-filters {
         display: flex;
         flex-wrap: wrap;
         gap: .5rem;
         align-items: center;
     }
-
     .toolbar-actions {
         display: flex;
         align-items: center;
@@ -1854,7 +1669,6 @@ else
         flex-wrap: nowrap;
         justify-content: flex-end;
     }
-
     .select {
         min-width: 160px;
         padding: .46rem .6rem;
@@ -1862,63 +1676,52 @@ else
         border-radius: 10px;
         background: #fff;
     }
-
     .select--narrow {
         width: 240px;
         max-width: 240px;
     }
-
     .toolbar .select {
         height: 44px;
     }
-
     .toolbar .btn {
         height: 44px;
         display: inline-flex;
         align-items: center;
     }
-
     @@media (max-width: 1100px) {
         .toolbar {
             grid-template-columns: 1fr;
         }
-
         .toolbar-actions {
             justify-content: flex-start;
         }
     }
-
     .actions {
         display: flex;
         flex-direction: column;
         gap: 10px;
         margin-bottom: 12px;
     }
-
     .actions .group {
         background: #fff;
         border: 1px solid #e5e7eb;
         border-radius: 12px;
         padding: 10px 12px;
     }
-
     .actions .caption {
         font-weight: 700;
         margin-bottom: .35rem;
     }
-
     .actions .row {
         display: flex;
         gap: .5rem;
         align-items: center;
         flex-wrap: wrap;
     }
-
     .actions .hint {
         color: #64748b;
         font-size: .875rem;
     }
-
     .btn {
         padding: .5rem .9rem;
         border-radius: 10px;
@@ -1926,18 +1729,15 @@ else
         cursor: pointer;
         font-weight: 600;
     }
-
     .btn-primary {
         background: #111827;
         color: #fff;
     }
-
     .btn-ghost {
         background: #fff;
         color: #111827;
         border-color: #d1d5db;
     }
-
     .btn-sm {
         padding: .2rem .5rem;
         font-size: .85rem;
@@ -1954,51 +1754,42 @@ else
         background: #eef2ff;
         color: #4338ca;
     }
-
     .td-room-mode {
         margin: 4px 0;
         font-size: .78rem;
         font-weight: 600;
     }
-
     .td-room-mode--required {
         color: #1f2937;
     }
-
     .td-room-mode--optional {
         color: #6b7280;
     }
-
     .alert {
         margin: 8px 0;
         padding: 10px 12px;
         border-radius: 10px;
     }
-
     .alert-ok {
         background: #ecfdf5;
         border: 1px solid #a7f3d0;
         color: #065f46;
     }
-
     .alert-err {
         background: #fef2f2;
         border: 1px solid #fecaca;
         color: #991b1b;
     }
-
     .alert-conflict {
         background: #fff7ed;
         border: 1px solid #fed7aa;
         color: #7c2d12;
     }
-
     .alert-info {
         background: #eff6ff;
         border: 1px solid #bfdbfe;
         color: #1e3a8a;
     }
-
     .conflict-head {
         display: flex;
         justify-content: space-between;
@@ -2006,55 +1797,45 @@ else
         flex-wrap: wrap;
         gap: 8px;
     }
-
     .conflict-meta {
         color: #64748b;
         font-size: .85rem;
         margin-top: 2px;
     }
-
     .conflict-actions {
         display: inline-flex;
         gap: 6px;
     }
-
     .conflict-list {
         margin: 8px 0 0;
         padding-left: 20px;
         color: #1f2937;
     }
-
     .conflict-warnings {
         margin-top: 8px;
     }
-
     .conflict-warnings-title {
         font-weight: 600;
         color: #92400e;
         margin-bottom: 4px;
     }
-
     .empty {
         color: #64748b;
     }
-
     .teacher-drafts-print-header {
         text-align: center;
         margin: 1.2rem 0 .8rem;
     }
-
     .teacher-drafts-print-title {
         text-transform: uppercase;
         font-weight: 700;
         font-size: 1.05rem;
     }
-
     .teacher-drafts-print-dates {
         color: #475569;
         font-size: .85rem;
         margin-top: .15rem;
     }
-
     .teacher-drafts-table-wrapper {
         overflow-x: auto;
         border: 1px solid #e2e8f0;
@@ -2062,14 +1843,12 @@ else
         background: #fff;
         padding: 1rem;
     }
-
     .teacher-drafts-table {
         width: 100%;
         border-collapse: collapse;
         table-layout: fixed;
         font-size: .9rem;
     }
-
     .teacher-drafts-table th,
     .teacher-drafts-table td {
         border: 1px solid #d9e2ec;
@@ -2077,72 +1856,59 @@ else
         vertical-align: top;
         background: #fff;
     }
-
     .teacher-drafts-table th {
         background: #f8fafc;
         text-align: center;
         font-weight: 700;
         font-size: .85rem;
     }
-
     .td-head-block,
     .td-head-groups {
         text-transform: uppercase;
     }
-
     .td-group-col {
         font-weight: 600;
         text-align: center;
     }
-
     .td-day-col {
         width: 160px;
     }
-
     .td-slot-col {
         width: 125px;
     }
-
     .td-cell {
         min-width: 270px;
         background: #fff;
-
         overflow-x: hidden;
         overflow-y: visible;
     }
-
     .td-day-cell,
     .td-slot-cell {
         background: #f1f5f9;
         text-align: center;
     }
-
     .td-day-name {
         font-weight: 700;
         user-select: none;
         -webkit-user-select: none;
     }
-
     .td-day-date {
         font-size: .78rem;
         color: #64748b;
         user-select: none;
         -webkit-user-select: none;
     }
-
     .td-slot-number {
         user-select: none;
         -webkit-user-select: none;
         font-weight: 700;
     }
-
     .td-slot-time {
         user-select: none;
         -webkit-user-select: none;
         font-size: .78rem;
         color: #64748b;
     }
-
     .td-cell-body {
         min-height: 120px;
         display: flex;
@@ -2153,15 +1919,11 @@ else
         border: 1px solid transparent;
         background: #fff;
         transition: box-shadow .15s ease;
-
         overflow-x: hidden;
         overflow-y: visible;
         position: relative;
     }
-
-
     .td-cell-body > * { min-width: 0; }
-
     .td-cell-body--empty {
         justify-content: center;
         align-items: center;
@@ -2170,7 +1932,6 @@ else
         background: #f8fafc;
         font-style: italic;
     }
-
     .td-cell-body--c1  { border-color: #9dcfff; background: #c9e6ff; }
     .td-cell-body--c2  { border-color: #8feabc; background: #b6f4d2; }
     .td-cell-body--c3  { border-color: #ffc76c; background: #ffe2a9; }
@@ -2186,7 +1947,6 @@ else
     .td-cell-body--c14 { border-color: #b5e57a; background: #d6f5a3; }
     .td-cell-body--c15 { border-color: #ffbd8b; background: #ffd2b3; }
     .td-cell-body--c16 { border-color: #b3becd; background: #ced7e5; }
-
     .td-cell-body--brk,
     .td-cell-body--break {
         border-color: #e2e8f0;
@@ -2196,7 +1956,6 @@ else
         justify-content: center;
         align-items: center;
     }
-
     .td-cell-body--can,
     .td-cell-body--canceled {
         border-color: #fecaca;
@@ -2204,18 +1963,13 @@ else
         color: #b91c1c;
         text-decoration: line-through;
     }
-
-
     .td-cell-body--locked { box-shadow: inset 4px 0 0 #2563eb; }
     .td-cell-body--published { box-shadow: 0 0 0 1px #22c55e inset; }
-
-
     .td-cell--drag-source { outline: 2px dashed #2563eb; outline-offset: -4px; }
     .td-cell--drop-free { outline: 2px solid #10b981; outline-offset: -4px; }
     .td-cell--drop-swap { outline: 2px solid #f97316; outline-offset: -4px; }
     .td-cell--locked { cursor: not-allowed; }
     .td-cell-body { position: relative; }
-
     .td-cell-body--draggable {
         cursor: grab;
         user-select: none;
@@ -2224,7 +1978,6 @@ else
     .td-cell-body--dragging { opacity: .6; cursor: grabbing; }
     .td-cell-body--drop-free { box-shadow: inset 0 0 0 2px #10b981; }
     .td-cell-body--drop-swap { box-shadow: inset 0 0 0 2px #f97316; }
-
     .td-cell-drag-handle {
         position: absolute;
         top: 6px;
@@ -2245,9 +1998,7 @@ else
         -webkit-user-select: none;
         box-shadow: 0 1px 2px rgba(15, 23, 42, .12);
     }
-
     .td-cell-drag-handle:active { cursor: grabbing; }
-
     .td-cell-title {
         font-weight: 600;
         text-transform: uppercase;
@@ -2256,13 +2007,11 @@ else
         word-break: break-word;
         overflow-wrap: anywhere;
     }
-
     .td-cell-course {
         font-weight: 500;
         font-size: .78rem;
         margin-top: .1rem;
     }
-
     .td-cell-teacher {
         font-weight: 500;
         font-size: .85rem;
@@ -2272,8 +2021,6 @@ else
         flex-direction: column;
         gap: 2px;
     }
-
-
     .td-cell-meta {
         font-size: .78rem;
         color: #475569;
@@ -2285,8 +2032,6 @@ else
         word-break: break-word;
         overflow-wrap: anywhere;
     }
-
-
     .td-cell-flag {
         margin-top: .4rem;
         display: inline-block;
@@ -2297,9 +2042,7 @@ else
         background: rgba(14, 165, 233, .16);
         border-radius: 999px;
     }
-
     .td-cell-warning { font-size: .75rem; color: #b45309; }
-
     .td-cell-footer {
         margin-top: auto;
         display: flex;
@@ -2307,7 +2050,6 @@ else
         align-items: center;
         gap: .4rem;
     }
-
     .td-cell-actions { display: flex; justify-content: flex-end; gap: 8px; }
     .td-empty { font-weight: 500; user-select: none; -webkit-user-select: none; }
     .td-empty-box {
@@ -2324,7 +2066,6 @@ else
         background: #fff;
     }
     .td-empty-add:hover { background: #f8fafc; }
-
     .badge {
         display: inline-block;
         padding: 2px 8px;
@@ -2337,7 +2078,6 @@ else
     }
     .badge-draft { background: #f1f5f9; color: #475569; }
     .badge-published { background: #ecfdf5; border-color: #bbf7d0; color: #047857; }
-
     .week-nav {
         display: flex;
         align-items: center;
@@ -2349,9 +2089,7 @@ else
         border: 1px solid #e5e7eb;
         border-radius: 16px;
     }
-
     .week-label { color: #475569; font-weight: 600; }
-
     .editor-overlay {
         position: fixed;
         inset: 0;
@@ -2364,7 +2102,6 @@ else
         overflow-y: auto;
         z-index: 2400;
     }
-
     .editor {
         margin-top: 14px;
         background: #fff;
@@ -2372,7 +2109,6 @@ else
         border-radius: 12px;
         padding: 12px;
     }
-
     .editor-modal {
         margin-top: 0;
         width: min(1100px, 100%);
@@ -2381,7 +2117,6 @@ else
         overflow-y: auto;
         position: relative;
     }
-
     .editor-modal-head {
         display: flex;
         align-items: flex-start;
@@ -2389,35 +2124,29 @@ else
         gap: 10px;
         margin-bottom: 10px;
     }
-
     .editor-title { font-weight: 800; margin-bottom: 8px; }
     .editor-subtitle { color: #475569; font-size: .9rem; margin-top: 4px; }
     .editor-close { min-width: 42px; height: 42px; font-size: 1.35rem; padding: 0 .6rem; }
-
     .editor-grid {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
         gap: 12px;
     }
-
     .editor-field {
         display: flex;
         flex-direction: column;
         gap: 6px;
         min-width: 0;
     }
-
     .editor-field--wide { grid-column: span 2; }
     .editor-field--room-left { grid-column: 1 / span 2; justify-self: start; }
     .editor-field--align-right { justify-self: end; }
-
     .editor-field label {
         display: flex;
         align-items: center;
         gap: 6px;
         font-weight: 600;
     }
-
     .editor-code {
         display: inline-flex;
         align-items: center;
@@ -2430,48 +2159,36 @@ else
         line-height: 1.2;
         white-space: nowrap;
     }
-
     .editor-grid .select,
     .editor-grid input.select {
         width: 100%;
         min-width: 0;
         max-width: 100%;
     }
-
     .editor-grid select { text-overflow: ellipsis; }
-
     .editor-grid select option { white-space: normal; }
-
     .editor-field--full { grid-column: 1 / -1; }
-
     .td-room-mode {
         margin-left: auto;
         font-size: .75rem;
         font-weight: 600;
         white-space: nowrap;
     }
-
     .td-room-mode--required { color: #1f2937; }
     .td-room-mode--optional { color: #6b7280; }
-
     @@media (max-width: 768px) {
         .editor-field--wide { grid-column: span 1; }
         .editor-field--room-left { grid-column: span 1; }
         .editor-lock { justify-content: flex-start; }
     }
-
     .editor-lock {
         flex-direction: row;
         align-items: center;
         justify-content: flex-end;
         gap: 8px;
     }
-
     .ck { display: inline-flex; align-items: center; gap: .4rem; }
-
     .editor-actions { margin-top: 10px; display: flex; gap: 8px; }
-
-
     .extra-duplicates {
         margin-top: 16px;
         padding: 12px;
@@ -2504,7 +2221,6 @@ else
         padding: 0 .5rem;
     }
     .extra-duplicates-add { align-self: flex-start; }
-
     .td-edit-btn {
         width: 30px;
         height: 30px;
@@ -2515,8 +2231,6 @@ else
         border-radius: 50%;
     }
     .td-edit-icon { display: inline-block; font-size: 1rem; line-height: 1; }
-
-
     .td-slot-alert {
         margin-top: 6px;
         border: 1px solid #fcd34d;
@@ -2528,12 +2242,10 @@ else
         gap: 6px;
         width: 100%;
         box-sizing: border-box;
-
         max-width: 100%;
         overflow-x: hidden;
         overflow-y: visible;
     }
-
     .td-slot-alert-head {
         display: flex;
         justify-content: space-between;
@@ -2542,7 +2254,6 @@ else
         flex-wrap: wrap;
     }
     .td-slot-alert-head > * { min-width: 0; }
-
     .td-slot-alert-toggle {
         background: none;
         border: none;
@@ -2559,7 +2270,6 @@ else
         text-align: left;
     }
     .td-slot-alert-toggle:hover { color: #92400e; }
-
     .td-slot-alert-summary {
         display: flex;
         flex-wrap: wrap;
@@ -2567,7 +2277,6 @@ else
         font-size: .78rem;
         color: #92400e;
     }
-
     .td-slot-alert-badge {
         display: inline-flex;
         align-items: center;
@@ -2582,15 +2291,12 @@ else
     }
     .td-slot-alert-badge--error { background: #fee2e2; border-color: #f87171; color: #b91c1c; }
     .td-slot-alert-badge--warn  { background: #fef3c7; border-color: #facc15; color: #92400e; }
-
     .td-slot-alert-time {
         font-style: italic;
         white-space: normal;
         word-break: break-word;
         overflow-wrap: anywhere;
     }
-
-
     .td-slot-alert-body {
         display: flex;
         flex-direction: column;
@@ -2598,7 +2304,6 @@ else
         max-height: none;
         overflow: visible;
     }
-
     .td-slot-issue {
         border-radius: 8px;
         padding: 6px 8px;
@@ -2606,11 +2311,8 @@ else
     }
     .td-slot-issue--error   { border-color: #f87171; background: #fee2e2; color: #7f1d1d; }
     .td-slot-issue--warning { border-color: #facc15; background: #fef3c7; color: #78350f; }
-
     .td-slot-issue-title { font-weight: 600; margin-bottom: 2px; }
     .td-slot-issue-text  { font-size: .78rem; line-height: 1.3; }
-
-
     .unrestricted-toggle {
         margin: 16px 0;
         padding: 12px;
@@ -2630,27 +2332,22 @@ else
     }
     .unrestricted-check input { width: 20px; height: 20px; }
     .unrestricted-hint { font-size: .82rem; color: #b45309; }
-
-
     .td-slot-alert {
         padding: 12px;
         gap: 10px;
         overflow: visible;
         word-break: break-word;
     }
-
     .td-slot-alert-body {
         max-height: none;
         overflow: visible;
         padding-right: 0;
         gap: 10px;
     }
-
     .td-slot-issue {
         padding: 10px 14px;
         word-break: break-word;
     }
-
     .td-slot-issue-text {
         word-break: break-word;
     }

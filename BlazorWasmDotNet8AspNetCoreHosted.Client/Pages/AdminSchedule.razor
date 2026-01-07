@@ -92,7 +92,6 @@ else
                 </div>
             </div>
         </div>
-
         <div class="mt-3 border rounded-3 p-3 bg-light">
             <div class="d-flex flex-column flex-md-row justify-content-between align-items-start align-items-md-center gap-3">
                 <div>
@@ -186,7 +185,6 @@ else
                 Розклад очищується окремо і не зачіпає закріплені заняття.
             </div>
         </div>
-
         @if (!string.IsNullOrWhiteSpace(ok))
         {
             <div class="alert alert-success mt-3">
@@ -231,7 +229,6 @@ else
         {
             <div class="alert alert-danger mt-3">@error</div>
         }
-
         @if (_currentConflict is not null)
         {
             <div class="alert alert-warning mt-3">
@@ -275,11 +272,9 @@ else
                 }
             </div>
         }
-
         @{
             var rows = ViewItems.ToList();
         }
-
         <div class="d-flex flex-column flex-md-row justify-content-between align-items-start align-items-md-center gap-2 mt-3">
             <div class="small text-muted">
                 Показано @rows.Count із @tableItems.Count записів.
@@ -292,7 +287,6 @@ else
                        @bind:event="oninput" />
             </div>
         </div>
-
         <div class="table-responsive mt-3">
             <table class="table table-sm align-middle">
                 <thead>
@@ -361,16 +355,12 @@ else
 @code
 {
     private MetaResponseDto? meta;
-
     private int breakTypeId;
     private int canceledTypeId;
-
     private DateOnly _selectedDate = DateOnly.FromDateTime(DateTime.Today);
     private WeekPreset _daysPreset = WeekPreset.MonFri;
-
     private int? _selectedCourseId;
     private readonly List<ModuleWeekRow> _moduleWeekRows = new();
-
     private string? ok;
     private string? error;
     private List<string> okWarnings = new();
@@ -387,11 +377,9 @@ else
     private readonly List<TeacherDraftItemDto> draftItems = new();
     private readonly List<ScheduleItemDto> publishedItems = new();
     private readonly List<TableItem> tableItems = new();
-
     private string _search = string.Empty;
     private string _sortField = SortByDate;
     private bool _sortAsc = true;
-
     private ConflictDetails? _currentConflict;
     private Dictionary<string, ConflictDetails> _conflictStorage = new();
     private bool _conflictsLoaded;
@@ -401,7 +389,6 @@ else
     {
         PropertyNameCaseInsensitive = true
     };
-
     private const string SortById = nameof(TeacherDraftItemDto.Id);
     private const string SortByDate = nameof(TeacherDraftItemDto.Date);
     private const string SortByTime = nameof(TeacherDraftItemDto.TimeStart);
@@ -411,57 +398,46 @@ else
     private const string SortByRoom = nameof(TeacherDraftItemDto.Room);
     private const string SortByLessonType = nameof(TeacherDraftItemDto.LessonTypeName);
     private const string SortByStatus = nameof(TeacherDraftItemDto.Status);
-
+    // Початкове завантаження метаданих і станів сторінки.
     protected override async Task OnInitializedAsync()
     {
         meta = await Api.GetMeta();
-
         if (meta is null)
         {
             error = "Не вдалося завантажити метадані.";
             return;
         }
-
         _calendarLookup = meta.Calendar
             .Where(c => c.CourseId is null && c.GroupId is null)
             .Select(c => new { Date = DateOnly.ParseExact(c.Date, "yyyy-MM-dd", CultureInfo.InvariantCulture), c.IsWorkingDay })
             .GroupBy(x => x.Date)
             .ToDictionary(g => g.Key, g => g.First().IsWorkingDay);
-
         await RestorePersistedAutoGenConfigAsync(restoreCourseSelection: true);
-
         if (_selectedCourseId is null && meta.Courses.Count == 1)
         {
             _selectedCourseId = meta.Courses[0].Id;
             BuildModuleWeekRows();
         }
-
         breakTypeId = meta.LessonTypes.FirstOrDefault(x => x.Code == "BREAK")?.Id ?? 0;
         canceledTypeId = meta.LessonTypes.FirstOrDefault(x => x.Code == "CANCELED")?.Id ?? 0;
-
         await LoadConflictsAsync();
         await LoadWeek();
         await RestorePersistedAutoGenStatusAsync();
     }
-
     private string CurrentWeekKey => GetMonday(_selectedDate).ToString("yyyy-MM-dd");
-
     private bool IsBreak(int lessonTypeId) => lessonTypeId == breakTypeId;
     private bool IsCanceled(int lessonTypeId) => lessonTypeId == canceledTypeId;
-
-
     private bool CanAutoGen
         => _selectedCourseId is int
            && _moduleWeekRows.Any(row => row.Selected && row.Hours > 0);
-
+    // Реагує на зміну обраного курсу для автогенерації.
     private async Task OnSelectedCourseChanged()
     {
         BuildModuleWeekRows();
-
         await RestorePersistedAutoGenConfigAsync(restoreCourseSelection: false);
         await PersistAutoGenConfigAsync();
     }
-
+    // Формує список модулів та годин для поточного курсу.
     private void BuildModuleWeekRows()
     {
         _moduleWeekRows.Clear();
@@ -469,25 +445,22 @@ else
         {
             return;
         }
-
         var modules = meta.Modules
             .Where(m => m.CourseId == courseId || m.CourseIds.Contains(courseId))
             .OrderBy(m => m.Code)
             .ThenBy(m => m.Name)
             .Select(m => new ModuleWeekRow(m.Id, $"{m.Code} — {m.Name}"))
             .ToList();
-
         _moduleWeekRows.AddRange(modules);
     }
-
-    
+    // Формує опис діапазону тижня для генерації.
     private string GetGenerationRangeDescription()
     {
         var weekStart = GetMonday(_selectedDate);
         var weekEnd = weekStart.AddDays(6);
         return $"Тиждень: {weekStart:dd.MM.yyyy} – {weekEnd:dd.MM.yyyy}";
     }
-
+    // Скидає статуси повідомлень та, за потреби, збережений стан.
     private async Task ResetStatusAsync(bool clearPersisted = true)
     {
         ok = error = null;
@@ -499,7 +472,7 @@ else
             await RemovePersistedAutoGenStatusAsync();
         }
     }
-
+    // Встановлює повідомлення успіху та опційні попередження.
     private async Task SetOkMessageAsync(string message, IEnumerable<string>? warnings = null, IEnumerable<AutoGenGapDetail>? gapDetails = null, bool persist = true)
     {
         ok = message;
@@ -511,12 +484,12 @@ else
             await PersistAutoGenStatusAsync();
         }
     }
-
+    // Перемикає видимість попереджень після успіху.
     private void ToggleOkWarnings()
     {
         okWarningsExpanded = !okWarningsExpanded;
     }
-
+    // Розбирає попередження у структуру для відображення.
     private (string Message, string? Reason) ParseWarning(string warning)
     {
         const string marker = "Причина:";
@@ -525,12 +498,11 @@ else
         {
             return (warning, null);
         }
-
         var message = warning[..idx].Trim();
         var reason = warning[(idx + marker.Length)..].Trim();
         return (string.IsNullOrWhiteSpace(message) ? warning : message, string.IsNullOrWhiteSpace(reason) ? null : reason);
     }
-
+    // Зберігає повідомлення про автогенерацію у сховищі.
     private async Task PersistAutoGenStatusAsync()
     {
         var entry = BuildPersistedAutoGenStatus();
@@ -539,12 +511,11 @@ else
             await RemovePersistedAutoGenStatusAsync();
             return;
         }
-
         var statuses = await LoadPersistedAutoGenStatusesAsync();
         statuses[CurrentWeekKey] = entry;
         await SavePersistedAutoGenStatusesAsync(statuses);
     }
-
+    // Видаляє збережений статус автогенерації.
     private async Task RemovePersistedAutoGenStatusAsync()
     {
         var statuses = await LoadPersistedAutoGenStatusesAsync();
@@ -552,10 +523,9 @@ else
         {
             return;
         }
-
         await SavePersistedAutoGenStatusesAsync(statuses);
     }
-
+    // Завантажує всі збережені статуси автогенерації.
     private async Task<Dictionary<string, PersistedAutoGenStatus>> LoadPersistedAutoGenStatusesAsync()
     {
         try
@@ -565,10 +535,8 @@ else
             {
                 stored = await ReadStorageAsync(AutoGenStatusLocalStorageKey, useLocal: true);
             }
-
             if (string.IsNullOrWhiteSpace(stored))
                 return new();
-
             var statuses = JsonSerializer.Deserialize<Dictionary<string, PersistedAutoGenStatus>>(stored, AutoGenStatusJsonOptions);
             return statuses ?? new();
         }
@@ -583,7 +551,7 @@ else
             return new();
         }
     }
-
+    // Зберігає статуси автогенерації у storage.
     private async Task SavePersistedAutoGenStatusesAsync(Dictionary<string, PersistedAutoGenStatus> statuses)
     {
         if (statuses.Count == 0)
@@ -591,7 +559,6 @@ else
             await ClearPersistedAutoGenStorageAsync();
             return;
         }
-
         var json = JsonSerializer.Serialize(statuses, AutoGenStatusJsonOptions);
         try
         {
@@ -602,7 +569,7 @@ else
         {
         }
     }
-
+    // Очищає storage для статусів автогенерації.
     private async Task ClearPersistedAutoGenStorageAsync()
     {
         try
@@ -614,55 +581,50 @@ else
         {
         }
     }
-
+    // Читає значення зі сховища браузера.
     private ValueTask<string?> ReadStorageAsync(string key, bool useLocal)
         => JS.InvokeAsync<string?>(useLocal ? "localStorage.getItem" : "sessionStorage.getItem", key);
-
+    // Записує значення у сховище браузера.
     private ValueTask SetStorageAsync(string key, string value, bool useLocal)
         => JS.InvokeVoidAsync(useLocal ? "localStorage.setItem" : "sessionStorage.setItem", key, value);
-
+    // Видаляє ключ зі сховища браузера.
     private ValueTask RemoveStorageAsync(string key, bool useLocal)
         => JS.InvokeVoidAsync(useLocal ? "localStorage.removeItem" : "sessionStorage.removeItem", key);
-
+    // Формує запис для збереження статусу автогенерації.
     private PersistedAutoGenStatus? BuildPersistedAutoGenStatus()
     {
         if (string.IsNullOrWhiteSpace(ok))
             return null;
-
         return new PersistedAutoGenStatus(
             Message: ok,
             Warnings: new List<string>(okWarnings),
             GapDetails: new List<AutoGenGapDetail>(_latestGapDetails)
         );
     }
-
+    // Відновлює останній статус автогенерації з storage.
     private async Task RestorePersistedAutoGenStatusAsync()
     {
         var statuses = await LoadPersistedAutoGenStatusesAsync();
         if (!statuses.TryGetValue(CurrentWeekKey, out var payload))
             return;
-
         await SetOkMessageAsync(payload.Message, payload.Warnings, payload.GapDetails, persist: false);
     }
-
+    // Зберігає налаштування автогенерації для тижня.
     private async Task PersistAutoGenConfigAsync()
     {
         try
         {
             var configs = await LoadPersistedAutoGenConfigsAsync();
             configs.TryGetValue(CurrentWeekKey, out var weekConfig);
-
             var selectedCourseId = _selectedCourseId;
             weekConfig ??= new PersistedWeekAutoGenConfig(
                 SelectedCourseId: selectedCourseId,
                 Courses: new Dictionary<int, PersistedCourseAutoGenConfig>()
             );
-
             if (weekConfig.SelectedCourseId != selectedCourseId)
             {
                 weekConfig = weekConfig with { SelectedCourseId = selectedCourseId };
             }
-
             if (selectedCourseId is int courseId)
             {
                 var moduleConfig = _moduleWeekRows
@@ -679,10 +641,8 @@ else
                             );
                         }
                     );
-
                 weekConfig.Courses[courseId] = new PersistedCourseAutoGenConfig(Modules: moduleConfig);
             }
-
             configs[CurrentWeekKey] = weekConfig;
             await SavePersistedAutoGenConfigsAsync(configs);
         }
@@ -690,16 +650,14 @@ else
         {
         }
     }
-
+    // Відновлює налаштування автогенерації для тижня.
     private async Task RestorePersistedAutoGenConfigAsync(bool restoreCourseSelection)
     {
         if (meta is null)
             return;
-
         var configs = await LoadPersistedAutoGenConfigsAsync();
         if (!configs.TryGetValue(CurrentWeekKey, out var weekConfig))
             return;
-
         if (restoreCourseSelection && weekConfig.SelectedCourseId is int persistedCourseId)
         {
             if (meta.Courses.Any(c => c.Id == persistedCourseId))
@@ -708,22 +666,18 @@ else
                 BuildModuleWeekRows();
             }
         }
-
         if (_selectedCourseId is not int courseId)
         {
             return;
         }
-
         if (_moduleWeekRows.Count == 0)
         {
             BuildModuleWeekRows();
         }
-
         if (!weekConfig.Courses.TryGetValue(courseId, out var courseConfig))
         {
             return;
         }
-
         foreach (var row in _moduleWeekRows)
         {
             row.Selected = false;
@@ -735,7 +689,7 @@ else
             }
         }
     }
-
+    // Завантажує збережені налаштування автогенерації.
     private async Task<Dictionary<string, PersistedWeekAutoGenConfig>> LoadPersistedAutoGenConfigsAsync()
     {
         try
@@ -745,10 +699,8 @@ else
             {
                 stored = await ReadStorageAsync(AutoGenConfigLocalStorageKey, useLocal: true);
             }
-
             if (string.IsNullOrWhiteSpace(stored))
                 return new();
-
             var configs = JsonSerializer.Deserialize<Dictionary<string, PersistedWeekAutoGenConfig>>(stored, AutoGenStatusJsonOptions);
             return configs ?? new();
         }
@@ -763,7 +715,7 @@ else
             return new();
         }
     }
-
+    // Зберігає налаштування автогенерації у storage.
     private async Task SavePersistedAutoGenConfigsAsync(Dictionary<string, PersistedWeekAutoGenConfig> configs)
     {
         if (configs.Count == 0)
@@ -771,7 +723,6 @@ else
             await ClearPersistedAutoGenConfigStorageAsync();
             return;
         }
-
         var json = JsonSerializer.Serialize(configs, AutoGenStatusJsonOptions);
         try
         {
@@ -782,7 +733,7 @@ else
         {
         }
     }
-
+    // Очищає storage для налаштувань автогенерації.
     private async Task ClearPersistedAutoGenConfigStorageAsync()
     {
         try
@@ -794,8 +745,7 @@ else
         {
         }
     }
-
-    
+    // Запускає автогенерацію чернеток для тижня.
     private async Task AutoGenDrafts()
     {
         await ResetStatusAsync();
@@ -806,20 +756,16 @@ else
                 error = "Оберіть курс для автогенерації.";
                 return;
             }
-
             var moduleHours = _moduleWeekRows
                 .Where(row => row.Selected && row.Hours > 0)
                 .GroupBy(row => row.ModuleId)
                 .ToDictionary(g => g.Key, g => g.First().Hours);
-
             if (moduleHours.Count == 0)
             {
                 error = "Оберіть хоча б один модуль і вкажіть години > 0.";
                 return;
             }
-
             await PersistAutoGenConfigAsync();
-
             var weekStart = GetMonday(_selectedDate);
             var res = await Drafts.AutogenWeek(new AutoGenRequest(
                 WeekStart: weekStart,
@@ -830,10 +776,8 @@ else
                 Days: _daysPreset,
                 ModuleHours: moduleHours
             ));
-
             var courseName = meta?.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
             var summary = $"Автогенерація тижня у чернетки (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}.";
-
             await SetOkMessageAsync(summary, res.Warnings, res.GapDetails);
             await LoadWeek();
         }
@@ -846,7 +790,7 @@ else
             error = ex.Message;
         }
     }
-
+    // Заповнює порожні слоти чернеток на тиждень.
     private async Task FillWeekDrafts()
     {
         await ResetStatusAsync();
@@ -857,20 +801,16 @@ else
                 error = "Оберіть курс для заповнення порожніх слотів.";
                 return;
             }
-
             var moduleHours = _moduleWeekRows
                 .Where(row => row.Selected && row.Hours > 0)
                 .GroupBy(row => row.ModuleId)
                 .ToDictionary(g => g.Key, g => g.First().Hours);
-
             if (moduleHours.Count == 0)
             {
                 error = "Оберіть хоча б один модуль і вкажіть години > 0.";
                 return;
             }
-
             await PersistAutoGenConfigAsync();
-
             var weekStart = GetMonday(_selectedDate);
             var res = await Drafts.AutogenWeek(new AutoGenRequest(
                 WeekStart: weekStart,
@@ -882,10 +822,8 @@ else
                 ModuleHours: moduleHours,
                 SoftFill: true
             ));
-
             var courseName = meta?.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
             var summary = $"Заповнення порожніх слотів тижня (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}.";
-
             await SetOkMessageAsync(summary, res.Warnings, res.GapDetails);
             await LoadWeek();
         }
@@ -898,7 +836,7 @@ else
             error = ex.Message;
         }
     }
-
+    // Очищає чернетки за обраний тиждень.
     private async Task ClearWeekForCurrent()
     {
         await ResetStatusAsync();
@@ -906,15 +844,12 @@ else
         {
             var monday = GetMonday(_selectedDate);
             var sunday = monday.AddDays(6);
-
             var confirm = await JS.InvokeAsync<bool>("confirm",
                 $"Очистити чернетки тижня {monday:dd.MM.yyyy} – {sunday:dd.MM.yyyy}? (всі групи)");
             if (!confirm) return;
-
             var deleted = await Drafts.ClearWeek(new ClearWeekRequest(
                 WeekStart: monday
             ));
-
             await LoadWeek();
             await SetOkMessageAsync($"Видалено {deleted} чернеток за поточний тиждень.");
         }
@@ -927,7 +862,7 @@ else
             error = ex.Message;
         }
     }
-
+    // Очищає опублікований розклад за обраний тиждень.
     private async Task ClearWeekOfficial()
     {
         await ResetStatusAsync();
@@ -935,15 +870,12 @@ else
         {
             var monday = GetMonday(_selectedDate);
             var sunday = monday.AddDays(6);
-
             var confirm = await JS.InvokeAsync<bool>("confirm",
                 $"Очистити опублікований розклад за {monday:dd.MM.yyyy} – {sunday:dd.MM.yyyy}? (всі групи)");
             if (!confirm) return;
-
             var deleted = await Api.ClearWeek(new ClearWeekRequest(
                 WeekStart: monday
             ));
-
             await SetOkMessageAsync($"Видалено {deleted} записів з опублікованого розкладу.");
         }
         catch (ApiErrorException ex)
@@ -955,18 +887,16 @@ else
             error = ex.Message;
         }
     }
-
+    // Обробляє помилки API та зберігає конфлікти.
     private async Task HandleApiError(ApiErrorException ex)
     {
         var headline = ComposeErrorHeadline(ex);
         error = headline;
-
         if (ex.StatusCode == HttpStatusCode.Conflict && (ex.Errors.Count > 0 || ex.Warnings.Count > 0))
         {
             var expanded = _conflictStorage.TryGetValue(CurrentWeekKey, out var existing)
                 ? existing.Expanded
                 : true;
-
             var details = new ConflictDetails
             {
                 Message = headline,
@@ -980,16 +910,14 @@ else
             await PersistConflictsAsync();
         }
     }
-
+    // Формує короткий заголовок помилки з деталей API.
     private static string ComposeErrorHeadline(ApiErrorException ex)
     {
         var parts = new List<string>();
-
         if (!string.IsNullOrWhiteSpace(ex.Message))
         {
             parts.Add(ex.Message.Trim());
         }
-
         var firstError = ex.Errors.FirstOrDefault(e => !string.IsNullOrWhiteSpace(e));
         if (!string.IsNullOrWhiteSpace(firstError))
         {
@@ -1003,20 +931,17 @@ else
                 parts.Add(firstWarning!.Trim());
             }
         }
-
         if (parts.Count == 0)
         {
             return "Невідома помилка.";
         }
-
         return parts.Count == 1 ? parts[0] : string.Join(": ", parts.Distinct(StringComparer.Ordinal));
     }
-
+    // Завантажує конфлікти з localStorage.
     private async Task LoadConflictsAsync()
     {
         if (_conflictsLoaded) return;
         _conflictsLoaded = true;
-
         try
         {
             var json = await JS.InvokeAsync<string?>("localStorage.getItem", ConflictStorageKey);
@@ -1034,7 +959,7 @@ else
             _conflictStorage = new();
         }
     }
-
+    // Зберігає конфлікти у localStorage.
     private async Task PersistConflictsAsync()
     {
         try
@@ -1051,15 +976,14 @@ else
         }
         catch
         {
-            
         }
     }
-
+    // Синхронізує поточний конфлікт із кешем.
     private void SyncCurrentConflict()
     {
         _conflictStorage.TryGetValue(CurrentWeekKey, out _currentConflict);
     }
-
+    // Перемикає видимість деталей конфлікту.
     private async Task ToggleConflictDetails()
     {
         if (_currentConflict is null) return;
@@ -1067,7 +991,7 @@ else
         _conflictStorage[CurrentWeekKey] = _currentConflict;
         await PersistConflictsAsync();
     }
-
+    // Очищає конфлікт для поточного тижня.
     private async Task ClearConflictDetails()
     {
         if (_conflictStorage.Remove(CurrentWeekKey))
@@ -1076,7 +1000,7 @@ else
             await PersistConflictsAsync();
         }
     }
-
+    // Визначає, чи дозволені вихідні для обраного пресету.
     private bool AllowDaysOffForPreset()
     {
         return _daysPreset switch
@@ -1086,7 +1010,7 @@ else
             _ => WeekHasCalendarDayOff(GetMonday(_selectedDate))
         };
     }
-
+    // Перевіряє, чи є вихідні дні у календарі на тиждень.
     private bool WeekHasCalendarDayOff(DateOnly monday)
     {
         for (var offset = 0; offset < 7; offset++)
@@ -1097,33 +1021,28 @@ else
                 return true;
             }
         }
-
         return false;
     }
-
+    // Повертає понеділок поточного тижня.
     private static DateOnly GetMonday(DateOnly d) => d.AddDays(-(((int)d.DayOfWeek + 6) % 7));
-
+    // Завантажує чернетки та опублікований розклад за тиждень.
     private async Task LoadWeek()
     {
         var monday = GetMonday(_selectedDate);
         var draftData = await Drafts.GetWeek(monday, null);
         var publishedData = await Api.GetWeek(monday);
-
         draftItems.Clear();
         draftItems.AddRange(draftData);
-
         publishedItems.Clear();
         publishedItems.AddRange(publishedData);
-
         tableItems.Clear();
         tableItems.AddRange(draftItems.Select(CreateTableItemFromDraft));
         tableItems.AddRange(publishedItems.Select(CreateTableItemFromPublished));
-
         ok ??= $"Завантажено {draftItems.Count} чернеток та {publishedItems.Count} опублікованих записів.";
         error = null;
         SyncCurrentConflict();
     }
-
+    // Обробляє зміну дати тижня.
     private async Task OnDateChanged(ChangeEventArgs args)
     {
         if (DateOnly.TryParse(args.Value?.ToString(), out var value))
@@ -1135,8 +1054,7 @@ else
             await RestorePersistedAutoGenStatusAsync();
         }
     }
-
-    
+    // Перемикає параметри сортування таблиці.
     private void ToggleSort(string field)
     {
         if (_sortField == field)
@@ -1149,20 +1067,16 @@ else
             _sortAsc = true;
         }
     }
-
-    
+    // Повертає піктограму напрямку сортування.
     private MarkupString HeaderIcon(string field)
         => new(_sortField == field ? $"<span class=\"ms-1\">{(_sortAsc ? "▲" : "▼")}</span>" : "");
-
     private IEnumerable<TableItem> ViewItems
         => ApplySort(ApplyFilter(tableItems));
-
-    
+    // Фільтрує рядки таблиці за пошуковим рядком.
     private IEnumerable<TableItem> ApplyFilter(IEnumerable<TableItem> seq)
     {
         if (string.IsNullOrWhiteSpace(_search)) return seq;
         var needle = _search.Trim();
-
         return seq.Where(item =>
             item.Id.ToString().Contains(needle, StringComparison.OrdinalIgnoreCase) ||
             item.Group.Contains(needle, StringComparison.OrdinalIgnoreCase) ||
@@ -1173,44 +1087,33 @@ else
             item.StatusText.Contains(needle, StringComparison.OrdinalIgnoreCase) ||
             item.SourceLabel.Contains(needle, StringComparison.OrdinalIgnoreCase));
     }
-
-    
+    // Сортує рядки таблиці за вибраним полем.
     private IEnumerable<TableItem> ApplySort(IEnumerable<TableItem> seq)
     {
         return (_sortField, _sortAsc) switch
         {
             (SortById, true) => seq.OrderBy(x => x.Id),
             (SortById, false) => seq.OrderByDescending(x => x.Id),
-
             (SortByDate, true) => seq.OrderBy(x => x.Date).ThenBy(x => x.TimeStart),
             (SortByDate, false) => seq.OrderByDescending(x => x.Date).ThenByDescending(x => x.TimeStart),
-
             (SortByTime, true) => seq.OrderBy(x => x.TimeStart),
             (SortByTime, false) => seq.OrderByDescending(x => x.TimeStart),
-
             (SortByGroup, true) => seq.OrderBy(x => x.Group),
             (SortByGroup, false) => seq.OrderByDescending(x => x.Group),
-
             (SortByModule, true) => seq.OrderBy(x => x.Module),
             (SortByModule, false) => seq.OrderByDescending(x => x.Module),
-
             (SortByTeacher, true) => seq.OrderBy(x => x.Teacher),
             (SortByTeacher, false) => seq.OrderByDescending(x => x.Teacher),
-
             (SortByRoom, true) => seq.OrderBy(x => x.Room),
             (SortByRoom, false) => seq.OrderByDescending(x => x.Room),
-
             (SortByLessonType, true) => seq.OrderBy(x => x.LessonTypeName),
             (SortByLessonType, false) => seq.OrderByDescending(x => x.LessonTypeName),
-
             (SortByStatus, true) => seq.OrderBy(x => x.StatusText),
             (SortByStatus, false) => seq.OrderByDescending(x => x.StatusText),
-
             _ => seq
         };
     }
-
-    
+    // Перетворює чернетку у рядок таблиці.
     private TableItem CreateTableItemFromDraft(TeacherDraftItemDto draft)
         => new(
             draft.Id,
@@ -1227,8 +1130,7 @@ else
             FormatDraftStatus(draft.Status),
             "Чернетка"
         );
-
-    
+    // Перетворює опублікований запис у рядок таблиці.
     private TableItem CreateTableItemFromPublished(ScheduleItemDto item)
         => new(
             item.Id,
@@ -1245,8 +1147,7 @@ else
             "Опубліковано (розклад)",
             "Розклад"
         );
-
-    
+    // Повертає назву курсу для модуля.
     private string ModuleCourseCaption(int? moduleId)
     {
         if (moduleId is null || meta is null) return string.Empty;
@@ -1255,6 +1156,7 @@ else
             ? string.Empty
             : module.CourseName;
     }
+    // Форматує статус чернетки для відображення.
     private static string FormatDraftStatus(DraftStatusDto status)
         => status switch
         {
@@ -1262,7 +1164,6 @@ else
             DraftStatusDto.Published => "Опубліковано (чернетка)",
             _ => status.ToString()
         };
-
     private sealed class ModuleWeekRow(int moduleId, string caption)
     {
         public int ModuleId { get; } = moduleId;
@@ -1270,21 +1171,17 @@ else
         public bool Selected { get; set; }
         public int Hours { get; set; }
     }
-
     private sealed record PersistedWeekAutoGenConfig(
         int? SelectedCourseId,
         Dictionary<int, PersistedCourseAutoGenConfig> Courses
     );
-
     private sealed record PersistedCourseAutoGenConfig(
         Dictionary<int, PersistedModuleSelection> Modules
     );
-
     private sealed record PersistedModuleSelection(
         bool Selected,
         int Hours
     );
-
     private sealed class ConflictDetails
     {
         public string Message { get; init; } = string.Empty;
@@ -1294,9 +1191,7 @@ else
         public bool Expanded { get; set; } = true;
         public string ToggleLabel => Expanded ? "Приховати" : "Розгорнути";
     }
-
     private sealed record PersistedAutoGenStatus(string Message, List<string> Warnings, List<AutoGenGapDetail> GapDetails);
-
     private sealed record TableItem(
         int Id,
         DateOnly Date,

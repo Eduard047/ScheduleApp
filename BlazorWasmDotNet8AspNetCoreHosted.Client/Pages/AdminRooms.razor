@@ -45,15 +45,12 @@
 
 <div class="card p-3">
     <div class="d-flex justify-content-between align-items-center mb-2 gap-2">
-        
         <div class="input-group" style="max-width:360px;">
             <span class="input-group-text">Пошук</span>
             <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / назва / місткість / корпус" />
         </div>
-
         <div class="small text-muted">Показано: @SortedAndFiltered.Count() з @items.Count</div>
     </div>
-
     <div class="table-responsive">
         <table class="table table-sm align-middle">
             <thead>
@@ -97,22 +94,18 @@
 </div>
 
 @code {
-    
+
     private string? error, ok;
     private List<RoomEditDto> items = new();
     private RoomEditDto form = new() { Id = null, Name = "", Capacity = 0, BuildingId = 0 };
     private List<BuildingEditDto> buildings = new();
-
-    
     private const string BuildingField = "Building";
     private string sortField = nameof(RoomEditDto.Name);
     private bool sortAsc = true;
-
-    
     private string? filter;
-
+    // Початкове завантаження аудиторій і корпусів.
     protected override async Task OnInitializedAsync() => await Load();
-
+    // Завантажує список аудиторій та корпусів.
     private async Task Load()
     {
         try
@@ -123,12 +116,10 @@
         }
         catch (Exception ex) { error = ex.Message; }
     }
-
-    
+    // Повертає назву корпусу за ідентифікатором.
     private static string NameOf(IEnumerable<BuildingEditDto> list, int id)
         => list.FirstOrDefault(x => x.Id == id)?.Name ?? $"#{id}";
-
-    
+    // Зберігає аудиторію через API.
     private async Task Save()
     {
         try
@@ -140,29 +131,26 @@
         }
         catch (Exception ex) { error = ex.Message; }
     }
-
-    private async Task Delete(int id)
-    {
-        try
-        {
-            var room = items.FirstOrDefault(r => r.Id == id);
-            var caption = room is null ? $"#{id}" : $"{room.Name} (#{id})";
-            var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити аудиторію {caption}? Дію не можна скасувати.");
-            if (!confirmed) return;
-
-            await Admin.DeleteRoom(id);
-            await Load();
-            ok = "Видалено.";
-        }
-        catch (Exception ex) { error = ex.Message; }
-    }
-
-
+    // Видаляє аудиторію після підтвердження.
+    private async Task Delete(int id)
+    {
+        try
+        {
+            var room = items.FirstOrDefault(r => r.Id == id);
+            var caption = room is null ? $"#{id}" : $"{room.Name} (#{id})";
+            var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити аудиторію {caption}? Дію не можна скасувати.");
+            if (!confirmed) return;
+            await Admin.DeleteRoom(id);
+            await Load();
+            ok = "Видалено.";
+        }
+        catch (Exception ex) { error = ex.Message; }
+    }
+    // Фільтрує аудиторії за пошуковим рядком.
     private IEnumerable<RoomEditDto> ApplyFilter(IEnumerable<RoomEditDto> seq)
     {
         if (string.IsNullOrWhiteSpace(filter)) return seq;
         var f = filter.Trim();
-
         return seq.Where(r =>
             r.Id?.ToString().Contains(f, StringComparison.OrdinalIgnoreCase) == true ||
             (r.Name?.Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
@@ -170,38 +158,30 @@
             NameOf(buildings, r.BuildingId).Contains(f, StringComparison.OrdinalIgnoreCase)
         );
     }
-
-    
+    // Сортує аудиторії за вибраним полем.
     private IEnumerable<RoomEditDto> ApplySort(IEnumerable<RoomEditDto> seq)
     {
         return (sortField, sortAsc) switch
         {
             (nameof(RoomEditDto.Id), true) => seq.OrderBy(x => x.Id),
             (nameof(RoomEditDto.Id), false) => seq.OrderByDescending(x => x.Id),
-
             (nameof(RoomEditDto.Name), true) => seq.OrderBy(x => x.Name),
             (nameof(RoomEditDto.Name), false) => seq.OrderByDescending(x => x.Name),
-
             (nameof(RoomEditDto.Capacity), true) => seq.OrderBy(x => x.Capacity),
             (nameof(RoomEditDto.Capacity), false) => seq.OrderByDescending(x => x.Capacity),
-
             (BuildingField, true) => seq.OrderBy(x => NameOf(buildings, x.BuildingId)).ThenBy(x => x.Name),
             (BuildingField, false) => seq.OrderByDescending(x => NameOf(buildings, x.BuildingId)).ThenByDescending(x => x.Name),
-
             _ => seq
         };
     }
-
-    
     private IEnumerable<RoomEditDto> SortedAndFiltered => ApplySort(ApplyFilter(items));
-
-    
+    // Перемикає напрямок сортування.
     private void ToggleSort(string field)
     {
         if (sortField == field) sortAsc = !sortAsc;
         else { sortField = field; sortAsc = true; }
     }
-
+    // Повертає піктограму для заголовка сортування.
     private MarkupString HeaderIcon(string field)
         => new(sortField == field ? $"<span class=\"ms-1\">{(sortAsc ? "▲" : "▼")}</span>" : "");
 }

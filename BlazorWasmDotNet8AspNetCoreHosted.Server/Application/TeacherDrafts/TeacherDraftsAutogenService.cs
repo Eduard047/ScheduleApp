@@ -10,50 +10,46 @@ using Microsoft.EntityFrameworkCore;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 
+// Сервіс автоматичної генерації чернеток розкладу.
 public sealed class TeacherDraftsAutogenService
 {
+    // Контекст БД для читання довідників та запису чернеток.
     private readonly AppDbContext _db;
-
     public TeacherDraftsAutogenService(AppDbContext db)
     {
+        // Зберігаємо залежність для подальших запитів.
         _db = db;
     }
-
     private sealed record BusySlot(
-        int GroupId,
-        int? TeacherId,
-        int? RoomId,
-        DateOnly Date,
-        TimeOnly StartTime,
-        TimeOnly EndTime,
-        int? BuildingId,
-        int ModuleId,
-        int LessonTypeId
+        int GroupId, // Група, для якої слот зайнятий.
+        int? TeacherId, // Викладач, якщо призначено.
+        int? RoomId, // Аудиторія, якщо призначено.
+        DateOnly Date, // Дата заняття.
+        TimeOnly StartTime, // Час початку.
+        TimeOnly EndTime, // Час завершення.
+        int? BuildingId, // Будівля аудиторії (для штрафів за переходи).
+        int ModuleId, // Модуль, до якого належить слот.
+        int LessonTypeId // Тип заняття (для обмежень).
     );
-
     private sealed record PlacementCandidate(
-        TimeSlot Slot,
-        int TeacherId,
-        Room? Room,
-        int LessonTypeId,
-        ModuleTopic? Topic,
-        bool IsSelfStudy,
-        double Penalty,
-        List<string> Notes);
-
+        TimeSlot Slot, // Слот розкладу для можливого розміщення.
+        int TeacherId, // Обраний викладач.
+        Room? Room, // Обрана аудиторія (може бути null).
+        int LessonTypeId, // Обраний тип заняття.
+        ModuleTopic? Topic, // Обрана тема модуля (може бути null).
+        bool IsSelfStudy, // Ознака самостійної роботи.
+        double Penalty, // Сумарний штраф за правилами.
+        List<string> Notes); // Пояснення нарахованих штрафів.
+    // Уніфіковані відповіді для API.
     private static ActionResult<AutoGenResult> Ok(AutoGenResult value) => new OkObjectResult(value);
     private static ActionResult<AutoGenResult> BadRequest(object value) => new BadRequestObjectResult(value);
-    /// <summary>
-    /// Викликає автогенерацію чернеток для одного тижня.
-    /// </summary>
+    // Викликає автогенерацію чернеток для одного тижня.
     public Task<ActionResult<AutoGenResult>> DraftAutoGenWeek(DraftAutoGenRequest r)
         => DraftAutoGen(r);
-
-    /// <summary>
-    /// Автоматично генерує чернетки для кожного тижня в межах місяця.
-    /// </summary>
+    // Автоматично генерує чернетки для кожного тижня в межах місяця.
     public async Task<ActionResult<AutoGenResult>> AutogenMonth(AutogenMonthRequest r)
     {
+        // Розраховуємо межі місяця і формуємо базовий шаблон запиту.
         var monthStart = r.MonthStart;
         var nextMonth = new DateOnly(monthStart.Year, monthStart.Month, 1).AddMonths(1);
         var template = new DraftAutoGenRequest(
@@ -65,15 +61,13 @@ public sealed class TeacherDraftsAutogenService
             AllowOnDaysOff: r.AllowOnDaysOff,
             Days: r.Days
         );
-
+        // Запускаємо автогенерацію для кожного тижня місяця.
         return await RunAutoGenForWeeks(template, EnumerateWeekStarts(monthStart, week => week < nextMonth));
     }
-
-    /// <summary>
-    /// Генерує чернетки для курсу в заданому діапазоні тижнів.
-    /// </summary>
+    // Генерує чернетки для курсу в заданому діапазоні тижнів.
     public async Task<ActionResult<AutoGenResult>> AutogenCourse(AutogenCourseRequest r)
     {
+        // Підготовка шаблону генерації з фільтрами курсу/групи/викладача.
         var template = new DraftAutoGenRequest(
             WeekStart: r.From,
             ClearExisting: true,
@@ -83,10 +77,10 @@ public sealed class TeacherDraftsAutogenService
             AllowOnDaysOff: r.AllowOnDaysOff,
             Days: r.Days
         );
-
+        // Проганяємо всі тижні в межах діапазону.
         return await RunAutoGenForWeeks(template, EnumerateWeekStarts(r.From, week => week <= r.To));
     }
-
+    // Генерує стартові дати тижнів у заданому діапазоні.
     private static IEnumerable<DateOnly> EnumerateWeekStarts(DateOnly reference, Func<DateOnly, bool> shouldInclude)
     {
         for (var week = DateHelpers.StartOfWeek(reference); shouldInclude(week); week = week.AddDays(7))
@@ -94,18 +88,17 @@ public sealed class TeacherDraftsAutogenService
             yield return week;
         }
     }
-
+    // Запускає автогенерацію для набору тижнів та агрегує результат.
     private async Task<ActionResult<AutoGenResult>> RunAutoGenForWeeks(DraftAutoGenRequest template, IEnumerable<DateOnly> weekStarts)
     {
         int created = 0, skipped = 0;
         var warnings = new List<string>();
         var gapDetails = new List<AutoGenGapDetail>();
-
         foreach (var weekStart in weekStarts)
         {
+            // Генеруємо тиждень окремо, щоб не зупиняти весь процес при часткових збоях.
             var res = await DraftAutoGen(template with { WeekStart = weekStart });
             if (res.Result is not OkObjectResult { Value: AutoGenResult ok }) continue;
-
             created += ok.Created;
             skipped += ok.Skipped;
             warnings.AddRange(ok.Warnings);
@@ -114,33 +107,37 @@ public sealed class TeacherDraftsAutogenService
                 gapDetails.AddRange(ok.GapDetails);
             }
         }
-
+        // Підсумовуємо статистику по всіх тижнях.
         return Ok(new AutoGenResult(created, skipped, warnings, gapDetails));
     }
-    /// <summary>
-    /// Створює чернетки на основі правил і доступних даних для заданого тижня.
-    /// </summary>
+    // Створює чернетки на основі правил і доступних даних для заданого тижня.
     public async Task<ActionResult<AutoGenResult>> DraftAutoGen(DraftAutoGenRequest r)
     {
+        // ЕТАП 1: збираємо типи занять і готуємо довідники правил.
         var types = await _db.LessonTypes.AsNoTracking().ToListAsync();
         if (types.Count == 0)
             return BadRequest(new AutoGenResult(0, 0, new() { "Типи занять відсутні або вимкнені." }));
+        // Визначаємо службові типи (перерва/скасування), які не беруть участі у плані.
         var typeBreakId = types.FirstOrDefault(t => t.Code.ToUpper() == "BREAK" && t.IsActive)?.Id;
         var typeCanceledId = types.FirstOrDefault(t => t.Code.ToUpper() == "CANCELED")?.Id;
         var excludedTypeIds = new HashSet<int>(new[] { typeBreakId, typeCanceledId }.Where(x => x != null)!.Select(x => x!.Value));
+        // Мапа типів за ідентифікатором для швидких перевірок.
         var typeById = types.ToDictionary(t => t.Id);
-
+        // Активні типи, які враховуються у плані (для циклічного підбору).
         var activeStudyTypes = types.Where(t => t.IsActive && t.CountInPlan).OrderBy(t => t.Id).ToList();
+        // Тип, який бажано ставити першим у тижні.
         var preferredFirstTypeId = types.FirstOrDefault(t => t.PreferredFirstInWeek)?.Id ?? 0;
-
+        // Індекс для циклічного вибору типів.
         int ltIndex = 0;
+        // Циклічний вибір типів занять, якщо немає жорсткої прив’язки до теми.
         int NextCyclicLessonTypeId() =>
             activeStudyTypes.Count > 0 ? activeStudyTypes[ltIndex++ % activeStudyTypes.Count].Id : preferredFirstTypeId;
-
+        // Межі тижня, що планується.
         var weekStart = r.WeekStart;
         var weekEnd = weekStart.AddDays(7);
+        // Режим "м'якого заповнення" дозволяє послаблювати частину правил.
         var softFill = r.SoftFill;
-
+        // Перевіряємо, чи день тижня дозволений у вибраному пресеті.
         bool DayAllowed(DayOfWeek dow)
         {
             var day = dow == DayOfWeek.Sunday ? 7 : (int)dow;
@@ -151,31 +148,31 @@ public sealed class TeacherDraftsAutogenService
                 _ => day is >= 1 and <= 5
             };
         }
-
+        // Витягуємо календарні винятки для тижня (робочі/вихідні).
         var calendar = await _db.CalendarExceptions
             .Where(c => c.Date >= weekStart && c.Date < weekEnd)
             .ToListAsync();
-
+        // Перевіряємо, чи дата робоча для конкретної групи з урахуванням винятків.
         bool IsWorking(DateOnly d, Group grp)
         {
             var scoped = TeacherDraftsHelpers.ResolveCalendarOverride(calendar, d, grp.CourseId, grp.Id);
             if (scoped.HasValue) return scoped.Value;
-
             var dow = d.ToDateTime(TimeOnly.MinValue).DayOfWeek;
             if (!DayAllowed(dow) && !r.AllowOnDaysOff) return false;
             if (r.AllowOnDaysOff) return true;
-
             return dow != DayOfWeek.Saturday && dow != DayOfWeek.Sunday;
         }
-
+        // Нормалізуємо фільтри: 0 або null означає "без фільтра".
         int? courseId = (r.CourseId > 0) ? r.CourseId : null;
         int? groupId = (r.GroupId > 0) ? r.GroupId : null;
+        // Ручні години по модулях (якщо задані в запиті).
         var moduleHoursByModuleId = r.ModuleHours?
             .Where(kv => kv.Value > 0)
             .ToDictionary(kv => kv.Key, kv => kv.Value)
             ?? new Dictionary<int, int>();
         bool hasModuleHourOverrides = moduleHoursByModuleId.Count > 0;
         var initWarnings = new List<string>();
+        // Без курсу неможливо перевірити валідність модулів.
         if (hasModuleHourOverrides && courseId is null)
         {
             return BadRequest(new
@@ -183,16 +180,15 @@ public sealed class TeacherDraftsAutogenService
                 message = "Для генерації за модулями потрібно обрати курс."
             });
         }
-
+        // Завантажуємо групи з урахуванням фільтрів курсу та групи.
         var groups = await _db.Groups
             .Include(x => x.Course)
             .Where(x => courseId == null || x.CourseId == courseId)
             .Where(x => groupId == null || x.Id == groupId)
             .ToListAsync();
-
         if (groups.Count == 0)
             return Ok(new AutoGenResult(0, 0, new() { "Групи не знайдено." }));
-
+        // Валідуємо перелік модулів проти вибраного курсу.
         if (hasModuleHourOverrides)
         {
             var cid = courseId!.Value;
@@ -214,7 +210,6 @@ public sealed class TeacherDraftsAutogenService
                 }
                 initWarnings.Add($"Ігноровано модулі, що не належать курсу #{cid}: {string.Join(", ", invalidModuleIds)}.");
             }
-
             if (moduleHoursByModuleId.Count == 0)
             {
                 return BadRequest(new
@@ -223,7 +218,7 @@ public sealed class TeacherDraftsAutogenService
                 });
             }
         }
-
+        // За потреби очищаємо існуючі незаблоковані чернетки тижня.
         if (r.ClearExisting && !softFill)
         {
             var gids = groups.Select(g => g.Id).ToList();
@@ -231,26 +226,24 @@ public sealed class TeacherDraftsAutogenService
                 .Where(x => x.Date >= weekStart && x.Date < weekEnd && gids.Contains(x.GroupId) && !x.IsLocked)
                 .ExecuteDeleteAsync();
         }
-
+        // Конфігурації обідніх перерв і список аудиторій для підбору.
         var lunchesAll = await _db.LunchConfigs.AsNoTracking().ToListAsync();
         var roomsAll = await _db.Rooms.AsNoTracking().ToListAsync();
-
+        // Список модулів для формування допустимих аудиторій/будівель.
         var moduleIdsAll = await _db.Modules.Select(m => m.Id).ToListAsync();
-
         var allowedRoomsByModule = await _db.ModuleRooms
             .Where(mr => moduleIdsAll.Contains(mr.ModuleId))
             .GroupBy(mr => mr.ModuleId)
             .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.RoomId).ToHashSet());
-
         var allowedBuildingsByModule = await _db.ModuleBuildings
             .Where(mb => moduleIdsAll.Contains(mb.ModuleId))
             .GroupBy(mb => mb.ModuleId)
             .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.BuildingId).ToHashSet());
-
+        // Історичне вікно для перевірки повторів.
         const int historyDaysForRepeats = 14;
         var historyStart = weekStart.AddDays(-historyDaysForRepeats);
         var lastWeekStart = weekStart.AddDays(-7);
-
+        // Завантажуємо вже зайняті слоти (поточні та історичні).
         var busy = await _db.TeacherDraftItems
             .Include(x => x.Room)
             .Where(x => x.Date >= historyStart && x.Date < weekEnd)
@@ -265,24 +258,25 @@ public sealed class TeacherDraftsAutogenService
                 x.ModuleId,
                 x.LessonTypeId))
             .ToListAsync();
-
+        // Фіксуємо, де вже використовувався пріоритетний тип на тижні.
         var hasPreferred = new HashSet<(int groupId, int moduleId)>(
             busy.Where(b => preferredFirstTypeId != 0 && b.LessonTypeId == preferredFirstTypeId)
                 .Select(b => (b.GroupId, b.ModuleId)));
-
+        // Збираємо модулі, що були минулого тижня (для зменшення повторів).
         var lastWeekModulesByGroup = busy
             .Where(b => b.Date >= lastWeekStart
                         && b.Date < weekStart
                         && !excludedTypeIds.Contains(b.LessonTypeId))
             .GroupBy(b => b.GroupId)
             .ToDictionary(g => g.Key, g => g.Select(x => x.ModuleId).Distinct().ToHashSet());
-
+        // Лічильник кількості пар на день для кожної групи.
         var perDayCount = new Dictionary<(int groupId, DateOnly date), int>();
         foreach (var b in busy.Where(b => !excludedTypeIds.Contains(b.LessonTypeId)))
         {
             var key = (b.GroupId, b.Date);
             perDayCount[key] = perDayCount.TryGetValue(key, out var existing) ? existing + 1 : 1;
         }
+        // Допоміжні методи для підрахунків навантаження по днях.
         int CountFor(int gid, DateOnly date) => perDayCount.TryGetValue((gid, date), out var c) ? c : 0;
         int CountModuleForDay(int gid, DateOnly date, int moduleId) =>
             busy.Count(x => x.GroupId == gid
@@ -294,7 +288,7 @@ public sealed class TeacherDraftsAutogenService
             var key = (gid, date);
             perDayCount[key] = CountFor(gid, date) + 1;
         }
-
+        // Перевірки повторів модулів по днях.
         bool HadSameModulePreviousDay(int gid, int mid, DateOnly date)
         {
             var prev = date.AddDays(-1);
@@ -303,6 +297,7 @@ public sealed class TeacherDraftsAutogenService
                                  && x.Date == prev
                                  && !excludedTypeIds.Contains(x.LessonTypeId));
         }
+        // Перевіряємо, чи модуль був у "вікні" навколо дати.
         bool HasRecentModule(int gid, int mid, DateOnly date, int windowDays = 2)
         {
             var from = date.AddDays(-windowDays);
@@ -314,13 +309,13 @@ public sealed class TeacherDraftsAutogenService
                                  && x.Date <= to
                                  && !excludedTypeIds.Contains(x.LessonTypeId));
         }
-
+        // Ознака, що модуль був використаний минулого тижня.
         bool UsedLastWeek(int gid, int mid) =>
             lastWeekModulesByGroup.TryGetValue(gid, out var mods) && mods.Contains(mid);
-
+        // Базові зв'язки модуль -> викладачі / керівники самостійної роботи.
         var teachersForModule = await _db.TeacherModules.AsNoTracking().ToListAsync();
         var supervisorsForModule = await _db.ModuleSupervisors.AsNoTracking().ToListAsync();
-
+        // Метадані викладачів (для підписів і перевірок кафедр).
         var teachersMeta = await _db.Teachers
             .AsNoTracking()
             .Select(t => new
@@ -330,18 +325,18 @@ public sealed class TeacherDraftsAutogenService
                 t.DepartmentId
             })
             .ToListAsync();
-
+        // Мапи для швидкого доступу до імен та кафедр викладачів.
         var teacherNames = teachersMeta.ToDictionary(x => x.Id, x => x.Name);
         var teacherDepartmentById = teachersMeta.ToDictionary(x => x.Id, x => x.DepartmentId);
-
+        // Назви кафедр для повідомлень та перевірок.
         var departmentNames = await _db.Departments
             .AsNoTracking()
             .ToDictionaryAsync(d => d.Id, d => string.IsNullOrWhiteSpace(d.Name) ? $"#{d.Id}" : d.Name!);
-
+        // Робочі години викладачів (обмеження часу).
         var teacherWorkingHours = await _db.TeacherWorkingHours.AsNoTracking()
             .Select(w => new { w.TeacherId, w.DayOfWeek, w.Start, w.End })
             .ToListAsync();
-
+        // Групуємо робочі години по викладачах та днях тижня.
         var workingHoursByTeacher = teacherWorkingHours
             .GroupBy(w => w.TeacherId)
             .ToDictionary(
@@ -352,40 +347,40 @@ public sealed class TeacherDraftsAutogenService
                         d => d.Select(x => (x.Start, x.End)).ToList()
                     )
             );
-
+        // Перевіряє, чи вкладається заняття в дозволені години викладача.
         bool TeacherFitsWorkingHours(int teacherId, DateOnly date, TimeOnly start, TimeOnly end)
         {
             if (!workingHoursByTeacher.TryGetValue(teacherId, out var dayMap) || dayMap.Count == 0)
                 return true;
-
             var dow = date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
             if (!dayMap.TryGetValue(dow, out var windows) || windows.Count == 0)
                 return false;
-
             return windows.Any(w => w.Start <= start && end <= w.End);
         }
-
+        // Перелік курсів, задіяних у генерації.
         var courseIds = groups.Select(g => g.CourseId).Distinct().ToList();
+        // Навантаження викладачів у вже опублікованому розкладі.
         var teacherLoadSchedule = await _db.ScheduleItems
             .Include(si => si.Group)
             .Where(si => si.TeacherId != null && courseIds.Contains(si.Group.CourseId))
             .GroupBy(si => new { si.TeacherId, si.Group.CourseId })
             .Select(g => new { TeacherId = g.Key.TeacherId!.Value, g.Key.CourseId, C = g.Count() })
             .ToListAsync();
-
+        // Навантаження викладачів у поточних чернетках.
         var teacherLoadDrafts = await _db.TeacherDraftItems
             .Include(di => di.Group)
             .Where(di => di.TeacherId != null && courseIds.Contains(di.Group.CourseId))
             .GroupBy(di => new { di.TeacherId, di.Group.CourseId })
             .Select(g => new { TeacherId = g.Key.TeacherId!.Value, g.Key.CourseId, C = g.Count() })
             .ToListAsync();
-
+        // Об'єднана карта навантажень для балансу.
         var teacherLoadMap = teacherLoadSchedule
             .Concat(teacherLoadDrafts)
             .GroupBy(x => (x.TeacherId, x.CourseId))
             .ToDictionary(g => g.Key, g => g.Sum(x => x.C));
+        // Активні плани модулів по курсах.
         var activePlans = await _db.ModulePlans.Where(p => courseIds.Contains(p.CourseId) && p.IsActive).ToListAsync();
-
+        // Базова метрика навантаження викладача в межах курсу.
         int TeacherLoadScore(int teacherId, int courseId)
         {
             if (teacherLoadMap.TryGetValue((teacherId, courseId), out var count))
@@ -394,7 +389,7 @@ public sealed class TeacherDraftsAutogenService
             }
             return 0;
         }
-
+        // Список модулів, які потрібно врахувати для планів та тем.
         var moduleIdsForPlans = activePlans.Select(p => p.ModuleId).Distinct().ToList();
         if (hasModuleHourOverrides)
         {
@@ -403,63 +398,77 @@ public sealed class TeacherDraftsAutogenService
                 .Distinct()
                 .ToList();
         }
+        // Назви модулів для повідомлень та логіки вибору.
         var moduleTitles = await _db.Modules.AsNoTracking()
             .Where(m => moduleIdsForPlans.Contains(m.Id))
             .ToDictionaryAsync(
                 m => m.Id,
                 m => string.IsNullOrWhiteSpace(m.Title) ? $"#{m.Id}" : m.Title.Trim());
+        // Формуємо зручний ярлик модуля.
         string ModuleTitleLabel(int moduleId) =>
             moduleTitles.TryGetValue(moduleId, out var title) ? title : $"#{moduleId}";
-
+        // Теми модулів для підбору тем і самостійної роботи.
         var topicsAll = await _db.ModuleTopics
             .Where(t => moduleIdsForPlans.Contains(t.ModuleId))
             .ToListAsync();
         // Сортуємо теми за кодом, щоб автоген відповідав порядку у плані модуля.
         topicsAll.Sort((a, b) => TeacherDraftsHelpers.CompareTopicCodes(a.TopicCode, b.TopicCode));
+        // Модулі, де всі теми міжзборові (їх пропускаємо у розкладі).
         var interAssemblyOnlyModules = topicsAll
             .GroupBy(t => t.ModuleId)
             .Where(g => g.Any() && g.All(x => x.IsInterAssembly))
             .Select(g => g.Key)
             .ToHashSet();
+        // Робочий набір тем без міжзборових.
         var topicsRaw = topicsAll
             .Where(t => !t.IsInterAssembly)
             .ToList();
+        // Дозволені теми для підстановки.
         var allowedTopicIds = topicsRaw.Select(t => t.Id).ToHashSet();
+        // Теми самостійної роботи під керівництвом викладача.
         var flaggedSelfStudyTopicIds = topicsRaw
             .Where(t => t.SelfStudyBySupervisor && t.SelfStudyHours > 0)
             .Select(t => t.Id)
             .ToHashSet();
+        // Групування тем за модулями.
         var topicsByModule = topicsRaw
             .GroupBy(t => t.ModuleId)
             .ToDictionary(g => g.Key, g => g.ToList());
+        // Теми самостійної роботи для кожного модуля.
         var selfStudyTopicsByModule = topicsByModule
             .ToDictionary(
                 kvp => kvp.Key,
                 kvp => kvp.Value
                     .Where(t => t.SelfStudyBySupervisor && t.SelfStudyHours > 0)
                     .ToList());
+        // Ліміти використання тем по аудиторних годинах.
         var topicUsageLimitById = topicsRaw
             .ToDictionary(t => t.Id, t => Math.Max(0, t.AuditoriumHours));
+        // Сумарні години по модулю (аудиторні та самостійні).
         var moduleAuditoriumHours = topicsByModule
             .ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Sum(t => Math.Max(0, t.AuditoriumHours)));
+        // Сумарні години самостійної роботи, які мають бути заплановані.
         var moduleSelfStudyHours = topicsByModule
             .ToDictionary(
                 kvp => kvp.Key,
                 kvp => kvp.Value
                     .Where(t => t.SelfStudyBySupervisor)
                     .Sum(t => Math.Max(0, t.SelfStudyHours)));
+        // Самостійні заняття, вже призначені у чернетках.
         var selfStudyAssignmentsDraft = await _db.TeacherDraftItems
             .Where(di => di.IsSelfStudy
                          && courseIds.Contains(di.Group.CourseId)
                          && (di.ModuleTopicId == null || flaggedSelfStudyTopicIds.Contains(di.ModuleTopicId.Value)))
             .Select(di => new { di.GroupId, di.ModuleId })
             .ToListAsync();
+        // Самостійні заняття, вже опубліковані у розкладі.
         var selfStudyAssignmentsSchedule = await _db.ScheduleItems
             .Where(si => si.IsSelfStudy
                          && courseIds.Contains(si.Group.CourseId)
                          && (si.ModuleTopicId == null || flaggedSelfStudyTopicIds.Contains(si.ModuleTopicId.Value)))
             .Select(si => new { si.GroupId, si.ModuleId })
             .ToListAsync();
+        // Самостійні заняття по конкретних темах (чернетки).
         var selfStudyTopicAssignmentsDraft = await _db.TeacherDraftItems
             .Where(di => di.IsSelfStudy
                          && di.ModuleTopicId != null
@@ -468,6 +477,7 @@ public sealed class TeacherDraftsAutogenService
             .GroupBy(di => new { di.GroupId, di.ModuleId, TopicId = di.ModuleTopicId!.Value })
             .Select(g => new { g.Key.GroupId, g.Key.ModuleId, g.Key.TopicId, C = g.Count() })
             .ToListAsync();
+        // Самостійні заняття по конкретних темах (розклад).
         var selfStudyTopicAssignmentsSchedule = await _db.ScheduleItems
             .Where(si => si.IsSelfStudy
                          && si.ModuleTopicId != null
@@ -476,28 +486,33 @@ public sealed class TeacherDraftsAutogenService
             .GroupBy(si => new { si.GroupId, si.ModuleId, TopicId = si.ModuleTopicId!.Value })
             .Select(g => new { g.Key.GroupId, g.Key.ModuleId, g.Key.TopicId, C = g.Count() })
             .ToListAsync();
+        // Зведений лічильник самостійних занять по модулю/групі.
         var selfStudyAssignments = selfStudyAssignmentsDraft
             .Concat(selfStudyAssignmentsSchedule)
             .GroupBy(x => (x.GroupId, x.ModuleId))
             .ToDictionary(g => g.Key, g => g.Count());
+        // Зведений лічильник самостійних занять по темі.
         var selfStudyTopicAssignments = selfStudyTopicAssignmentsDraft
             .Concat(selfStudyTopicAssignmentsSchedule)
             .GroupBy(x => (x.GroupId, x.ModuleId, x.TopicId))
             .ToDictionary(g => g.Key, g => g.Sum(x => x.C));
+        // Призначені теми по групі/модулю (чернетки).
         var topicAssignmentsDraft = await _db.TeacherDraftItems
             .Where(di => di.ModuleTopicId != null
                          && courseIds.Contains(di.Group.CourseId)
                          && allowedTopicIds.Contains(di.ModuleTopicId!.Value))
             .Select(di => new { di.GroupId, di.ModuleId, TopicId = di.ModuleTopicId!.Value })
             .ToListAsync();
+        // Призначені теми по групі/модулю (розклад).
         var topicAssignmentsSchedule = await _db.ScheduleItems
             .Where(si => si.ModuleTopicId != null
                          && courseIds.Contains(si.Group.CourseId)
                          && allowedTopicIds.Contains(si.ModuleTopicId!.Value))
             .Select(si => new { si.GroupId, si.ModuleId, TopicId = si.ModuleTopicId!.Value })
             .ToListAsync();
+        // Сховище використаних тем по групі/модулю.
         var topicAssignments = new Dictionary<(int GroupId, int ModuleId), Dictionary<int, int>>();
-
+        // Збільшує лічильник використаної теми.
         void SeedTopicAssignment(int groupId, int moduleId, int topicId)
         {
             var key = (groupId, moduleId);
@@ -506,45 +521,40 @@ public sealed class TeacherDraftsAutogenService
                 assigned = new Dictionary<int, int>();
                 topicAssignments[key] = assigned;
             }
-
             assigned.TryGetValue(topicId, out var usedCount);
             assigned[topicId] = usedCount + 1;
         }
-
         foreach (var entry in topicAssignmentsDraft.Concat(topicAssignmentsSchedule))
         {
             SeedTopicAssignment(entry.GroupId, entry.ModuleId, entry.TopicId);
         }
-
+        // Ліміт використання теми у розкладі.
         int GetTopicUsageLimit(ModuleTopic topic)
             => topicUsageLimitById.TryGetValue(topic.Id, out var limit) ? limit : Math.Max(0, topic.AuditoriumHours);
-
+        // Вибір наступної теми строго за порядком коду.
         ModuleTopic? SelectNextTopicInOrder(int groupId, int moduleId)
         {
             if (!topicsByModule.TryGetValue(moduleId, out var list) || list.Count == 0)
                 return null;
-
             topicAssignments.TryGetValue((groupId, moduleId), out var assigned);
-
             // Вибираємо наступну тему строго за порядком коду і не "перестрибуємо" вперед.
             foreach (var t in list)
             {
                 var limit = GetTopicUsageLimit(t);
                 if (limit <= 0) continue;
-
                 var usedByGroup = (assigned != null && assigned.TryGetValue(t.Id, out var usedGroupVal)) ? usedGroupVal : 0;
                 if (usedByGroup < limit)
                 {
                     return t;
                 }
             }
-
             return null;
         }
-
+        // Тримаємо прапорці, щоб не дублювати попередження.
         var topicsExhaustedNotified = new HashSet<(int GroupId, int ModuleId)>();
         var missingModulesNotified = new HashSet<int>();
         int created = 0, skipped = 0;
+        // Збираємо попередження та деталі прогалин.
         var warnings = new List<string>();
         if (initWarnings.Count > 0)
         {
@@ -553,8 +563,7 @@ public sealed class TeacherDraftsAutogenService
         var gapDetails = new List<AutoGenGapDetail>();
         var gapWarnings = new HashSet<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End)>();
         var slotFailureReasons = new Dictionary<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End), HashSet<string>>();
-
-
+        // Перевірка валідності типу заняття.
         bool TypeAllowed(int lessonTypeId)
         {
             return typeById.TryGetValue(lessonTypeId, out var lt)
@@ -562,18 +571,17 @@ public sealed class TeacherDraftsAutogenService
                    && lt.CountInPlan
                    && !excludedTypeIds.Contains(lessonTypeId);
         }
-
+        // Чи є тип заняття лекційним.
         bool IsLectureType(int lessonTypeId) =>
             typeById.TryGetValue(lessonTypeId, out var lt)
             && string.Equals(lt.Code, "LECTURE", StringComparison.OrdinalIgnoreCase);
-
+        // Чи залишилися лекційні теми, які бажано поставити до обіду.
         bool HasPendingLectureBeforeLunch(int gid)
         {
             foreach (var kvp in topicsByModule)
             {
                 var mid = kvp.Key;
                 if (RemainingFor(gid, mid) <= 0) continue;
-
                 var topicCandidate = SelectNextTopicInOrder(gid, mid);
                 if (topicCandidate is not null && IsLectureType(topicCandidate.LessonTypeId))
                 {
@@ -582,7 +590,7 @@ public sealed class TeacherDraftsAutogenService
             }
             return false;
         }
-
+        // Позначає тему як використану для конкретної групи.
         void MarkTopicUsed(int groupId, int moduleId, ModuleTopic topic)
         {
             var key = (groupId, moduleId);
@@ -591,16 +599,14 @@ public sealed class TeacherDraftsAutogenService
                 assigned = new Dictionary<int, int>();
                 topicAssignments[key] = assigned;
             }
-
             assigned.TryGetValue(topic.Id, out var used);
             assigned[topic.Id] = used + 1;
         }
-
+        // Перевіряє, чи вичерпано всі теми модуля для групи.
         bool TopicsDepleted(int groupIdCheck, int moduleIdCheck)
         {
             if (!topicsByModule.TryGetValue(moduleIdCheck, out var list) || list.Count == 0)
                 return false;
-
             var key = (groupIdCheck, moduleIdCheck);
             topicAssignments.TryGetValue(key, out var assigned);
             return list.All(topic =>
@@ -611,7 +617,7 @@ public sealed class TeacherDraftsAutogenService
                 return usedCount >= limit;
             });
         }
-
+        // Чи був той самий тип заняття вчора для цього модуля.
         bool HadSameLessonTypePreviousDay(int gid, int mid, int lessonTypeId, DateOnly date)
         {
             var prev = date.AddDays(-1);
@@ -621,7 +627,7 @@ public sealed class TeacherDraftsAutogenService
                                  && x.LessonTypeId == lessonTypeId
                                  && !excludedTypeIds.Contains(x.LessonTypeId));
         }
-
+        // Обирає тип заняття і тему (якщо є) з урахуванням правил.
         (int LessonTypeId, ModuleTopic? Topic) PickLessonType(int groupIdPick, int courseIdPick, int moduleIdPick, DateOnly date)
         {
             var topicCandidate = SelectNextTopicInOrder(groupIdPick, moduleIdPick);
@@ -629,7 +635,6 @@ public sealed class TeacherDraftsAutogenService
             {
                 return (topicCandidate.LessonTypeId, topicCandidate);
             }
-
             if (!hasPreferred.Contains((groupIdPick, moduleIdPick))
                 && preferredFirstTypeId != 0
                 && TypeAllowed(preferredFirstTypeId)
@@ -637,7 +642,6 @@ public sealed class TeacherDraftsAutogenService
             {
                 return (preferredFirstTypeId, null);
             }
-
             var cycleCount = activeStudyTypes.Count == 0 ? 1 : activeStudyTypes.Count;
             for (int attempt = 0; attempt < cycleCount; attempt++)
             {
@@ -645,37 +649,35 @@ public sealed class TeacherDraftsAutogenService
                 if (!TypeAllowed(candidate)) continue;
                 if (HadSameLessonTypePreviousDay(groupIdPick, moduleIdPick, candidate, date) && cycleCount > 1)
                     continue;
-
                 return (candidate, null);
             }
-
             var fallbackType = activeStudyTypes.FirstOrDefault()?.Id ?? preferredFirstTypeId;
             if (fallbackType != 0 && TypeAllowed(fallbackType))
             {
                 return (fallbackType, null);
             }
-
             return (types.First().Id, null);
         }
+        // Послідовність модулів для основного порядку в курсі.
         var sequenceItems = await _db.ModuleSequenceItems
             .Where(x => courseIds.Contains(x.CourseId))
             .OrderBy(x => x.Order)
             .ToListAsync();
+        // Мапа курс -> основна послідовність модулів.
         var mainSequenceByCourse = sequenceItems
             .GroupBy(x => x.CourseId)
             .ToDictionary(g => g.Key, g => g.Select(x => x.ModuleId).ToList());
-
+        // Мапа курс -> модулі-наповнювачі (filler).
         var fillerByCourse = await _db.ModuleFillers
             .Where(x => courseIds.Contains(x.CourseId))
             .GroupBy(x => x.CourseId)
             .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.ModuleId).ToHashSet());
-
+        // Формуємо порядок модулів з урахуванням основної послідовності та fillers.
         List<int> BuildCourseModuleOrder(int courseId, List<int> planModules)
         {
             var ordered = new List<int>();
             var seen = new HashSet<int>();
             var planSet = new HashSet<int>(planModules);
-
             if (mainSequenceByCourse.TryGetValue(courseId, out var mainSequence))
             {
                 foreach (var mid in mainSequence)
@@ -686,7 +688,6 @@ public sealed class TeacherDraftsAutogenService
                     }
                 }
             }
-
             if (fillerByCourse.TryGetValue(courseId, out var fillerSet) && fillerSet.Count > 0)
             {
                 foreach (var mid in planModules)
@@ -697,7 +698,6 @@ public sealed class TeacherDraftsAutogenService
                     }
                 }
             }
-
             foreach (var mid in planModules)
             {
                 if (seen.Add(mid))
@@ -705,23 +705,24 @@ public sealed class TeacherDraftsAutogenService
                     ordered.Add(mid);
                 }
             }
-
             return ordered;
         }
-
+        // Кількість годин, які ще потрібно запланувати по групі/модулю.
         var remainingByGroupModule = new Dictionary<(int GroupId, int ModuleId), int>();
+        // Групи по курсах, відсортовані для стабільних результатів.
         var allGroupsByCourse = await _db.Groups
             .Where(g => courseIds.Contains(g.CourseId))
             .GroupBy(g => g.CourseId)
             .ToDictionaryAsync(g => g.Key, g => g.OrderBy(x => x.Id).ToList());
-
+        // Факт по модулях у чернетках (без службових типів).
         var factByGroupModule = await _db.TeacherDraftItems
             .Where(si => !excludedTypeIds.Contains(si.LessonTypeId) && courseIds.Contains(si.Group.CourseId))
             .GroupBy(si => new { si.GroupId, si.ModuleId })
             .Select(g => new { g.Key.GroupId, g.Key.ModuleId, C = g.Count() })
             .ToListAsync();
+        // Перетворюємо факт у словник для швидких доступів.
         var factMap = factByGroupModule.ToDictionary(k => (k.GroupId, k.ModuleId), v => v.C);
-
+        // Факт по модулях у вже опублікованому розкладі.
         var scheduleByGroupModule = await _db.ScheduleItems
             .Where(si => !excludedTypeIds.Contains(si.LessonTypeId) && courseIds.Contains(si.Group.CourseId))
             .GroupBy(si => new { si.GroupId, si.ModuleId })
@@ -739,14 +740,15 @@ public sealed class TeacherDraftsAutogenService
                 factMap[key] = item.C;
             }
         }
-
+        // Залишки самостійної роботи по групі/модулю та по конкретних темах.
         var selfStudyRemainingByGroupModule = new Dictionary<(int GroupId, int ModuleId), int>();
         var selfStudyTopicRemaining = new Dictionary<(int GroupId, int ModuleId, int TopicId), int>();
+        // Якщо задано ручні години по модулях - беремо їх як базу.
         if (hasModuleHourOverrides)
         {
+            // Стабільний порядок модулів та груп для рівномірного розподілу.
             var orderedSelectedModules = moduleHoursByModuleId.Keys.OrderBy(mid => mid).ToList();
             var selectedGroups = groups.OrderBy(g => g.Id).ToList();
-
             foreach (var moduleId in orderedSelectedModules)
             {
                 if (interAssemblyOnlyModules.Contains(moduleId))
@@ -755,22 +757,19 @@ public sealed class TeacherDraftsAutogenService
                     {
                         remainingByGroupModule[(grpRow.Id, moduleId)] = 0;
                     }
-
                     var moduleLabel = ModuleTitleLabel(moduleId);
                     var groupList = string.Join(", ", selectedGroups.Select(g => g.Name));
                     warnings.Add($"Модуль \"{moduleLabel}\" містить лише міжзборові теми, тому автогенерація пропускає його для груп: {groupList}.");
                     continue;
                 }
-
+                // Розподіляємо однакову кількість годин по всіх вибраних групах.
                 var hours = moduleHoursByModuleId[moduleId];
                 foreach (var grpRow in selectedGroups)
                 {
                     remainingByGroupModule[(grpRow.Id, moduleId)] = Math.Max(0, hours);
                 }
-
                 if (!selfStudyTopicsByModule.TryGetValue(moduleId, out var ssTopics) || ssTopics.Count == 0)
                     continue;
-
                 foreach (var grpRow in selectedGroups)
                 {
                     var total = 0;
@@ -785,7 +784,6 @@ public sealed class TeacherDraftsAutogenService
                             total += remaining;
                         }
                     }
-
                     if (total > 0)
                     {
                         selfStudyRemainingByGroupModule[(grpRow.Id, moduleId)] = total;
@@ -795,35 +793,35 @@ public sealed class TeacherDraftsAutogenService
         }
         else
         {
+            // Розподіляємо години згідно з активними планами модулів.
             foreach (var plan in activePlans)
         {
             if (!allGroupsByCourse.TryGetValue(plan.CourseId, out var courseGroups) || courseGroups.Count == 0)
                 continue;
-
             if (interAssemblyOnlyModules.Contains(plan.ModuleId))
             {
                 foreach (var grpRow in courseGroups)
                 {
                     remainingByGroupModule[(grpRow.Id, plan.ModuleId)] = 0;
                 }
-
                 var moduleLabel = ModuleTitleLabel(plan.ModuleId);
                 var groupList = string.Join(", ", courseGroups.Select(g => g.Name));
                 warnings.Add($"Модуль \"{moduleLabel}\" містить лише міжзборові теми, тому автогенерація пропускає його для груп: {groupList}.");
                 continue;
             }
-
+            // Вираховуємо години, що підуть у самостійне навчання без викладача.
             var excludedSelfStudy = topicsByModule.TryGetValue(plan.ModuleId, out var tlist)
                 ? tlist.Where(t => t.SelfStudyHours > 0 && !t.SelfStudyBySupervisor).Sum(t => Math.Max(0, t.SelfStudyHours))
                 : 0;
+            // Чисті години, які потрібно запланувати в аудиторіях або під керівництвом.
             var effectiveTargetHours = Math.Max(0, plan.TargetHours - excludedSelfStudy);
             int n = courseGroups.Count;
+            // Рівномірно розподіляємо години між групами, залишок - по перших групах.
             int baseShare = effectiveTargetHours / n;
             int extra = effectiveTargetHours % n;
             var moduleMinHours =
                 (moduleAuditoriumHours.TryGetValue(plan.ModuleId, out var minHours) ? minHours : 0)
                 + (moduleSelfStudyHours.TryGetValue(plan.ModuleId, out var ssHours) ? ssHours : 0);
-
             for (int i = 0; i < n; i++)
             {
                 int gid = courseGroups[i].Id;
@@ -832,10 +830,8 @@ public sealed class TeacherDraftsAutogenService
                 int fact = factMap.TryGetValue((gid, plan.ModuleId), out var c) ? c : 0;
                 remainingByGroupModule[(gid, plan.ModuleId)] = Math.Max(0, target - fact);
             }
-
             if (!selfStudyTopicsByModule.TryGetValue(plan.ModuleId, out var ssTopics) || ssTopics.Count == 0)
                 continue;
-
             foreach (var grpRow in courseGroups)
             {
                 var total = 0;
@@ -850,7 +846,6 @@ public sealed class TeacherDraftsAutogenService
                         total += remaining;
                     }
                 }
-
                 if (total > 0)
                 {
                     selfStudyRemainingByGroupModule[(grpRow.Id, plan.ModuleId)] = total;
@@ -858,16 +853,17 @@ public sealed class TeacherDraftsAutogenService
             }
         }
         }
+        // Доступ до залишків годин по групі/модулю.
         int RemainingFor(int gid, int mid) =>
             remainingByGroupModule.TryGetValue((gid, mid), out var left) ? left : 0;
+        // Доступ до залишків самостійної роботи.
         int SelfStudyRemaining(int gid, int mid) =>
             selfStudyRemainingByGroupModule.TryGetValue((gid, mid), out var left) ? left : 0;
-
+        // Обирає тему самостійної роботи з доступним лімітом.
         ModuleTopic? PeekSelfStudyTopic(int gid, int mid)
         {
             if (!selfStudyTopicsByModule.TryGetValue(mid, out var list) || list.Count == 0)
                 return null;
-
             foreach (var t in list)
             {
                 var key = (gid, mid, t.Id);
@@ -876,40 +872,37 @@ public sealed class TeacherDraftsAutogenService
                     return t;
                 }
             }
-
             return null;
         }
-
-
-
+        // Основний цикл генерації: обходимо всі групи.
         foreach (var grp in groups)
         {
+            // Обідня перерва для курсу або глобальна (якщо не задано для курсу).
             var groupLunch = lunchesAll.FirstOrDefault(l => l.CourseId == grp.CourseId)
                           ?? lunchesAll.FirstOrDefault(l => l.CourseId == null);
+            // Якщо для курсу є власні слоти - беремо їх, інакше беремо глобальні.
             var hasCourseSlots = await _db.TimeSlots.AsNoTracking().AnyAsync(s => s.CourseId == grp.CourseId && s.IsActive);
             var slots = await _db.TimeSlots.AsNoTracking()
                 .Where(s => s.IsActive && (hasCourseSlots ? s.CourseId == grp.CourseId : s.CourseId == null))
                 .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
                 .ToListAsync();
-
             if (slots.Count == 0)
             {
                 warnings.Add($"Не знайдено жодного слоту розкладу (глобального або для курсу {grp.Course.Name}). Група {grp.Name} пропущена.");
                 continue;
             }
-
+            // Індекс слоту за часом для швидкого пошуку сусідніх слотів.
             var slotIndexByTime = slots
                 .Select((slot, index) => new { slot, index })
                 .ToDictionary(x => (x.slot.Start, x.slot.End), x => x.index);
-
+            // Перевіряє, чи слот уже зайнятий у групи.
             bool SlotFilled(DateOnly date, TimeSlot slot) =>
                 busy.Any(b => b.GroupId == grp.Id && b.Date == date && b.StartTime == slot.Start && b.EndTime == slot.End);
-
+            // Повертає викладача, який веде цей модуль у сусідньому слоті.
             int? GetAdjacentSameModuleTeacherId(DateOnly date, TimeSlot slot, int moduleId)
             {
                 if (!slotIndexByTime.TryGetValue((slot.Start, slot.End), out var slotIndex))
                     return null;
-
                 int? prevTeacherId = null;
                 if (slotIndex > 0)
                 {
@@ -925,7 +918,6 @@ public sealed class TeacherDraftsAutogenService
                         .Select(b => b.TeacherId)
                         .FirstOrDefault();
                 }
-
                 int? nextTeacherId = null;
                 if (slotIndex + 1 < slots.Count)
                 {
@@ -941,13 +933,11 @@ public sealed class TeacherDraftsAutogenService
                         .Select(b => b.TeacherId)
                         .FirstOrDefault();
                 }
-
                 if (prevTeacherId is int pt && nextTeacherId is int nt && pt == nt)
                     return pt;
-
                 return prevTeacherId ?? nextTeacherId;
             }
-
+            // Перевіряє, чи є порожні слоти у день.
             bool DayHasGaps(DateOnly date, out TimeSlot? firstGap)
             {
                 foreach (var slot in slots)
@@ -957,21 +947,18 @@ public sealed class TeacherDraftsAutogenService
                         firstGap = slot;
                         return true;
                     }
-
                 }
-
                 firstGap = null;
                 return false;
             }
-
-
-
+            // Збираємо створені чернетки для подальших зсувів і аналізу.
             var createdDrafts = new List<TeacherDraftItem>();
+            // Формуємо підпис викладача для повідомлень.
             string TeacherLabel(int teacherId) =>
                 teacherNames.TryGetValue(teacherId, out var name) && !string.IsNullOrWhiteSpace(name)
                     ? name
                     : $"#{teacherId}";
-
+            // Фіксує причину, чому слот не був заповнений.
             void RecordSlotFailureReason(DateOnly date, TimeSlot slot, string reason)
             {
                 var key = (grp.Id, date, slot.Start, slot.End);
@@ -982,7 +969,7 @@ public sealed class TeacherDraftsAutogenService
                 }
                 reasons.Add(reason);
             }
-
+            // Додає причину для всіх слотів дня (масове повідомлення).
             void RecordSlotFailureReasonForAllSlots(DateOnly date, string reason)
             {
                 foreach (var slot in slots)
@@ -990,7 +977,7 @@ public sealed class TeacherDraftsAutogenService
                     RecordSlotFailureReason(date, slot, reason);
                 }
             }
-
+            // Формує зрозуміле пояснення для прогалини.
             string? ComposeGapReason(DateOnly date, TimeSlot slot)
             {
                 var key = (grp.Id, date, slot.Start, slot.End);
@@ -998,15 +985,13 @@ public sealed class TeacherDraftsAutogenService
                 {
                     return string.Join("; ", reasons);
                 }
-
                 if (!remainingByGroupModule.Any(entry => entry.Key.GroupId == grp.Id && entry.Value > 0))
                 {
                     return $"Для групи {grp.Name} більше не лишилось модулів із невикористаними годинами.";
                 }
-
                 return "Причину не вдалося визначити автоматично. Перевірте доступність викладачів, аудиторій, обмеження за типом заняття та дозволені повторення.";
             }
-
+            // Додає попередження щодо порожнього слоту.
             void WarnGap(DateOnly date, TimeSlot gap)
             {
                 var label = $"{gap.Start:HH\\:mm}-{gap.End:HH\\:mm}";
@@ -1020,7 +1005,6 @@ public sealed class TeacherDraftsAutogenService
                             .Select(kv => kv.Key.ModuleId)
                             .Distinct()
                             .ToList();
-
                         if (modulesWithHours.Count == 0)
                         {
                             RecordSlotFailureReason(date, gap, $"Для групи {grp.Name} не лишилось модулів із невикористаними годинами.");
@@ -1031,12 +1015,10 @@ public sealed class TeacherDraftsAutogenService
                                 .Where(mid => !teachersForModule.Any(t => t.ModuleId == mid))
                                 .Select(mid => $"#{mid}")
                                 .ToList();
-
                             var noRooms = modulesWithHours
                                 .Where(mid => CandidateRoomsFor(mid).Count == 0)
                                 .Select(mid => $"#{mid}")
                                 .ToList();
-
                             if (noTeachers.Count > 0)
                             {
                                 RecordSlotFailureReason(date, gap, $"Немає викладачів для модулів: {string.Join(", ", noTeachers)}.");
@@ -1068,12 +1050,11 @@ public sealed class TeacherDraftsAutogenService
                         Reason: reason));
                 }
             }
-
+            // Спроба прибрати прогалини шляхом пересування занять у межах дня.
             bool TryShiftGaps(DateOnly date)
             {
                 bool moved = false;
                 var attempted = new HashSet<TeacherDraftItem>();
-
                 while (DayHasGaps(date, out var gap) && gap is not null)
                 {
                     var candidate = createdDrafts
@@ -1084,19 +1065,15 @@ public sealed class TeacherDraftsAutogenService
                                      && !attempted.Contains(cd))
                         .OrderBy(cd => cd.StartTime)
                         .FirstOrDefault();
-
                     if (candidate is null)
                     {
                         break;
                     }
-
                     attempted.Add(candidate);
-
                     if (typeBreakId.HasValue && candidate.LessonTypeId == typeBreakId.Value)
                     {
                         continue;
                     }
-
                     var s = gap.Start;
                     var e = gap.End;
                     int? tidCandidate = candidate.TeacherId;
@@ -1104,7 +1081,6 @@ public sealed class TeacherDraftsAutogenService
                     {
                         continue;
                     }
-
                     bool peopleBusy = busy.Any(x => x.Date == date
                                                     && (x.GroupId == grp.Id || (tidCandidate is int t && x.TeacherId == t))
                                                     && !(x.GroupId == candidate.GroupId
@@ -1118,7 +1094,6 @@ public sealed class TeacherDraftsAutogenService
                     {
                         continue;
                     }
-
                     bool requiresRoom = typeById.TryGetValue(candidate.LessonTypeId, out var ltMeta)
                         ? ltMeta.RequiresRoom
                         : true;
@@ -1137,7 +1112,6 @@ public sealed class TeacherDraftsAutogenService
                             continue;
                         }
                     }
-
                     var oldStart = candidate.StartTime;
                     var oldEnd = candidate.EndTime;
                     var idx = busy.FindIndex(x =>
@@ -1152,11 +1126,9 @@ public sealed class TeacherDraftsAutogenService
                     {
                         busy.RemoveAt(idx);
                     }
-
                     var buildingId = candidate.RoomId.HasValue
                         ? roomsAll.FirstOrDefault(r => r.Id == candidate.RoomId)?.BuildingId
                         : null;
-
                     busy.Add(new BusySlot(
                         candidate.GroupId,
                         candidate.TeacherId,
@@ -1167,18 +1139,15 @@ public sealed class TeacherDraftsAutogenService
                         buildingId,
                         candidate.ModuleId,
                         candidate.LessonTypeId));
-
                     candidate.StartTime = s;
                     candidate.EndTime = e;
                     candidate.DayOfWeek = date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
-
                     warnings.Add($"[{date:yyyy-MM-dd} {s:HH\\:mm}-{e:HH\\:mm}] {grp.Name}: заняття пересунуто, щоб прибрати розрив.");
                     moved = true;
                 }
-
                 return moved;
             }
-
+            // Додаємо перерви (BREAK) у слотах, що перекривають обід.
             if (typeBreakId.HasValue && groupLunch is not null)
             {
                 var anyModuleId = await _db.ModuleCourses
@@ -1190,24 +1159,20 @@ public sealed class TeacherDraftsAutogenService
                     var candidateSlots = slots
                         .Where(sl => sl.Start <= groupLunch.Start && groupLunch.End <= sl.End)
                         .ToList();
-
                     if (candidateSlots.Count == 0)
                     {
                         candidateSlots = slots
                             .Where(sl => sl.Start < groupLunch.End && groupLunch.Start < sl.End)
                             .ToList();
                     }
-
                     for (int d = 0; d < 7; d++)
                     {
                         var date = weekStart.AddDays(d);
                         if (!IsWorking(date, grp)) continue;
-
                         foreach (var slot in candidateSlots)
                         {
                             var s = slot.Start;
                             var e = slot.End;
-
                             var hasBreak = busy.Any(b =>
                                 b.GroupId == grp.Id &&
                                 b.Date == date &&
@@ -1215,7 +1180,6 @@ public sealed class TeacherDraftsAutogenService
                                 b.EndTime == e &&
                                 b.LessonTypeId == typeBreakId.Value);
                             if (hasBreak) continue;
-
                             var breakItem = new TeacherDraftItem
                             {
                                 Date = date,
@@ -1228,15 +1192,13 @@ public sealed class TeacherDraftsAutogenService
                                 Status = DraftStatus.Draft,
                                 IsLocked = false
                             };
-
                             _db.TeacherDraftItems.Add(breakItem);
-
                             busy.Add(new BusySlot(grp.Id, null, null, date, s, e, null, anyModuleId, typeBreakId.Value));
                         }
                     }
                 }
             }
-
+            // Формуємо список модулів для генерації у цій групі.
             var modules = hasModuleHourOverrides
                 ? remainingByGroupModule
                     .Where(kv => kv.Key.GroupId == grp.Id && kv.Value > 0)
@@ -1244,7 +1206,9 @@ public sealed class TeacherDraftsAutogenService
                     .Distinct()
                     .ToList()
                 : activePlans.Where(p => p.CourseId == grp.CourseId).Select(p => p.ModuleId).Distinct().ToList();
+            // Упорядковуємо модулі відповідно до послідовності курсу.
             var orderedModules = BuildCourseModuleOrder(grp.CourseId, modules);
+            // Набір наповнювачів (другорядні модулі).
             fillerByCourse.TryGetValue(grp.CourseId, out var fillerSetRaw);
             var fillerLookup = fillerSetRaw is not null
                 ? new HashSet<int>(fillerSetRaw)
@@ -1255,74 +1219,67 @@ public sealed class TeacherDraftsAutogenService
             var hasCompletedMainModules = mainModulesOrdered.Any(mid =>
                 factMap.TryGetValue((grp.Id, mid), out var completed) && completed > 0);
             // Для першої генерації курсу фіксуємо старт із першого головного модуля.
+            // Для першої генерації намагаємось стартувати з першого головного модуля.
             bool forceFirstMainModule = firstMainModuleId != 0
                 && !hasCompletedMainModules
                 && RemainingFor(grp.Id, firstMainModuleId) > 0;
             bool firstMainPlaced = !forceFirstMainModule;
             DateOnly? firstMainDate = null;
             TimeOnly? firstMainStart = null;
-
+            // Перевірка для заборони слотів до першого головного модуля.
             bool IsBeforeFirstMain(DateOnly date, TimeOnly start)
             {
                 if (!firstMainDate.HasValue || !firstMainStart.HasValue) return false;
                 if (date < firstMainDate.Value) return true;
                 return date == firstMainDate.Value && start < firstMainStart.Value;
             }
-
+            // Детемінований генератор для стабільного випадкового вибору.
             var groupRandom = new Random(HashCode.Combine(weekStart.DayNumber, grp.Id, grp.CourseId));
+            // Лічильник використання аудиторій цією групою (для рівномірності).
             var groupRoomUsage = busy
                 .Where(b => b.GroupId == grp.Id && b.Date >= weekStart && b.Date < weekEnd && b.RoomId != null)
                 .GroupBy(b => b.RoomId!.Value)
                 .ToDictionary(g => g.Key, g => g.Count());
-
             // Ваги штрафів/пріоритетів для вибору найкращої комбінації у слоті.
             // Чим більше значення штрафу — тим сильніше автогенерація уникає ситуації; 0 вимикає вплив.
-
             // Штраф за повторення того ж модуля у попередній день.
             // Збільшуйте, якщо потрібно рідше ставити модуль у сусідні дні; зменшуйте/0 — щоб дозволяти частіше.
             const double penaltySameModulePrevDay = 10.0;
-
             // Штраф за 3-тю і наступні пари того ж модуля в один день (за 1-шу/2-гу не застосовується).
             // Збільшуйте, якщо потрібно уникати надмірної концентрації; зменшуйте/0 — щоб дозволяти більше пар в день.
             const double penaltyExtraSameDay = 6.0;
-
             // Штраф за нелекційне заняття у слоті до обіду, якщо є (або очікуються) лекції до обідньої перерви.
             // Збільшуйте, якщо потрібно сильніше резервувати "дообідні" слоти під лекції; зменшуйте/0 — послабити.
             const double penaltyNonLecturePreLunch = 2.0;
-
             // Штраф за повтор одного й того ж часу (StartTime) для цього модуля в інші дні тижня.
             // Збільшуйте, якщо потрібен більш різноманітний розклад по годинах; зменшуйте/0 — дозволяти повтори.
             const double penaltySameSlotPattern = 1.5;
-
             // Пріоритет зберігати одного викладача для двох послідовних слотів одного модуля.
             // Якщо найкращий варіант з "тим самим викладачем" гірший за глобально найкращий більш ніж на це значення — дозволяємо зміну.
             // Збільшуйте, якщо хочете частіше отримувати "один викладач на дві пари підряд"; 0 — вимкнути пріоритет.
             const double maxExtraPenaltyPreferSameTeacherForConsecutiveModule = 6.0;
-
             // Пріоритет для типу занять, позначеного як "Бажано першим у тижні".
             // Для цього типу: штрафуємо пізніші слоти (щоб частіше ставився раніше у день).
             // Для інших типів (коли пріоритетний тип ще можна поставити цього дня): штрафуємо ранні слоти (щоб частіше ставилися після нього).
             // Збільшуйте, якщо потрібно сильніше наблизитися до "спочатку пріоритетний тип, потім інші"; зменшуйте/0 — вимкнути вплив.
             const double penaltyPreferredFirstTypeLateSlot = 1.5;
             const double penaltyNonPreferredEarlySlotWhilePreferredPending = 1.5;
+            // Штраф за загальне навантаження викладача на цьому курсі.
             double TeacherLoadPenalty(int teacherId) =>
                 TeacherLoadScore(teacherId, grp.CourseId) * 0.25;
-
+            // Штраф за зміну будівлі для групи або викладача.
             double BuildingDistancePenalty(int teacherId, Room? room, DateOnly date, TimeOnly start)
             {
                 if (room is null || room.BuildingId == 0)
                     return 2.0;
-
                 double score = 0;
                 var groupPrev = LastGroupBuilding(date, start);
                 var teacherPrev = LastTeacherBuilding(teacherId, date, start);
-
                 if (groupPrev is int gb && gb != room.BuildingId) score += 1.0;
                 if (teacherPrev is int tb && tb != room.BuildingId) score += 1.0;
-
                 return score;
             }
-
+            // Рахуємо, скільки занять уже виконано з основних модулів.
             int CountCompletedPrimary()
             {
                 int total = 0;
@@ -1335,11 +1292,11 @@ public sealed class TeacherDraftsAutogenService
                 }
                 return total;
             }
-
+            // Індекс наступного модуля у циклі основних модулів.
             int nextModuleIndex = mainModulesOrdered.Count > 0
                 ? CountCompletedPrimary() % mainModulesOrdered.Count
                 : 0;
-
+            // Перевіряє, чи є альтернатива для слоту, якщо модуль не вдається поставити.
             bool HasAvailableAlternativeForSlot(int currentModuleId, DateOnly date, TimeOnly start, TimeOnly end)
             {
                 foreach (var altModuleId in orderedModules)
@@ -1347,7 +1304,6 @@ public sealed class TeacherDraftsAutogenService
                     if (altModuleId == currentModuleId) continue;
                     if (RemainingFor(grp.Id, altModuleId) <= 0) continue;
                     if (HasRecentModule(grp.Id, altModuleId, date, windowDays: 2)) continue;
-
                     bool altSelfStudy = SelfStudyRemaining(grp.Id, altModuleId) > 0;
                     var altTids = (altSelfStudy
                             ? supervisorsForModule.Where(x => x.ModuleId == altModuleId).Select(x => x.TeacherId)
@@ -1357,19 +1313,15 @@ public sealed class TeacherDraftsAutogenService
                         .ThenBy(id => id)
                         .ToList();
                     if (altTids.Count == 0) continue;
-
                     var altRooms = CandidateRoomsFor(altModuleId);
-
                     foreach (var tid in altTids)
                     {
                         if (!TeacherFitsWorkingHours(tid, date, start, end))
                             continue;
-
                         bool peopleBusy = busy.Any(x => x.Date == date
                                                         && (x.GroupId == grp.Id || x.TeacherId == tid)
                                                         && x.StartTime < end && start < x.EndTime);
                         if (peopleBusy) continue;
-
                         ModuleTopic? altTopic = null;
                         int altLtId;
                         if (altSelfStudy)
@@ -1383,21 +1335,17 @@ public sealed class TeacherDraftsAutogenService
                             altLtId = pick.LessonTypeId;
                             altTopic = pick.Topic;
                         }
-
                         if (altTopic?.DepartmentId is int altDepId
                             && altDepId > 0
                             && (!teacherDepartmentById.TryGetValue(tid, out var teacherDep) || teacherDep != altDepId))
                         {
                             continue;
                         }
-
                         if (!TypeAllowed(altLtId)) continue;
-
                         if (groupLunch is not null && IsLectureType(altLtId) && end > groupLunch.Start)
                         {
                             continue;
                         }
-
                         bool isPreLunchSlot = groupLunch is not null && end <= groupLunch.Start;
                         if (isPreLunchSlot && !IsLectureType(altLtId))
                         {
@@ -1407,19 +1355,16 @@ public sealed class TeacherDraftsAutogenService
                                 && IsLectureType(b.LessonTypeId)
                                 && b.EndTime <= groupLunch!.Start
                                 && b.StartTime < start);
-
                             var lecturesPending = HasPendingLectureBeforeLunch(grp.Id);
                             if (hasLectureBefore || lecturesPending)
                             {
                                 continue;
                             }
                         }
-
                         var requiresRoom = (typeById.TryGetValue(altLtId, out var ltMetaAlt) ? ltMetaAlt.RequiresRoom : (bool?)null) ?? true;
                         if (requiresRoom)
                         {
                             if (altRooms.Count == 0) continue;
-
                             foreach (var rm in altRooms)
                             {
                                 bool roomBusy = busy.Any(x => x.Date == date
@@ -1435,10 +1380,9 @@ public sealed class TeacherDraftsAutogenService
                         }
                     }
                 }
-
                 return false;
             }
-
+            // Сортуємо модулі так, щоб уникати повторів з минулого тижня.
             IEnumerable<int> PreferNotUsedLastWeek(IEnumerable<int> modules)
             {
                 var list = modules.ToList();
@@ -1446,7 +1390,7 @@ public sealed class TeacherDraftsAutogenService
                 var rest = list.Where(mid => !preferred.Contains(mid)).ToList();
                 return preferred.Concat(rest);
             }
-
+            // Підбирає аудиторії, які підходять під обмеження модуля і місткість групи.
             List<Room> CandidateRoomsFor(int mid)
             {
                 allowedRoomsByModule.TryGetValue(mid, out var allowedRooms);
@@ -1460,7 +1404,7 @@ public sealed class TeacherDraftsAutogenService
                     .ThenBy(rm => rm.Id)
                     .ToList();
             }
-
+            // Остання будівля групи до поточного слоту.
             int? LastGroupBuilding(DateOnly date, TimeOnly start)
             {
                 return busy
@@ -1468,7 +1412,7 @@ public sealed class TeacherDraftsAutogenService
                     .OrderBy(b => b.EndTime)
                     .LastOrDefault()?.BuildingId;
             }
-
+            // Остання будівля викладача до поточного слоту.
             int? LastTeacherBuilding(int teacherId, DateOnly date, TimeOnly start)
             {
                 return busy
@@ -1476,23 +1420,20 @@ public sealed class TeacherDraftsAutogenService
                     .OrderBy(b => b.EndTime)
                     .LastOrDefault()?.BuildingId;
             }
-
+            // Визначає, який модуль вважаємо пріоритетним на поточний день.
             int? ResolvePrimaryModule()
             {
                 if (mainModulesOrdered.Count == 0) return null;
-
                 if (forceFirstMainModule && !firstMainPlaced && RemainingFor(grp.Id, firstMainModuleId) > 0)
                 {
                     return firstMainModuleId;
                 }
-
                 var preferredPrimary = mainModulesOrdered
                     .FirstOrDefault(mid => RemainingFor(grp.Id, mid) > 0 && !UsedLastWeek(grp.Id, mid));
                 if (preferredPrimary != 0)
                 {
                     return preferredPrimary;
                 }
-
                 for (int offset = 0; offset < mainModulesOrdered.Count; offset++)
                 {
                     var idx = (nextModuleIndex + offset) % mainModulesOrdered.Count;
@@ -1501,29 +1442,29 @@ public sealed class TeacherDraftsAutogenService
                     {
                         continue;
                     }
-
                     return moduleId;
                 }
-
                 return null;
             }
-
+            // Основна спроба розмістити модуль у межах конкретного дня.
             async Task<bool> TryPlaceModuleAsync(int moduleId, DateOnly date, bool isPrimary, bool allowRepeatPreviousDay = false, bool allowExtraSameDay = false, bool relaxed = false, bool preferEarliestSlot = false)
             {
+                // Якщо день уже заповнений або порушуємо правило першого головного модуля — виходимо.
                 if (CountFor(grp.Id, date) >= slots.Count)
                     return false;
-
                 if (forceFirstMainModule && !firstMainPlaced && moduleId != firstMainModuleId)
                     return false;
-
+                // Ключ для залишків по групі/модулю.
                 var remainingKey = (grp.Id, moduleId);
+                // Ознака, що модуль належить до fillers.
                 bool isFiller = fillerLookup.Contains(moduleId);
                 string? moduleTitle = null;
+                // Чи використовуємо пріоритетний тип занять.
                 bool preferredFirstEnabled = preferredFirstTypeId != 0 && TypeAllowed(preferredFirstTypeId);
                 bool preferredFirstPendingToday = false;
-
                 if (preferredFirstEnabled && (penaltyPreferredFirstTypeLateSlot > 0 || penaltyNonPreferredEarlySlotWhilePreferredPending > 0))
                 {
+                    // Визначаємо, чи є сьогодні ще теми з пріоритетним типом.
                     foreach (var mid in orderedModules)
                     {
                         if (RemainingFor(grp.Id, mid) <= 0) continue;
@@ -1542,63 +1483,58 @@ public sealed class TeacherDraftsAutogenService
                         }
                     }
                 }
-
+                // Ледачо завантажуємо назву модуля для повідомлень.
                 async Task<bool> EnsureModuleTitleAsync()
                 {
                     if (moduleTitle is not null)
                     {
                         return true;
                     }
-
                     moduleTitle = await _db.Modules
                         .Where(m => m.Id == moduleId)
                         .Select(m => m.Title)
                         .FirstOrDefaultAsync();
-
                     if (moduleTitle is null)
                     {
                         if (missingModulesNotified.Add(moduleId))
                         {
                             warnings.Add($"В базі даних відсутній модуль із ідентифікатором {moduleId}. Автогенерацію для нього пропущено.");
                         }
-
                         skipped++;
                         return false;
                     }
-
                     return true;
                 }
-
+                // Лейбл модуля для текстів попереджень.
                 string ModuleLabel() => string.IsNullOrWhiteSpace(moduleTitle) ? $"#{moduleId}" : moduleTitle!;
-
+                // Для основних модулів — перевіряємо залишок годин.
                 if (!isFiller && RemainingFor(grp.Id, moduleId) <= 0)
                 {
                     return false;
                 }
-
+                // Якщо модуль відсутній у БД — пропускаємо.
                 if (!await EnsureModuleTitleAsync())
                 {
                     return false;
                 }
-
+                // Якщо теми вичерпано — прибираємо модуль з плану.
                 if (TopicsDepleted(grp.Id, moduleId))
                 {
                     if (remainingByGroupModule.ContainsKey(remainingKey))
                     {
                         remainingByGroupModule[remainingKey] = 0;
                     }
-
                     if (topicsExhaustedNotified.Add(remainingKey))
                     {
                         warnings.Add($"Для модуля <{ModuleLabel()}> у групи {grp.Name} вичерпано теми. Пропустили розкладення.");
                     }
-
                     var topicReason = $"Для модуля <{ModuleLabel()}> у групи {grp.Name} вичерпано теми для цього тижня.";
                     RecordSlotFailureReasonForAllSlots(date, topicReason);
                     return false;
                 }
-
+                // Визначаємо, чи ставимо самостійну роботу.
                 bool placeSelfStudy = SelfStudyRemaining(grp.Id, moduleId) > 0;
+                // Підбираємо кандидатів-викладачів/керівників.
                 var tids = (placeSelfStudy
                         ? supervisorsForModule.Where(x => x.ModuleId == moduleId).Select(x => x.TeacherId)
                         : teachersForModule.Where(x => x.ModuleId == moduleId).Select(x => x.TeacherId))
@@ -1606,6 +1542,7 @@ public sealed class TeacherDraftsAutogenService
                     .OrderBy(id => TeacherLoadPenalty(id))
                     .ThenBy(id => id)
                     .ToList();
+                // Якщо немає викладачів — фіксуємо причину і пропускаємо.
                 if (tids.Count == 0)
                 {
                     var teacherReason = placeSelfStudy
@@ -1622,29 +1559,29 @@ public sealed class TeacherDraftsAutogenService
                     skipped++;
                     return false;
                 }
-
+                // Кандидатні аудиторії для модуля.
                 var candidateRooms = CandidateRoomsFor(moduleId);
-
                 PlacementCandidate? best = null;
-
+                // Перебираємо слоти дня та шукаємо найкращого кандидата.
                 foreach (var sl in slots)
                 {
                     if (CountFor(grp.Id, date) >= slots.Count) break;
-
                     var s = sl.Start;
                     var e = sl.End;
                     var slotLabel = $"{s:HH\\:mm}-{e:HH\\:mm}";
+                    // Тимчасові колекції причин та кандидатів для цього слоту.
                     var slotIssues = new HashSet<string>();
                     var slotCandidates = new List<PlacementCandidate>();
                     int slotIndex = slotIndexByTime.TryGetValue((s, e), out var si) ? si : 0;
+                    // Викладач у сусідньому слоті (для пріоритету суміжних пар).
                     var preferredAdjacentTeacherId = GetAdjacentSameModuleTeacherId(date, sl, moduleId);
-
+                    // Не дозволяємо ставити інші модулі до першого головного.
                     if (forceFirstMainModule && firstMainPlaced && moduleId != firstMainModuleId && IsBeforeFirstMain(date, s))
                     {
                         RecordSlotFailureReason(date, sl, "Слот до першого головного модуля заблоковано.");
                         continue;
                     }
-
+                    // Слот зайнятий перервою/обідом.
                     bool slotBreak = busy.Any(b => b.GroupId == grp.Id && b.Date == date
                                                    && b.LessonTypeId == typeBreakId && b.StartTime == s && b.EndTime == e);
                     if (slotBreak)
@@ -1652,14 +1589,14 @@ public sealed class TeacherDraftsAutogenService
                         RecordSlotFailureReason(date, sl, $"Слот {slotLabel} зайнятий перервою/обідом.");
                         continue;
                     }
-
+                    // Уникаємо повторів модуля у вузькому часовому вікні.
                     bool hasRecent = HasRecentModule(grp.Id, moduleId, date, windowDays: 2);
                     if (!allowRepeatPreviousDay && hasRecent && HasAvailableAlternativeForSlot(moduleId, date, s, e))
                     {
                         RecordSlotFailureReason(date, sl, $"Модуль <{ModuleLabel()}> не ставимо у вікні ±2 дні, поки є інші модулі з годинами.");
                         continue;
                     }
-
+                    // Спроба розмістити самостійну роботу, якщо вона ще лишилась.
                     var isSelfStudyPlacement = placeSelfStudy && SelfStudyRemaining(grp.Id, moduleId) > 0;
                     ModuleTopic? topicSelection = null;
                     int ltypeId = 0;
@@ -1676,14 +1613,13 @@ public sealed class TeacherDraftsAutogenService
                             ltypeId = topicSelection.LessonTypeId;
                         }
                     }
-
+                    // Якщо самостійна робота не підходить — обираємо звичайний тип/тему.
                     if (!isSelfStudyPlacement)
                     {
                         var pickResult = PickLessonType(grp.Id, grp.CourseId, moduleId, date);
                         ltypeId = pickResult.LessonTypeId;
                         topicSelection = pickResult.Topic;
                     }
-
                     if (!TypeAllowed(ltypeId))
                     {
                         string reason;
@@ -1707,11 +1643,10 @@ public sealed class TeacherDraftsAutogenService
                         {
                             reason = $"Тип заняття #{ltypeId} недоступний для автогенерації, тому слот {slotLabel} пропущено.";
                         }
-
                         RecordSlotFailureReason(date, sl, reason);
                         continue;
                     }
-
+                    // Нотатка, якщо пріоритетний тип опиняється після обіду (relaxed).
                     string? preferredFirstAfterLunchNote = null;
                     if (preferredFirstEnabled
                         && groupLunch is not null
@@ -1729,14 +1664,13 @@ public sealed class TeacherDraftsAutogenService
                         }
                         preferredFirstAfterLunchNote = "Бажаний перший тип поставлено після обіду (relaxed)";
                     }
-
+                    // За потреби фільтруємо викладачів за кафедрою теми.
                     var filteredTeacherIds = tids;
                     if (topicSelection?.DepartmentId is int departmentId && departmentId > 0)
                     {
                         filteredTeacherIds = tids
                             .Where(tid => teacherDepartmentById.TryGetValue(tid, out var depId) && depId == departmentId)
                             .ToList();
-
                         if (filteredTeacherIds.Count == 0)
                         {
                             var depName = departmentNames.TryGetValue(departmentId, out var dn) ? dn : $"#{departmentId}";
@@ -1748,7 +1682,7 @@ public sealed class TeacherDraftsAutogenService
                             continue;
                         }
                     }
-
+                    // Перебір кандидатів-викладачів для цього слоту.
                     foreach (var tidCandidate in filteredTeacherIds)
                     {
                         if (!TeacherFitsWorkingHours(tidCandidate, date, s, e))
@@ -1756,7 +1690,7 @@ public sealed class TeacherDraftsAutogenService
                             slotIssues.Add($"Викладач {TeacherLabel(tidCandidate)} не працює у слоті {slotLabel}.");
                             continue;
                         }
-
+                        // Перевірка конфліктів по групі або викладачу.
                         bool peopleBusy = busy.Any(x => x.Date == date
                                                         && (x.GroupId == grp.Id || x.TeacherId == tidCandidate)
                                                         && x.StartTime < e && s < x.EndTime);
@@ -1765,14 +1699,13 @@ public sealed class TeacherDraftsAutogenService
                             slotIssues.Add($"Група {grp.Name} або викладач {TeacherLabel(tidCandidate)} зайняті у слоті {slotLabel}.");
                             continue;
                         }
-
+                        // Накопичуємо штрафи та їх пояснення.
                         var penalties = new List<string>();
                         double penaltyScore = 0;
                         if (!string.IsNullOrWhiteSpace(preferredFirstAfterLunchNote))
                         {
                             penalties.Add(preferredFirstAfterLunchNote);
                         }
-
                         if (preferredFirstEnabled)
                         {
                             if (ltypeId == preferredFirstTypeId && penaltyPreferredFirstTypeLateSlot > 0)
@@ -1784,7 +1717,7 @@ public sealed class TeacherDraftsAutogenService
                                 penaltyScore += (slots.Count - 1 - slotIndex) * penaltyNonPreferredEarlySlotWhilePreferredPending;
                             }
                         }
-
+                        // Штрафуємо повтори модуля в один день.
                         var sameDayCount = CountModuleForDay(grp.Id, date, moduleId);
                         if (sameDayCount >= 2)
                         {
@@ -1792,7 +1725,7 @@ public sealed class TeacherDraftsAutogenService
                             penaltyScore += penaltyExtraSameDay * (sameDayCount - 1) * multiplier;
                             penalties.Add("Дозволено більше двох пар модуля в один день");
                         }
-
+                        // Штрафуємо повтори модуля у сусідні дні.
                         if (HadSameModulePreviousDay(grp.Id, moduleId, date))
                         {
                             if (allowRepeatPreviousDay)
@@ -1806,9 +1739,8 @@ public sealed class TeacherDraftsAutogenService
                                 penalties.Add("Дозволено повторення модуля у сусідні дні");
                             }
                         }
-
+                        // Чи потрібна аудиторія для цього типу заняття.
                         var requiresRoom = (typeById.TryGetValue(ltypeId, out var ltMeta) ? ltMeta.RequiresRoom : (bool?)null) ?? true;
-
                         if (groupLunch is not null && IsLectureType(ltypeId) && sl.End > groupLunch.Start)
                         {
                             if (!relaxed)
@@ -1820,7 +1752,7 @@ public sealed class TeacherDraftsAutogenService
                             }
                             penalties.Add("Лекцію поставлено після обіду (relaxed)");
                         }
-
+                        // Обмеження до обідньої перерви для лекцій.
                         bool isPreLunchSlot = groupLunch is not null && sl.End <= groupLunch.Start;
                         if (isPreLunchSlot && !IsLectureType(ltypeId))
                         {
@@ -1830,18 +1762,16 @@ public sealed class TeacherDraftsAutogenService
                                 && IsLectureType(b.LessonTypeId)
                                 && b.EndTime <= groupLunch!.Start
                                 && b.StartTime < sl.Start);
-
                             var lecturesPending = HasPendingLectureBeforeLunch(grp.Id);
-
                             if (hasLectureBefore || lecturesPending)
                             {
                                 penaltyScore += penaltyNonLecturePreLunch;
                                 penalties.Add("Слот до обіду зарезервовано під лекцію");
                             }
                         }
-
+                        // Додаємо штраф за навантаження викладача.
                         penaltyScore += TeacherLoadPenalty(tidCandidate);
-
+                        // Штрафуємо повтор однакового часу для модуля в інший день.
                         bool sameSlotPattern = busy.Any(b =>
                             b.GroupId == grp.Id
                             && b.ModuleId == moduleId
@@ -1853,7 +1783,7 @@ public sealed class TeacherDraftsAutogenService
                             penaltyScore += penaltySameSlotPattern;
                             penalties.Add("Повтор того ж часу в інші дні");
                         }
-
+                        // Підбір аудиторій (якщо потрібні).
                         if (requiresRoom)
                         {
                             if (candidateRooms.Count == 0)
@@ -1863,7 +1793,7 @@ public sealed class TeacherDraftsAutogenService
                                 warnings.Add(roomReason);
                                 continue;
                             }
-
+                            // Перевіряємо кожну аудиторію на зайнятість.
                             foreach (var rm in candidateRooms)
                             {
                                 bool roomBusy = busy.Any(x => x.Date == date
@@ -1874,7 +1804,6 @@ public sealed class TeacherDraftsAutogenService
                                     slotIssues.Add($"Усі аудиторії для модуля <{ModuleLabel()}> зайняті у слоті {slotLabel}.");
                                     continue;
                                 }
-
                                 var totalPenalty = penaltyScore + BuildingDistancePenalty(tidCandidate, rm, date, s);
                                 var notes = new List<string>(penalties);
                                 var candidate = new PlacementCandidate(sl, tidCandidate, rm, ltypeId, topicSelection, isSelfStudyPlacement, totalPenalty, notes);
@@ -1888,14 +1817,13 @@ public sealed class TeacherDraftsAutogenService
                             slotCandidates.Add(candidate);
                         }
                     }
-
+                    // Якщо є кандидати — обираємо найкращого за штрафами.
                     if (slotCandidates.Count > 0)
                     {
                         var bestAny = slotCandidates
                             .OrderBy(c => c.Penalty)
                             .ThenBy(c => groupRandom.Next())
                             .First();
-
                         var localBest = bestAny;
                         if (preferredAdjacentTeacherId is int pt && maxExtraPenaltyPreferSameTeacherForConsecutiveModule > 0)
                         {
@@ -1904,7 +1832,6 @@ public sealed class TeacherDraftsAutogenService
                                 .OrderBy(c => c.Penalty)
                                 .ThenBy(c => groupRandom.Next())
                                 .FirstOrDefault();
-
                             if (bestPreferred is not null
                                 && bestPreferred.Penalty <= bestAny.Penalty + maxExtraPenaltyPreferSameTeacherForConsecutiveModule)
                             {
@@ -1921,6 +1848,7 @@ public sealed class TeacherDraftsAutogenService
                             best = localBest;
                         }
                     }
+                    // Якщо кандидатів немає, фіксуємо причини відмов.
                     else if (slotIssues.Count > 0)
                     {
                         foreach (var reason in slotIssues)
@@ -1937,12 +1865,12 @@ public sealed class TeacherDraftsAutogenService
                         }
                     }
                 }
-
+                // Якщо не знайдено жодного слоту — виходимо.
                 if (best is null)
                 {
                     return false;
                 }
-
+                // Фіксуємо обраний варіант та створюємо чернетку.
                 var selectedSlot = best.Slot;
                 var selectedRoom = best.Room;
                 var selectedTeacher = best.TeacherId;
@@ -1950,7 +1878,6 @@ public sealed class TeacherDraftsAutogenService
                 var selectedLessonTypeId = best.LessonTypeId;
                 var startTime = selectedSlot.Start;
                 var endTime = selectedSlot.End;
-
                 var item = new TeacherDraftItem
                 {
                     Date = date,
@@ -1969,12 +1896,12 @@ public sealed class TeacherDraftsAutogenService
                 };
                 _db.TeacherDraftItems.Add(item);
                 createdDrafts.Add(item);
-
+                // Позначаємо тему як використану (для звичайних занять).
                 if (selectedTopic is not null && !best.IsSelfStudy)
                 {
                     MarkTopicUsed(grp.Id, moduleId, selectedTopic);
                 }
-
+                // Додаємо слот у список зайнятих.
                 busy.Add(new BusySlot(
                     grp.Id,
                     selectedTeacher,
@@ -1985,21 +1912,22 @@ public sealed class TeacherDraftsAutogenService
                     selectedRoom?.BuildingId,
                     moduleId,
                     selectedLessonTypeId));
-
+                // Оновлюємо статистику використання аудиторій.
                 if (selectedRoom?.Id is int ridSelected)
                 {
                     groupRoomUsage[ridSelected] = groupRoomUsage.TryGetValue(ridSelected, out var usedRoom)
                         ? usedRoom + 1
                         : 1;
                 }
-
+                // Збільшуємо лічильники створених записів і зайнятих слотів.
                 created++;
                 Inc(grp.Id, date);
+                // Фіксуємо, що пріоритетний тип уже використано для модуля.
                 if (preferredFirstTypeId != 0 && selectedLessonTypeId == preferredFirstTypeId)
                 {
                     hasPreferred.Add((grp.Id, moduleId));
                 }
-
+                // Зменшуємо залишки самостійної роботи.
                 if (best.IsSelfStudy && selfStudyRemainingByGroupModule.TryGetValue(remainingKey, out var ssLeft) && ssLeft > 0)
                 {
                     selfStudyRemainingByGroupModule[remainingKey] = Math.Max(0, ssLeft - 1);
@@ -2012,19 +1940,20 @@ public sealed class TeacherDraftsAutogenService
                         selfStudyTopicRemaining[topicKey] = Math.Max(0, leftByTopic - 1);
                     }
                 }
+                // Зменшуємо загальні залишки годин по модулю.
                 if (remainingByGroupModule.TryGetValue(remainingKey, out var leftRemaining) && leftRemaining > 0)
                 {
                     leftRemaining--;
                     remainingByGroupModule[remainingKey] = Math.Max(0, leftRemaining);
                 }
-
+                // Фіксуємо перший головний модуль (для обмежень).
                 if (forceFirstMainModule && !firstMainPlaced && moduleId == firstMainModuleId)
                 {
                     firstMainPlaced = true;
                     firstMainDate = date;
                     firstMainStart = startTime;
                 }
-
+                // Рухаємо індекс основних модулів у циклі.
                 if (isPrimary && mainModulesOrdered.Count > 0)
                 {
                     var currentIdx = mainModulesOrdered.FindIndex(mid => mid == moduleId);
@@ -2033,26 +1962,23 @@ public sealed class TeacherDraftsAutogenService
                         nextModuleIndex = (currentIdx + 1) % mainModulesOrdered.Count;
                     }
                 }
-
+                // Додаємо нотатки з причинами штрафів.
                 if (best.Notes.Count > 0)
                 {
                     var noteText = string.Join("; ", best.Notes);
                     warnings.Add($"[{date:yyyy-MM-dd} {startTime:HH\\:mm}-{endTime:HH\\:mm}] {grp.Name}: {noteText}");
                 }
-
                 return true;
             }
-
+            // Генеруємо розклад по днях тижня для поточної групи.
             for (int d = 0; d < 7; d++)
             {
                 var date = weekStart.AddDays(d);
                 if (!IsWorking(date, grp)) continue;
-
                 int maxPerDay = slots.Count;
                 if (maxPerDay == 0) continue;
-
                 var modulesAttemptedToday = new HashSet<int>();
-
+                // Допоміжний прохід: заповнення залишків з різними рівнями послаблень.
                 async Task FillWithRemainingModulesAsync(bool allowRepeatPreviousDay = false, bool allowExtraSameDay = false, bool relaxed = false)
                 {
                     foreach (var moduleId in PreferNotUsedLastWeek(orderedModules))
@@ -2061,22 +1987,19 @@ public sealed class TeacherDraftsAutogenService
                         {
                             break;
                         }
-
                         if (!allowExtraSameDay && modulesAttemptedToday.Contains(moduleId))
                         {
                             continue;
                         }
-
                         if (RemainingFor(grp.Id, moduleId) <= 0)
                         {
                             continue;
                         }
-
                         modulesAttemptedToday.Add(moduleId);
                         await TryPlaceModuleAsync(moduleId, date, isPrimary: false, allowRepeatPreviousDay: allowRepeatPreviousDay, allowExtraSameDay: allowExtraSameDay, relaxed: relaxed);
                     }
                 }
-
+                // Основний модуль дня (пріоритетний у логіці курсу).
                 var primaryModuleId = ResolvePrimaryModule();
                 bool placedPrimary = false;
                 if (primaryModuleId.HasValue)
@@ -2107,28 +2030,25 @@ public sealed class TeacherDraftsAutogenService
                             relaxed: softFill);
                     }
                 }
-
+                // Черга filler-модулів, відсортована за залишками.
                 Queue<int> BuildFillerQueueForDay()
                 {
                     if (fillerModulesOrdered.Count == 0)
                         return new Queue<int>();
-
                     var ordered = fillerModulesOrdered
                         .OrderByDescending(mid => RemainingFor(grp.Id, mid))
                         .ThenBy(mid => mid)
                         .ToList();
                     return new Queue<int>(ordered);
                 }
-
+                // Заповнюємо день filler-модулями, якщо залишився простір.
                 if (fillerModulesOrdered.Count > 0)
                 {
                     var fillerQueue = BuildFillerQueueForDay();
                     int fillerAttempts = 0;
-
                     while (CountFor(grp.Id, date) < maxPerDay)
                     {
                         if (fillerQueue.Count == 0) break;
-
                         var fillerModuleId = fillerQueue.Dequeue();
                         if (RemainingFor(grp.Id, fillerModuleId) <= 0)
                         {
@@ -2137,14 +2057,12 @@ public sealed class TeacherDraftsAutogenService
                             {
                                 break;
                             }
-
                             if (fillerQueue.Count == 0)
                             {
                                 fillerQueue = BuildFillerQueueForDay();
                             }
                             continue;
                         }
-
                         modulesAttemptedToday.Add(fillerModuleId);
                         var placedFiller = await TryPlaceModuleAsync(
                             fillerModuleId,
@@ -2160,23 +2078,20 @@ public sealed class TeacherDraftsAutogenService
                             {
                                 break;
                             }
-
                             if (fillerQueue.Count == 0)
                             {
                                 fillerQueue = BuildFillerQueueForDay();
                             }
                             continue;
                         }
-
                         fillerAttempts = 0;
-
                         if (fillerQueue.Count == 0 && CountFor(grp.Id, date) < maxPerDay)
                         {
                             fillerQueue = BuildFillerQueueForDay();
                         }
                     }
                 }
-
+                // Додаткові проходи для заповнення (softFill дозволяє більше повторів).
                 if (softFill)
                 {
                     if (CountFor(grp.Id, date) < maxPerDay)
@@ -2190,30 +2105,26 @@ public sealed class TeacherDraftsAutogenService
                     {
                         await FillWithRemainingModulesAsync();
                     }
-
                     if (CountFor(grp.Id, date) < maxPerDay)
                     {
                         await FillWithRemainingModulesAsync(allowRepeatPreviousDay: false, allowExtraSameDay: true);
                     }
-
                     if (CountFor(grp.Id, date) < maxPerDay)
                     {
                         await FillWithRemainingModulesAsync(allowRepeatPreviousDay: true, allowExtraSameDay: true, relaxed: true);
                     }
                 }
-
+                // Після заповнення пробуємо вирівняти прогалини.
                 TryShiftGaps(date);
-
                 if (DayHasGaps(date, out var remainingGap) && remainingGap is not null)
                 {
                     WarnGap(date, remainingGap);
                 }
             }
         }
-
+        // Зберігаємо створені чернетки та повертаємо результат.
         await _db.SaveChangesAsync();
         return Ok(new AutoGenResult(created, skipped, warnings, gapDetails));
     }
-
 
 }

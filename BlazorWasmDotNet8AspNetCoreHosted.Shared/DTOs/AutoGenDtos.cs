@@ -4,6 +4,7 @@ using System.Collections.Generic;
 // DTO для автогенерації розкладу
 namespace BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 
+// Набір днів тижня для автогенерації.
 public enum WeekPreset
 {
     MonFri,
@@ -11,6 +12,7 @@ public enum WeekPreset
     MonSun
 }
 
+// DTO запиту автогенерації чернеток.
 public record AutoGenRequest(
     DateOnly WeekStart,
     bool ClearExisting = true,
@@ -22,6 +24,7 @@ public record AutoGenRequest(
     bool SoftFill = false
 );
 
+// DTO деталі пропущеного слота.
 public record AutoGenGapDetail(
     int GroupId,
     string GroupName,
@@ -32,6 +35,7 @@ public record AutoGenGapDetail(
     string? Reason
 );
 
+// Результат автогенерації чернеток.
 public record AutoGenResult(
     int Created,
     int Skipped,

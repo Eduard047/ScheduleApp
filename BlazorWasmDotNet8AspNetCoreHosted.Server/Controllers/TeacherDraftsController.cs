@@ -28,7 +28,6 @@ public sealed class TeacherDraftsController : ControllerBase
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         WriteIndented = false
     };
-
     public TeacherDraftsController(
         AppDbContext db,
         RulesService rules,
@@ -44,56 +43,43 @@ public sealed class TeacherDraftsController : ControllerBase
         _autogenService = autogenService;
         _publishService = publishService;
     }
-
     [HttpGet]
-    /// <summary>
-    /// Повертає перелік чернеток викладачів за тиждень із додатковою інформацією.
-    /// </summary>
+    // Повертає перелік чернеток викладачів за тиждень із додатковою інформацією.
     public Task<IReadOnlyList<TeacherDraftItemDto>> Get(
         [FromQuery] DateOnly weekStart,
         [FromQuery] int? teacherId,
         [FromQuery] int? groupId,
         [FromQuery] int? roomId)
         => _queryService.GetAsync(weekStart, teacherId, groupId, roomId);
-
     [HttpGet("export")]
+    // Експортує чернетки в Excel за фільтрами.
     public async Task<IActionResult> Export(
         [FromQuery] DateOnly weekStart,
         [FromQuery] int? teacherId,
         [FromQuery] int? groupId,
         [FromQuery] int? roomId)
         => await _exportService.ExportAsync(weekStart, teacherId, groupId, roomId);
-
     [HttpGet("week")]
-    /// <summary>
-    /// Додає коротку кінцеву точку, що делегує основному методу отримання даних.
-    /// </summary>
+    // Додає коротку кінцеву точку, що делегує основному методу отримання даних.
     public Task<IReadOnlyList<TeacherDraftItemDto>> GetWeekAlias(
         [FromQuery] DateOnly weekStart,
         [FromQuery] int? teacherId,
         [FromQuery] int? groupId,
         [FromQuery] int? roomId)
         => _queryService.GetAsync(weekStart, teacherId, groupId, roomId);
-
     [HttpDelete("{id:int}")]
-    /// <summary>
-    /// Видаляє чернетку, якщо запис існує та не заблокований.
-    /// </summary>
+    // Видаляє чернетку, якщо запис існує та не заблокований.
     public async Task<IActionResult> Delete(int id, [FromQuery] bool confirm = false, [FromQuery] bool unrestricted = false)
     {
         var item = await _db.TeacherDraftItems.FirstOrDefaultAsync(x => x.Id == id);
         if (item is null) return NotFound(new { message = $"TeacherDraftItem {id} not found" });
         if (item.IsLocked && !unrestricted) return Conflict(new { message = "Чернетка заблокована. Увімкніть режим без обмежень, щоб видалити." });
-
         _db.TeacherDraftItems.Remove(item);
         await _db.SaveChangesAsync();
         return NoContent();
     }
-
     [HttpPost("upsert")]
-    /// <summary>
-    /// Валідує й створює або оновлює чернетку викладача, повертає її ідентифікатор.
-    /// </summary>
+    // Валідує й створює або оновлює чернетку викладача, повертає її ідентифікатор.
     public async Task<ActionResult<int>> Upsert([FromBody] DraftUpsertRequest r)
     {
         var validation = await _rules.ValidateDraftAsync(r);
@@ -105,37 +91,31 @@ public sealed class TeacherDraftsController : ControllerBase
                 warnings = validation.Warnings,
                 details = validation.Report
             });
-
         var reportJson = validation.Report.Issues.Count > 0
             ? JsonSerializer.Serialize(validation.Report, ValidationJsonOptions)
             : null;
-
         var lessonTypeRequiresRoom = await _db.LessonTypes
             .Where(x => x.Id == r.LessonTypeId)
             .Select(x => (bool?)x.RequiresRoom)
             .FirstOrDefaultAsync();
         var normalizedRoomId = lessonTypeRequiresRoom is false ? null : r.RoomId;
-
         var start = TimeOnly.Parse(r.TimeStart);
         var end = TimeOnly.Parse(r.TimeEnd);
-
         if (r.Id is int id && id > 0)
         {
             var item = await _db.TeacherDraftItems.FirstOrDefaultAsync(x => x.Id == id);
             if (item is null) return NotFound(new { message = $"TeacherDraftItem {id} not found" });
-
             ApplyDraftRequest(item, r, start, end, normalizedRoomId, reportJson);
             await _db.SaveChangesAsync();
             return Ok(item.Id);
         }
-
         var newItem = new TeacherDraftItem();
         ApplyDraftRequest(newItem, r, start, end, normalizedRoomId, reportJson);
         _db.TeacherDraftItems.Add(newItem);
         await _db.SaveChangesAsync();
         return Ok(newItem.Id);
     }
-
+    // Переносить дані запиту у доменну модель чернетки.
     private static void ApplyDraftRequest(
         TeacherDraftItem item,
         DraftUpsertRequest request,
@@ -159,63 +139,40 @@ public sealed class TeacherDraftsController : ControllerBase
         item.ValidationWarnings = validationReport;
         item.Status = DraftStatus.Draft;
     }
-
     [HttpPost("clear-week")]
-    /// <summary>
-    /// Очищає незаблоковані чернетки за вказаний тиждень із можливими додатковими фільтрами.
-    /// </summary>
+    // Очищає незаблоковані чернетки за вказаний тиждень із можливими додатковими фільтрами.
     public async Task<ActionResult<ClearWeekResult>> ClearWeek([FromBody] ClearWeekRequest r)
     {
         var start = r.WeekStart;
         var end = start.AddDays(7);
-
         var q = _db.TeacherDraftItems.Where(x => x.Date >= start && x.Date < end && !x.IsLocked);
         if (r.CourseId is int cid) q = q.Where(x => x.Group.CourseId == cid);
         if (r.GroupId is int gid) q = q.Where(x => x.GroupId == gid);
-
         var deleted = await q.ExecuteDeleteAsync();
         return Ok(new ClearWeekResult(deleted));
     }
-
     [HttpPost("autogen/week")]
-    /// <summary>
-    /// Викликає автогенерацію чернеток для одного тижня.
-    /// </summary>
+    // Викликає автогенерацію чернеток для одного тижня.
     public Task<ActionResult<AutoGenResult>> DraftAutoGenWeek([FromBody] DraftAutoGenRequest r)
         => _autogenService.DraftAutoGenWeek(r);
-
     [HttpPost("autogen/month")]
-    /// <summary>
-    /// Автоматично генерує чернетки для кожного тижня в межах місяця.
-    /// </summary>
+    // Автоматично генерує чернетки для кожного тижня в межах місяця.
     public async Task<ActionResult<AutoGenResult>> AutogenMonth([FromBody] AutogenMonthRequest r)
         => await _autogenService.AutogenMonth(r);
-
     [HttpPost("autogen/course")]
-    /// <summary>
-    /// Генерує чернетки для курсу в заданому діапазоні тижнів.
-    /// </summary>
+    // Генерує чернетки для курсу в заданому діапазоні тижнів.
     public async Task<ActionResult<AutoGenResult>> AutogenCourse([FromBody] AutogenCourseRequest r)
         => await _autogenService.AutogenCourse(r);
-
     [HttpPost("autogen")]
-    /// <summary>
-    /// Створює чернетки на основі правил і доступних даних для заданого тижня.
-    /// </summary>
+    // Створює чернетки на основі правил і доступних даних для заданого тижня.
     public async Task<ActionResult<AutoGenResult>> DraftAutoGen([FromBody] DraftAutoGenRequest r)
         => await _autogenService.DraftAutoGen(r);
-
     [HttpPost("approve-week")]
-    /// <summary>
-    /// Позначає чернетки викладача за тиждень як затверджені.
-    /// </summary>
+    // Позначає чернетки викладача за тиждень як затверджені.
     public async Task<IActionResult> ApproveWeek([FromBody] ApproveWeekRequest r)
         => await _publishService.ApproveWeekAsync(r);
-
     [HttpPost("publish-week")]
-    /// <summary>
-    /// Публікує затверджені чернетки у розкладі та повертає статистику операції.
-    /// </summary>
+    // Публікує затверджені чернетки у розкладі та повертає статистику операції.
     public async Task<ActionResult<PublishWeekResults>> PublishWeek([FromBody] PublishWeekRequest r)
         => await _publishService.PublishWeekAsync(r);
 }

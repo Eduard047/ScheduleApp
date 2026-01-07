@@ -12,8 +12,6 @@
 @inject IJSRuntime JS
 @inject HttpClient Http
 
-
-
 <PageTitle>Модулі</PageTitle>
 
 <h3 class="mb-3">Модулі</h3>
@@ -160,7 +158,6 @@
                 {
                     var cid = c.Id;
                     var isSelected = IsCourseSelected(cid);
-
                     <button type="button"
                             class="course-chip btn btn-sm @(isSelected ? "btn-primary" : "btn-outline-primary")"
                             @onclick="() => ToggleCourse(cid)">
@@ -175,8 +172,6 @@
                 </div>
             }
         </div>
-
-        
         <div class="col-12 col-lg-6">
             <div class="d-flex justify-content-between align-items-center mb-1">
                 <label class="form-label mb-0">Дозволені корпуси</label>
@@ -195,8 +190,6 @@
                 }
             </div>
         </div>
-
-        
         <div class="col-12 col-lg-6">
             <div class="d-flex justify-content-between align-items-center mb-1">
                 <label class="form-label mb-0">Дозволені аудиторії</label>
@@ -228,14 +221,11 @@
                 </div>
             }
         </div>
-
-        
         <div class="col-12 d-grid mt-2">
             <button class="btn btn-primary" @onclick="Save">Зберегти</button>
         </div>
     </div>
 </div>
-
 
 <div class="card p-3 mb-3">
     <div class="d-flex justify-content-between align-items-center mb-2 gap-2">
@@ -282,7 +272,6 @@
                         <td>@ModuleCourseSummary(m)</td>
                         <td>@m.Credits</td>
                         <td class="text-end">
-                            
                             <button class="btn btn-sm btn-outline-secondary me-2" title="План модуля"
                                     @onclick="() => OpenPlans(m)">
                                 План модуля
@@ -300,7 +289,6 @@
         </table>
     </div>
 </div>
-
 
 @if (plansModuleId is not null)
 {
@@ -330,9 +318,7 @@
                     <button class="btn btn-sm btn-primary" @onclick="SavePlans" disabled="@(selectedPlanCourseId <= 0)">Зберегти план</button>
                 </div>
             </div>
-
             <div class="plan-modal-body">
-                
                 <div class="row g-3 mt-3">
                     <div class="col-12 col-md-4">
                         <label class="form-label">Обсяг кредитів (за планом)</label>
@@ -350,20 +336,14 @@
                         </div>
                     </div>
                 </div>
-
                 <div class="small text-muted mt-2">
                     * Зміни набувають чинності після натискання кнопки <b>Зберегти план</b> та повторного перезавантаження модуля.
                 </div>
-
                 <hr />
-                
                 <div class="card module-topics-card p-3 mb-3">
                     <div class="module-topics-header">
-
                         <h6 class="mb-0">Керування заняттями</h6>
-
                         <p class="small text-muted mb-0">Вкажіть код у форматі <code>1.1.1.1</code> та заповніть інші поля.</p>
-
                     </div>
                     <div class="row g-3 align-items-end">
                         <div class="col-12 col-lg-3">
@@ -424,9 +404,7 @@
                                     <th class="module-topics-col-groups">Заплановані групи</th>
                                     <th class="module-topics-col-groups">Відпрацьовані групи</th>
                                     <th class="module-topics-col-actions"></th>
-
                                 </tr>
-
                             </thead>
                             <tbody>
                                 @if (moduleTopics.Count == 0)
@@ -462,11 +440,9 @@
                                             <td class="module-topics-col-groups">
                                                 <span>@GroupsHoursCaption(topic.PlannedGroupsHours ?? new())</span>
                                             </td>
-
                                             <td class="module-topics-col-groups">
                                                 <span>@GroupsHoursCaption(topic.CompletedGroupsHours ?? new())</span>
                                             </td>
-
                                             <td class="module-topics-col-actions text-end">
                                                 <div class="btn-group btn-group-sm me-1 mb-1 mb-sm-0">
                                                     <button class="btn btn-outline-secondary" @onclick="() => EditTopic(topic)">Редагувати</button>
@@ -476,7 +452,6 @@
                                         </tr>
                                     }
                                 }
-
                             </tbody>
                             @if (moduleTopics.Any())
                             {
@@ -501,7 +476,7 @@
 }
 
 @code {
-    
+
     private string? error, ok;
     private IBrowserFile? importFile;
     private DocxImportResultDto? importResult;
@@ -511,8 +486,6 @@
     private bool clearBusy;
     private string? clearError;
     private string? clearOk;
-
-    
     private List<ModuleEditDto> items = new();
     private ModuleEditDto form = new()
     {
@@ -525,7 +498,6 @@
         CloneCourseIds = new(),
         Credits = 0
     };
-
     private List<LookupDto> courses = new();
     private List<LookupDto> departments = new();
     private IEnumerable<string> SelectedCourseNames
@@ -537,7 +509,6 @@
     private List<BuildingEditDto> buildings = new();
     private List<IdCodeNameDto> lessonTypes = new();
 
-    
 private int? plansModuleId;
 private List<int> planCourseIds = new();
 private int selectedPlanCourseId;
@@ -545,30 +516,22 @@ private string plansModuleTitle = "";
 private string plansModuleCode = "";
 private PlanCourseVM planCourse = new();
 
-    
     private List<ModuleTopicViewDto> moduleTopics = new();
-    
     private ModuleTopicFormVM topicForm = new();
     private string topicCodeInput = string.Empty;
     // Дозволяємо літери/цифри/крапки/дефіси, щоб підтримати коди на кшталт КП.1.1
     private static readonly Regex TopicCodePattern = new(@"^[A-Za-zА-Яа-яІіЇїЄєҐґ0-9._-]+$");
-
-    
     private const string CourseField = "CourseName";
     private string sortField = nameof(ModuleEditDto.Title);
     private bool sortAsc = true;
     private string? filter;
-    /// <summary>
-    /// Завантажує дані модулів і довідників під час першого відкриття сторінки.
-    /// </summary>
-
+    // Завантажує дані модулів і довідників під час першого відкриття сторінки.
     protected override async Task OnInitializedAsync() => await Load();
-
     private int ImportedTopicsCount => importResult?.Modules?.Sum(m => m.Topics?.Count ?? 0) ?? 0;
     private string ImportFileCaption => importFile is null
         ? "Файл не обрано"
         : $"{importFile.Name} ({Math.Round(importFile.Size / 1024.0, 1)} КБ)";
-
+    // Обробляє вибір файлу для імпорту DOCX.
     private async Task OnImportFileChange(InputFileChangeEventArgs e)
     {
         importFile = e.FileCount > 0 ? e.File : null;
@@ -577,7 +540,7 @@ private PlanCourseVM planCourse = new();
         importOk = null;
         await InvokeAsync(StateHasChanged);
     }
-
+    // Запускає імпорт або попередній перегляд DOCX.
     private async Task ImportDocx(bool apply)
     {
         if (importFile is null)
@@ -586,16 +549,13 @@ private PlanCourseVM planCourse = new();
             importOk = null;
             return;
         }
-
         try
         {
             importBusy = true;
             importError = null;
             importOk = null;
-
             importResult = await Admin.ImportModulesFromDocx(importFile, apply);
             importOk = apply ? "Імпорт виконано." : "Прев’ю імпорту отримано.";
-
             if (apply)
             {
                 await Load();
@@ -610,7 +570,7 @@ private PlanCourseVM planCourse = new();
             importBusy = false;
         }
     }
-
+    // Намагається витягнути повідомлення помилки з JSON-відповіді.
     private string TryParseImportError(string message)
     {
         try
@@ -628,14 +588,13 @@ private PlanCourseVM planCourse = new();
             return message;
         }
     }
-
+    // Викликає повне очищення модулів після підтвердження.
     private async Task ClearAllModules()
     {
         clearError = null;
         clearOk = null;
         var confirm = await JS.InvokeAsync<bool>("confirm", "Видалити всі модулі, плани та теми?");
         if (!confirm) return;
-
         try
         {
             clearBusy = true;
@@ -652,68 +611,46 @@ private PlanCourseVM planCourse = new();
             clearBusy = false;
         }
     }
-
-    
-    /// <summary>
-    /// Отримує список модулів, супровідні довідники та налаштовує стан форми.
-    /// </summary>
-
-    
+    // Отримує список модулів, супровідні довідники та налаштовує стан форми.
     private async Task Load()
     {
         try
         {
             ok = "Дані модулів завантажено.";
-
             items = await Admin.GetModules();
-
             var meta = await Admin.GetMeta();
             courses = meta.Courses ?? new();
             lessonTypes = meta.LessonTypes ?? new();
             departments = meta.Departments ?? new();
-
             allRooms = await Admin.GetRooms() ?? new();
             buildings = await Admin.GetBuildings();
-
             EnsureBuildingsCoverSelectedRooms();
             UpdateVisibleRooms();
         }
         catch (Exception ex) { error = ex.Message; }
     }
-
-    
-    /// <summary>
-    /// Додає або вилучає ідентифікатор зі списку залежно від прапорця.
-    /// </summary>
-
-    
+    // Додає або вилучає ідентифікатор зі списку залежно від прапорця.
     private static void Toggle(List<int> list, int id, bool on)
     {
         if (on) { if (!list.Contains(id)) list.Add(id); }
         else list.Remove(id);
     }
-    /// <summary>
-    /// Перемикає доступність будівлі й оновлює видимі аудиторії.
-    /// </summary>
+    // Перемикає доступність будівлі й оновлює видимі аудиторії.
     private void ToggleBuilding(int buildingId, bool on)
     {
         if (buildingId <= 0) return;
         Toggle(form.AllowedBuildingIds, buildingId, on);
         UpdateVisibleRooms();
     }
-    /// <summary>
-    /// Гарантує, що вибрані аудиторії належать дозволеним будівлям.
-    /// </summary>
+    // Гарантує, що вибрані аудиторії належать дозволеним будівлям.
     private void EnsureBuildingsCoverSelectedRooms()
     {
         if (form.AllowedRoomIds.Count == 0 || allRooms.Count == 0) return;
-
         var roomBuildingIds = allRooms
             .Where(r => r.Id.HasValue && form.AllowedRoomIds.Contains(r.Id.Value))
             .Select(r => r.BuildingId)
             .Where(id => id > 0)
             .Distinct();
-
         foreach (var bid in roomBuildingIds)
         {
             if (!form.AllowedBuildingIds.Contains(bid))
@@ -722,50 +659,38 @@ private PlanCourseVM planCourse = new();
             }
         }
     }
-    /// <summary>
-    /// Формує список аудиторій згідно з вибраними будівлями.
-    /// </summary>
+    // Формує список аудиторій згідно з вибраними будівлями.
     private void UpdateVisibleRooms()
     {
-        
         if (form.AllowedBuildingIds.Count == 0)
         {
             rooms = new();
             form.AllowedRoomIds = new();
             return;
         }
-
         var selectedBuildings = form.AllowedBuildingIds.ToHashSet();
         rooms = allRooms
             .Where(r => r.Id.HasValue && selectedBuildings.Contains(r.BuildingId))
             .OrderBy(r => r.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
-
         var validRoomIds = rooms
             .Select(r => r.Id!.Value)
             .ToHashSet();
-
         form.AllowedRoomIds = form.AllowedRoomIds
             .Where(validRoomIds.Contains)
             .Distinct()
             .ToList();
     }
-    /// <summary>
-    /// Повертає назву курсу або службове позначення за відсутності значення.
-    /// </summary>
+    // Повертає назву курсу або службове позначення за відсутності значення.
     private string NameOfCourse(int id) => courses.FirstOrDefault(c => c.Id == id)?.Name ?? $"#{id}";
-    /// <summary>
-    /// Повертає всі курси, вибрані в поточній формі.
-    /// </summary>
+    // Повертає всі курси, вибрані в поточній формі.
     private List<int> CurrentCourseIds()
     {
         var result = new List<int>();
-
         if (form.CourseId > 0)
         {
             result.Add(form.CourseId);
         }
-
         if (form.CloneCourseIds is { Count: > 0 })
         {
             foreach (var id in form.CloneCourseIds)
@@ -776,21 +701,16 @@ private PlanCourseVM planCourse = new();
                 }
             }
         }
-
         return result;
     }
-    /// <summary>
-    /// Збирає ідентифікатори курсів, прив'язаних до переданого модуля.
-    /// </summary>
+    // Збирає ідентифікатори курсів, прив'язаних до переданого модуля.
     private static List<int> ModuleCourseIds(ModuleEditDto module)
     {
         var result = new List<int>();
-
         if (module.CourseId > 0)
         {
             result.Add(module.CourseId);
         }
-
         if (module.CloneCourseIds is { Count: > 0 })
         {
             foreach (var id in module.CloneCourseIds)
@@ -801,44 +721,33 @@ private PlanCourseVM planCourse = new();
                 }
             }
         }
-
         return result;
     }
-    /// <summary>
-    /// Оновлює DTO модуля списком вибраних курсів.
-    /// </summary>
+    // Оновлює DTO модуля списком вибраних курсів.
     private static void ApplySelectedCourses(ModuleEditDto target, IEnumerable<int> courseIds)
     {
         var normalized = courseIds?
             .Where(id => id > 0)
             .Distinct()
             .ToList() ?? new List<int>();
-
         target.CourseId = normalized.FirstOrDefault();
         target.CloneCourseIds = normalized.Skip(1).ToList();
     }
-    /// <summary>
-    /// Застосовує вибрані курси до поточної форми модуля.
-    /// </summary>
+    // Застосовує вибрані курси до поточної форми модуля.
     private void ApplySelectedCourses(IEnumerable<int> courseIds)
         => ApplySelectedCourses(form, courseIds);
-    /// <summary>
-    /// Перевіряє, чи входить курс до переліку вибраних.
-    /// </summary>
+    // Перевіряє, чи входить курс до переліку вибраних.
     private bool IsCourseSelected(int courseId)
         => courseId > 0 && (form.CourseId == courseId || form.CloneCourseIds.Contains(courseId));
-    /// <summary>
-    /// Формує текстовий список курсів, пов'язаних із модулем.
-    /// </summary>
+    // Формує текстовий список курсів, пов'язаних із модулем.
     private string ModuleCourseSummary(ModuleEditDto module)
     {
         var summary = ModuleCourseIds(module)
             .Select(NameOfCourse)
             .Where(name => !string.IsNullOrWhiteSpace(name));
-
         return string.Join(", ", summary);
     }
-
+    // Формує підпис з годинами по групах.
     private static string GroupsHoursCaption(IEnumerable<TopicGroupHoursDto> rows)
     {
         var parts = new List<string>();
@@ -850,12 +759,9 @@ private PlanCourseVM planCourse = new();
             var suffix = chunks.Count > 0 ? $" ({string.Join(", ", chunks)})" : string.Empty;
             parts.Add($"{row.GroupName}{suffix}");
         }
-
         return parts.Count == 0 ? "—" : string.Join("; ", parts);
     }
-    /// <summary>
-    /// Заповнює форму даними модуля для редагування.
-    /// </summary>
+    // Заповнює форму даними модуля для редагування.
     private void Edit(ModuleEditDto m)
     {
         form = new(m.Id, m.Code, m.Title, m.CourseId, new List<int>(m.AllowedRoomIds), new List<int>(m.AllowedBuildingIds), m.Credits);
@@ -864,11 +770,7 @@ private PlanCourseVM planCourse = new();
         EnsureBuildingsCoverSelectedRooms();
         UpdateVisibleRooms();
     }
-
-    /// <summary>
-    /// Перевіряє введені дані та зберігає модуль через API.
-    /// </summary>
-
+    // Перевіряє введені дані та зберігає модуль через API.
     private async Task Save()
     {
         try
@@ -879,7 +781,6 @@ private PlanCourseVM planCourse = new();
                 error = "Оберіть принаймні один курс для модуля.";
                 return;
             }
-
             ApplySelectedCourses(selectedCourses);
             await Admin.UpsertModule(form);
             await Load();
@@ -899,52 +800,27 @@ private PlanCourseVM planCourse = new();
         }
         catch (Exception ex) { error = ex.Message; }
     }
-
-    
-    /// <summary>
-    /// Видаляє модуль і перезавантажує перелік.
-    /// </summary>
-
-    
+    // Видаляє модуль і перезавантажує перелік.
     private async Task Delete(int id)
-
     {
-
         try
-
         {
             var module = items.FirstOrDefault(m => m.Id == id);
-
             var caption = module is null ? $"#{id}" : $"{module.Code} — {module.Title}";
-
             var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити модуль {caption}? Дію не можна скасувати.");
-
             if (!confirmed) return;
-
-
-
             await Admin.DeleteModule(id);
-
             await Load();
-
             ok = "Модуль успішно видалено.";
-
         }
-
         catch (Exception ex) { error = ex.Message; }
-
     }
-
-    /// <summary>
-    /// Перемикає прапорець міжзборових заходів для теми і зберігає зміни.
-    /// </summary>
+    // Перемикає прапорець міжзборових заходів для теми і зберігає зміни.
     private async Task ToggleTopicInterAssembly(ModuleTopicViewDto topic, ChangeEventArgs e)
     {
         if (plansModuleId is null) return;
         if (e?.Value is null) return;
-
         var newValue = e.Value is bool b && b;
-
         try
         {
             var payload = new ModuleTopicDto(
@@ -960,7 +836,6 @@ private PlanCourseVM planCourse = new();
                 newValue,
                 topic.SelfStudyBySupervisor
             );
-
             await Admin.UpsertModuleTopic(plansModuleId.Value, payload);
             await LoadTopics(plansModuleId.Value);
             ok = newValue
@@ -972,16 +847,11 @@ private PlanCourseVM planCourse = new();
             error = ex.Message;
         }
     }
-
-    /// <summary>
-    /// Перемикає позначку, що самостійні години веде керівник, і виключає їх з розкладу.
-    /// </summary>
+    // Перемикає позначку, що самостійні години веде керівник, і виключає їх з розкладу.
     private async Task ToggleTopicSupervisorSelfStudy(ModuleTopicViewDto topic)
     {
         if (plansModuleId is null) return;
-
         var newValue = !topic.SelfStudyBySupervisor;
-
         try
         {
             var payload = new ModuleTopicDto(
@@ -997,7 +867,6 @@ private PlanCourseVM planCourse = new();
                 topic.IsInterAssembly,
                 newValue
             );
-
             await Admin.UpsertModuleTopic(plansModuleId.Value, payload);
             await LoadTopics(plansModuleId.Value);
             ok = newValue
@@ -1009,28 +878,19 @@ private PlanCourseVM planCourse = new();
             error = ex.Message;
         }
     }
-
-
-
     ///
-    /// <summary>
-    /// Відкриває панель планів для обраного модуля та завантажує дані.
-    /// </summary>
-
+    // Відкриває панель планів для обраного модуля та завантажує дані.
     private async Task OpenPlans(ModuleEditDto m)
     {
         try
         {
             ok = "Дані плану модуля завантажено.";
-
             plansModuleId = m.Id;
             plansModuleTitle = $"{m.Code} - {m.Title}";
             plansModuleCode = m.Code ?? string.Empty;
             planCourseIds = ModuleCourseIds(m);
             selectedPlanCourseId = planCourseIds.FirstOrDefault();
-
             var moduleCredits = m.Credits;
-
             if (plansModuleId is int moduleId && selectedPlanCourseId > 0)
             {
                 await LoadPlanDetails(moduleId, selectedPlanCourseId, moduleCredits);
@@ -1047,7 +907,6 @@ private PlanCourseVM planCourse = new();
                     IsActive = true
                 };
             }
-
             if (plansModuleId is int id)
             {
                 await LoadTopics(id);
@@ -1055,9 +914,7 @@ private PlanCourseVM planCourse = new();
         }
         catch (Exception ex) { error = ex.Message; }
     }
-    /// <summary>
-    /// Скидає стан панелі планів і приховує її.
-    /// </summary>
+    // Скидає стан панелі планів і приховує її.
     private void ClosePlans()
     {
         plansModuleId = null;
@@ -1069,13 +926,10 @@ private PlanCourseVM planCourse = new();
         moduleTopics.Clear();
         ResetTopicForm(0);
     }
-    /// <summary>
-    /// Зберігає налаштування плану годин для вибраного курсу.
-    /// </summary>
+    // Зберігає налаштування плану годин для вибраного курсу.
     private async Task SavePlans()
     {
         if (plansModuleId is null || selectedPlanCourseId <= 0) return;
-
         try
         {
             var normalizedHours = (int)Math.Round(Math.Max(0m, planCourse.Credits) * 30m);
@@ -1085,11 +939,8 @@ private PlanCourseVM planCourse = new();
                 new SaveCourseModulePlanDto(normalizedHours, planCourse.IsActive)
             );
             planCourse.TargetHours = normalizedHours;
-
             ok = "План модуля оновлено.";
-
             await LoadPlanDetails(plansModuleId.Value, selectedPlanCourseId, planCourse.Credits);
-
             var moduleRow = items.FirstOrDefault(x => x.Id == plansModuleId);
             if (moduleRow is not null)
             {
@@ -1098,9 +949,7 @@ private PlanCourseVM planCourse = new();
         }
         catch (Exception ex) { error = ex.Message; }
     }
-    /// <summary>
-    /// Завантажує деталі плану годин для модуля та курсу.
-    /// </summary>
+    // Завантажує деталі плану годин для модуля та курсу.
     private async Task LoadPlanDetails(int moduleId, int courseId, decimal fallbackCredits)
     {
         if (courseId <= 0)
@@ -1116,7 +965,6 @@ private PlanCourseVM planCourse = new();
             };
             return;
         }
-
         var dto = await Admin.GetCourseModulePlan(moduleId, courseId);
         if (dto is null)
         {
@@ -1142,9 +990,7 @@ private PlanCourseVM planCourse = new();
             };
         }
     }
-    /// <summary>
-    /// Реагує на зміну курсу у плані та підвантажує його дані.
-    /// </summary>
+    // Реагує на зміну курсу у плані та підвантажує його дані.
     private async Task OnPlanCourseChanged(ChangeEventArgs e)
     {
         if (plansModuleId is null) return;
@@ -1152,90 +998,52 @@ private PlanCourseVM planCourse = new();
         if (!int.TryParse(e.Value.ToString(), out var nextCourseId)) return;
         if (!planCourseIds.Contains(nextCourseId)) return;
         if (nextCourseId <= 0 || nextCourseId == selectedPlanCourseId) return;
-
         selectedPlanCourseId = nextCourseId;
         var module = items.FirstOrDefault(x => x.Id == plansModuleId);
         var credits = module?.Credits ?? planCourse.Credits;
         await LoadPlanDetails(plansModuleId.Value, selectedPlanCourseId, credits);
     }
-
-
-    
-    /// <summary>
-    /// Ініціалізує форму теми з типовими значеннями для вказаного модуля.
-    /// </summary>
-
+    // Ініціалізує форму теми з типовими значеннями для вказаного модуля.
     private void ResetTopicForm(int moduleId)
-
     {
-
         var nextOrder = moduleTopics.Count + 1;
-
         var defaultLessonType = lessonTypes.FirstOrDefault()?.Id ?? 0;
-
-
-
         topicForm = new ModuleTopicFormVM
-
         {
-
             Id = null,
-
             ModuleId = moduleId,
-
             Order = nextOrder,
-
             TopicCode = string.Empty,
-
             LessonTypeId = defaultLessonType > 0 ? defaultLessonType : null,
             DepartmentId = null,
-
             TotalHours = 0,
-
             AuditoriumHours = 0,
-
             SelfStudyHours = 0,
-
             IsInterAssembly = false,
             SelfStudyBySupervisor = false,
         };
-
-
-
         topicCodeInput = string.Empty;
-
     }
-    /// <summary>
-    /// Підтримує сумарну кількість годин у відповідності до складових.
-    /// </summary>
-
+    // Підтримує сумарну кількість годин у відповідності до складових.
     private void SyncTotalHours()
     {
         var safeAuditorium = Math.Max(0, topicForm.AuditoriumHours ?? 0);
         var safeSelf = Math.Max(0, topicForm.SelfStudyHours ?? 0);
-
         topicForm.AuditoriumHours = safeAuditorium;
         topicForm.SelfStudyHours = safeSelf;
         topicForm.TotalHours = safeAuditorium + safeSelf;
     }
-    /// <summary>
-    /// Перемикає режим «веде керівник» для самостійних годин у формі.
-    /// </summary>
+    // Перемикає режим «веде керівник» для самостійних годин у формі.
     private void ToggleFormSupervisorFlag()
     {
         topicForm.SelfStudyBySupervisor = !topicForm.SelfStudyBySupervisor;
     }
-    /// <summary>
-    /// Очищає форму теми та встановлює значення за замовчуванням.
-    /// </summary>
+    // Очищає форму теми та встановлює значення за замовчуванням.
     private void ClearTopicForm()
     {
         ResetTopicForm(plansModuleId ?? 0);
     }
-    /// <summary>
-    /// Завантажує теми модуля та готує агреговану інформацію.
-    /// </summary>
-
+    // Завантажує теми модуля та готує агреговану інформацію.
     private async Task LoadTopics(int moduleId)
     {
         try
@@ -1253,9 +1061,7 @@ private PlanCourseVM planCourse = new();
             ResetTopicForm(moduleId);
         }
     }
-    /// <summary>
-    /// Підраховує загальну кількість годин для тем у модулі.
-    /// </summary>
+    // Підраховує загальну кількість годин для тем у модулі.
     private (int total, int auditorium, int self) CalculateModuleTopicTotals()
     {
         var total = moduleTopics.Sum(t => Math.Max(0, t.TotalHours));
@@ -1263,219 +1069,106 @@ private PlanCourseVM planCourse = new();
         var self = moduleTopics.Sum(t => Math.Max(0, t.SelfStudyHours));
         return (total, auditorium, self);
     }
-    /// <summary>
-    /// Заповнює форму теми даними для редагування.
-    /// </summary>
+    // Заповнює форму теми даними для редагування.
     private void EditTopic(ModuleTopicViewDto topic)
-
     {
-
         topicForm = new ModuleTopicFormVM
-
         {
-
             Id = topic.Id,
-
             ModuleId = topic.ModuleId,
-
             Order = topic.Order,
-
             TopicCode = topic.TopicCode ?? string.Empty,
-
             LessonTypeId = topic.LessonTypeId,
             DepartmentId = topic.DepartmentId,
-
             TotalHours = topic.TotalHours,
-
             AuditoriumHours = topic.AuditoriumHours,
-
             SelfStudyHours = topic.SelfStudyHours,
-
             IsInterAssembly = topic.IsInterAssembly,
             SelfStudyBySupervisor = topic.SelfStudyBySupervisor,
         };
-
         topicCodeInput = topicForm.TopicCode;
-
     }
-    /// <summary>
-    /// Валідує та зберігає тему модуля, оновлює список.
-    /// </summary>
-
+    // Валідує та зберігає тему модуля, оновлює список.
     private async Task SaveTopic()
-
     {
-
         if (plansModuleId is null) return;
-
         try
-
         {
-
             var moduleId = plansModuleId.Value;
-
             var rawCode = (topicCodeInput ?? string.Empty).Trim();
-
             if (string.IsNullOrWhiteSpace(rawCode))
-
             {
-
                 error = "Вкажіть код заняття.";
-
                 return;
-
             }
-
-
-
             if (!TopicCodePattern.IsMatch(rawCode))
-
             {
-
                 error = "Код заняття обовʼязковий.";
-
                 return;
-
             }
-
-
-
             var lessonTypeId = topicForm.LessonTypeId.HasValue && topicForm.LessonTypeId.Value > 0
-
                 ? topicForm.LessonTypeId.Value
-
                 : lessonTypes.FirstOrDefault()?.Id ?? 0;
-
             if (lessonTypeId == 0)
-
             {
-
                 error = "Оберіть тип заняття.";
-
-
                 return;
-
             }
-
-
-
             var auditoriumHours = Math.Max(0, topicForm.AuditoriumHours ?? 0);
-
             var selfStudyHours = Math.Max(0, topicForm.SelfStudyHours ?? 0);
-
             var totalHours = Math.Max(0, auditoriumHours + selfStudyHours);
-
-
-
             topicForm.ModuleId = moduleId;
-
             topicForm.TopicCode = rawCode;
-
             topicForm.LessonTypeId = lessonTypeId;
-
             topicForm.AuditoriumHours = auditoriumHours;
-
             topicForm.SelfStudyHours = selfStudyHours;
-
             topicForm.TotalHours = totalHours;
-
-
-
             var payload = new ModuleTopicDto(
-
                 topicForm.Id,
-
                 moduleId,
-
                 0,
-
                 rawCode,
-
                 lessonTypeId,
-
                 topicForm.DepartmentId,
-
                 totalHours,
-
                 auditoriumHours,
-
                 selfStudyHours,
-
                 topicForm.IsInterAssembly,
                 topicForm.SelfStudyBySupervisor);
-
-
-
             await Admin.UpsertModuleTopic(moduleId, payload);
-
             ok = "Заняття збережено.";
-
             await LoadTopics(moduleId);
-
         }
-
         catch (Exception ex)
-
         {
-
             error = ex.Message;
-
         }
-
     }
-    /// <summary>
-    /// Видаляє тему модуля та перезавантажує дані.
-    /// </summary>
-
+    // Видаляє тему модуля та перезавантажує дані.
     private async Task DeleteTopic(int topicId)
-
     {
-
         if (plansModuleId is null) return;
-
         try
-
         {
-
             var topic = moduleTopics.FirstOrDefault(t => t.Id == topicId);
-
             var caption = topic is null ? $"#{topicId}" : $"{topic.TopicCode} ({topic.LessonTypeName})";
-
             var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити тему {caption}? Дію не можна скасувати.");
-
             if (!confirmed) return;
-
-
-
             await Admin.DeleteModuleTopic(plansModuleId.Value, topicId);
-
             ok = "Тему видалено.";
-
             await LoadTopics(plansModuleId.Value);
-
         }
-
         catch (Exception ex)
-
         {
-
             error = ex.Message;
-
         }
-
     }
-
-
-
     ///
-    /// <summary>
-    /// Фільтрує перелік модулів за введеним рядком.
-    /// </summary>
+    // Фільтрує перелік модулів за введеним рядком.
     private IEnumerable<ModuleEditDto> ApplyFilter(IEnumerable<ModuleEditDto> seq)
     {
         if (string.IsNullOrWhiteSpace(filter)) return seq;
         var f = filter.Trim();
-
         return seq.Where(m =>
             (m.Id?.ToString().Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
             (m.Code?.Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
@@ -1484,39 +1177,28 @@ private PlanCourseVM planCourse = new();
             m.Credits.ToString(CultureInfo.InvariantCulture).Contains(f, StringComparison.OrdinalIgnoreCase)
         );
     }
-    /// <summary>
-    /// Сортує перелік модулів згідно з вибраним полем.
-    /// </summary>
+    // Сортує перелік модулів згідно з вибраним полем.
     private IEnumerable<ModuleEditDto> ApplySort(IEnumerable<ModuleEditDto> seq)
     {
         return (sortField, sortAsc) switch
         {
             (nameof(ModuleEditDto.Id), true) => seq.OrderBy(x => x.Id ?? 0),
             (nameof(ModuleEditDto.Id), false) => seq.OrderByDescending(x => x.Id ?? 0),
-
             (nameof(ModuleEditDto.Code), true) => seq.OrderBy(x => x.Code),
             (nameof(ModuleEditDto.Code), false) => seq.OrderByDescending(x => x.Code),
-
             (nameof(ModuleEditDto.Title), true) => seq.OrderBy(x => x.Title),
             (nameof(ModuleEditDto.Title), false) => seq.OrderByDescending(x => x.Title),
-
             (nameof(ModuleEditDto.Credits), true) => seq.OrderBy(x => x.Credits),
             (nameof(ModuleEditDto.Credits), false) => seq.OrderByDescending(x => x.Credits),
-
             (CourseField, true) => seq.OrderBy(ModuleCourseSummary),
             (CourseField, false) => seq.OrderByDescending(ModuleCourseSummary),
-
             _ => seq
         };
     }
-    /// <summary>
-    /// Повертає модулі після застосування фільтру та сортування.
-    /// </summary>
+    // Повертає модулі після застосування фільтру та сортування.
     private IEnumerable<ModuleEditDto> SortedAndFiltered
         => ApplySort(ApplyFilter(items));
-    /// <summary>
-    /// Змінює параметри сортування для таблиці модулів.
-    /// </summary>
+    // Змінює параметри сортування для таблиці модулів.
     private void ToggleSort(string field)
     {
         if (sortField == field) sortAsc = !sortAsc;
@@ -1526,9 +1208,7 @@ private PlanCourseVM planCourse = new();
             sortAsc = true;
         }
     }
-    /// <summary>
-    /// Обрізає довгий текст до вказаної довжини для відображення.
-    /// </summary>
+    // Обрізає довгий текст до вказаної довжини для відображення.
     private string TruncateText(string? value, int max = 80)
     {
         if (string.IsNullOrWhiteSpace(value)) return string.Empty;
@@ -1537,21 +1217,16 @@ private PlanCourseVM planCourse = new();
         var truncated = trimmed.Substring(0, Math.Min(trimmed.Length, max)).TrimEnd();
         return $"{truncated}…";
     }
-    /// <summary>
-    /// Повертає піктограму напряму сортування для заголовка.
-    /// </summary>
+    // Повертає піктограму напряму сортування для заголовка.
     private MarkupString HeaderIcon(string field)
     {
         if (sortField != field) return new MarkupString(string.Empty);
         var icon = sortAsc ? "&#9650;" : "&#9660;";
         return new MarkupString($"<span class=\"ms-1\">{icon}</span>");
     }
-    /// <summary>
-    /// Позначає всі доступні аудиторії для модуля.
-    /// </summary>
+    // Позначає всі доступні аудиторії для модуля.
     private void SelectAllRooms()
     {
-        
         var allIds = rooms
             .Select(r => r.Id ?? 0)
             .Where(id => id > 0)
@@ -1560,9 +1235,7 @@ private PlanCourseVM planCourse = new();
             .ToList();
         form.AllowedRoomIds = allIds;
     }
-    /// <summary>
-    /// Позначає всі курси у списку, щоб швидко застосувати їх до модуля.
-    /// </summary>
+    // Позначає всі курси у списку, щоб швидко застосувати їх до модуля.
     private void SelectAllCourses()
     {
         var allIds = courses
@@ -1570,21 +1243,16 @@ private PlanCourseVM planCourse = new();
             .Where(id => id > 0)
             .Distinct()
             .ToList();
-
         var currentPrimary = form.CourseId;
         if (currentPrimary > 0 && allIds.Remove(currentPrimary))
         {
             allIds.Insert(0, currentPrimary);
         }
-
         ApplySelectedCourses(allIds);
     }
-    /// <summary>
-    /// Дозволяє всі будівлі для модуля одним кліком.
-    /// </summary>
+    // Дозволяє всі будівлі для модуля одним кліком.
     private void SelectAllBuildings()
     {
-        
         var allIds = buildings
             .Select(b => b.Id ?? 0)
             .Where(id => id > 0)
@@ -1594,15 +1262,11 @@ private PlanCourseVM planCourse = new();
         form.AllowedBuildingIds = allIds;
         UpdateVisibleRooms();
     }
-    /// <summary>
-    /// Перемикає належність курсу до вибраного переліку.
-    /// </summary>
+    // Перемикає належність курсу до вибраного переліку.
     private void ToggleCourse(int courseId)
     {
         if (courseId <= 0) return;
-
         var selected = CurrentCourseIds();
-
         if (selected.Contains(courseId))
         {
             selected.Remove(courseId);
@@ -1611,22 +1275,14 @@ private PlanCourseVM planCourse = new();
         {
             selected.Add(courseId);
         }
-
         ApplySelectedCourses(selected);
     }
-
-
-    /// <summary>
-    /// Порівнює коди тем з урахуванням числових сегментів.
-    /// </summary>
-
-
+    // Порівнює коди тем з урахуванням числових сегментів.
     private static int CompareTopicCodes(string? left, string? right)
     {
         var leftParts = TopicCodeSegments(left);
         var rightParts = TopicCodeSegments(right);
         var maxLength = Math.Max(leftParts.Count, rightParts.Count);
-
         for (var i = 0; i < maxLength; i++)
         {
             var leftValue = i < leftParts.Count ? leftParts[i] : 0;
@@ -1637,25 +1293,19 @@ private PlanCourseVM planCourse = new();
                 return diff;
             }
         }
-
         return string.Compare(left ?? string.Empty, right ?? string.Empty, System.StringComparison.Ordinal);
     }
-    /// <summary>
-    /// Розбиває код теми на числові сегменти для сортування.
-    /// </summary>
+    // Розбиває код теми на числові сегменти для сортування.
     private static IReadOnlyList<int> TopicCodeSegments(string? code)
     {
         if (string.IsNullOrWhiteSpace(code))
         {
             return System.Array.Empty<int>();
         }
-
         return code.Split('.', StringSplitOptions.RemoveEmptyEntries)
             .Select(part => int.TryParse(part, out var value) ? value : int.MaxValue)
             .ToArray();
     }
-
-
     private sealed class PlanCourseVM
     {
         public decimal Credits { get; set; }
@@ -1664,85 +1314,59 @@ private PlanCourseVM planCourse = new();
         public int ScheduledHours { get; set; }
         public bool IsActive { get; set; }
     }
-
-
-    
     private sealed class ModuleTopicFormVM
-
     {
-
         public int? Id { get; set; }
-
         public int ModuleId { get; set; }
-
         public int Order { get; set; }
-
         public string TopicCode { get; set; } = string.Empty;
-
         public int? LessonTypeId { get; set; }
-
         public int? DepartmentId { get; set; }
-
         public int TotalHours { get; set; }
-
         public int? AuditoriumHours { get; set; }
-
         public int? SelfStudyHours { get; set; }
-
         public bool IsInterAssembly { get; set; }
-
         public bool SelfStudyBySupervisor { get; set; }
-
     }
-
 
 }
 
 <style>
-    
+
     .course-chip-grid {
         display: flex;
         flex-wrap: wrap;
         gap: .5rem;
     }
-
     .course-chip {
         min-width: 120px;
     }
-
     .sortable-th {
         cursor: pointer;
         user-select: none;
         white-space: nowrap;
     }
-
-    
     .module-topics-card {
         border: 1px solid #e5e7eb;
         background: #f9fafb;
         border-radius: 12px;
     }
-
     .module-topics-header {
         display: flex;
         flex-direction: column;
         gap: 4px;
         margin-bottom: 12px;
     }
-
     .module-topics-actions .btn {
         min-width: 140px;
     }
-
     .module-topics-table th,
     .module-topics-table td {
         vertical-align: middle;
     }
-
     .module-topics-col-groups .topic-text-truncate {
         max-width: 220px;
     }
-
     .topic-text-truncate {
         display: inline-block;
         overflow: hidden;
@@ -1750,17 +1374,14 @@ private PlanCourseVM planCourse = new();
         white-space: nowrap;
         vertical-align: bottom;
     }
-
     .module-topics-col-actions {
         width: 200px;
         white-space: nowrap;
     }
-
     .topic-flag-btn {
         min-width: 140px;
         font-weight: 600;
     }
-
     /* Стилі модального вікна для плану модуля */
     .plan-modal-overlay {
         position: fixed;
@@ -1771,13 +1392,11 @@ private PlanCourseVM planCourse = new();
         justify-content: center;
         padding: 2rem 1rem;
     }
-
     .plan-modal-backdrop {
         position: absolute;
         inset: 0;
         background: rgba(0, 0, 0, 0.55);
     }
-
     .plan-modal-dialog {
         position: relative;
         width: 100%;
@@ -1790,7 +1409,6 @@ private PlanCourseVM planCourse = new();
         flex-direction: column;
         overflow: hidden;
     }
-
     .plan-modal-header {
         position: sticky;
         top: 0;
@@ -1803,22 +1421,15 @@ private PlanCourseVM planCourse = new();
         background: #fff;
         border-bottom: 1px solid #e5e7eb;
     }
-
     .plan-modal-body {
         padding: 1.25rem;
         overflow: auto;
     }
-
     @@media (max-width: 576px) {
         .plan-modal-header {
             flex-direction: column;
             align-items: flex-start;
         }
     }
-
-
-
-
-
 
 </style>

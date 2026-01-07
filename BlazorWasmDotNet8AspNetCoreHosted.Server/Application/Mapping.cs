@@ -8,7 +8,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 public static class Mapping
 {
     private static readonly CultureInfo Uk = new("uk-UA");
-
+    // Перетворює доменний елемент розкладу у DTO для клієнта.
     public static ScheduleItemDto ToDto(this ScheduleItem x)
     {
         var lt = x.LessonType;
@@ -17,7 +17,6 @@ public static class Mapping
         string? ltCss =
             lt?.CssKey ??
             (ltCode.Equals("BREAK", StringComparison.OrdinalIgnoreCase) ? "brk" : null);
-
         var isBreak = ltCode.Equals("BREAK", StringComparison.OrdinalIgnoreCase);
         var isRescheduled = ltCode.Equals("RESCHEDULED", StringComparison.OrdinalIgnoreCase);
         var isCanceled = ltCode.Equals("CANCELED", StringComparison.OrdinalIgnoreCase);
@@ -26,10 +25,8 @@ public static class Mapping
         {
             requiresRoom = true;
         }
-
         var roomName = (!isBreak && requiresRoom && x.Room != null) ? x.Room.Name : "";
         var buildingName = (!isBreak && requiresRoom && x.Room?.Building != null) ? x.Room.Building.Name : "";
-
         return new(
             Id: x.Id,
             Date: x.Date,

@@ -1,6 +1,7 @@
 // DTO для опису параметрів часового слоту
 namespace BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 
+// DTO для налаштування тайм-слоту.
 public record class TimeSlotDto
 {
     public int Id { get; set; }
