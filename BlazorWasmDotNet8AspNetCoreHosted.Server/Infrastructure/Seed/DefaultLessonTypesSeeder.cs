@@ -7,6 +7,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure.Seed;
 
 public static class DefaultLessonTypesSeeder
 {
+    // Опис типу заняття для стартового наповнення.
     private sealed record SeedLessonType(
         string Code,
         string Name,
@@ -19,12 +20,11 @@ public static class DefaultLessonTypesSeeder
         bool CountInPlan,
         bool CountInLoad,
         bool PreferredFirstInWeek);
-
+    // Заповнює довідник типів занять типовими значеннями.
     public static async Task SeedAsync(IServiceProvider services)
     {
         using var scope = services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
         var defaults = new[]
         {
             new SeedLessonType("BREAK", "Перерва", "brk", true, false, false, false, false, false, false, false),
@@ -33,15 +33,14 @@ public static class DefaultLessonTypesSeeder
             new SeedLessonType("EXAM", "Екзамен", "exam", true, true, true, true, true, true, true, false),
             new SeedLessonType("CREDIT", "Залік", "credit", true, true, true, true, true, true, true, false),
         };
-
         var existing = await db.LessonTypes.ToListAsync();
         var changed = false;
-
         foreach (var d in defaults)
         {
             var entity = existing.FirstOrDefault(x => string.Equals(x.Code, d.Code, StringComparison.OrdinalIgnoreCase));
             if (entity is null)
             {
+                // Додаємо новий тип заняття, якщо його ще немає.
                 db.LessonTypes.Add(new LessonTypeRef
                 {
                     Code = d.Code,
@@ -60,6 +59,7 @@ public static class DefaultLessonTypesSeeder
             }
             else
             {
+                // Доповнюємо відсутні поля в існуючих записах.
                 if (string.IsNullOrWhiteSpace(entity.Name))
                 {
                     entity.Name = d.Name;
@@ -72,7 +72,6 @@ public static class DefaultLessonTypesSeeder
                 }
             }
         }
-
         if (changed)
         {
             await db.SaveChangesAsync();

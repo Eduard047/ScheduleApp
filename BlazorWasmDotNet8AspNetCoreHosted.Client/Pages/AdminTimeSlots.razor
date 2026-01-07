@@ -13,7 +13,6 @@
             <option value="Global">Глобально (для всіх курсів)</option>
             <option value="Course">Тільки для обраного курсу</option>
         </select>
-
         @if (_scope == Scope.Course)
         {
             <select class="form-select" style="max-width: 360px" @bind="_courseId">
@@ -24,7 +23,6 @@
                 }
             </select>
         }
-
         <button class="btn btn-outline-secondary" @onclick="LoadRaw">Завантажити</button>
         <button class="btn btn-outline-info" @onclick="LoadEffective" title="Показати ефективні (курсові(якщо є), інакше глобальні)">
             Показати ефективні
@@ -52,7 +50,6 @@
                 <button class="btn btn-sm btn-primary" @onclick="Save">Зберегти</button>
             </div>
         </div>
-
         <table class="table table-sm align-middle">
             <thead>
                 <tr>
@@ -101,7 +98,6 @@
                 }
             </tbody>
         </table>
-
         <div class="form-text">
             Порада: Тримайте тривалості однаковими (наприклад, 45 хвилин). Оберіть один із слотів як обід — він займе місце пари автоматично.
         </div>
@@ -113,35 +109,33 @@
     private static readonly TimeSpan DefaultDuration = TimeSpan.FromMinutes(45);
     private static readonly TimeSpan DefaultBreak = TimeSpan.FromMinutes(10);
     enum Scope { Global, Course }
-
     private Scope _scope = Scope.Global;
     private int? _courseId;
     private List<LookupDto> _courses = new();
     private List<TimeSlotDto> _rows = new();
     private string? _error;
     private string? _ok;
-
+    // Завантажує метадані курсів при старті сторінки.
     protected override async Task OnInitializedAsync()
     {
-        
         var meta = await Http.GetFromJsonAsync<MetaResponseDto>("api/meta");
         _courses = meta?.Courses ?? new();
     }
-
+    // Завантажує сирі слоти для обраного рівня.
     private async Task LoadRaw()
     {
         _error = _ok = null;
         if (_scope == Scope.Course && _courseId is null) { _error = "Вибери курс."; return; }
         _rows = await Api.GetRawAsync(_scope == Scope.Global ? null : _courseId);
     }
-
+    // Завантажує ефективні слоти (курсні або глобальні).
     private async Task LoadEffective()
     {
         _error = _ok = null;
         if (_scope == Scope.Course && _courseId is null) { _error = "Вибери курс."; return; }
         _rows = await Api.GetEffectiveAsync(_scope == Scope.Global ? null : _courseId);
     }
-
+    // Обчислює наступний слот з урахуванням перерв.
     private (string start, string end) CalculateNextSlot()
     {
         var valid = _rows
@@ -154,12 +148,11 @@
             .Where(x => x.Start is not null && x.End is not null && x.Start < x.End)
             .OrderBy(x => x.Row.SortOrder)
             .ThenBy(x => x.Start);
-
         var nextStart = valid.LastOrDefault()?.End?.Add(DefaultBreak) ?? DefaultStart;
         var nextEnd = nextStart.Add(DefaultDuration);
         return (nextStart.ToString("HH:mm"), nextEnd.ToString("HH:mm"));
     }
-
+    // Додає новий рядок слота.
     private void AddRow()
     {
         var maxOrder = _rows.Count == 0 ? 1 : _rows.Max(x => x.SortOrder) + 1;
@@ -174,11 +167,11 @@
             IsActive = true
         });
     }
-
+    // Видаляє рядок слота зі списку.
     private void RemoveRow(TimeSlotDto r) => _rows.Remove(r);
-
+    // Перевіряє коректність часу у форматі HH:mm.
     private static bool TryTime(string s, out TimeOnly t) => TimeOnly.TryParseExact(s, "HH:mm", out t);
-
+    // Позначає слот як обідній і знімає прапорець з інших.
     private void ToggleLunch(TimeSlotDto slot, bool value)
     {
         if (value)
@@ -197,18 +190,15 @@
             slot.IsLunch = false;
         }
     }
-
+    // Валідатор слотів перед збереженням.
     private string? Validate()
     {
-        
         foreach (var r in _rows)
         {
             if (!TryTime(r.Start, out var s) || !TryTime(r.End, out var e))
                 return $"Невірний час у рядку з порядком {r.SortOrder}. Формат HH:mm";
             if (s >= e) return $"Старт >= фініш у рядку {r.SortOrder}.";
         }
-
-        
         var actives = _rows.Where(x => x.IsActive).ToList();
         for (int i = 0; i < actives.Count; i++)
             for (int j = i + 1; j < actives.Count; j++)
@@ -219,21 +209,18 @@
                 var overlap = as1 < be1 && bs1 < ae1;
                 if (overlap) return $"Перекриття між слотами {a.SortOrder} і {b.SortOrder}.";
             }
-
         var lunch = _rows.Where(x => x.IsLunch).ToList();
         if (lunch.Count > 1) return "Може бути лише один слот, позначений як обід.";
         if (lunch.Count == 1 && !lunch[0].IsActive) return "Слот обіду має бути активним.";
-
         return null;
     }
-
+    // Зберігає слоти та перезавантажує дані.
     private async Task Save()
     {
         _error = _ok = null;
         _error = Validate();
         if (_error is not null) return;
         await Api.SaveAsync(_scope == Scope.Global ? null : _courseId, _rows);
-        
         await LoadRaw();
         _ok = "Збережено.";
     }

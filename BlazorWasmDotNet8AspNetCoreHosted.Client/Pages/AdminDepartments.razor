@@ -43,10 +43,8 @@
             <span class="input-group-text">Пошук</span>
             <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / назва" />
         </div>
-
         <div class="small text-muted">Показано: @SortedAndFiltered.Count() з @items.Count</div>
     </div>
-
     <div class="table-responsive">
         <table class="table table-sm align-middle">
             <thead>
@@ -96,13 +94,12 @@
     private string? error, ok;
     private List<DepartmentEditDto> items = new();
     private DepartmentEditDto form = new() { Id = null, Name = "", IsActive = true };
-
     private string? filter;
     private string sortField = nameof(DepartmentEditDto.Name);
     private bool sortAsc = true;
-
+    // Початкове завантаження списку кафедр.
     protected override async Task OnInitializedAsync() => await Load();
-
+    // Завантажує кафедри з API.
     private async Task Load()
     {
         try
@@ -115,17 +112,15 @@
             error = ex.Message;
         }
     }
-
+    // Зберігає кафедру через API.
     private async Task Save()
     {
         try
         {
             error = null;
             ok = null;
-
             var resp = await Http.PostAsJsonAsync("api/admin/departments/upsert", form);
             await Ensure(resp);
-
             await Load();
             ok = "Збережено.";
             form = new() { Id = null, Name = "", IsActive = true };
@@ -135,23 +130,20 @@
             error = ex.Message;
         }
     }
-
+    // Заповнює форму даними для редагування.
     private void Edit(DepartmentEditDto dto)
         => form = new DepartmentEditDto(dto.Id, dto.Name, dto.IsActive);
-
+    // Видаляє кафедру з підтвердженням та force-режимом.
     private async Task Delete(int id)
     {
         try
         {
             error = null;
             ok = null;
-
             var dep = items.FirstOrDefault(x => x.Id == id);
             var caption = dep is null ? $"#{id}" : $"{dep.Name} (#{id})";
-
             var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити кафедру {caption}? Дію не можна скасувати.");
             if (!confirmed) return;
-
             var resp = await Http.DeleteAsync($"api/admin/departments/{id}?confirm=true");
             if (resp.StatusCode == HttpStatusCode.Conflict)
             {
@@ -159,10 +151,8 @@
                     "confirm",
                     "Кафедра використовується викладачами або темами. Видалити примусово (force) і очистити привʼязки?");
                 if (!forceConfirmed) return;
-
                 resp = await Http.DeleteAsync($"api/admin/departments/{id}?confirm=true&force=true");
             }
-
             await Ensure(resp);
             await Load();
             ok = "Видалено.";
@@ -172,7 +162,7 @@
             error = ex.Message;
         }
     }
-
+    // Перевіряє успішність відповіді API.
     private static async Task Ensure(HttpResponseMessage resp)
     {
         if (resp.IsSuccessStatusCode) return;
@@ -180,46 +170,40 @@
         var msg = string.IsNullOrWhiteSpace(body) ? resp.ReasonPhrase : body;
         throw new HttpRequestException(msg ?? "Request failed", null, resp.StatusCode);
     }
-
+    // Перемикає напрямок сортування.
     private void ToggleSort(string field)
     {
         if (sortField == field) sortAsc = !sortAsc;
         else { sortField = field; sortAsc = true; }
     }
-
+    // Повертає піктограму для заголовка сортування.
     private string HeaderIcon(string field)
     {
         if (sortField != field) return "";
         return sortAsc ? "▲" : "▼";
     }
-
+    // Фільтрує кафедри за пошуковим рядком.
     private IEnumerable<DepartmentEditDto> ApplyFilter(IEnumerable<DepartmentEditDto> seq)
     {
         if (string.IsNullOrWhiteSpace(filter)) return seq;
         var f = filter.Trim();
-
         return seq.Where(x =>
             x.Id?.ToString().Contains(f, StringComparison.OrdinalIgnoreCase) == true
             || (x.Name?.Contains(f, StringComparison.OrdinalIgnoreCase) ?? false));
     }
-
+    // Сортує кафедри за вибраним полем.
     private IEnumerable<DepartmentEditDto> ApplySort(IEnumerable<DepartmentEditDto> seq)
     {
         return (sortField, sortAsc) switch
         {
             (nameof(DepartmentEditDto.Id), true) => seq.OrderBy(x => x.Id),
             (nameof(DepartmentEditDto.Id), false) => seq.OrderByDescending(x => x.Id),
-
             (nameof(DepartmentEditDto.Name), true) => seq.OrderBy(x => x.Name),
             (nameof(DepartmentEditDto.Name), false) => seq.OrderByDescending(x => x.Name),
-
             (nameof(DepartmentEditDto.IsActive), true) => seq.OrderByDescending(x => x.IsActive).ThenBy(x => x.Name),
             (nameof(DepartmentEditDto.IsActive), false) => seq.OrderBy(x => x.IsActive).ThenBy(x => x.Name),
-
             _ => seq
         };
     }
-
     private IEnumerable<DepartmentEditDto> SortedAndFiltered => ApplySort(ApplyFilter(items));
 }
-

@@ -13,45 +13,36 @@ public sealed class AdminPlansController : ControllerBase
 {
     private readonly AppDbContext _db;
     public AdminPlansController(AppDbContext db) => _db = db;
-
-    
-    
     [HttpGet("module/{moduleId:int}")]
+    // Повертає план годин для модуля з урахуванням курсу.
     public async Task<ActionResult<List<CourseModulePlanDto>>> GetByModule(int moduleId, [FromQuery] int? courseId = null)
     {
         var module = await _db.Modules
             .AsNoTracking()
             .Include(m => m.ModuleCourses)
             .FirstOrDefaultAsync(m => m.Id == moduleId);
-
         if (module is null)
             return NotFound(new { message = "Модуль не знайдено" });
-
         var linkedCourseIds = module.ModuleCourses
             .Select(mc => mc.CourseId)
             .ToHashSet();
         linkedCourseIds.Add(module.CourseId);
-
         if (linkedCourseIds.Count == 0)
             return NotFound(new { message = "Модуль не прив'язаний до курсу" });
-
         int resolvedCourseId;
         if (courseId is int requested && requested > 0)
         {
             if (!linkedCourseIds.Contains(requested))
                 return NotFound(new { message = "Модуль не прив'язаний до зазначеного курсу" });
-
             resolvedCourseId = requested;
         }
         else
         {
             resolvedCourseId = module.CourseId;
         }
-
         var lessonTypes = await _db.LessonTypes
             .Select(t => new { t.Id, t.Code, t.CountInPlan })
             .ToListAsync();
-
         var excludePlanIds = lessonTypes
             .Where(t =>
                 !t.CountInPlan
@@ -59,16 +50,13 @@ public sealed class AdminPlansController : ControllerBase
                 || string.Equals(t.Code, "RESCHEDULED", System.StringComparison.OrdinalIgnoreCase))
             .Select(t => t.Id)
             .ToHashSet();
-
         var scheduled = await _db.ScheduleItems
             .Where(si => si.ModuleId == moduleId
                          && si.Group.CourseId == resolvedCourseId
                          && !excludePlanIds.Contains(si.LessonTypeId))
             .CountAsync();
-
         var plan = await _db.ModulePlans.AsNoTracking()
             .FirstOrDefaultAsync(p => p.CourseId == resolvedCourseId && p.ModuleId == moduleId);
-
         var row = new CourseModulePlanDto(
             CourseId: resolvedCourseId,
             ModuleId: moduleId,
@@ -76,49 +64,39 @@ public sealed class AdminPlansController : ControllerBase
             ScheduledHours: scheduled,
             IsActive: plan?.IsActive ?? false
         );
-
         return Ok(new List<CourseModulePlanDto> { row });
     }
-
-    
     [HttpPost("module/{moduleId:int}/upsert")]
+    // Зберігає план годин для модуля та курсу.
     public async Task<IActionResult> Upsert(int moduleId, [FromBody] List<SaveCourseModulePlanDto> items, [FromQuery] int? courseId = null)
     {
         var module = await _db.Modules
             .Include(m => m.ModuleCourses)
             .FirstOrDefaultAsync(m => m.Id == moduleId);
-
         if (module is null)
             return NotFound(new { message = "Модуль не знайдено" });
-
         var linkedCourseIds = module.ModuleCourses
             .Select(mc => mc.CourseId)
             .ToHashSet();
         linkedCourseIds.Add(module.CourseId);
-
         if (linkedCourseIds.Count == 0)
             return BadRequest(new { message = "Модуль не прив'язаний до жодного курсу" });
-
         int resolvedCourseId;
         if (courseId is int requested && requested > 0)
         {
             if (!linkedCourseIds.Contains(requested))
                 return NotFound(new { message = "Модуль не прив'язаний до зазначеного курсу" });
-
             resolvedCourseId = requested;
         }
         else
         {
             resolvedCourseId = module.CourseId;
         }
-
         var dto = items?.FirstOrDefault();
         if (dto is null)
             return BadRequest(new { message = "Некоректні дані" });
-
         var plan = await _db.ModulePlans
             .FirstOrDefaultAsync(p => p.CourseId == resolvedCourseId && p.ModuleId == moduleId);
-
         if (plan is null)
         {
             _db.ModulePlans.Add(new ModulePlan
@@ -135,9 +113,7 @@ public sealed class AdminPlansController : ControllerBase
             plan.TargetHours = dto.TargetHours;
             plan.IsActive = dto.IsActive;
         }
-
         module.Credits = Math.Round(dto.TargetHours / 30m, 2);
-
         await _db.SaveChangesAsync();
         return NoContent();
     }

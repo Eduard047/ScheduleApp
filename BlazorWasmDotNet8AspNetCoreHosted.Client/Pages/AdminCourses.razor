@@ -18,16 +18,13 @@
 
 <div class="row">
     <div class="col-md-6">
-
         <div class="d-flex justify-content-between align-items-center mb-2 gap-2">
             <button class="btn btn-primary" @onclick="New">+ Додати курс</button>
-
             <div class="input-group" style="max-width:280px;">
                 <span class="input-group-text">Пошук</span>
                 <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / назва / тижні" />
             </div>
         </div>
-
         <table class="table table-sm table-striped align-middle">
             <thead>
                 <tr>
@@ -58,12 +55,10 @@
                 }
             </tbody>
         </table>
-
         <div class="text-muted small">
             Показано: @SortedAndFilteredItems.Count() з @items.Count
         </div>
     </div>
-
     <div class="col-md-6">
         <EditForm Model="model" OnValidSubmit="Save">
             <DataAnnotationsValidator />
@@ -94,52 +89,46 @@
     private CourseEditDto model = new();
     private string? error, ok;
     private string formTitle = "Новий курс";
-    
     private string sortField = nameof(CourseEditDto.Name);
     private bool sortAsc = true;
     private string? filter;
-
     private IEnumerable<CourseEditDto> SortedAndFilteredItems
         => ApplySort(ApplyFilter(items));
-
+    // Фільтрує курси за пошуковим рядком.
     private IEnumerable<CourseEditDto> ApplyFilter(IEnumerable<CourseEditDto> seq)
     {
         if (string.IsNullOrWhiteSpace(filter)) return seq;
-
         var f = filter.Trim();
         return seq.Where(c =>
             (c.Id?.ToString().Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
             (!string.IsNullOrEmpty(c.Name) && c.Name.Contains(f, StringComparison.OrdinalIgnoreCase)) ||
             c.DurationWeeks.ToString().Contains(f, StringComparison.OrdinalIgnoreCase));
     }
-
+    // Сортує курси за вибраним полем.
     private IEnumerable<CourseEditDto> ApplySort(IEnumerable<CourseEditDto> seq)
     {
         return (sortField, sortAsc) switch
         {
             (nameof(CourseEditDto.Id), true) => seq.OrderBy(c => c.Id ?? 0),
             (nameof(CourseEditDto.Id), false) => seq.OrderByDescending(c => c.Id ?? 0),
-
             (nameof(CourseEditDto.DurationWeeks), true) => seq.OrderBy(c => c.DurationWeeks),
             (nameof(CourseEditDto.DurationWeeks), false) => seq.OrderByDescending(c => c.DurationWeeks),
-
             (nameof(CourseEditDto.Name), false) => seq.OrderByDescending(c => c.Name),
             _ => seq.OrderBy(c => c.Name)
         };
     }
-
+    // Перемикає напрямок сортування.
     private void ToggleSort(string field)
     {
         if (sortField == field) sortAsc = !sortAsc;
         else { sortField = field; sortAsc = true; }
     }
-
+    // Повертає піктограму для заголовка сортування.
     private MarkupString HeaderIcon(string field)
         => new MarkupString(sortField == field ? $"<span class=\"ms-1\">{(sortAsc ? "▲" : "▼")}</span>" : "");
-
-    
+    // Початкове завантаження курсів.
     protected override async Task OnInitializedAsync() => await Load();
-
+    // Завантажує список курсів та ініціалізує форму.
     private async Task Load()
     {
         error = ok = null;
@@ -151,21 +140,21 @@
         }
         StateHasChanged();
     }
-
+    // Скидає форму створення курсу.
     private void New()
     {
         error = ok = null;
         model = new CourseEditDto(null, "", 16);
         formTitle = "Новий курс";
     }
-
+    // Заповнює форму для редагування курсу.
     private void Edit(CourseEditDto c)
     {
         error = ok = null;
         model = new CourseEditDto(c.Id, c.Name, c.DurationWeeks);
         formTitle = $"Редагування: {c.Name}";
     }
-
+    // Зберігає курс через API.
     private async Task Save()
     {
         error = ok = null;
@@ -178,9 +167,9 @@
         }
         catch (Exception ex) { error = ex.Message; }
     }
-
+    // Скасовує редагування.
     private void Cancel() => New();
-
+    // Видаляє курс з підтвердженням та force-режимом.
     private async Task Delete(int id)
     {
         error = ok = null;
@@ -202,7 +191,6 @@
                 var sure = await JS.InvokeAsync<bool>("confirm",
                     "Курс використовується. Видалити разом із пов’язаними групами, модулями та заняттями?");
                 if (!sure) { error = "Скасовано користувачем."; return; }
-
                 await Api.DeleteCourse(id, force: true);
                 await Load();
                 ok = "Курс і пов’язані дані видалено.";

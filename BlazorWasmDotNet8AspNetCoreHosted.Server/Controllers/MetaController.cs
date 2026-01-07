@@ -10,6 +10,7 @@ using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 public class MetaController(AppDbContext db) : ControllerBase
 {
     [HttpGet]
+    // Повертає довідкові дані для клієнта, зокрема календар на тиждень.
     public async Task<MetaResponseDto> Get([FromQuery] DateOnly? weekStart)
     {
         var courses = await db.Courses.AsNoTracking().Select(x => new LookupDto(x.Id, x.Name)).ToListAsync();
@@ -36,7 +37,6 @@ public class MetaController(AppDbContext db) : ControllerBase
                 CourseIds = x.ModuleCourses.Select(mc => mc.CourseId).ToList()
             })
             .ToListAsync();
-
         var modules = moduleRows
             .Select(row =>
             {
@@ -45,7 +45,6 @@ public class MetaController(AppDbContext db) : ControllerBase
                 {
                     courseIds.Add(row.CourseId);
                 }
-
                 return new ModuleMetaDto(
                     row.Id,
                     row.Code,
@@ -58,7 +57,6 @@ public class MetaController(AppDbContext db) : ControllerBase
                 };
             })
             .ToList();
-
         var lessonTypes = await db.LessonTypes.AsNoTracking().OrderBy(x => x.Id)
             .Select(x => new IdCodeNameDto(x.Id, x.Code, x.Name)
             {
@@ -68,7 +66,6 @@ public class MetaController(AppDbContext db) : ControllerBase
         var lunches = await db.LunchConfigs
             .Select(x => new LunchConfigDto(x.CourseId, x.Start.ToString("HH:mm"), x.End.ToString("HH:mm")))
             .ToListAsync();
-
         var cal = new List<CalendarExceptionDto>();
         if (weekStart is DateOnly s)
         {
@@ -80,7 +77,6 @@ public class MetaController(AppDbContext db) : ControllerBase
                 GroupId = x.GroupId
             }).ToList();
         }
-
         return new MetaResponseDto(courses, groups, teachers, rooms, buildings, lessonTypes, lunches)
         {
             Modules = modules,

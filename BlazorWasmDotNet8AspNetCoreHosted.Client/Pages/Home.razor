@@ -3,6 +3,7 @@
 @inject NavigationManager Nav
 
 @code {
+    // Перенаправляє користувача на розклад.
     protected override void OnInitialized()
         => Nav.NavigateTo("/schedule", replace: true);
 }

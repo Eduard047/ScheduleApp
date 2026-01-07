@@ -197,14 +197,13 @@ else
     private Dictionary<int, ModuleEditDto> moduleLookup = new();
     private readonly List<int> mainModules = new();
     private HashSet<int> fillerIds = new();
-
     private int _selectedCourseId;
     private bool isLoading;
     private bool isCourseLoading;
     private bool isSaving;
     private string? ok;
     private string? error;
-
+    // Початкове завантаження курсів, модулів і послідовності.
     protected override async Task OnInitializedAsync()
     {
         isLoading = true;
@@ -216,13 +215,11 @@ else
             moduleLookup = modules
                 .Where(m => m.Id.HasValue)
                 .ToDictionary(m => m.Id!.Value, m => m);
-
             _selectedCourseId = courses
                 .Where(c => c.Id.HasValue)
                 .OrderBy(c => c.Name)
                 .Select(c => c.Id!.Value)
                 .FirstOrDefault();
-
             if (_selectedCourseId > 0)
             {
                 await LoadSequence(_selectedCourseId);
@@ -237,12 +234,11 @@ else
             isLoading = false;
         }
     }
-
+    // Реагує на зміну курсу та перезавантажує послідовність.
     private async Task OnCourseChanged(ChangeEventArgs args)
     {
         ok = null;
         error = null;
-
         if (int.TryParse(args.Value?.ToString(), out var cid))
         {
             _selectedCourseId = cid;
@@ -251,16 +247,14 @@ else
         {
             _selectedCourseId = 0;
         }
-
         mainModules.Clear();
         fillerIds.Clear();
-
         if (_selectedCourseId > 0)
         {
             await LoadSequence(_selectedCourseId);
         }
     }
-
+    // Оновлює послідовність для поточного курсу.
     private async Task RefreshCurrent()
     {
         if (_selectedCourseId <= 0) return;
@@ -270,7 +264,7 @@ else
         fillerIds.Clear();
         await LoadSequence(_selectedCourseId);
     }
-
+    // Завантажує збережену послідовність модулів курсу.
     private async Task LoadSequence(int courseId)
     {
         isCourseLoading = true;
@@ -281,10 +275,8 @@ else
                 .Where(m => m.Id.HasValue && ModuleBelongsToCourse(m, courseId))
                 .Select(m => m.Id!.Value)
                 .ToHashSet();
-
             var ordered = new List<int>();
             var seen = new HashSet<int>();
-
             if (cfg is not null)
             {
                 foreach (var mid in cfg.MainSequence.Select(x => x.ModuleId))
@@ -294,7 +286,6 @@ else
                         ordered.Add(mid);
                     }
                 }
-
                 fillerIds = cfg.FillerModuleIds
                     .Where(allowed.Contains)
                     .ToHashSet();
@@ -303,7 +294,6 @@ else
             {
                 fillerIds.Clear();
             }
-
             fillerIds.ExceptWith(ordered);
             mainModules.Clear();
             mainModules.AddRange(ordered);
@@ -318,23 +308,21 @@ else
             StateHasChanged();
         }
     }
-
+    // Повертає модулі, що належать до курсу.
     private List<ModuleEditDto> CourseModules()
         => modules
             .Where(m => m.Id.HasValue && ModuleBelongsToCourse(m, _selectedCourseId))
             .OrderBy(m => string.IsNullOrWhiteSpace(m.Code) ? m.Title : m.Code)
             .ThenBy(m => m.Title)
             .ToList();
-
+    // Повертає список курсів, пов'язаних із модулем.
     private static List<int> ModuleCourseIds(ModuleEditDto module)
     {
         var result = new List<int>();
-
         if (module.CourseId > 0)
         {
             result.Add(module.CourseId);
         }
-
         if (module.CloneCourseIds is { Count: > 0 })
         {
             foreach (var id in module.CloneCourseIds)
@@ -345,13 +333,12 @@ else
                 }
             }
         }
-
         return result;
     }
-
+    // Перевіряє, чи модуль належить курсу.
     private static bool ModuleBelongsToCourse(ModuleEditDto module, int courseId)
         => courseId > 0 && ModuleCourseIds(module).Contains(courseId);
-
+    // Додає модуль до основної послідовності.
     private void AddToMain(int moduleId)
     {
         if (!moduleLookup.ContainsKey(moduleId)) return;
@@ -360,28 +347,28 @@ else
         mainModules.Add(moduleId);
         fillerIds.Remove(moduleId);
     }
-
+    // Підіймає модуль у послідовності.
     private void MoveUp(int index)
     {
         if (index <= 0 || index >= mainModules.Count) return;
         ok = null;
         (mainModules[index - 1], mainModules[index]) = (mainModules[index], mainModules[index - 1]);
     }
-
+    // Опускає модуль у послідовності.
     private void MoveDown(int index)
     {
         if (index < 0 || index >= mainModules.Count - 1) return;
         ok = null;
         (mainModules[index], mainModules[index + 1]) = (mainModules[index + 1], mainModules[index]);
     }
-
+    // Видаляє модуль з основної послідовності.
     private void RemoveFromMain(int index)
     {
         if (index < 0 || index >= mainModules.Count) return;
         ok = null;
         mainModules.RemoveAt(index);
     }
-
+    // Перемикає модуль у списку низького пріоритету.
     private void ToggleFiller(ChangeEventArgs args, int moduleId)
     {
         if (mainModules.Contains(moduleId)) return;
@@ -396,7 +383,7 @@ else
             fillerIds.Remove(moduleId);
         }
     }
-
+    // Позначає всі модулі як низький пріоритет.
     private void SelectAllFillers()
     {
         ok = null;
@@ -405,19 +392,19 @@ else
             .Where(id => !mainModules.Contains(id))
             .ToHashSet();
     }
-
+    // Очищає список низьких пріоритетів.
     private void ClearFillers()
     {
         ok = null;
         fillerIds.Clear();
     }
-
+    // Очищає основну послідовність.
     private void ClearMain()
     {
         ok = null;
         mainModules.Clear();
     }
-
+    // Формує назву модуля для відображення.
     private string ModuleTitle(int moduleId)
     {
         if (moduleLookup.TryGetValue(moduleId, out var module))
@@ -432,34 +419,29 @@ else
         }
         return $"#{moduleId}";
     }
-
+    // Повертає назву курсу для модуля.
     private string ModuleCourseName(int moduleId)
     {
         if (!moduleLookup.TryGetValue(moduleId, out var module))
             return string.Empty;
-
         var courseIds = ModuleCourseIds(module);
         var courseId = courseIds.FirstOrDefault();
-
         if (_selectedCourseId > 0 && courseIds.Contains(_selectedCourseId))
         {
             courseId = _selectedCourseId;
         }
-
         return CourseName(courseId);
     }
-
+    // Повертає назву курсу за ідентифікатором.
     private string CourseName(int courseId)
         => courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
-
+    // Зберігає послідовність модулів для курсу.
     private async Task SaveAsync()
     {
         if (_selectedCourseId <= 0) return;
-
         isSaving = true;
         ok = null;
         error = null;
-
         try
         {
             var payload = new ModuleSequenceSaveRequestDto(
@@ -468,7 +450,6 @@ else
                 fillerIds
                     .Where(id => moduleLookup.TryGetValue(id, out var module) && ModuleBelongsToCourse(module, _selectedCourseId))
                     .ToList());
-
             await Admin.SaveModuleSequence(payload);
             ok = "Збережено.";
         }
@@ -487,17 +468,14 @@ else
     .table-responsive {
         max-height: 520px;
     }
-
     .module-label {
         display: flex;
         flex-direction: column;
     }
-
     .module-label-title {
         font-weight: 600;
         line-height: 1.2;
     }
-
     .module-label-course {
         font-size: .78rem;
         margin-top: .1rem;

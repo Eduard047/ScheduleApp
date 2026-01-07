@@ -25,7 +25,6 @@
                 <h6 class="m-0">@((form.Id is null ? "Додати тип" : $"Редагувати тип #{form.Id}"))</h6>
                 <button class="btn btn-sm btn-success" @onclick="NewItem">+ Новий</button>
             </div>
-
             <div class="mb-2">
                 <label class="form-label">Код</label>
                 <input class="form-control" @bind="form.Code" placeholder="LECTURE / SEMINAR / LAB / BREAK / CANCELED / PRACTICE / EXAM ..." />
@@ -34,11 +33,9 @@
                 <label class="form-label">Назва</label>
                 <input class="form-control" @bind="form.Name" />
             </div>
-
             <div class="row g-2">
                 <div class="col-12">
                     <label class="form-label">Колір на розкладі</label>
-
                     @if (palette.Count == 0)
                     {
                         <div class="form-text text-muted">Завантаження палітри…</div>
@@ -52,7 +49,6 @@
                                     var isMine = form.Id.HasValue && c.UsedByTypeId.HasValue && c.UsedByTypeId.Value == form.Id.Value;
                                     var usedByOther = c.IsUsed && !isMine;
                                     var itemClass = usedByOther ? "palette-item palette-item--used" : "palette-item";
-
                                     <label class="@itemClass" title="@($"{c.Name} ({c.Key})")">
                                         <InputRadio TValue="string" Value="@c.Key" />
                                         <span class="swatch @c.Key"></span>
@@ -71,15 +67,12 @@
                         <div class="small text-muted mt-1">Можна обрати будь-який колір. Зайняті позначені, але залишаються доступними.</div>
                     }
                 </div>
-
                 <div class="col-12">
                     <label class="form-label d-block">Активний</label>
                     <input type="checkbox" class="form-check-input" @bind="form.IsActive" />
                 </div>
             </div>
-
             <hr />
-
             <div class="row row-cols-1 row-cols-md-2 g-2">
                 <div class="col"><div class="form-check"><input class="form-check-input" type="checkbox" @bind="form.RequiresRoom" /> <label class="form-check-label">Потребує аудиторію</label></div></div>
                 <div class="col"><div class="form-check"><input class="form-check-input" type="checkbox" @bind="form.RequiresTeacher" /> <label class="form-check-label">Потребує викладача</label></div></div>
@@ -89,24 +82,20 @@
                 <div class="col"><div class="form-check"><input class="form-check-input" type="checkbox" @bind="form.CountInLoad" /> <label class="form-check-label">Рахується у навант.</label></div></div>
                 <div class="col"><div class="form-check"><input class="form-check-input" type="checkbox" @bind="form.PreferredFirstInWeek" disabled="@PreferredFirstInWeekLocked" /> <label class="form-check-label">Бажано першим у тижні</label></div></div>
             </div>
-
             <div class="mt-3 d-grid">
                 <button class="btn btn-primary" @onclick="Save">Зберегти</button>
             </div>
         </div>
     </div>
-
     <div class="col-lg-7">
         <div class="card p-3">
             <div class="d-flex justify-content-between align-items-center mb-2 gap-2">
                 <h6 class="m-0">Список типів</h6>
-
                 <div class="input-group" style="max-width:360px;">
                     <span class="input-group-text">Пошук</span>
                     <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / код / назва / css" />
                 </div>
             </div>
-
             <div class="table-responsive">
                 <table class="table table-sm align-middle">
                     <thead>
@@ -175,7 +164,6 @@
                     </tbody>
                 </table>
             </div>
-
             <div class="d-flex justify-content-between">
                 <small class="text-muted">Показано: @SortedItems.Count() з @items.Count</small>
                 <small class="text-muted">Підказка: <code>BREAK</code> з вимкнутими Requires/Blocks/Count — це «перерва».</small>
@@ -188,18 +176,13 @@
     private string? error, ok;
     private List<LessonTypeEditDto> items = new();
     private LessonTypeEditDto form = NewForm();
-
     private List<LessonColorDto> palette = new();
-
-    
     private string? filter;
-
-    
     private string sortField = nameof(LessonTypeEditDto.Id);
     private bool sortAsc = true;
-
+    // Початкове завантаження типів занять і палітри.
     protected override async Task OnInitializedAsync() => await Load();
-
+    // Створює порожню форму типу заняття.
     private static LessonTypeEditDto NewForm() => new()
     {
         Id = null,
@@ -215,7 +198,7 @@
         PreferredFirstInWeek = false,
         CssKey = null
     };
-
+    // Клонує DTO для редагування.
     private static LessonTypeEditDto Clone(LessonTypeEditDto x) => new()
     {
         Id = x.Id,
@@ -231,7 +214,7 @@
         PreferredFirstInWeek = x.PreferredFirstInWeek,
         CssKey = x.CssKey
     };
-
+    // Завантажує типи занять і палітру кольорів.
     private async Task Load()
     {
         try
@@ -239,8 +222,6 @@
             error = ok = null;
             items = await Api.GetLessonTypes();
             palette = await Api.GetLessonColorPalette();
-
-            
             if (form.Id is null && string.IsNullOrWhiteSpace(form.CssKey))
             {
                 var free = palette.FirstOrDefault(p => !p.IsUsed);
@@ -249,27 +230,27 @@
         }
         catch (Exception ex) { error = ex.Message; }
     }
-
+    // Скидає форму для створення нового типу.
     private void NewItem()
     {
         form = NewForm();
         var free = palette.FirstOrDefault(c => !c.IsUsed);
         if (free is not null) form.CssKey = free.Key;
     }
-
+    // Заповнює форму даними для редагування.
     private void Edit(LessonTypeEditDto x)
     {
         form = Clone(x);
         _ = RefreshPalette();
     }
-
+    // Оновлює палітру кольорів.
     private async Task RefreshPalette()
     {
         try { palette = await Api.GetLessonColorPalette(); }
         catch {  }
         StateHasChanged();
     }
-
+    // Зберігає тип заняття через API.
     private async Task Save()
     {
         try
@@ -283,7 +264,7 @@
         catch (HttpRequestException ex) { error = ex.Message; }
         catch (Exception ex) { error = ex.Message; }
     }
-
+    // Видаляє тип заняття після підтвердження.
     private async Task Delete(int id)
     {
         try
@@ -299,16 +280,13 @@
         }
         catch (Exception ex) { error = ex.Message; }
     }
-
-    
+    // Оновлює UI після вибору кольору.
     private void OnCssSelected() => StateHasChanged();
-
-    
+    // Фільтрує список типів за пошуковим рядком.
     private IEnumerable<LessonTypeEditDto> ApplyFilter(IEnumerable<LessonTypeEditDto> seq)
     {
         if (string.IsNullOrWhiteSpace(filter)) return seq;
         var f = filter.Trim();
-
         return seq.Where(x =>
             (x.Id?.ToString().Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
             (x.Code?.Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
@@ -316,76 +294,60 @@
             (x.CssKey?.Contains(f, StringComparison.OrdinalIgnoreCase) ?? false)
         );
     }
-
-    
+    // Сортує список типів за вибраним полем.
     private IEnumerable<LessonTypeEditDto> ApplySort(IEnumerable<LessonTypeEditDto> seq)
     {
         return (sortField, sortAsc) switch
         {
             (nameof(LessonTypeEditDto.Id), true) => seq.OrderBy(x => x.Id),
             (nameof(LessonTypeEditDto.Id), false) => seq.OrderByDescending(x => x.Id),
-
             (nameof(LessonTypeEditDto.Code), true) => seq.OrderBy(x => x.Code),
             (nameof(LessonTypeEditDto.Code), false) => seq.OrderByDescending(x => x.Code),
-
             (nameof(LessonTypeEditDto.Name), true) => seq.OrderBy(x => x.Name),
             (nameof(LessonTypeEditDto.Name), false) => seq.OrderByDescending(x => x.Name),
-
             (nameof(LessonTypeEditDto.CssKey), true) => seq.OrderBy(x => x.CssKey),
             (nameof(LessonTypeEditDto.CssKey), false) => seq.OrderByDescending(x => x.CssKey),
-
             (nameof(LessonTypeEditDto.IsActive), true) => seq.OrderBy(x => x.IsActive).ThenBy(x => x.Name),
             (nameof(LessonTypeEditDto.IsActive), false) => seq.OrderByDescending(x => x.IsActive).ThenByDescending(x => x.Name),
-
             (nameof(LessonTypeEditDto.RequiresRoom), true) => seq.OrderBy(x => x.RequiresRoom).ThenBy(x => x.Name),
             (nameof(LessonTypeEditDto.RequiresRoom), false) => seq.OrderByDescending(x => x.RequiresRoom).ThenByDescending(x => x.Name),
-
             (nameof(LessonTypeEditDto.RequiresTeacher), true) => seq.OrderBy(x => x.RequiresTeacher).ThenBy(x => x.Name),
             (nameof(LessonTypeEditDto.RequiresTeacher), false) => seq.OrderByDescending(x => x.RequiresTeacher).ThenByDescending(x => x.Name),
-
             (nameof(LessonTypeEditDto.BlocksRoom), true) => seq.OrderBy(x => x.BlocksRoom).ThenBy(x => x.Name),
             (nameof(LessonTypeEditDto.BlocksRoom), false) => seq.OrderByDescending(x => x.BlocksRoom).ThenByDescending(x => x.Name),
-
             (nameof(LessonTypeEditDto.BlocksTeacher), true) => seq.OrderBy(x => x.BlocksTeacher).ThenBy(x => x.Name),
             (nameof(LessonTypeEditDto.BlocksTeacher), false) => seq.OrderByDescending(x => x.BlocksTeacher).ThenByDescending(x => x.Name),
-
             (nameof(LessonTypeEditDto.CountInPlan), true) => seq.OrderBy(x => x.CountInPlan).ThenBy(x => x.Name),
             (nameof(LessonTypeEditDto.CountInPlan), false) => seq.OrderByDescending(x => x.CountInPlan).ThenByDescending(x => x.Name),
-
             (nameof(LessonTypeEditDto.CountInLoad), true) => seq.OrderBy(x => x.CountInLoad).ThenBy(x => x.Name),
             (nameof(LessonTypeEditDto.CountInLoad), false) => seq.OrderByDescending(x => x.CountInLoad).ThenByDescending(x => x.Name),
-
             (nameof(LessonTypeEditDto.PreferredFirstInWeek), true) => seq.OrderBy(x => x.PreferredFirstInWeek).ThenBy(x => x.Name),
             (nameof(LessonTypeEditDto.PreferredFirstInWeek), false) => seq.OrderByDescending(x => x.PreferredFirstInWeek).ThenByDescending(x => x.Name),
-
             _ => seq
         };
     }
-
     private IEnumerable<LessonTypeEditDto> SortedItems => ApplySort(ApplyFilter(items));
-
     private bool PreferredFirstInWeekLocked
         => !form.PreferredFirstInWeek
            && items.Any(x => x.PreferredFirstInWeek && x.Id != form.Id);
-
+    // Перемикає напрямок сортування.
     private void ToggleSort(string field)
     {
         if (sortField == field) sortAsc = !sortAsc;
         else { sortField = field; sortAsc = true; }
     }
-
+    // Повертає піктограму для заголовка сортування.
     private MarkupString HeaderIcon(string field)
         => new(sortField == field ? $"<span class=\"ms-1\">{(sortAsc ? "▲" : "▼")}</span>" : "");
 }
 
 <style>
-    
+
     .sortable-th {
         cursor: pointer;
         user-select: none;
         white-space: nowrap;
     }
-
     .badge-soft {
         display: inline-block;
         padding: 2px 8px;
@@ -394,8 +356,6 @@
         font-weight: 600;
         background: #eef2f7;
     }
-
-    
     .c1  { background: #c9e6ff; }
     .c2  { background: #b6f4d2; }
     .c3  { background: #ffe2a9; }
@@ -421,20 +381,16 @@
     .c22 { background: #d3dae3; }
     .c23 { background: #cdefb8; }
     .c24 { background: #ffe6b5; }
-
-    
     .palette-grid {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: .5rem;
     }
-
     @@media (min-width: 576px) {
         .palette-grid {
             grid-template-columns: repeat(3, minmax(0, 1fr));
         }
     }
-
         .palette-item {
             display: flex;
             align-items: center;
@@ -445,19 +401,15 @@
             background: #fff;
             user-select: none;
         }
-
         .palette-item--used {
             border-style: dashed;
         }
-
         .palette-item input[type="radio"] {
             margin-right: .25rem;
         }
-
             .palette-item input[type="radio"]:disabled + .swatch {
                 opacity: .4;
             }
-
         .palette-item .swatch {
             display: inline-block;
             width: 28px;
@@ -465,7 +417,6 @@
             border-radius: 4px;
             border: 1px solid rgba(0,0,0,.08);
         }
-
         .palette-item .caption {
             line-height: 1;
         }

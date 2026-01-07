@@ -10,6 +10,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers;
 public class RulesController(RulesService rules) : ControllerBase
 {
     [HttpPost("validate")]
+    // Повертає результат перевірки правил для пари.
     public async Task<IActionResult> Validate([FromBody] UpsertScheduleItemRequest r)
     {
         var (errors, warnings) = await rules.ValidateUpsertAsync(r);

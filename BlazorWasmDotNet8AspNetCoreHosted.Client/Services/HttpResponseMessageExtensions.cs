@@ -18,23 +18,20 @@ public sealed class ApiErrorException : Exception
         Errors = errors ?? Array.Empty<string>();
         Warnings = warnings ?? Array.Empty<string>();
     }
-
     public HttpStatusCode StatusCode { get; }
-
     public IReadOnlyList<string> Errors { get; }
-
     public IReadOnlyList<string> Warnings { get; }
 }
 
 public static class HttpResponseMessageExtensions
 {
+    // Перевіряє відповідь HTTP і кидає виняток з деталями помилки.
     public static async Task EnsureSuccessWithDetailsAsync(this HttpResponseMessage response, CancellationToken cancellationToken = default)
     {
         if (response.IsSuccessStatusCode)
         {
             return;
         }
-
         string? payload = null;
         if (response.Content is not null)
         {
@@ -44,52 +41,44 @@ public static class HttpResponseMessageExtensions
             }
             catch
             {
-                
             }
         }
-
         var (message, errors, warnings) = ParseErrorPayload(payload);
         throw new ApiErrorException(response.StatusCode, message ?? response.ReasonPhrase ?? string.Empty, errors, warnings);
     }
-
+    // Розбирає JSON-помилку в узгоджений формат повідомлення.
     private static (string? Message, IReadOnlyList<string>? Errors, IReadOnlyList<string>? Warnings) ParseErrorPayload(string? payload)
     {
         if (string.IsNullOrWhiteSpace(payload))
         {
             return (null, null, null);
         }
-
         try
         {
             using var document = JsonDocument.Parse(payload);
             var root = document.RootElement;
-
             string? message = TryGetString(root, "message")
                                ?? TryGetString(root, "title")
                                ?? TryGetString(root, "detail");
-
             var errors = root.TryGetProperty("errors", out var errorsElement) ? ExtractStrings(errorsElement) : null;
             var warnings = root.TryGetProperty("warnings", out var warningsElement) ? ExtractStrings(warningsElement) : null;
-
             return (message ?? payload, errors, warnings);
         }
         catch (JsonException)
         {
-            
             return (payload, null, null);
         }
     }
-
+    // Безпечно читає рядкове поле з JSON.
     private static string? TryGetString(JsonElement root, string propertyName)
     {
         if (root.TryGetProperty(propertyName, out var element) && element.ValueKind == JsonValueKind.String)
         {
             return element.GetString();
         }
-
         return null;
     }
-
+    // Витягує список рядків з масиву/об'єкта JSON.
     private static IReadOnlyList<string>? ExtractStrings(JsonElement element)
     {
         switch (element.ValueKind)
@@ -108,7 +97,6 @@ public static class HttpResponseMessageExtensions
                     }
                 }
                 return list.Count > 0 ? list : null;
-
             case JsonValueKind.Object:
                 var aggregated = new List<string>();
                 foreach (var property in element.EnumerateObject())
@@ -120,10 +108,8 @@ public static class HttpResponseMessageExtensions
                     }
                 }
                 return aggregated.Count > 0 ? aggregated : null;
-
             case JsonValueKind.String:
                 return new[] { element.GetString() ?? string.Empty };
-
             default:
                 return null;
         }

@@ -12,10 +12,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Admin;
 // Контролер адміністратора для типів занять
 public class AdminTypesController(AppDbContext db) : ControllerBase
 {
-    
-    private sealed record PaletteItem(string Name, string Hex);
 
-    
+    private sealed record PaletteItem(string Name, string Hex);
     private static readonly IReadOnlyDictionary<string, PaletteItem> Palette =
         new Dictionary<string, PaletteItem>
         {
@@ -45,18 +43,15 @@ public class AdminTypesController(AppDbContext db) : ControllerBase
             ["c23"] = new("М'ята-лайм", "#CDEFB8"),
             ["c24"] = new("Сонячний", "#FFE6B5"),
         };
-
-    
     [HttpGet("lesson/palette")]
+    // Повертає палітру кольорів із позначенням зайнятих.
     public async Task<IReadOnlyList<LessonColorDto>> LessonPalette()
     {
         var used = await db.LessonTypes
             .Where(x => x.CssKey != null && x.CssKey != "")
             .Select(x => new { x.Id, CssKey = x.CssKey! })
             .ToListAsync();
-
         var usedMap = used.GroupBy(x => x.CssKey).ToDictionary(g => g.Key, g => g.First().Id);
-
         return Palette.Select(p =>
         {
             usedMap.TryGetValue(p.Key, out var usedById);
@@ -69,9 +64,8 @@ public class AdminTypesController(AppDbContext db) : ControllerBase
             );
         }).ToList();
     }
-
-    
     [HttpGet("lesson")]
+    // Повертає список типів занять.
     public async Task<IReadOnlyList<LessonTypeEditDto>> LessonList() =>
         await db.LessonTypes.AsNoTracking()
             .OrderBy(x => x.Id)
@@ -91,13 +85,12 @@ public class AdminTypesController(AppDbContext db) : ControllerBase
                 PreferredFirstInWeek = x.PreferredFirstInWeek
             })
             .ToListAsync();
-
     [HttpPost("lesson/upsert")]
+    // Створює або оновлює тип заняття з перевіркою палітри.
     public async Task<ActionResult<int>> LessonUpsert([FromBody] LessonTypeEditDto dto)
     {
         if (string.IsNullOrWhiteSpace(dto.Code) || string.IsNullOrWhiteSpace(dto.Name))
             return BadRequest(new { message = "Код та Назва є обовʼязковими" });
-
         LessonTypeRef e;
         if (dto.Id is int id && id > 0)
         {
@@ -109,37 +102,28 @@ public class AdminTypesController(AppDbContext db) : ControllerBase
             e = new LessonTypeRef();
             db.LessonTypes.Add(e);
         }
-
         e.Code = dto.Code.Trim();
         e.Name = dto.Name.Trim();
         e.IsActive = dto.IsActive;
-
-        
         var newKey = string.IsNullOrWhiteSpace(dto.CssKey) ? null : dto.CssKey.Trim();
-
         if (newKey != null)
         {
             if (!Palette.ContainsKey(newKey))
                 return BadRequest(new { message = $"Недопустимий CSS-ключ '{newKey}'. Оберіть один із фіксованої палітри." });
-
             var takenBy = await db.LessonTypes
                 .Where(x => x.CssKey == newKey)
                 .Select(x => x.Id)
                 .FirstOrDefaultAsync();
-
             if (takenBy != 0 && takenBy != e.Id)
                 return Conflict(new { message = $"Колір '{newKey}' уже використовується типом #{takenBy}." });
         }
-
         e.CssKey = newKey;
-
         e.RequiresRoom = dto.RequiresRoom;
         e.RequiresTeacher = dto.RequiresTeacher;
         e.BlocksRoom = dto.BlocksRoom;
         e.BlocksTeacher = dto.BlocksTeacher;
         e.CountInPlan = dto.CountInPlan;
         e.CountInLoad = dto.CountInLoad;
-
         if (dto.PreferredFirstInWeek)
         {
             var taken = await db.LessonTypes
@@ -147,7 +131,6 @@ public class AdminTypesController(AppDbContext db) : ControllerBase
                 .Where(x => x.PreferredFirstInWeek && x.Id != e.Id)
                 .Select(x => new { x.Id, x.Code, x.Name })
                 .FirstOrDefaultAsync();
-
             if (taken is not null)
             {
                 var label = string.IsNullOrWhiteSpace(taken.Code)
@@ -157,13 +140,12 @@ public class AdminTypesController(AppDbContext db) : ControllerBase
             }
         }
         e.PreferredFirstInWeek = dto.PreferredFirstInWeek;
-
         await db.SaveChangesAsync();
         return Ok(e.Id);
     }
-
     [HttpDelete("lesson/{id:int}")]
     [RequireDeletionConfirmation("тип заняття")]
+    // Видаляє тип заняття, якщо він не використовується.
     public async Task<IActionResult> LessonDelete(int id)
     {
         var used = await db.ScheduleItems.AnyAsync(s => s.LessonTypeId == id);
@@ -172,7 +154,5 @@ public class AdminTypesController(AppDbContext db) : ControllerBase
         if (rows == 0) return NotFound();
         return NoContent();
     }
-
-
 
 }

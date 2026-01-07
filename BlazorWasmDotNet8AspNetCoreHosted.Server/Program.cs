@@ -13,10 +13,12 @@ builder.Services.AddRazorPages();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
+// Підключення до БД та конфігурація EF Core.
 var cs = builder.Configuration.GetConnectionString("Default");
 var serverVersion = new MySqlServerVersion(new Version(8, 0, 0));
 builder.Services.AddDbContextPool<AppDbContext>(opt => opt.UseMySql(cs, serverVersion));
 
+// Реєстрація доменних сервісів.
 builder.Services.AddScoped<RulesService>();
 builder.Services.AddScoped<AggregatesService>();
 builder.Services.AddScoped<TeacherDraftsQueryService>();
@@ -28,12 +30,14 @@ var app = builder.Build();
 
 if (app.Environment.IsDevelopment())
 {
+    // У режимі розробки вмикаємо Swagger та отладку WASM.
     app.UseWebAssemblyDebugging();
     app.UseSwagger();
     app.UseSwaggerUI();
 }
 else
 {
+    // Для продакшену використовуємо обробник помилок та HSTS.
     app.UseExceptionHandler("/Error");
     app.UseHsts();
 }
@@ -47,6 +51,7 @@ app.MapRazorPages();
 app.MapControllers();
 app.MapFallbackToFile("index.html");
 
+// Початкове заповнення довідника типів занять.
 await DefaultLessonTypesSeeder.SeedAsync(app.Services);
 
 app.Run();

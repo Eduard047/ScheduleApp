@@ -54,7 +54,6 @@
             <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / назва / студенти / курс" />
         </div>
     </div>
-
     <div class="table-responsive">
         <table class="table table-sm align-middle">
             <thead>
@@ -104,22 +103,18 @@
 </div>
 
 @code {
-    
-    private string? error, ok;
 
-    
+    private string? error, ok;
     private List<GroupEditDto> items = new();
     private GroupEditDto form = new() { Id = null, Name = "", StudentsCount = 0, CourseId = 0 };
     private List<LookupDto> courses = new();
-
-    
     private const string CourseField = "CourseName";
     private string sortField = nameof(GroupEditDto.Name);
     private bool sortAsc = true;
     private string? filter;
-
+    // Початкове завантаження груп і курсів.
     protected override async Task OnInitializedAsync() => await Load();
-
+    // Завантажує список груп і довідник курсів.
     private async Task Load()
     {
         try
@@ -131,9 +126,9 @@
         }
         catch (Exception ex) { error = ex.Message; }
     }
-
+    // Повертає назву курсу за ідентифікатором.
     private string NameOfCourse(int id) => courses.FirstOrDefault(c => c.Id == id)?.Name ?? $"#{id}";
-
+    // Зберігає групу через API.
     private async Task Save()
     {
         try
@@ -145,44 +140,40 @@
         }
         catch (Exception ex) { error = ex.Message; }
     }
-
-    private async Task Delete(int id)
-    {
-        error = ok = null;
-        var group = items.FirstOrDefault(g => g.Id == id);
-        var caption = group?.Name ?? $"#{id}";
-        var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити групу {caption}? Дію не можна скасувати.");
-        if (!confirmed) return;
-
-        try
-        {
-            try
-            {
-                await Api.DeleteGroup(id);
-                await Load();
-                ok = "Видалено.";
-                return;
-            }
-            catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Conflict || ex.Message.Contains("409"))
-            {
-                var sure = await JS.InvokeAsync<bool>("confirm",
-                    "Група використовується у розкладі. Видалити всі пов’язані заняття?");
-                if (!sure) { error = "Дію скасовано користувачем."; return; }
-
-                await Api.DeleteGroup(id, force: true);
-                await Load();
-                ok = "Групу та пов’язані записи видалено.";
-            }
-        }
-        catch (Exception ex) { error = ex.Message; }
-    }
-
-
+    // Видаляє групу з підтвердженням та можливим force.
+    private async Task Delete(int id)
+    {
+        error = ok = null;
+        var group = items.FirstOrDefault(g => g.Id == id);
+        var caption = group?.Name ?? $"#{id}";
+        var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити групу {caption}? Дію не можна скасувати.");
+        if (!confirmed) return;
+        try
+        {
+            try
+            {
+                await Api.DeleteGroup(id);
+                await Load();
+                ok = "Видалено.";
+                return;
+            }
+            catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Conflict || ex.Message.Contains("409"))
+            {
+                var sure = await JS.InvokeAsync<bool>("confirm",
+                    "Група використовується у розкладі. Видалити всі пов’язані заняття?");
+                if (!sure) { error = "Дію скасовано користувачем."; return; }
+                await Api.DeleteGroup(id, force: true);
+                await Load();
+                ok = "Групу та пов’язані записи видалено.";
+            }
+        }
+        catch (Exception ex) { error = ex.Message; }
+    }
+    // Фільтрує групи за пошуковим рядком.
     private IEnumerable<GroupEditDto> ApplyFilter(IEnumerable<GroupEditDto> seq)
     {
         if (string.IsNullOrWhiteSpace(filter)) return seq;
         var f = filter.Trim();
-
         return seq.Where(g =>
             (g.Id?.ToString().Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
             (g.Name?.Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
@@ -190,40 +181,31 @@
             NameOfCourse(g.CourseId).Contains(f, StringComparison.OrdinalIgnoreCase)
         );
     }
-
-    
+    // Сортує список груп за вибраним полем.
     private IEnumerable<GroupEditDto> ApplySort(IEnumerable<GroupEditDto> seq)
     {
         return (sortField, sortAsc) switch
         {
             (nameof(GroupEditDto.Id), true) => seq.OrderBy(x => x.Id ?? 0),
             (nameof(GroupEditDto.Id), false) => seq.OrderByDescending(x => x.Id ?? 0),
-
             (nameof(GroupEditDto.Name), true) => seq.OrderBy(x => x.Name),
             (nameof(GroupEditDto.Name), false) => seq.OrderByDescending(x => x.Name),
-
             (nameof(GroupEditDto.StudentsCount), true) => seq.OrderBy(x => x.StudentsCount),
             (nameof(GroupEditDto.StudentsCount), false) => seq.OrderByDescending(x => x.StudentsCount),
-
             (CourseField, true) => seq.OrderBy(x => NameOfCourse(x.CourseId)),
             (CourseField, false) => seq.OrderByDescending(x => NameOfCourse(x.CourseId)),
-
             _ => seq
         };
     }
-
-    
     private IEnumerable<GroupEditDto> SortedAndFiltered
         => ApplySort(ApplyFilter(items));
-
-    
+    // Перемикає напрямок сортування.
     private void ToggleSort(string field)
     {
         if (sortField == field) sortAsc = !sortAsc;
         else { sortField = field; sortAsc = true; }
     }
-
-    
+    // Повертає піктограму для заголовка сортування.
     private MarkupString HeaderIcon(string field)
         => new(sortField == field ? $"<span class=\"ms-1\">{(sortAsc ? "▲" : "▼")}</span>" : "");
 }

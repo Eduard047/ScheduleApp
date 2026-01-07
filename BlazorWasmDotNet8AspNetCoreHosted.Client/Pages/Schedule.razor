@@ -8,47 +8,33 @@
 @inject IScheduleApi ScheduleApi
 
 @code {
-    
-    private const string AppVersion = "1.1.2"; // Оновлюйте перед релізом
 
+    private const string AppVersion = "1.1.4"; // Оновлюйте перед релізом
     private MetaResponseDto? _meta;
-
     private int? _groupId;
     private int? _teacherId;
     private int? _roomId;
-
-    
     private DateOnly _weekStart = FirstMonday(DateOnly.FromDateTime(DateTime.Today));
-
-    
     private List<ScheduleItemDto> _items = new();
     private List<TimeSlotDto> _slots = new();
-
-    
     private int? _editItemId;
     private int _editLessonTypeId;
     private bool _editSaving;
     private string? _editError;
-
-    
     private static readonly int[] DaysMonFirst = new[] { 1, 2, 3, 4, 5, 6, 0 };
-
-    
     private record SlotRow(string Start, string End)
     {
         public string Label => $"{Start}-{End}";
     }
     private List<SlotRow> _rows = new();
-
-    
+    // Фільтрує елементи розкладу за вибраними параметрами.
     private IEnumerable<ScheduleItemDto> Filtered =>
         _items.Where(i =>
             (_groupId is null || i.GroupId == _groupId) &&
             (_teacherId is null || i.TeacherId == _teacherId) &&
             (_roomId is null || i.RoomId == _roomId)
         );
-
-    
+    // Формує читабельний діапазон дат для поточного тижня.
     private string WeekRangeLabel
     {
         get
@@ -59,55 +45,45 @@
             return $"{from} — {to}";
         }
     }
-
+    // Початкове завантаження метаданих і розкладу.
     protected override async Task OnInitializedAsync()
     {
         _meta = await Http.GetFromJsonAsync<MetaResponseDto>("api/meta");
         await Reload();
     }
-
+    // Перезавантажує розклад і тайм-слоти.
     private async Task Reload()
     {
-        
         _items = await Http.GetFromJsonAsync<List<ScheduleItemDto>>(
             $"api/schedule?weekStart={_weekStart:yyyy-MM-dd}") ?? new();
-
-        
         var eff = await Http.GetFromJsonAsync<EffectiveSlotsResponse>("api/admin/config/slots");
         _slots = eff?.slots ?? new();
-
-        
         _rows = _slots
             .Select(s => new SlotRow(s.Start, s.End))
             .GroupBy(x => (x.Start, x.End))
             .Select(g => g.First())
             .OrderBy(x => x.Start)
             .ToList();
-
         if (_editItemId is int editing && !_items.Any(i => i.Id == editing))
         {
             CancelEdit();
         }
     }
-
+    // Вирівнює дату на понеділок поточного тижня.
     private static DateOnly FirstMonday(DateOnly d)
     {
         int diff = ((int)d.DayOfWeek + 6) % 7; 
         return d.AddDays(-diff);
     }
-
-    
     private sealed record EffectiveSlotsResponse(int? courseId, bool usingCourseSpecific, List<TimeSlotDto> slots);
-
-    
+    // Повертає назву дня українською з великої літери.
     static string DayNameUk(int d)
     {
         var ci = new CultureInfo("uk-UA");
         var name = ci.DateTimeFormat.GetDayName((DayOfWeek)d); 
         return ci.TextInfo.ToTitleCase(name);
     }
-
-    
+    // Мапить коди станів на CSS-класи.
     static string CssByCode(string code) => code switch
     {
         "CANCELED" => "can",
@@ -115,9 +91,7 @@
         "BREAK" => "brk",
         _ => ""
     };
-
     private static string LessonModeLabel(bool requiresRoom) => requiresRoom ? "Аудиторна година" : "Без аудиторії";
-
     private string ModuleCourseCaption(int moduleId)
     {
         if (_meta is null) return string.Empty;
@@ -126,7 +100,6 @@
             ? string.Empty
             : module.CourseName;
     }
-
     private Task PrevWeek() { _weekStart = _weekStart.AddDays(-7); return Reload(); }
     private Task NextWeek() { _weekStart = _weekStart.AddDays(+7); return Reload(); }
     private void ResetFilters()
@@ -134,8 +107,7 @@
         _groupId = _teacherId = _roomId = null;
         StateHasChanged();
     }
-
-    
+    // Вмикає режим редагування типу заняття.
     private void BeginEdit(ScheduleItemDto item)
     {
         if (item.IsLocked) return;
@@ -143,15 +115,12 @@
         _editLessonTypeId = item.LessonTypeId;
         _editError = null;
     }
-
-    
+    // Скасовує редагування та очищає помилку.
     private void CancelEdit()
     {
         _editItemId = null;
         _editError = null;
     }
-
-    
     private void OnLessonTypeChanged(ChangeEventArgs args)
     {
         if (int.TryParse(args.Value?.ToString(), out var id))
@@ -159,8 +128,7 @@
             _editLessonTypeId = id;
         }
     }
-
-    
+    // Зберігає новий тип заняття для вибраної пари.
     private async Task SaveLessonTypeAsync()
     {
         if (_editItemId is null) return;
@@ -170,7 +138,6 @@
             CancelEdit();
             return;
         }
-
         _editSaving = true;
         _editError = null;
         try
@@ -188,7 +155,6 @@
                 IsLocked: item.IsLocked,
                 OverrideNonWorkingDay: false
             );
-
             await ScheduleApi.Upsert(payload);
             await Reload();
             CancelEdit();
@@ -215,7 +181,6 @@
 
 <h3 class="page-title">Розклад <span class="weak">(тиждень @_weekStart.ToString("yyyy-MM-dd"))</span></h3>
 
-
 <div class="toolbar">
 
     <select class="select" @bind="_groupId">
@@ -228,7 +193,6 @@
             }
         }
     </select>
-
     <select class="select select--narrow" @bind="_teacherId">
         <option value="">Обрати викладача</option>
         @if (_meta is not null)
@@ -239,7 +203,6 @@
             }
         }
     </select>
-
     <select class="select" @bind="_roomId">
         <option value="">Обрати аудиторію</option>
         @if (_meta is not null)
@@ -250,12 +213,10 @@
             }
         }
     </select>
-
     <input type="date"
            class="select"
            value="@_weekStart.ToString("yyyy-MM-dd")"
            @onchange="e => _weekStart = FirstMonday(DateOnly.Parse((string)e.Value!))" />
-
     <button class="btn btn-primary" @onclick="Reload">Оновити</button>
     <button class="btn btn-ghost" @onclick="ResetFilters">Скинути</button>
 </div>
@@ -267,7 +228,6 @@
 else
 {
     <div class="layout">
-        
         <div class="grid-wrap">
             <table class="schedule">
                 <thead>
@@ -286,14 +246,12 @@ else
                             <th class="time-cell">
                                 <span class="time-pill">@row.Label</span>
                             </th>
-
                             @foreach (var d in DaysMonFirst)
                             {
                                 var item = Filtered.FirstOrDefault(x =>
                                 x.DayNumber == d &&
                                 x.TimeStart == row.Start &&
                                 x.TimeEnd == row.End);
-
                                 <td class="cell">
                                     @if (item is not null)
                                     {
@@ -317,7 +275,6 @@ else
                                             }
                                             @{
                                                 var isBreak = string.Equals(item.LessonTypeCode, "BREAK", StringComparison.OrdinalIgnoreCase);
-                                                
                                                 var moduleCourse = isBreak ? string.Empty : ModuleCourseCaption(item.ModuleId);
                                             }
                                             <div class="title">
@@ -395,7 +352,6 @@ else
         </div>
     </div>
 
-    
 <div class="week-nav">
         <button class="btn btn-ghost" @onclick="PrevWeek">‹ Попередній тиждень</button>
         <div class="week-label">@WeekRangeLabel</div>
@@ -404,17 +360,14 @@ else
 }
 
 <style>
-    
+
     .page-title {
         margin: .3rem 0 .8rem;
     }
-
         .page-title .weak {
             color: #64748b;
             font-weight: 400;
         }
-
-    
     .toolbar {
         display: flex;
         flex-wrap: wrap;
@@ -422,7 +375,6 @@ else
         align-items: center;
         margin-bottom: 8px;
     }
-
     .select {
         min-width: 160px;
         padding: .46rem .6rem;
@@ -430,57 +382,45 @@ else
         border-radius: 10px;
         background: #fff;
     }
-    
     .toolbar .select {
         flex: 0 0 auto;
     }
-    
     .select--narrow {
         width: 240px;
         max-width: 240px;
     }
-
     .btn {
         padding: .5rem .9rem;
         border-radius: 10px;
         border: 1px solid transparent;
         cursor: pointer;
     }
-
     .btn-primary {
         background: #111827;
         color: #fff;
     }
-
     .btn-ghost {
         background: #fff;
         color: #111827;
         border-color: #d1d5db;
     }
-
     .title-course {
         font-weight: 500;
         font-size: .8rem;
         margin-top: .1rem;
     }
-
     .empty {
         color: #64748b;
     }
-
-    
     .layout {
         display: flex;
         gap: 16px;
         align-items: flex-start;
     }
-
     .grid-wrap {
         width: 100%;
         overflow: auto;
     }
-
-    
     table.schedule {
         width: 100%;
         table-layout: fixed;
@@ -488,7 +428,6 @@ else
         border-spacing: 0;
         background: #fff;
     }
-
         table.schedule thead th {
             position: sticky;
             top: 0;
@@ -501,15 +440,12 @@ else
             border-right: 1px solid #e5e7eb;
             border-top: 1px solid #e5e7eb; // Закриваємо верхню лінію шапки
         }
-
             table.schedule thead th:first-child {
                 border-left: 1px solid #e5e7eb;
             }
-
     .col-time {
         width: 140px;
     }
-
     .time-cell {
         position: sticky;
         left: 0;
@@ -521,21 +457,17 @@ else
         border-right: 1px solid #e5e7eb;
         border-left: 1px solid #e5e7eb;
     }
-
     table.schedule tbody td, table.schedule tbody th.time-cell {
         border-right: 1px solid #e5e7eb;
         border-bottom: 1px solid #e5e7eb;
     }
-
     table.schedule tbody tr:first-child td,
     table.schedule tbody tr:first-child th.time-cell {
         border-top: 1px solid #e5e7eb;
     }
-
     table.schedule tbody td:last-child {
         border-right: 1px solid #e5e7eb;
     }
-
     .time-pill {
         display: inline-block;
         padding: .35rem .6rem;
@@ -546,15 +478,12 @@ else
         font-size: .92rem;
         border: 1px solid #dbe7ff;
     }
-
     .cell {
         padding: .5rem;
         min-height: 92px;
         vertical-align: top;
         overflow: hidden;
     }
-
-    
     .card {
         position: relative;
         box-sizing: border-box;
@@ -566,13 +495,11 @@ else
         box-shadow: 0 1px 0 rgba(16,24,40,.04);
         overflow: hidden;
     }
-        
         .card, .card * {
             word-break: break-word;
             overflow-wrap: anywhere;
             hyphens: auto;
         }
-
     .card-top {
         display: flex;
         justify-content: space-between;
@@ -581,8 +508,6 @@ else
         font-size: .8rem;
         color: #334155;
     }
-
-    
     .badge {
         display: inline-block;
         padding: 2px 8px;
@@ -593,7 +518,6 @@ else
         color: #111827;
         border: 1px solid #e5e7eb;
     }
-
     .title {
         font-weight: 800;
         margin-bottom: .15rem;
@@ -603,24 +527,20 @@ else
         -webkit-box-orient: vertical;
         overflow: hidden;
     }
-
     .sub {
         color: #334155;
     }
-
     .meta {
         color: #475569;
         display: flex;
         gap: .5rem;
         flex-wrap: wrap;
     }
-
         .meta span {
             display: block;
             max-width: 100%;
             white-space: normal;
         }
-
     .slot-mode {
         display: inline-flex;
         align-items: center;
@@ -633,12 +553,9 @@ else
         background: #eef2ff;
         color: #4338ca;
     }
-
     .lock {
         opacity: .7;
     }
-
-    
     .c1  { background: #c9e6ff; }
     .c2  { background: #b6f4d2; }
     .c3  { background: #ffe2a9; }
@@ -659,24 +576,18 @@ else
     .c14 { background: #e7ffe5; }
     .c15 { background: #fbeae3; }
     .c16 { background: #e6eef7; }
-    
     .brk {
         background: #e6ecf4;
         text-align: center;
     }
-
     .can {
         background: #ffd9e0;
         text-decoration: line-through;
     }
-
-    
     .res {
         background: #cdebff;
         border: 1px dashed #38bdf8;
     }
-
-    
     .week-nav {
         display: flex;
         align-items: center;
@@ -688,12 +599,10 @@ else
         border: 1px solid #e5e7eb;
         border-radius: 16px;
     }
-
     .week-label {
         color: #475569;
         font-weight: 600;
     }
-
     .card-edit-trigger {
         position: absolute;
         top: 10px;
@@ -710,11 +619,9 @@ else
         cursor: pointer;
         transition: background .15s ease;
     }
-
     .card-edit-trigger:hover {
         background: #f1f5f9;
     }
-
     .card-edit {
         margin-top: .6rem;
         padding: .5rem;
@@ -725,7 +632,6 @@ else
         gap: .5rem;
         border: 1px dashed rgba(148, 163, 184, .5);
     }
-
     .card-edit-field {
         display: flex;
         flex-direction: column;
@@ -733,12 +639,10 @@ else
         font-size: .82rem;
         color: #1f2937;
     }
-
     .card-edit-label {
         font-size: .78rem;
         color: #475569;
     }
-
     .card-edit-select {
         padding: .4rem .5rem;
         border-radius: 8px;
@@ -746,28 +650,23 @@ else
         background: #fff;
         font-size: .82rem;
     }
-
     .card-edit-actions {
         display: flex;
         gap: .4rem;
         flex-wrap: wrap;
     }
-
     .card-edit-error {
         color: #dc2626;
         font-size: .78rem;
     }
-
     .btn-sm {
         padding: .35rem .6rem;
         font-size: .78rem;
     }
-
     .td-edit-icon {
         font-size: .9rem;
         line-height: 1;
     }
-
     .app-version {
         display: inline-flex;
         align-items: center;
@@ -780,7 +679,6 @@ else
         font-weight: 600;
         font-size: .85rem;
     }
-
     .app-version__number {
         color: #0f172a;
         font-weight: 700;
