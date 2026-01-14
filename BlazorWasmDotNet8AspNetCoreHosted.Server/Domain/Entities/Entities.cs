@@ -232,6 +232,7 @@ public class TimeSlot
     public int? CourseId { get; set; }
     [ForeignKey(nameof(CourseId))]
     public Course? Course { get; set; }
+    public DayOfWeek? DayOfWeek { get; set; }
     public TimeOnly Start { get; set; }
     public TimeOnly End { get; set; }
     public int SortOrder { get; set; } = 0;

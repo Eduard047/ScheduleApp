@@ -212,7 +212,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
                 .OnDelete(DeleteBehavior.Cascade);
             e.Property(x => x.SortOrder).HasDefaultValue(0);
             e.Property(x => x.IsActive).HasDefaultValue(true);
-            e.HasIndex(x => new { x.CourseId, x.SortOrder }).IsUnique();
+            e.HasIndex(x => new { x.CourseId, x.DayOfWeek, x.SortOrder }).IsUnique();
         });
         // Контролюємо чернетки викладачів і їхні залежності.
         b.Entity<TeacherDraftItem>(e =>

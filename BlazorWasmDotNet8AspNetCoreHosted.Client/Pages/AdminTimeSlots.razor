@@ -7,8 +7,8 @@
 <h3>Слоти часу</h3>
 
 <div class="mb-3">
-    <label class="form-label">Уровень</label>
-    <div class="d-flex gap-2">
+    <label class="form-label">Рівень</label>
+    <div class="d-flex gap-2 flex-wrap">
         <select class="form-select" style="max-width: 280px" @bind="_scope">
             <option value="Global">Глобально (для всіх курсів)</option>
             <option value="Course">Тільки для обраного курсу</option>
@@ -16,18 +16,38 @@
         @if (_scope == Scope.Course)
         {
             <select class="form-select" style="max-width: 360px" @bind="_courseId">
-                <option value="">— оберіть курс —</option>
+                <option value="">- оберіть курс -</option>
                 @foreach (var c in _courses)
                 {
                     <option value="@c.Id">@c.Name</option>
                 }
             </select>
         }
+        <select class="form-select" style="max-width: 240px" @bind="_dayOfWeek">
+            <option value="">Усі дні (за замовчуванням)</option>
+            @foreach (var day in DayOptions)
+            {
+                <option value="@day.Value">@day.Label</option>
+            }
+        </select>
         <button class="btn btn-outline-secondary" @onclick="LoadRaw">Завантажити</button>
-        <button class="btn btn-outline-info" @onclick="LoadEffective" title="Показати ефективні (курсові(якщо є), інакше глобальні)">
-            Показати ефективні
-        </button>
     </div>
+    <div class="form-text">Оберіть день, завантажте або скопіюйте шаблон, відредагуйте та збережіть.</div>
+</div>
+
+<div class="mb-3">
+    <label class="form-label">Копіювання шаблону</label>
+    <div class="d-flex gap-2 flex-wrap">
+        <select class="form-select" style="max-width: 240px" @bind="_copyFromDay">
+            <option value="">Шаблон за замовчуванням (усі дні)</option>
+            @foreach (var day in DayOptions)
+            {
+                <option value="@day.Value">@day.Label</option>
+            }
+        </select>
+        <button class="btn btn-outline-info" @onclick="CopyFromDay">Скопіювати у поточний день</button>
+    </div>
+    <div class="form-text">Копіювання бере ефективні слоти з вибраного дня.</div>
 </div>
 
 @if (_error is not null)
@@ -108,9 +128,21 @@
     private static readonly TimeOnly DefaultStart = new(9, 0);
     private static readonly TimeSpan DefaultDuration = TimeSpan.FromMinutes(45);
     private static readonly TimeSpan DefaultBreak = TimeSpan.FromMinutes(10);
+    private static readonly (int Value, string Label)[] DayOptions = new[]
+    {
+        (1, "Понеділок"),
+        (2, "Вівторок"),
+        (3, "Середа"),
+        (4, "Четвер"),
+        (5, "П'ятниця"),
+        (6, "Субота"),
+        (0, "Неділя")
+    };
     enum Scope { Global, Course }
     private Scope _scope = Scope.Global;
     private int? _courseId;
+    private int? _dayOfWeek;
+    private int? _copyFromDay;
     private List<LookupDto> _courses = new();
     private List<TimeSlotDto> _rows = new();
     private string? _error;
@@ -126,14 +158,54 @@
     {
         _error = _ok = null;
         if (_scope == Scope.Course && _courseId is null) { _error = "Вибери курс."; return; }
-        _rows = await Api.GetRawAsync(_scope == Scope.Global ? null : _courseId);
+        try
+        {
+            _rows = await Api.GetRawAsync(_scope == Scope.Global ? null : _courseId, _dayOfWeek);
+        }
+        catch (BlazorWasmDotNet8AspNetCoreHosted.Client.Services.ApiErrorException ex)
+        {
+            _error = ex.Errors.FirstOrDefault() ?? ex.Message;
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
     }
-    // Завантажує ефективні слоти (курсні або глобальні).
-    private async Task LoadEffective()
+    // Копіює ефективні слоти з обраного дня.
+    private async Task CopyFromDay()
     {
         _error = _ok = null;
         if (_scope == Scope.Course && _courseId is null) { _error = "Вибери курс."; return; }
-        _rows = await Api.GetEffectiveAsync(_scope == Scope.Global ? null : _courseId);
+        try
+        {
+            var courseId = _scope == Scope.Global ? null : _courseId;
+            var source = await Api.GetEffectiveAsync(courseId, _copyFromDay);
+            if (source.Count == 0)
+            {
+                _rows = new List<TimeSlotDto>();
+                _error = "Немає слотів для копіювання.";
+                return;
+            }
+            _rows = source.Select(s => new TimeSlotDto
+            {
+                Id = 0,
+                CourseId = courseId,
+                DayOfWeek = _dayOfWeek,
+                SortOrder = s.SortOrder,
+                Start = s.Start,
+                End = s.End,
+                IsActive = s.IsActive,
+                IsLunch = s.IsLunch
+            }).ToList();
+        }
+        catch (BlazorWasmDotNet8AspNetCoreHosted.Client.Services.ApiErrorException ex)
+        {
+            _error = ex.Errors.FirstOrDefault() ?? ex.Message;
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
     }
     // Обчислює наступний слот з урахуванням перерв.
     private (string start, string end) CalculateNextSlot()
@@ -161,6 +233,7 @@
         {
             Id = 0,
             CourseId = _scope == Scope.Global ? null : _courseId,
+            DayOfWeek = _dayOfWeek,
             SortOrder = maxOrder,
             Start = start,
             End = end,
@@ -220,8 +293,28 @@
         _error = _ok = null;
         _error = Validate();
         if (_error is not null) return;
-        await Api.SaveAsync(_scope == Scope.Global ? null : _courseId, _rows);
-        await LoadRaw();
-        _ok = "Збережено.";
+        try
+        {
+            var courseId = _scope == Scope.Global ? null : _courseId;
+            foreach (var row in _rows)
+            {
+                row.CourseId = courseId;
+                row.DayOfWeek = _dayOfWeek;
+            }
+            await Api.SaveAsync(courseId, _rows, _dayOfWeek);
+            await LoadRaw();
+            if (_error is null)
+            {
+                _ok = "Збережено.";
+            }
+        }
+        catch (BlazorWasmDotNet8AspNetCoreHosted.Client.Services.ApiErrorException ex)
+        {
+            _error = ex.Errors.FirstOrDefault() ?? ex.Message;
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
     }
 }

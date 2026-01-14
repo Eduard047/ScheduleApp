@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using System.Globalization;
@@ -104,51 +105,153 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
         if (rows == 0) return NotFound();
         return NoContent();
     }
-    public sealed record BulkTimeSlotsSaveDto(int? CourseId, List<TimeSlotDto> Slots);
-    public sealed record CloneRequest(int CourseId);
-    private sealed record SlotRow(int Id, int? CourseId, TimeOnly Start, TimeOnly End, int SortOrder, bool IsActive);
+    public sealed record BulkTimeSlotsSaveDto(int? CourseId, int? DayOfWeek, List<TimeSlotDto> Slots);
+    public sealed record CloneRequest(int CourseId, int? DayOfWeek);
+    private sealed record SlotRow(int Id, int? CourseId, DayOfWeek? DayOfWeek, TimeOnly Start, TimeOnly End, int SortOrder, bool IsActive);
     // Парсить час у форматі HH:mm.
     private static TimeOnly ParseTime(string s)
     {
         if (TimeOnly.TryParseExact(s, "HH:mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out var v)) return v;
         return TimeOnly.Parse(s, CultureInfo.InvariantCulture);
     }
+    private static bool TryParseDayOfWeek(int? raw, out DayOfWeek? day)
+    {
+        day = null;
+        if (raw is null) return true;
+        if (!Enum.IsDefined(typeof(DayOfWeek), raw.Value)) return false;
+        day = (DayOfWeek)raw.Value;
+        return true;
+    }
     // Перевіряє, чи слот співпадає з обідом.
     private static bool SlotMatchesLunch(TimeOnly start, TimeOnly end, LunchConfig? lunch)
         => lunch is not null && lunch.Start == start && lunch.End == end;
     [HttpGet("slots")]
     // Повертає ефективні тайм-слоти з урахуванням курсу.
-    public async Task<IActionResult> GetEffectiveSlots([FromQuery] int? courseId)
+    public async Task<IActionResult> GetEffectiveSlots([FromQuery] int? courseId, [FromQuery] int? dayOfWeek, [FromQuery] bool includeDayOverrides = false)
     {
-        var hasCourse = courseId is int;
-        bool useCourse = hasCourse && await db.TimeSlots.AnyAsync(s => s.CourseId == courseId);
+        if (!TryParseDayOfWeek(dayOfWeek, out var day))
+        {
+            return BadRequest(new { message = "Некоректний день тижня." });
+        }
         LunchConfig? lunch = null;
         if (courseId is int cidExact)
         {
             lunch = await db.LunchConfigs.AsNoTracking().FirstOrDefaultAsync(l => l.CourseId == cidExact);
         }
         lunch ??= await db.LunchConfigs.AsNoTracking().FirstOrDefaultAsync(l => l.CourseId == null);
-        var rows = await db.TimeSlots.AsNoTracking()
-            .Where(s => useCourse ? s.CourseId == courseId : s.CourseId == null)
-            .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
-            .Select(s => new { s.Id, s.CourseId, s.Start, s.End, s.SortOrder, s.IsActive })
-            .ToListAsync();
-        var slots = rows.Select(s => new TimeSlotDto
+        if (day is null && includeDayOverrides)
+        {
+            var slotQuery = db.TimeSlots.AsNoTracking().Where(s => s.IsActive);
+            if (courseId is int cidForWeek)
+            {
+                slotQuery = slotQuery.Where(s => s.CourseId == null || s.CourseId == cidForWeek);
+            }
+            var allSlots = await slotQuery.ToListAsync();
+            if (courseId is null)
+            {
+                var slots = allSlots
+                    .OrderBy(s => s.DayOfWeek.HasValue ? (int)s.DayOfWeek.Value : 7)
+                    .ThenBy(s => s.SortOrder)
+                    .ThenBy(s => s.Start)
+                    .Select(s => new TimeSlotDto
+                    {
+                        Id = s.Id,
+                        CourseId = s.CourseId,
+                        DayOfWeek = s.DayOfWeek is DayOfWeek d ? (int)d : null,
+                        Start = s.Start.ToString("HH:mm"),
+                        End = s.End.ToString("HH:mm"),
+                        SortOrder = s.SortOrder,
+                        IsActive = s.IsActive,
+                        IsLunch = SlotMatchesLunch(s.Start, s.End, lunch) && s.IsActive
+                    })
+                    .ToList();
+                var usingCourseSpecific = allSlots.Any(s => s.CourseId != null);
+                return Ok(new { courseId, dayOfWeek = (int?)null, usingCourseSpecific, slots });
+            }
+            var resolved = TimeSlotsResolver.ResolveForWeek(allSlots, courseId);
+            var resolvedSlots = new List<TimeSlotDto>();
+            foreach (var entry in resolved.OrderBy(x => x.Key))
+            {
+                foreach (var s in entry.Value.Slots)
+                {
+                    resolvedSlots.Add(new TimeSlotDto
+                    {
+                        Id = s.Id,
+                        CourseId = s.CourseId,
+                        DayOfWeek = (int)entry.Key,
+                        Start = s.Start.ToString("HH:mm"),
+                        End = s.End.ToString("HH:mm"),
+                        SortOrder = s.SortOrder,
+                        IsActive = s.IsActive,
+                        IsLunch = SlotMatchesLunch(s.Start, s.End, lunch) && s.IsActive
+                    });
+                }
+            }
+            var usingCourseSpecificResolved = resolved.Values.Any(x => x.UsingCourseSpecific);
+            return Ok(new { courseId, dayOfWeek = (int?)null, usingCourseSpecific = usingCourseSpecificResolved, slots = resolvedSlots });
+        }
+        if (day is null)
+        {
+            var baseQuery = db.TimeSlots.AsNoTracking().Where(s => s.IsActive);
+            List<TimeSlot> rows;
+            bool usingCourseSpecific = false;
+            if (courseId is int cid)
+            {
+                rows = await baseQuery.Where(s => s.CourseId == cid && s.DayOfWeek == null)
+                    .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
+                    .ToListAsync();
+                if (rows.Count > 0)
+                {
+                    usingCourseSpecific = true;
+                }
+                else
+                {
+                    rows = await baseQuery.Where(s => s.CourseId == null && s.DayOfWeek == null)
+                        .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
+                        .ToListAsync();
+                }
+            }
+            else
+            {
+                rows = await baseQuery.Where(s => s.CourseId == null && s.DayOfWeek == null)
+                    .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
+                    .ToListAsync();
+            }
+            var slots = rows.Select(s => new TimeSlotDto
+            {
+                Id = s.Id,
+                CourseId = s.CourseId,
+                DayOfWeek = null,
+                Start = s.Start.ToString("HH:mm"),
+                End = s.End.ToString("HH:mm"),
+                SortOrder = s.SortOrder,
+                IsActive = s.IsActive,
+                IsLunch = SlotMatchesLunch(s.Start, s.End, lunch) && s.IsActive
+            }).ToList();
+            return Ok(new { courseId, dayOfWeek = (int?)null, usingCourseSpecific, slots });
+        }
+        var resolvedDay = await TimeSlotsResolver.ResolveForDayAsync(db, courseId, day.Value);
+        var daySlots = resolvedDay.Slots.Select(s => new TimeSlotDto
         {
             Id = s.Id,
             CourseId = s.CourseId,
+            DayOfWeek = (int)day.Value,
             Start = s.Start.ToString("HH:mm"),
             End = s.End.ToString("HH:mm"),
             SortOrder = s.SortOrder,
             IsActive = s.IsActive,
             IsLunch = SlotMatchesLunch(s.Start, s.End, lunch) && s.IsActive
         }).ToList();
-        return Ok(new { courseId, usingCourseSpecific = useCourse, slots });
+        return Ok(new { courseId, dayOfWeek = (int)day.Value, usingCourseSpecific = resolvedDay.UsingCourseSpecific, usingDaySpecific = resolvedDay.UsingDaySpecific, slots = daySlots });
     }
     [HttpGet("slots/raw")]
     // Повертає сирі тайм-слоти (глобальні та курсні).
-    public async Task<IActionResult> GetRawSlots([FromQuery] int? courseId)
+    public async Task<IActionResult> GetRawSlots([FromQuery] int? courseId, [FromQuery] int? dayOfWeek)
     {
+        if (!TryParseDayOfWeek(dayOfWeek, out var day))
+        {
+            return BadRequest(new { message = "Некоректний день тижня." });
+        }
         var lunches = await db.LunchConfigs.AsNoTracking().ToListAsync();
         LunchConfig? courseLunch = null;
         if (courseId is int cidRaw)
@@ -156,22 +259,25 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
             courseLunch = lunches.FirstOrDefault(l => l.CourseId == cidRaw);
         }
         var globalLunch = lunches.FirstOrDefault(l => l.CourseId == null);
-        var sel = db.TimeSlots.AsNoTracking()
-            .Select(s => new SlotRow(s.Id, s.CourseId, s.Start, s.End, s.SortOrder, s.IsActive));
+        var baseQuery = db.TimeSlots.AsNoTracking()
+            .Where(s => s.DayOfWeek == day);
         List<SlotRow> courseRows = new();
         if (courseId is int cid)
         {
-            courseRows = await sel.Where(s => s.CourseId == cid)
+            courseRows = await baseQuery.Where(s => s.CourseId == cid)
                                   .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
+                                  .Select(s => new SlotRow(s.Id, s.CourseId, s.DayOfWeek, s.Start, s.End, s.SortOrder, s.IsActive))
                                   .ToListAsync();
         }
-        var globalRows = await sel.Where(s => s.CourseId == null)
+        var globalRows = await baseQuery.Where(s => s.CourseId == null)
                                   .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
+                                  .Select(s => new SlotRow(s.Id, s.CourseId, s.DayOfWeek, s.Start, s.End, s.SortOrder, s.IsActive))
                                   .ToListAsync();
         List<TimeSlotDto> course = courseRows.Select(s => new TimeSlotDto
         {
             Id = s.Id,
             CourseId = s.CourseId,
+            DayOfWeek = s.DayOfWeek is DayOfWeek d ? (int)d : null,
             Start = s.Start.ToString("HH:mm"),
             End = s.End.ToString("HH:mm"),
             SortOrder = s.SortOrder,
@@ -182,6 +288,7 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
         {
             Id = s.Id,
             CourseId = s.CourseId,
+            DayOfWeek = s.DayOfWeek is DayOfWeek d ? (int)d : null,
             Start = s.Start.ToString("HH:mm"),
             End = s.End.ToString("HH:mm"),
             SortOrder = s.SortOrder,
@@ -195,6 +302,11 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
     public async Task<IActionResult> UpsertSlots([FromBody] BulkTimeSlotsSaveDto body)
     {
         var courseId = body?.CourseId;
+        var dayRaw = body?.DayOfWeek;
+        if (!TryParseDayOfWeek(dayRaw, out var day))
+        {
+            return BadRequest(new { message = "Некоректний день тижня." });
+        }
         var rows = body?.Slots ?? new();
         if (courseId is int cid && await db.Courses.FindAsync(cid) is null)
             return BadRequest(new { message = "Course not found" });
@@ -229,13 +341,14 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
             return BadRequest(new { message = "Слот обіду має бути активним." });
         }
         await using var tx = await db.Database.BeginTransactionAsync();
-        await db.TimeSlots.Where(s => s.CourseId == courseId).ExecuteDeleteAsync();
+        await db.TimeSlots.Where(s => s.CourseId == courseId && s.DayOfWeek == day).ExecuteDeleteAsync();
         int sort = 1;
         foreach (var x in norm)
         {
             db.TimeSlots.Add(new TimeSlot
             {
                 CourseId = courseId,
+                DayOfWeek = day,
                 Start = x.Start,
                 End = x.End,
                 SortOrder = sort++,
@@ -271,11 +384,15 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
     [HttpDelete("slots/clear")]
     [RequireDeletionConfirmation("слоти розкладу", TargetArgumentName = nameof(courseId))]
     // Очищає тайм-слоти для курсу або глобальні.
-    public async Task<IActionResult> ClearSlots([FromQuery] int? courseId)
+    public async Task<IActionResult> ClearSlots([FromQuery] int? courseId, [FromQuery] int? dayOfWeek)
     {
+        if (!TryParseDayOfWeek(dayOfWeek, out var day))
+        {
+            return BadRequest(new { message = "Некоректний день тижня." });
+        }
         if (courseId is int cid && await db.Courses.FindAsync(cid) is null)
             return BadRequest(new { message = "Course not found" });
-        var rows = await db.TimeSlots.Where(s => s.CourseId == courseId).ExecuteDeleteAsync();
+        var rows = await db.TimeSlots.Where(s => s.CourseId == courseId && s.DayOfWeek == day).ExecuteDeleteAsync();
         return rows > 0 ? NoContent() : NotFound();
     }
     [HttpPost("slots/clone-from-global")]
@@ -284,17 +401,22 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
     {
         var course = await db.Courses.FindAsync(r.CourseId);
         if (course is null) return BadRequest(new { message = "Course not found" });
+        if (!TryParseDayOfWeek(r.DayOfWeek, out var day))
+        {
+            return BadRequest(new { message = "Некоректний день тижня." });
+        }
         var global = await db.TimeSlots.AsNoTracking()
-            .Where(s => s.CourseId == null)
+            .Where(s => s.CourseId == null && s.DayOfWeek == day)
             .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
             .ToListAsync();
         await using var tx = await db.Database.BeginTransactionAsync();
-        await db.TimeSlots.Where(s => s.CourseId == r.CourseId).ExecuteDeleteAsync();
+        await db.TimeSlots.Where(s => s.CourseId == r.CourseId && s.DayOfWeek == day).ExecuteDeleteAsync();
         foreach (var s in global)
         {
             db.TimeSlots.Add(new TimeSlot
             {
                 CourseId = r.CourseId,
+                DayOfWeek = day,
                 Start = s.Start,
                 End = s.End,
                 SortOrder = s.SortOrder,

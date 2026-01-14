@@ -125,7 +125,13 @@
             }
         }
         _expandedWarningSlots.RemoveWhere(id => !_warningReports.ContainsKey(id));
-        var eff = await Http.GetFromJsonAsync<EffectiveSlotsResponse>("api/admin/config/slots");
+        var courseId = ResolveCourseIdForSlots();
+        var slotsUrl = "api/admin/config/slots?includeDayOverrides=true";
+        if (courseId is int cid)
+        {
+            slotsUrl += $"&courseId={cid}";
+        }
+        var eff = await Http.GetFromJsonAsync<EffectiveSlotsResponse>(slotsUrl);
         _slots = eff?.slots ?? new();
         _rows = _slots
             .Select(s => new SlotRow(s.Start, s.End))
@@ -1056,6 +1062,12 @@
         public string ToggleLabel => Expanded ? "Згорнути" : "Розгорнути";
     }
     private sealed record EffectiveSlotsResponse(int? courseId, bool usingCourseSpecific, List<TimeSlotDto> slots);
+    private int? ResolveCourseIdForSlots()
+    {
+        if (_courseId is int cid) return cid;
+        if (_meta is null || _groupId is null) return null;
+        return _meta.Groups.FirstOrDefault(g => g.Id == _groupId)?.CourseId;
+    }
 
 static string CssByCode(string code) => code switch
     {

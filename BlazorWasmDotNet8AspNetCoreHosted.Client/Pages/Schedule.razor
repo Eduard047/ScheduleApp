@@ -9,7 +9,7 @@
 
 @code {
 
-    private const string AppVersion = "1.1.4"; // Оновлюйте перед релізом
+    private const string AppVersion = "1.1.5"; // Оновлюйте перед релізом
     private MetaResponseDto? _meta;
     private int? _groupId;
     private int? _teacherId;
@@ -56,7 +56,13 @@
     {
         _items = await Http.GetFromJsonAsync<List<ScheduleItemDto>>(
             $"api/schedule?weekStart={_weekStart:yyyy-MM-dd}") ?? new();
-        var eff = await Http.GetFromJsonAsync<EffectiveSlotsResponse>("api/admin/config/slots");
+        var courseId = ResolveCourseIdForSlots();
+        var slotsUrl = "api/admin/config/slots?includeDayOverrides=true";
+        if (courseId is int cid)
+        {
+            slotsUrl += $"&courseId={cid}";
+        }
+        var eff = await Http.GetFromJsonAsync<EffectiveSlotsResponse>(slotsUrl);
         _slots = eff?.slots ?? new();
         _rows = _slots
             .Select(s => new SlotRow(s.Start, s.End))
@@ -76,6 +82,11 @@
         return d.AddDays(-diff);
     }
     private sealed record EffectiveSlotsResponse(int? courseId, bool usingCourseSpecific, List<TimeSlotDto> slots);
+    private int? ResolveCourseIdForSlots()
+    {
+        if (_meta is null || _groupId is null) return null;
+        return _meta.Groups.FirstOrDefault(g => g.Id == _groupId)?.CourseId;
+    }
     // Повертає назву дня українською з великої літери.
     static string DayNameUk(int d)
     {

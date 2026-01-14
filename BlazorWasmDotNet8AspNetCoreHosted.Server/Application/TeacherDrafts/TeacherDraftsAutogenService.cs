@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using Microsoft.AspNetCore.Mvc;
@@ -880,21 +881,32 @@ public sealed class TeacherDraftsAutogenService
             // Обідня перерва для курсу або глобальна (якщо не задано для курсу).
             var groupLunch = lunchesAll.FirstOrDefault(l => l.CourseId == grp.CourseId)
                           ?? lunchesAll.FirstOrDefault(l => l.CourseId == null);
-            // Якщо для курсу є власні слоти - беремо їх, інакше беремо глобальні.
-            var hasCourseSlots = await _db.TimeSlots.AsNoTracking().AnyAsync(s => s.CourseId == grp.CourseId && s.IsActive);
-            var slots = await _db.TimeSlots.AsNoTracking()
-                .Where(s => s.IsActive && (hasCourseSlots ? s.CourseId == grp.CourseId : s.CourseId == null))
+            var allSlots = await _db.TimeSlots.AsNoTracking()
+                .Where(s => s.IsActive && (s.CourseId == grp.CourseId || s.CourseId == null))
                 .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
                 .ToListAsync();
-            if (slots.Count == 0)
+            if (allSlots.Count == 0)
             {
                 warnings.Add($"Не знайдено жодного слоту розкладу (глобального або для курсу {grp.Course.Name}). Група {grp.Name} пропущена.");
                 continue;
             }
-            // Індекс слоту за часом для швидкого пошуку сусідніх слотів.
-            var slotIndexByTime = slots
-                .Select((slot, index) => new { slot, index })
-                .ToDictionary(x => (x.slot.Start, x.slot.End), x => x.index);
+            var resolvedByDay = TimeSlotsResolver.ResolveForWeek(allSlots, grp.CourseId);
+            List<TimeSlot> slots = new();
+            Dictionary<(TimeOnly Start, TimeOnly End), int> slotIndexByTime = new();
+            void ApplySlotsForDate(DateOnly date)
+            {
+                var dayOfWeek = date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
+                if (!resolvedByDay.TryGetValue(dayOfWeek, out var resolved) || resolved.Slots.Count == 0)
+                {
+                    slots = new List<TimeSlot>();
+                    slotIndexByTime = new Dictionary<(TimeOnly, TimeOnly), int>();
+                    return;
+                }
+                slots = resolved.Slots;
+                slotIndexByTime = slots
+                    .Select((slot, index) => new { slot, index })
+                    .ToDictionary(x => (x.slot.Start, x.slot.End), x => x.index);
+            }
             // Перевіряє, чи слот уже зайнятий у групи.
             bool SlotFilled(DateOnly date, TimeSlot slot) =>
                 busy.Any(b => b.GroupId == grp.Id && b.Date == date && b.StartTime == slot.Start && b.EndTime == slot.End);
@@ -1156,19 +1168,21 @@ public sealed class TeacherDraftsAutogenService
                     .FirstOrDefaultAsync();
                 if (anyModuleId != 0)
                 {
-                    var candidateSlots = slots
-                        .Where(sl => sl.Start <= groupLunch.Start && groupLunch.End <= sl.End)
-                        .ToList();
-                    if (candidateSlots.Count == 0)
-                    {
-                        candidateSlots = slots
-                            .Where(sl => sl.Start < groupLunch.End && groupLunch.Start < sl.End)
-                            .ToList();
-                    }
                     for (int d = 0; d < 7; d++)
                     {
                         var date = weekStart.AddDays(d);
                         if (!IsWorking(date, grp)) continue;
+                        ApplySlotsForDate(date);
+                        if (slots.Count == 0) continue;
+                        var candidateSlots = slots
+                            .Where(sl => sl.Start <= groupLunch.Start && groupLunch.End <= sl.End)
+                            .ToList();
+                        if (candidateSlots.Count == 0)
+                        {
+                            candidateSlots = slots
+                                .Where(sl => sl.Start < groupLunch.End && groupLunch.Start < sl.End)
+                                .ToList();
+                        }
                         foreach (var slot in candidateSlots)
                         {
                             var s = slot.Start;
@@ -1975,6 +1989,7 @@ public sealed class TeacherDraftsAutogenService
             {
                 var date = weekStart.AddDays(d);
                 if (!IsWorking(date, grp)) continue;
+                ApplySlotsForDate(date);
                 int maxPerDay = slots.Count;
                 if (maxPerDay == 0) continue;
                 var modulesAttemptedToday = new HashSet<int>();
