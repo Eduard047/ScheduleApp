@@ -45,6 +45,8 @@
             .Where(lt => string.Equals(lt.Code, "EXAM", StringComparison.OrdinalIgnoreCase)
                       || string.Equals(lt.Code, "CREDIT", StringComparison.OrdinalIgnoreCase))
             .ToList() ?? new();
+    private int? NoneLessonTypeId =>
+        _meta?.LessonTypes.FirstOrDefault(lt => string.Equals(lt.Code, "NONE", StringComparison.OrdinalIgnoreCase))?.Id;
     // Перевіряє, чи тип заняття є підсумковим контролем.
     private bool IsFinalAssessment(int? lessonTypeId)
     {
@@ -295,6 +297,11 @@
             _edit = _edit with { RequiresRoom = requiresRoomFallback, RoomId = roomFallback };
             return;
         }
+        if (ltId <= 0)
+        {
+            _edit = _edit with { LessonTypeId = 0 };
+            return;
+        }
         if (_edit.LessonTypeId != ltId && _edit.RequiresRoom && _edit.RoomId is int previousRoom)
         {
             RememberRoom(_edit.LessonTypeId, previousRoom);
@@ -313,6 +320,7 @@
     private void EnsureAllowedLessonType()
     {
         if (_edit is null) return;
+        if (_edit.LessonTypeId <= 0) return;
         var allowed = AllowedLessonTypes;
         if (allowed.Count == 0) return;
         var currentAllowed = allowed.Any(lt => lt.Id == _edit.LessonTypeId);
@@ -349,13 +357,19 @@
         if (_edit is null) return;
         var moduleId = int.TryParse(e.Value?.ToString(), out var parsed) ? parsed : 0;
         await EnsureTopicsLoaded(moduleId);
+        var topics = TopicsForModule(moduleId);
         _edit = _edit with { ModuleId = moduleId, ModuleTopicId = null };
+        if (_edit.Id is null)
+        {
+            _edit = _edit with { LessonTypeId = 0 };
+            return;
+        }
         var shouldAttachTopic = !IsFinalAssessment(_edit.LessonTypeId);
         if (!shouldAttachTopic)
         {
             return;
         }
-        var firstTopic = TopicsForModule(moduleId).FirstOrDefault();
+        var firstTopic = topics.FirstOrDefault();
         if (firstTopic is not null)
         {
             ApplyTopicSelection(firstTopic.Id);
@@ -366,6 +380,15 @@
         if (_edit is null) return;
         var topicId = int.TryParse(e.Value?.ToString(), out var parsed) ? parsed : (int?)null;
         await EnsureTopicsLoaded(_edit.ModuleId);
+        if (topicId is null)
+        {
+            ApplyTopicSelection(null);
+            if (_edit.Id is null)
+            {
+                _edit = _edit with { LessonTypeId = 0 };
+            }
+            return;
+        }
         ApplyTopicSelection(topicId);
         ClearTopicForFinalAssessment();
     }
@@ -373,15 +396,82 @@
     {
         if (_edit is null) return;
         var ltId = int.TryParse(e.Value?.ToString(), out var parsed) ? parsed : (int?)null;
-        if (ltId is null)
+        if (ltId is null || ltId <= 0)
         {
-            var fallback = AllowedLessonTypes.FirstOrDefault()?.Id;
-            ApplyLessonType(fallback);
-            ClearTopicForFinalAssessment();
+            _edit = _edit with { LessonTypeId = 0 };
             return;
         }
         ApplyLessonType(ltId);
         ClearTopicForFinalAssessment();
+    }
+    private List<SlotRow> DaySlotsFor(DateOnly date)
+    {
+        if (_slots.Count == 0) return _rows;
+        var courseId = ResolveCourseIdForEdit();
+        var scopedSlots = courseId is int cid
+            ? _slots.Where(s => s.CourseId is null || s.CourseId == cid).ToList()
+            : _slots;
+        var dayNumber = DayNumberFromDate(date);
+        var daySlots = scopedSlots
+            .Where(s => s.DayOfWeek == dayNumber)
+            .OrderBy(s => s.SortOrder)
+            .ThenBy(s => s.Start)
+            .ThenBy(s => s.End)
+            .Select(s => new SlotRow(s.Start, s.End))
+            .ToList();
+        if (daySlots.Count > 0) return daySlots;
+        var fallback = scopedSlots
+            .Where(s => s.DayOfWeek is null)
+            .OrderBy(s => s.SortOrder)
+            .ThenBy(s => s.Start)
+            .ThenBy(s => s.End)
+            .Select(s => new SlotRow(s.Start, s.End))
+            .ToList();
+        if (fallback.Count > 0) return fallback;
+        return _rows;
+    }
+    // Парсить час, що може мати секунди.
+    private static TimeOnly ParseSlotTime(string value)
+    {
+        if (TimeOnly.TryParseExact(value, "HH:mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsed))
+        {
+            return parsed;
+        }
+        if (TimeOnly.TryParseExact(value, "HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed))
+        {
+            return parsed;
+        }
+        return TimeOnly.Parse(value, CultureInfo.InvariantCulture);
+    }
+    // Повертає послідовні слоти між обраними часами.
+    private List<SlotRow> ResolveSlotRange(DateOnly date, string start, string end)
+    {
+        var slots = DaySlotsFor(date);
+        var startTime = ParseSlotTime(start);
+        var endTime = ParseSlotTime(end);
+        var normalized = slots
+            .Select(s => new { Row = s, Start = ParseSlotTime(s.Start), End = ParseSlotTime(s.End) })
+            .ToList();
+        var startIndex = normalized.FindIndex(s => s.Start == startTime);
+        var endIndex = normalized.FindIndex(s => s.End == endTime);
+        if (startIndex < 0 || endIndex < 0 || endIndex < startIndex)
+        {
+            return new List<SlotRow>();
+        }
+        return normalized.Skip(startIndex).Take(endIndex - startIndex + 1).Select(s => s.Row).ToList();
+    }
+    private string GetSlotNumberLabel(SlotRow slot, int slotIndex)
+    {
+        if (_rows.Count == 0) return (slotIndex + 1).ToString("00");
+        var exactIndex = _rows.FindIndex(r => r.Start == slot.Start && r.End == slot.End);
+        if (exactIndex >= 0) return (exactIndex + 1).ToString("00");
+        var startIndex = _rows.FindIndex(r => r.Start == slot.Start);
+        var endIndex = _rows.FindIndex(r => r.End == slot.End);
+        if (startIndex >= 0 && endIndex >= 0 && endIndex >= startIndex)
+        {
+            return $"{startIndex + 1:00}-{endIndex + 1:00}";
+        }
+        return (slotIndex + 1).ToString("00");
     }
     // Готує форму редагування для існуючої чернетки.
     private async Task StartEdit(TeacherDraftItemDto item)
@@ -399,7 +489,7 @@
             TeacherId: item.TeacherId,
             RoomId: item.RoomId,
             RequiresRoom: item.RequiresRoom,
-            LessonTypeId: item.LessonTypeId,
+            LessonTypeId: IsNoneLessonType(item) ? 0 : item.LessonTypeId,
             OverrideNonWorkingDay: false,
             BatchKey: item.BatchKey,
             IsLocked: item.IsLocked,
@@ -429,29 +519,21 @@
             return;
         }
         await EnsureTopicsLoaded(module.Id);
-        var topics = TopicsForModule(module.Id);
-        var defaultTopic = topics.FirstOrDefault();
-        var preservedLessonType = _edit?.LessonTypeId ?? _meta.LessonTypes.FirstOrDefault()?.Id;
-        var lessonTypeId = defaultTopic?.LessonTypeId ?? preservedLessonType;
-        if (lessonTypeId is null)
-        {
-            _err = "Немає доступних типів занять для створення чернетки.";
-            return;
-        }
+        var lessonTypeId = 0;
         var resolvedGroupId = groupId > 0 ? groupId : (_groupId ?? _meta.Groups.FirstOrDefault()?.Id);
         if (resolvedGroupId is null)
         {
             _err = "Немає доступних груп для створення чернетки.";
             return;
         }
-        var requiresRoom = LessonTypeRequiresRoom(lessonTypeId.Value);
-        var resolvedRoomId = ResolveRoomForType(lessonTypeId.Value, requiresRoom, sameType: false);
+        var requiresRoom = LessonTypeRequiresRoom(lessonTypeId);
+        var resolvedRoomId = ResolveRoomForType(lessonTypeId, requiresRoom, sameType: false);
         if (requiresRoom && resolvedRoomId is null)
         {
             _err = "Немає доступних аудиторій для цього типу заняття.";
             return;
         }
-        RememberRoom(lessonTypeId.Value, resolvedRoomId);
+        RememberRoom(lessonTypeId, resolvedRoomId);
         var draftRequest = new DraftUpsertRequest(
             Id: null,
             Date: date,
@@ -459,11 +541,11 @@
             TimeEnd: end,
             GroupId: resolvedGroupId.Value,
             ModuleId: module.Id,
-            ModuleTopicId: defaultTopic?.Id,
+            ModuleTopicId: null,
             TeacherId: _teacherId,
             RoomId: resolvedRoomId,
             RequiresRoom: requiresRoom,
-            LessonTypeId: lessonTypeId.Value,
+            LessonTypeId: lessonTypeId,
             OverrideNonWorkingDay: false,
             BatchKey: null,
             IsLocked: false,
@@ -472,7 +554,7 @@
         );
         _edit = NormalizeRequest(draftRequest);
         ApplyLessonType(_edit.LessonTypeId);
-        ApplyTopicSelection(defaultTopic?.Id);
+        ApplyTopicSelection(null);
         EnsureAllowedLessonType();
     }
     private List<DateOnly> GetWeekDates()
@@ -563,6 +645,15 @@
         => items
             .GroupBy(i => (i.DayNumber, i.TimeStart, i.TimeEnd, i.GroupId))
             .ToDictionary(g => g.Key, g => g.First());
+    // Додає часові проміжки чернеток до базового списку слотів.
+    private static List<SlotRow> MergeSlotRows(IEnumerable<SlotRow> baseRows, IEnumerable<TeacherDraftItemDto> items)
+        => baseRows
+            .Concat(items.Select(i => new SlotRow(i.TimeStart, i.TimeEnd)))
+            .GroupBy(x => (x.Start, x.End))
+            .Select(g => g.First())
+            .OrderBy(x => x.Start)
+            .ThenBy(x => x.End)
+            .ToList();
     private static TeacherDraftItemDto? FindItem(Dictionary<(int DayNumber, string Start, string End, int GroupId), TeacherDraftItemDto> lookup, int dayNumber, SlotRow slot, int groupId)
         => lookup.TryGetValue((dayNumber, slot.Start, slot.End, groupId), out var value) ? value : null;
     private readonly record struct SlotKey(int DayNumber, string Start, string End, int GroupId);
@@ -575,6 +666,7 @@
     private static string GetDayName(DateOnly date) => UkrainianDayNames[(int)date.DayOfWeek];
     private static bool IsBreak(TeacherDraftItemDto item) => string.Equals(item.LessonTypeCode, "BREAK", StringComparison.OrdinalIgnoreCase);
     private static bool IsCanceled(TeacherDraftItemDto item) => string.Equals(item.LessonTypeCode, "CANCELED", StringComparison.OrdinalIgnoreCase);
+    private static bool IsNoneLessonType(TeacherDraftItemDto item) => string.Equals(item.LessonTypeCode, "NONE", StringComparison.OrdinalIgnoreCase);
     private static string GetCellCss(TeacherDraftItemDto? item)
     {
         if (item is null) return "td-cell-body td-cell-body--empty";
@@ -837,38 +929,99 @@
     {
         if (_edit is null) return;
         _ok = _err = null;
+        var lessonTypeId = _edit.LessonTypeId;
+        if (lessonTypeId <= 0)
+        {
+            var fallbackLessonTypeId = NoneLessonTypeId;
+            if (fallbackLessonTypeId is null)
+            {
+                _err = "Не знайдено тип заняття \"Без типу\". Оновіть довідник типів занять.";
+                return;
+            }
+            lessonTypeId = fallbackLessonTypeId.Value;
+        }
         try
         {
-            var payload = NormalizeRequest(_edit with { IgnoreValidationErrors = _unrestrictedMode });
+            var payload = NormalizeRequest(_edit with
+            {
+                LessonTypeId = lessonTypeId,
+                IgnoreValidationErrors = _unrestrictedMode
+            });
+            var slotRange = _edit.Id is null
+                ? ResolveSlotRange(payload.Date, payload.TimeStart, payload.TimeEnd)
+                : new List<SlotRow>();
+            var hasRange = _edit.Id is null && slotRange.Count > 1;
             var hasExtras = _edit.Id is null && _extraAssignments.Count > 0;
-            var resolvedBatchKey = hasExtras
+            var resolvedBatchKey = (hasExtras || hasRange)
                 ? (payload.BatchKey ?? $"clone-{Guid.NewGuid():N}")
                 : payload.BatchKey;
-            var primaryRequest = NormalizeRequest(payload with { BatchKey = resolvedBatchKey });
-            var id = await DraftsApi.Upsert(primaryRequest);
-            var cloneIds = new List<int>();
-            if (hasExtras && !string.IsNullOrWhiteSpace(resolvedBatchKey))
+            if (!hasRange)
             {
-                foreach (var extra in _extraAssignments.ToList())
+                var primaryRequest = NormalizeRequest(payload with { BatchKey = resolvedBatchKey });
+                var id = await DraftsApi.Upsert(primaryRequest);
+                var cloneIds = new List<int>();
+                if (hasExtras && !string.IsNullOrWhiteSpace(resolvedBatchKey))
                 {
-                    var groupId = extra.GroupId ?? primaryRequest.GroupId;
-                    var teacherId = extra.TeacherId ?? primaryRequest.TeacherId;
-                    if (teacherId == primaryRequest.TeacherId && groupId == primaryRequest.GroupId)
+                    foreach (var extra in _extraAssignments.ToList())
                     {
-                        continue;
+                        var groupId = extra.GroupId ?? primaryRequest.GroupId;
+                        var teacherId = extra.TeacherId ?? primaryRequest.TeacherId;
+                        if (teacherId == primaryRequest.TeacherId && groupId == primaryRequest.GroupId)
+                        {
+                            continue;
+                        }
+                        var cloneRequest = NormalizeRequest(primaryRequest with
+                        {
+                            Id = null,
+                            GroupId = groupId,
+                            TeacherId = teacherId
+                        });
+                        var cloneId = await DraftsApi.Upsert(cloneRequest);
+                        cloneIds.Add(cloneId);
                     }
-                    var cloneRequest = NormalizeRequest(primaryRequest with
+                }
+                var suffix = cloneIds.Count > 0 ? $" (+{cloneIds.Count} дубль.)" : string.Empty;
+                _ok = $"Збережено (Id = {id}){suffix}.";
+            }
+            else
+            {
+                var createdIds = new List<int>();
+                var cloneIds = new List<int>();
+                foreach (var slot in slotRange)
+                {
+                    var slotRequest = NormalizeRequest(payload with
                     {
                         Id = null,
-                        GroupId = groupId,
-                        TeacherId = teacherId
+                        BatchKey = resolvedBatchKey,
+                        TimeStart = slot.Start,
+                        TimeEnd = slot.End
                     });
-                    var cloneId = await DraftsApi.Upsert(cloneRequest);
-                    cloneIds.Add(cloneId);
+                    var id = await DraftsApi.Upsert(slotRequest);
+                    createdIds.Add(id);
+                    if (hasExtras && !string.IsNullOrWhiteSpace(resolvedBatchKey))
+                    {
+                        foreach (var extra in _extraAssignments.ToList())
+                        {
+                            var groupId = extra.GroupId ?? slotRequest.GroupId;
+                            var teacherId = extra.TeacherId ?? slotRequest.TeacherId;
+                            if (teacherId == slotRequest.TeacherId && groupId == slotRequest.GroupId)
+                            {
+                                continue;
+                            }
+                            var cloneRequest = NormalizeRequest(slotRequest with
+                            {
+                                Id = null,
+                                GroupId = groupId,
+                                TeacherId = teacherId
+                            });
+                            var cloneId = await DraftsApi.Upsert(cloneRequest);
+                            cloneIds.Add(cloneId);
+                        }
+                    }
                 }
+                var suffix = cloneIds.Count > 0 ? $" (+{cloneIds.Count} дубль.)" : string.Empty;
+                _ok = $"Збережено {createdIds.Count} пар{suffix}.";
             }
-            var suffix = cloneIds.Count > 0 ? $" (+{cloneIds.Count} дубль.)" : string.Empty;
-            _ok = $"Збережено (Id = {id}){suffix}.";
             _extraAssignments.Clear();
             await Reload();
         }
@@ -1068,6 +1221,12 @@
         if (_meta is null || _groupId is null) return null;
         return _meta.Groups.FirstOrDefault(g => g.Id == _groupId)?.CourseId;
     }
+    private int? ResolveCourseIdForEdit()
+    {
+        if (_edit is null || _meta is null) return ResolveCourseIdForSlots();
+        var courseId = _meta.Groups.FirstOrDefault(g => g.Id == _edit.GroupId)?.CourseId;
+        return courseId ?? ResolveCourseIdForSlots();
+    }
 
 static string CssByCode(string code) => code switch
     {
@@ -1253,7 +1412,7 @@ else
     var filtered = Filtered.ToList();
     var groups = ResolveGroups(filtered);
     var weekDays = GetWeekDates();
-    var slots = _rows;
+    var slots = MergeSlotRows(_rows, filtered);
     var lookup = BuildLookup(filtered);
     var monday = _weekStart;
     var isoWeek = ISOWeek.GetWeekOfYear(monday.ToDateTime(TimeOnly.MinValue));
@@ -1304,7 +1463,7 @@ else
                                     </th>
                                 }
                                 <th class="td-slot-col td-slot-cell">
-                                    <div class="td-slot-number">@((slotIndex + 1).ToString("00"))</div>
+                                    <div class="td-slot-number">@GetSlotNumberLabel(slot, slotIndex)</div>
                                     <div class="td-slot-time">@slot.Label</div>
                                 </th>
                                 @foreach (var group in groups)
@@ -1559,6 +1718,7 @@ else
             <div class="editor-field">
                 <label>Тип заняття</label>
                 <select class="select" @onchange="OnLessonTypeChanged">
+                    <option value="" selected="@(_edit!.LessonTypeId <= 0)">Оберіть тип заняття</option>
                     @foreach (var lt in AllowedLessonTypes)
                     {
                         <option value="@lt.Id" selected="@(@lt.Id == _edit!.LessonTypeId)">

@@ -82,8 +82,21 @@ public sealed class TeacherDraftsController : ControllerBase
     // Валідує й створює або оновлює чернетку викладача, повертає її ідентифікатор.
     public async Task<ActionResult<int>> Upsert([FromBody] DraftUpsertRequest r)
     {
-        var validation = await _rules.ValidateDraftAsync(r);
-        if (validation.Errors.Count > 0 && !r.IgnoreValidationErrors)
+        var request = r;
+        if (request.LessonTypeId <= 0)
+        {
+            var noneTypeId = await _db.LessonTypes
+                .Where(x => x.Code == "NONE")
+                .Select(x => (int?)x.Id)
+                .FirstOrDefaultAsync();
+            if (noneTypeId is null)
+            {
+                return Conflict(new { message = "Тип заняття \"Без типу\" не налаштований." });
+            }
+            request = request with { LessonTypeId = noneTypeId.Value };
+        }
+        var validation = await _rules.ValidateDraftAsync(request);
+        if (validation.Errors.Count > 0 && !request.IgnoreValidationErrors)
             return Conflict(new
             {
                 message = "Validation failed",
@@ -95,22 +108,22 @@ public sealed class TeacherDraftsController : ControllerBase
             ? JsonSerializer.Serialize(validation.Report, ValidationJsonOptions)
             : null;
         var lessonTypeRequiresRoom = await _db.LessonTypes
-            .Where(x => x.Id == r.LessonTypeId)
+            .Where(x => x.Id == request.LessonTypeId)
             .Select(x => (bool?)x.RequiresRoom)
             .FirstOrDefaultAsync();
-        var normalizedRoomId = lessonTypeRequiresRoom is false ? null : r.RoomId;
-        var start = TimeOnly.Parse(r.TimeStart);
-        var end = TimeOnly.Parse(r.TimeEnd);
-        if (r.Id is int id && id > 0)
+        var normalizedRoomId = lessonTypeRequiresRoom is false ? null : request.RoomId;
+        var start = TimeOnly.Parse(request.TimeStart);
+        var end = TimeOnly.Parse(request.TimeEnd);
+        if (request.Id is int id && id > 0)
         {
             var item = await _db.TeacherDraftItems.FirstOrDefaultAsync(x => x.Id == id);
             if (item is null) return NotFound(new { message = $"TeacherDraftItem {id} not found" });
-            ApplyDraftRequest(item, r, start, end, normalizedRoomId, reportJson);
+            ApplyDraftRequest(item, request, start, end, normalizedRoomId, reportJson);
             await _db.SaveChangesAsync();
             return Ok(item.Id);
         }
         var newItem = new TeacherDraftItem();
-        ApplyDraftRequest(newItem, r, start, end, normalizedRoomId, reportJson);
+        ApplyDraftRequest(newItem, request, start, end, normalizedRoomId, reportJson);
         _db.TeacherDraftItems.Add(newItem);
         await _db.SaveChangesAsync();
         return Ok(newItem.Id);

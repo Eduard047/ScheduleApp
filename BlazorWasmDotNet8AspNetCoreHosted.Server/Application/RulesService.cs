@@ -49,9 +49,9 @@ public sealed class RulesService(AppDbContext db)
         {
             var resolved = await TimeSlotsResolver.ResolveForDayAsync(db, group.CourseId, dayOfWeek);
             var effectiveSlots = resolved.Slots
-                .Select(s => new { s.Start, s.End })
+                .Select(s => (s.Start, s.End))
                 .ToList();
-            if (effectiveSlots.Count > 0 && !effectiveSlots.Any(s => s.Start == start && s.End == end))
+            if (effectiveSlots.Count > 0 && !IsSlotRangeAllowed(start, end, effectiveSlots))
                 errors.Add("Обраний часовий проміжок не входить до дозволених слотів.");
         }
         bool isWeekend = dayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday;
@@ -189,9 +189,9 @@ public sealed class RulesService(AppDbContext db)
         {
             var resolved = await TimeSlotsResolver.ResolveForDayAsync(db, group.CourseId, dayOfWeek);
             var effectiveSlots = resolved.Slots
-                .Select(s => new { s.Start, s.End })
+                .Select(s => (s.Start, s.End))
                 .ToList();
-            if (effectiveSlots.Count > 0 && !effectiveSlots.Any(s => s.Start == start && s.End == end))
+            if (effectiveSlots.Count > 0 && !IsSlotRangeAllowed(start, end, effectiveSlots))
                 AddError("slot-not-allowed", "Недозволений слот", $"Проміжок {r.TimeStart}-{r.TimeEnd} відсутній серед дозволених для курсу {group.Course.Name}.");
         }
         bool isWeekend = dayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday;
@@ -328,6 +328,20 @@ public sealed class RulesService(AppDbContext db)
         }
         var report = new DraftValidationReportDto(DateTimeOffset.UtcNow, issues);
         return new DraftValidationResult(errors, warnings, report);
+    }
+    // Дозволяє проміжок, що складається з послідовних слотів за порядком.
+    private static bool IsSlotRangeAllowed(TimeOnly start, TimeOnly end, List<(TimeOnly Start, TimeOnly End)> slots)
+    {
+        if (slots.Count == 0) return true;
+        for (var i = 0; i < slots.Count; i++)
+        {
+            if (slots[i].Start != start) continue;
+            for (var j = i; j < slots.Count; j++)
+            {
+                if (slots[j].End == end) return true;
+            }
+        }
+        return false;
     }
     // Повертає найточніший календарний виняток для дати/курсу/групи.
     private async Task<CalendarException?> FindCalendarExceptionAsync(DateOnly date, int? courseId, int? groupId)
