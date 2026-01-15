@@ -54,6 +54,41 @@
         margin-left: 1.25rem;
         margin-top: .05rem;
     }
+    .lesson-editor-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(15, 23, 42, 0.45);
+        backdrop-filter: blur(2px);
+        display: flex;
+        align-items: flex-start;
+        justify-content: center;
+        padding: 72px 16px 24px;
+        z-index: 1050;
+    }
+    .lesson-editor {
+        width: min(720px, 100%);
+        border-radius: 12px;
+        box-shadow: 0 24px 50px rgba(15, 23, 42, 0.25);
+    }
+    .lesson-editor-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+    }
+    .lesson-editor-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 12px;
+    }
+    .lesson-editor-label {
+        font-size: .72rem;
+        text-transform: uppercase;
+        letter-spacing: .02em;
+        color: #64748b;
+        margin-bottom: 2px;
+    }
 </style>
 
 @page "/admin/schedule"
@@ -300,6 +335,7 @@ else
                         <th class="sortable-th" role="button" @onclick="() => ToggleSort(SortByRoom)">Аудиторія @HeaderIcon(SortByRoom)</th>
                         <th class="sortable-th" role="button" @onclick="() => ToggleSort(SortByLessonType)">Тип @HeaderIcon(SortByLessonType)</th>
                         <th class="sortable-th" role="button" @onclick="() => ToggleSort(SortByStatus)">Статус @HeaderIcon(SortByStatus)</th>
+                        <th class="text-end">Дії</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -335,13 +371,20 @@ else
                                 <td>@(isCanceled ? "-" : (item.Room ?? "-"))</td>
                                 <td>@item.LessonTypeName</td>
                                 <td>@item.StatusText</td>
+                                <td class="text-end">
+                                    <button type="button"
+                                            class="btn btn-sm btn-outline-secondary"
+                                            @onclick="() => OpenEditor(item)">
+                                        Редактор
+                                    </button>
+                                </td>
                             </tr>
                         }
                     }
                     else
                     {
                         <tr>
-                            <td colspan="9" class="text-center text-muted py-3">
+                            <td colspan="10" class="text-center text-muted py-3">
                                 Даних не знайдено для вибраних критеріїв.
                             </td>
                         </tr>
@@ -349,6 +392,81 @@ else
                 </tbody>
             </table>
         </div>
+        @if (_editItem is not null)
+        {
+            var selected = _editItem!;
+            <div class="lesson-editor-overlay" @onclick="CloseEditor">
+                <div class="lesson-editor card p-3" @onclick:stopPropagation="true">
+                    <div class="lesson-editor-head">
+                        <div>
+                            <div class="fw-semibold">Редактор заняття</div>
+                            <div class="text-muted small">@selected.SourceLabel - ID @selected.Id</div>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="CloseEditor">x</button>
+                    </div>
+                    <div class="lesson-editor-grid small">
+                        <div>
+                            <div class="lesson-editor-label">Дата</div>
+                            <div>@selected.Date.ToString("dd.MM.yyyy")</div>
+                        </div>
+                        <div>
+                            <div class="lesson-editor-label">Час</div>
+                            <div>@selected.TimeStart-@selected.TimeEnd</div>
+                        </div>
+                        <div>
+                            <div class="lesson-editor-label">Група</div>
+                            <div>@(string.IsNullOrWhiteSpace(selected.Group) ? "-" : selected.Group)</div>
+                        </div>
+                        <div>
+                            <div class="lesson-editor-label">Модуль</div>
+                            <div>@(string.IsNullOrWhiteSpace(selected.Module) ? "-" : selected.Module)</div>
+                        </div>
+                        <div>
+                            <div class="lesson-editor-label">Викладач</div>
+                            <div>@(string.IsNullOrWhiteSpace(selected.Teacher) ? "-" : selected.Teacher)</div>
+                        </div>
+                        <div>
+                            <div class="lesson-editor-label">Аудиторія</div>
+                            <div>@(string.IsNullOrWhiteSpace(selected.Room) ? "-" : selected.Room)</div>
+                        </div>
+                        <div>
+                            <div class="lesson-editor-label">Тип</div>
+                            <div>@selected.LessonTypeName</div>
+                        </div>
+                        <div>
+                            <div class="lesson-editor-label">Статус</div>
+                            <div>@selected.StatusText</div>
+                        </div>
+                        <div>
+                            <div class="lesson-editor-label">Блокування</div>
+                            <div>@(selected.IsLocked ? "Так" : "Ні")</div>
+                        </div>
+                    </div>
+                    @if (!string.IsNullOrWhiteSpace(_editError))
+                    {
+                        <div class="alert alert-danger mt-2">@_editError</div>
+                    }
+                    <div class="d-flex gap-2 mt-3">
+                        <button type="button"
+                                class="btn btn-danger"
+                                @onclick="DeleteSelectedAsync"
+                                disabled="@_editDeleting">
+                            @if (_editDeleting)
+                            {
+                                <span class="spinner-border spinner-border-sm" role="status"></span>
+                            }
+                            <span>Видалити</span>
+                        </button>
+                        <button type="button"
+                                class="btn btn-outline-secondary"
+                                @onclick="CloseEditor"
+                                disabled="@_editDeleting">
+                            Закрити
+                        </button>
+                    </div>
+                </div>
+            </div>
+        }
     </div>
 }
 
@@ -377,6 +495,9 @@ else
     private readonly List<TeacherDraftItemDto> draftItems = new();
     private readonly List<ScheduleItemDto> publishedItems = new();
     private readonly List<TableItem> tableItems = new();
+    private TableItem? _editItem;
+    private bool _editDeleting;
+    private string? _editError;
     private string _search = string.Empty;
     private string _sortField = SortByDate;
     private bool _sortAsc = true;
@@ -1042,6 +1163,66 @@ else
         error = null;
         SyncCurrentConflict();
     }
+    private void OpenEditor(TableItem item)
+    {
+        _editItem = item;
+        _editError = null;
+    }
+    private void CloseEditor()
+    {
+        _editItem = null;
+        _editError = null;
+    }
+    private async Task DeleteSelectedAsync()
+    {
+        if (_editItem is null)
+        {
+            return;
+        }
+        var current = _editItem;
+        var confirmText = current.Source == TableItemSource.Draft
+            ? $"Видалити чернетку #{current.Id}? Дію не можна скасувати."
+            : $"Видалити запис розкладу #{current.Id}? Дію не можна скасувати.";
+        if (current.Source == TableItemSource.Draft && current.IsLocked)
+        {
+            confirmText = $"Чернетка #{current.Id} заблокована. Видалити її попри блокування?";
+        }
+        var confirmed = await JS.InvokeAsync<bool>("confirm", confirmText);
+        if (!confirmed)
+        {
+            return;
+        }
+        await ResetStatusAsync(clearPersisted: false);
+        _editDeleting = true;
+        _editError = null;
+        try
+        {
+            if (current.Source == TableItemSource.Draft)
+            {
+                await Drafts.Delete(current.Id, confirm: true, unrestricted: current.IsLocked);
+            }
+            else
+            {
+                await Api.Delete(current.Id);
+            }
+            await LoadWeek();
+            await SetOkMessageAsync($"Видалено заняття #{current.Id}.", persist: false);
+            CloseEditor();
+        }
+        catch (ApiErrorException ex)
+        {
+            await HandleApiError(ex);
+            _editError = error ?? "Сталася помилка під час видалення заняття.";
+        }
+        catch (Exception)
+        {
+            _editError = "Сталася помилка під час видалення заняття.";
+        }
+        finally
+        {
+            _editDeleting = false;
+        }
+    }
     // Обробляє зміну дати тижня.
     private async Task OnDateChanged(ChangeEventArgs args)
     {
@@ -1128,7 +1309,9 @@ else
             draft.LessonTypeName,
             draft.LessonTypeId,
             FormatDraftStatus(draft.Status),
-            "Чернетка"
+            "Чернетка",
+            TableItemSource.Draft,
+            draft.IsLocked
         );
     // Перетворює опублікований запис у рядок таблиці.
     private TableItem CreateTableItemFromPublished(ScheduleItemDto item)
@@ -1145,7 +1328,9 @@ else
             item.LessonTypeName,
             item.LessonTypeId,
             "Опубліковано (розклад)",
-            "Розклад"
+            "Розклад",
+            TableItemSource.Published,
+            item.IsLocked
         );
     // Повертає назву курсу для модуля.
     private string ModuleCourseCaption(int? moduleId)
@@ -1192,6 +1377,11 @@ else
         public string ToggleLabel => Expanded ? "Приховати" : "Розгорнути";
     }
     private sealed record PersistedAutoGenStatus(string Message, List<string> Warnings, List<AutoGenGapDetail> GapDetails);
+    private enum TableItemSource
+    {
+        Draft,
+        Published
+    }
     private sealed record TableItem(
         int Id,
         DateOnly Date,
@@ -1205,6 +1395,8 @@ else
         string LessonTypeName,
         int LessonTypeId,
         string StatusText,
-        string SourceLabel
+        string SourceLabel,
+        TableItemSource Source,
+        bool IsLocked
     );
 }
