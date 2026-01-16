@@ -179,14 +179,15 @@ public class ScheduleController : ControllerBase
         var sequenceItems = await _db.ModuleSequenceItems
             .Where(x => x.CourseId == groupInfo.CourseId)
             .OrderBy(x => x.Order)
-            .Select(x => new { x.ModuleId, x.Order })
+            .Select(x => new { x.ModuleId, x.Order, x.GroupOrder })
             .ToListAsync();
         var currentSequence = sequenceItems.FirstOrDefault(x => x.ModuleId == source.ModuleId);
         if (currentSequence is not null)
         {
             var predecessors = sequenceItems
-                .Where(x => x.Order < currentSequence.Order)
+                .Where(x => x.GroupOrder < currentSequence.GroupOrder)
                 .Select(x => x.ModuleId)
+                .Distinct()
                 .ToList();
             if (predecessors.Count > 0)
             {

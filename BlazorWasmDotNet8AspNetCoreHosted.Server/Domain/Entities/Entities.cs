@@ -259,6 +259,7 @@ public class ModuleSequenceItem
     public int ModuleId { get; set; }
     public Module Module { get; set; } = null!;
     public int Order { get; set; }
+    public int GroupOrder { get; set; }
 }
 
 public class ModuleFiller

@@ -194,6 +194,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             e.HasIndex(x => new { x.CourseId, x.ModuleId }).IsUnique();
             e.HasIndex(x => new { x.CourseId, x.Order }).IsUnique();
             e.Property(x => x.Order).HasDefaultValue(0);
+            e.Property(x => x.GroupOrder).HasDefaultValue(0);
         });
         // Фіксуємо наповнювачі модулів для курсу без дублювання.
         b.Entity<ModuleFiller>(e =>
