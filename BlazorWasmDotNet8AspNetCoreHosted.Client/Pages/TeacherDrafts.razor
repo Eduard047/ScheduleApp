@@ -43,8 +43,7 @@
     private List<ModuleTopicViewDto> TopicsForModule(int moduleId) => _topicsCache.TryGetValue(moduleId, out var list) ? list : new List<ModuleTopicViewDto>();
     private List<IdCodeNameDto> AllowedLessonTypes =>
         _meta?.LessonTypes
-            .Where(lt => string.Equals(lt.Code, "EXAM", StringComparison.OrdinalIgnoreCase)
-                      || string.Equals(lt.Code, "CREDIT", StringComparison.OrdinalIgnoreCase))
+            .Where(lt => !string.Equals(lt.Code, "NONE", StringComparison.OrdinalIgnoreCase))
             .ToList() ?? new();
     private int? NoneLessonTypeId =>
         _meta?.LessonTypes.FirstOrDefault(lt => string.Equals(lt.Code, "NONE", StringComparison.OrdinalIgnoreCase))?.Id;
