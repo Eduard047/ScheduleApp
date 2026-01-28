@@ -74,6 +74,12 @@
         PropertyNameCaseInsensitive = true
     };
     private string? _ok, _err;
+    private readonly HashSet<int> _bulkSelectedIds = new();
+    private int? _bulkSelectedDayNumber;
+    private readonly HashSet<int> _bulkTeacherIds = new();
+    private int? _bulkRoomId;
+    private bool _bulkApplying;
+    private bool _bulkEditOpen;
     private ConflictDetails? _currentConflict;
     private Dictionary<string, ConflictDetails> _conflictStorage = new();
     private bool _conflictsLoaded;
@@ -113,6 +119,7 @@
         _extraGroups.Clear();
         _extraTeachers.Clear();
         _topicsCache.Clear();
+        ClearBulkSelection();
         _items = await DraftsApi.GetWeek(_weekStart, _teacherId);
         _warningReports.Clear();
         foreach (var draft in _items)
@@ -703,6 +710,9 @@
         }
         return string.Join(' ', classes);
     }
+    // Перевіряє, чи позначена пара для масового редагування.
+    private bool IsBulkSelected(TeacherDraftItemDto item)
+        => _bulkSelectedIds.Contains(item.Id);
     private bool CanDragItem(TeacherDraftItemDto? item)
         => item is { IsLocked: false };
     private bool CanDeleteItem(TeacherDraftItemDto item)
@@ -739,7 +749,279 @@
         {
             css += item is null ? " td-cell-body--drop-free" : " td-cell-body--drop-swap";
         }
+        if (item is not null && IsBulkSelected(item))
+        {
+            css += " td-cell-body--selected";
+        }
         return css;
+    }
+    // Обробляє вибір пари для масового редагування.
+    private void ToggleBulkSelection(TeacherDraftItemDto item)
+    {
+        if (IsBreak(item) || IsCanceled(item))
+        {
+            return;
+        }
+        if (_bulkSelectedDayNumber is null)
+        {
+            _bulkSelectedDayNumber = item.DayNumber;
+        }
+        else if (_bulkSelectedDayNumber != item.DayNumber)
+        {
+            _err = "Не можна обирати пари з різних днів.";
+            return;
+        }
+        _err = null;
+        if (_bulkSelectedIds.Contains(item.Id))
+        {
+            _bulkSelectedIds.Remove(item.Id);
+            if (_bulkSelectedIds.Count == 0)
+            {
+                _bulkSelectedDayNumber = null;
+            }
+            return;
+        }
+        _bulkSelectedIds.Add(item.Id);
+    }
+    // Очищає вибір пар для масового редагування.
+    private void ClearBulkSelection()
+    {
+        _bulkSelectedIds.Clear();
+        _bulkSelectedDayNumber = null;
+        CloseBulkEdit();
+    }
+    // Відкриває масове редагування для вибраних пар.
+    private async Task OpenBulkEditAsync(TeacherDraftItemDto item)
+    {
+        if (_bulkSelectedIds.Count > 1)
+        {
+            if (!_bulkSelectedIds.Contains(item.Id))
+            {
+                _err = "Для масового редагування оберіть одну з виділених пар.";
+                return;
+            }
+            _err = null;
+            _bulkEditOpen = true;
+            return;
+        }
+        await StartEdit(item);
+    }
+    // Закриває масове редагування.
+    private void CloseBulkEdit()
+    {
+        _bulkEditOpen = false;
+        _bulkTeacherIds.Clear();
+        _bulkRoomId = null;
+    }
+    // Перемикає вибір викладача для масового редагування.
+    private void ToggleBulkTeacher(ChangeEventArgs args, int teacherId)
+    {
+        var isChecked = false;
+        if (args.Value is bool boolValue)
+        {
+            isChecked = boolValue;
+        }
+        else if (args.Value is string text && bool.TryParse(text, out var parsed))
+        {
+            isChecked = parsed;
+        }
+        if (isChecked) _bulkTeacherIds.Add(teacherId);
+        else _bulkTeacherIds.Remove(teacherId);
+    }
+    // Обирає всіх викладачів для масового редагування.
+    private void SelectAllBulkTeachers()
+    {
+        if (_meta is null) return;
+        foreach (var teacher in _meta.Teachers)
+        {
+            _bulkTeacherIds.Add(teacher.Id);
+        }
+    }
+    // Очищає вибір викладачів для масового редагування.
+    private void ClearBulkTeachers()
+    {
+        _bulkTeacherIds.Clear();
+    }
+    // Формує підпис для обраного дня у масовому редагуванні.
+    private string BulkSelectedDayLabel()
+        => _bulkSelectedDayNumber is int dayNumber ? DayToDate(dayNumber).ToString("dd.MM.yyyy") : "—";
+    // Повертає підпис для викладача.
+    private string ResolveTeacherLabel(int? teacherId)
+    {
+        if (teacherId is not int id) return "без змін";
+        return _meta?.Teachers.FirstOrDefault(t => t.Id == id)?.Name ?? $"#{id}";
+    }
+    // Повертає підпис для аудиторії.
+    private string ResolveRoomLabel(int? roomId)
+    {
+        if (roomId is not int id) return "без змін";
+        return _meta?.Rooms.FirstOrDefault(r => r.Id == id)?.Name ?? $"#{id}";
+    }
+    // Виконує масове оновлення викладача/аудиторії для обраних пар.
+    private async Task ApplyBulkEditAsync()
+    {
+        if (_bulkApplying) return;
+        _ok = _err = null;
+        if (_meta is null)
+        {
+            _err = "Метадані не завантажені.";
+            return;
+        }
+        if (_bulkSelectedIds.Count == 0)
+        {
+            _err = "Оберіть хоча б одну пару.";
+            return;
+        }
+        if (_bulkTeacherIds.Count == 0 && _bulkRoomId is null)
+        {
+            _err = "Оберіть викладача або аудиторію.";
+            return;
+        }
+        var selectedItems = _items.Where(i => _bulkSelectedIds.Contains(i.Id)).ToList();
+        if (selectedItems.Count == 0)
+        {
+            _err = "Обрані пари не знайдені у поточному тижні.";
+            return;
+        }
+        if (selectedItems.Select(i => i.DayNumber).Distinct().Count() > 1)
+        {
+            _err = "Не можна редагувати пари з різних днів.";
+            return;
+        }
+        var dayLabel = DayToDate(selectedItems.First().DayNumber).ToString("dd.MM.yyyy");
+        var confirmText = $"Застосувати зміни до {selectedItems.Count} пар за {dayLabel}? " +
+                          $"Викладачі: {ResolveTeacherListLabel()}. " +
+                          $"Аудиторія: {ResolveRoomLabel(_bulkRoomId)}.";
+        var confirmed = await JS.InvokeAsync<bool>("confirm", confirmText);
+        if (!confirmed) return;
+        _bulkApplying = true;
+        var updated = 0;
+        var skipped = 0;
+        var skippedLocked = 0;
+        var processedSlots = new HashSet<string>(StringComparer.Ordinal);
+        try
+        {
+            foreach (var item in selectedItems)
+            {
+                var slotKey = BuildBulkSlotKey(item);
+                if (!processedSlots.Add(slotKey))
+                {
+                    continue;
+                }
+                if (IsBreak(item) || IsCanceled(item))
+                {
+                    skipped++;
+                    continue;
+                }
+                var batch = CollectSlotItems(item);
+                if (batch.Count == 0)
+                {
+                    skipped++;
+                    continue;
+                }
+                if (!_unrestrictedMode && batch.Any(x => x.IsLocked))
+                {
+                    skippedLocked++;
+                    continue;
+                }
+                var newRoomId = _bulkRoomId ?? item.RoomId;
+                var desiredTeachers = _bulkTeacherIds.ToList();
+                if (desiredTeachers.Count == 0)
+                {
+                    foreach (var entry in batch)
+                    {
+                        if (newRoomId == entry.RoomId)
+                        {
+                            skipped++;
+                            continue;
+                        }
+                        var slot = BuildSlotKey(entry);
+                        var baseRequest = BuildUpsertRequest(entry, slot, _unrestrictedMode);
+                        var updatedRequest = baseRequest with { RoomId = newRoomId };
+                        var normalized = NormalizeRequest(updatedRequest);
+                        await DraftsApi.Upsert(normalized);
+                        updated++;
+                    }
+                }
+                else
+                {
+                    var batchKey = item.BatchKey ?? $"bulk-{Guid.NewGuid():N}";
+                    var existingByTeacher = batch
+                        .Where(x => x.TeacherId is int)
+                        .ToDictionary(x => x.TeacherId!.Value, x => x);
+                    foreach (var teacherId in desiredTeachers)
+                    {
+                        if (existingByTeacher.TryGetValue(teacherId, out var existing))
+                        {
+                            var slot = BuildSlotKey(existing);
+                            var baseRequest = BuildUpsertRequest(existing, slot, _unrestrictedMode);
+                            var updatedRequest = baseRequest with { RoomId = newRoomId };
+                            var normalized = NormalizeRequest(updatedRequest);
+                            await DraftsApi.Upsert(normalized);
+                            updated++;
+                        }
+                        else
+                        {
+                            var slot = BuildSlotKey(item);
+                            var baseRequest = BuildUpsertRequest(item, slot, _unrestrictedMode);
+                            var createdRequest = baseRequest with
+                            {
+                                Id = null,
+                                TeacherId = teacherId,
+                                RoomId = newRoomId,
+                                BatchKey = batchKey
+                            };
+                            var normalized = NormalizeRequest(createdRequest);
+                            await DraftsApi.Upsert(normalized);
+                            updated++;
+                        }
+                    }
+                    foreach (var extra in batch)
+                    {
+                        if (extra.TeacherId is int existingId && desiredTeachers.Contains(existingId))
+                        {
+                            continue;
+                        }
+                        await DraftsApi.Delete(extra.Id, confirm: true, unrestricted: _unrestrictedMode);
+                        updated++;
+                    }
+                }
+            }
+            _ok = $"Оновлено пар: {updated}. Пропущено: {skipped}.";
+            if (skippedLocked > 0)
+            {
+                _ok += $" Заблокованих: {skippedLocked}.";
+            }
+            await Reload();
+            ClearBulkSelection();
+            CloseBulkEdit();
+        }
+        catch (ApiErrorException ex)
+        {
+            await HandleApiError(ex);
+        }
+        catch (Exception ex)
+        {
+            _err = ex.Message;
+        }
+        finally
+        {
+            _bulkApplying = false;
+        }
+    }
+    // Формує ключ слоту без аудиторії для уникнення дублювання.
+    private static string BuildBulkSlotKey(TeacherDraftItemDto item)
+        => $"{item.Date:yyyyMMdd}|{item.TimeStart}|{item.TimeEnd}|g{item.GroupId}|m{item.ModuleId}|lt{item.LessonTypeId}|ss{item.IsSelfStudy}|t{item.ModuleTopicId?.ToString() ?? "none"}";
+    // Формує підпис списку викладачів.
+    private string ResolveTeacherListLabel()
+    {
+        if (_bulkTeacherIds.Count == 0) return "без змін";
+        if (_meta is null) return string.Join(", ", _bulkTeacherIds);
+        var labels = _meta.Teachers
+            .Where(t => _bulkTeacherIds.Contains(t.Id))
+            .Select(t => t.Name)
+            .ToList();
+        return labels.Count == 0 ? "без змін" : string.Join(", ", labels);
     }
     private SlotKey BuildSlotKey(TeacherDraftItemDto item)
         => new(item.DayNumber, item.TimeStart, item.TimeEnd, item.GroupId);
@@ -1582,12 +1864,14 @@ else
                                         @ondragleave="() => OnSlotDragLeave(slotKey)"
                                         @ondrop="async e => await OnSlotDropAsync(slotKey, item)" @ondrop:preventDefault>
                                         <div class="@wrapperCss"
+                                             @onclick="() => { if (item is not null) ToggleBulkSelection(item); }"
                                              data-drag-id="@((canDrag && item is not null) ? item.Id.ToString() : null)">
                                             @if (canDrag && item is not null)
                                             {
                                                 <div class="td-cell-drag-handle"
                                                      draggable="true"
                                                      title="Drag handle"
+                                                     @onclick:stopPropagation="true"
                                                      @onmousedown:preventDefault
                                                      @ondragstart="e => OnItemDragStart(slotKey, item, e)"
                                                      @ondragend="OnItemDragEnd">
@@ -1610,13 +1894,14 @@ else
                                                 <div class="td-cell-title">@item.LessonTypeName</div>
                                                 <div class="td-cell-meta">@slot.Label</div>
                                                 <div class="td-cell-actions">
-                                                    <button class="btn btn-ghost btn-sm td-edit-btn text-danger" title="Редагувати" @onclick="async () => await StartEdit(item)">
+                                                    <button class="btn btn-ghost btn-sm td-edit-btn text-danger" title="Редагувати" @onclick="async () => await OpenBulkEditAsync(item)" @onclick:stopPropagation="true">
                                                         <span class="td-edit-icon" aria-hidden="true">✎</span>
                                                     </button>
                                                     <button class="btn btn-ghost btn-sm td-edit-btn text-danger"
                                                             title="Видалити"
                                                             disabled="@(!CanDeleteItem(item))"
-                                                            @onclick="async () => await DeleteItemAsync(item)">
+                                                            @onclick="async () => await DeleteItemAsync(item)"
+                                                            @onclick:stopPropagation="true">
                                                         <span class="td-edit-icon" aria-hidden="true">🗑</span>
                                                     </button>
                                                 </div>
@@ -1666,7 +1951,7 @@ else
                                                     var (errorCount, warningCount) = CountIssues(report);
                                                     <div class="td-slot-alert">
                                                         <div class="td-slot-alert-head">
-                                                            <button type="button" class="td-slot-alert-toggle" @onclick="() => ToggleWarningPanel(item.Id)">
+                                                            <button type="button" class="td-slot-alert-toggle" @onclick="() => ToggleWarningPanel(item.Id)" @onclick:stopPropagation="true">
                                                                 @(expanded ? "Згорнути попередження" : "Розгорнути попередження")
                                                             </button>
                                                             <div class="td-slot-alert-summary">
@@ -1692,13 +1977,14 @@ else
                                                 <div class="td-cell-footer">
                                                     <span class="badge @GetStatusBadgeCss(item.Status)">@FormatStatus(item.Status)</span>
                                                     <div class="td-cell-actions">
-                                                        <button class="btn btn-ghost btn-sm td-edit-btn text-danger" title="Редагувати" @onclick="async () => await StartEdit(item)">
+                                                        <button class="btn btn-ghost btn-sm td-edit-btn text-danger" title="Редагувати" @onclick="async () => await OpenBulkEditAsync(item)" @onclick:stopPropagation="true">
                                                             <span class="td-edit-icon" aria-hidden="true">✎</span>
                                                         </button>
                                                         <button class="btn btn-ghost btn-sm td-edit-btn text-danger"
                                                                 title="Видалити"
                                                                 disabled="@(!CanDeleteItem(item))"
-                                                                @onclick="async () => await DeleteItemAsync(item)">
+                                                                @onclick="async () => await DeleteItemAsync(item)"
+                                                                @onclick:stopPropagation="true">
                                                             <span class="td-edit-icon" aria-hidden="true">🗑</span>
                                                         </button>
                                                     </div>
@@ -1714,6 +2000,61 @@ else
             </table>
         </div>
     }
+}
+
+@if (_bulkEditOpen && _meta is not null)
+{
+    <div class="editor-overlay" @onclick="CloseBulkEdit">
+        <div class="editor editor-modal bulk-editor" @onclick:stopPropagation="true">
+            <div class="editor-modal-head">
+                <div>
+                    <div class="editor-title">Масове редагування пар</div>
+                    <div class="editor-subtitle">
+                        Обрано: @_bulkSelectedIds.Count, день: @BulkSelectedDayLabel()
+                    </div>
+                </div>
+                <button class="btn btn-ghost editor-close" type="button" @onclick="CloseBulkEdit">×</button>
+            </div>
+            <div class="editor-grid">
+                <div class="editor-field editor-field--wide">
+                    <label>Викладачі (можна кілька)</label>
+                    <div class="bulk-editor-teachers">
+                        @foreach (var teacher in _meta.Teachers.OrderBy(t => t.Name, StringComparer.CurrentCultureIgnoreCase))
+                        {
+                            var selected = _bulkTeacherIds.Contains(teacher.Id);
+                            <label class="bulk-editor-teacher-row">
+                                <input type="checkbox"
+                                       checked="@selected"
+                                       @onchange="(e) => ToggleBulkTeacher(e, teacher.Id)" />
+                                <span>@teacher.Name</span>
+                            </label>
+                        }
+                    </div>
+                    <div class="bulk-editor-actions">
+                        <button class="btn btn-ghost btn-sm" type="button" @onclick="SelectAllBulkTeachers">Обрати всіх</button>
+                        <button class="btn btn-ghost btn-sm" type="button" @onclick="ClearBulkTeachers">Очистити</button>
+                    </div>
+                    <div class="bulk-editor-hint">Порожній список означає: викладачів не змінювати.</div>
+                </div>
+                <div class="editor-field">
+                    <label>Аудиторія</label>
+                    <select class="select" @bind="_bulkRoomId">
+                        <option value="">Без змін</option>
+                        @foreach (var room in _meta.Rooms.OrderBy(r => r.Name, StringComparer.CurrentCultureIgnoreCase))
+                        {
+                            <option value="@room.Id">@room.Name</option>
+                        }
+                    </select>
+                </div>
+            </div>
+            <div class="editor-actions">
+                <button class="btn btn-primary" type="button" @onclick="ApplyBulkEditAsync" disabled="@_bulkApplying">
+                    @(_bulkApplying ? "Застосовую..." : "Застосувати")
+                </button>
+                <button class="btn btn-ghost" type="button" @onclick="CloseBulkEdit">Скасувати</button>
+            </div>
+        </div>
+    </div>
 }
 
 @if (_edit is not null && _meta is not null)
@@ -2274,6 +2615,11 @@ else
     .td-cell-body--dragging { opacity: .6; cursor: grabbing; }
     .td-cell-body--drop-free { box-shadow: inset 0 0 0 2px #10b981; }
     .td-cell-body--drop-swap { box-shadow: inset 0 0 0 2px #f97316; }
+    .td-cell-body--selected {
+        box-shadow: 0 0 0 2px #0ea5e9 inset;
+        outline: 2px solid #0ea5e9;
+        outline-offset: -2px;
+    }
     .td-cell-drag-handle {
         position: absolute;
         top: 6px;
@@ -2485,6 +2831,26 @@ else
     }
     .ck { display: inline-flex; align-items: center; gap: .4rem; }
     .editor-actions { margin-top: 10px; display: flex; gap: 8px; }
+    .bulk-editor { max-width: 820px; }
+    .bulk-editor-teachers {
+        max-height: 240px;
+        overflow: auto;
+        border: 1px solid #e2e8f0;
+        border-radius: 10px;
+        padding: 8px 10px;
+        background: #f8fafc;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+    }
+    .bulk-editor-teacher-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: .9rem;
+    }
+    .bulk-editor-actions { display: flex; gap: 8px; margin-top: 6px; }
+    .bulk-editor-hint { font-size: .78rem; color: #64748b; margin-top: 6px; }
     .extra-duplicates {
         margin-top: 16px;
         padding: 12px;
