@@ -36,7 +36,8 @@
     private DateOnly _weekStart = FirstMonday(DateOnly.FromDateTime(DateTime.Today));
     private List<TeacherDraftItemDto> _items = new();
     private List<TimeSlotDto> _slots = new();
-    private readonly List<ExtraDraftSelection> _extraAssignments = new();
+    private readonly List<ExtraGroupSelection> _extraGroups = new();
+    private readonly List<ExtraTeacherSelection> _extraTeachers = new();
     private readonly Dictionary<int, List<ModuleTopicViewDto>> _topicsCache = new();
     private readonly Dictionary<int, int?> _lessonTypeRoomCache = new();
     private List<ModuleTopicViewDto> TopicsForModule(int moduleId) => _topicsCache.TryGetValue(moduleId, out var list) ? list : new List<ModuleTopicViewDto>();
@@ -110,7 +111,8 @@
         await LoadConflictsAsync();
         _ok = _err = null;
         _edit = null;
-        _extraAssignments.Clear();
+        _extraGroups.Clear();
+        _extraTeachers.Clear();
         _topicsCache.Clear();
         _items = await DraftsApi.GetWeek(_weekStart, _teacherId);
         _warningReports.Clear();
@@ -500,12 +502,14 @@
         ApplyLessonType(_edit.LessonTypeId);
         ApplyTopicSelection(item.ModuleTopicId);
         EnsureAllowedLessonType();
-        _extraAssignments.Clear();
+        _extraGroups.Clear();
+        _extraTeachers.Clear();
     }
     // Готує форму створення нової чернетки з типовими значеннями.
     private async Task StartCreate(int dayNumber, string start, string end, int groupId)
     {
-        _extraAssignments.Clear();
+        _extraGroups.Clear();
+        _extraTeachers.Clear();
         if (_meta is null)
         {
             _err = "Метадані не завантажені для створення чернетки.";
@@ -950,43 +954,44 @@
             var slotRange = _edit.Id is null
                 ? ResolveSlotRange(payload.Date, payload.TimeStart, payload.TimeEnd)
                 : new List<SlotRow>();
-            var hasRange = _edit.Id is null && slotRange.Count > 1;
-            var hasExtras = _edit.Id is null && _extraAssignments.Count > 0;
+            var isNewDraft = _edit.Id is null;
+            var hasRange = isNewDraft && slotRange.Count > 1;
+            var extraGroupIds = isNewDraft
+                ? _extraGroups.Select(x => x.GroupId).Where(id => id is > 0).Select(id => id!.Value).Distinct().ToList()
+                : new List<int>();
+            var extraTeacherIds = isNewDraft
+                ? _extraTeachers.Select(x => x.TeacherId).Where(id => id is > 0).Select(id => id!.Value).Distinct().ToList()
+                : new List<int>();
+            var hasExtras = isNewDraft && (extraGroupIds.Count > 0 || extraTeacherIds.Count > 0);
             var resolvedBatchKey = (hasExtras || hasRange)
                 ? (payload.BatchKey ?? $"clone-{Guid.NewGuid():N}")
                 : payload.BatchKey;
             if (!hasRange)
             {
                 var primaryRequest = NormalizeRequest(payload with { BatchKey = resolvedBatchKey });
-                var id = await DraftsApi.Upsert(primaryRequest);
-                var cloneIds = new List<int>();
-                if (hasExtras && !string.IsNullOrWhiteSpace(resolvedBatchKey))
+                if (!isNewDraft)
                 {
-                    foreach (var extra in _extraAssignments.ToList())
-                    {
-                        var groupId = extra.GroupId ?? primaryRequest.GroupId;
-                        var teacherId = extra.TeacherId ?? primaryRequest.TeacherId;
-                        if (teacherId == primaryRequest.TeacherId && groupId == primaryRequest.GroupId)
-                        {
-                            continue;
-                        }
-                        var cloneRequest = NormalizeRequest(primaryRequest with
-                        {
-                            Id = null,
-                            GroupId = groupId,
-                            TeacherId = teacherId
-                        });
-                        var cloneId = await DraftsApi.Upsert(cloneRequest);
-                        cloneIds.Add(cloneId);
-                    }
+                    var id = await DraftsApi.Upsert(primaryRequest);
+                    _ok = $"Збережено (Id = {id}).";
                 }
-                var suffix = cloneIds.Count > 0 ? $" (+{cloneIds.Count} дубль.)" : string.Empty;
-                _ok = $"Збережено (Id = {id}){suffix}.";
+                else if (!hasExtras)
+                {
+                    var id = await DraftsApi.Upsert(primaryRequest);
+                    _ok = $"Збережено (Id = {id}).";
+                }
+                else
+                {
+                    var requests = BuildDuplicateRequests(primaryRequest, extraGroupIds, extraTeacherIds);
+                    var (primaryCount, totalCount) = await UpsertDuplicateRequestsAsync(requests, primaryRequest);
+                    var extraCount = totalCount - primaryCount;
+                    var suffix = extraCount > 0 ? $" (+{extraCount} дубль.)" : string.Empty;
+                    _ok = $"Збережено {primaryCount} пар{suffix}.";
+                }
             }
             else
             {
-                var createdIds = new List<int>();
-                var cloneIds = new List<int>();
+                var primaryCount = 0;
+                var totalCount = 0;
                 foreach (var slot in slotRange)
                 {
                     var slotRequest = NormalizeRequest(payload with
@@ -996,33 +1001,17 @@
                         TimeStart = slot.Start,
                         TimeEnd = slot.End
                     });
-                    var id = await DraftsApi.Upsert(slotRequest);
-                    createdIds.Add(id);
-                    if (hasExtras && !string.IsNullOrWhiteSpace(resolvedBatchKey))
-                    {
-                        foreach (var extra in _extraAssignments.ToList())
-                        {
-                            var groupId = extra.GroupId ?? slotRequest.GroupId;
-                            var teacherId = extra.TeacherId ?? slotRequest.TeacherId;
-                            if (teacherId == slotRequest.TeacherId && groupId == slotRequest.GroupId)
-                            {
-                                continue;
-                            }
-                            var cloneRequest = NormalizeRequest(slotRequest with
-                            {
-                                Id = null,
-                                GroupId = groupId,
-                                TeacherId = teacherId
-                            });
-                            var cloneId = await DraftsApi.Upsert(cloneRequest);
-                            cloneIds.Add(cloneId);
-                        }
-                    }
+                    var requests = BuildDuplicateRequests(slotRequest, extraGroupIds, extraTeacherIds);
+                    var result = await UpsertDuplicateRequestsAsync(requests, slotRequest);
+                    primaryCount += result.primaryCount;
+                    totalCount += result.totalCount;
                 }
-                var suffix = cloneIds.Count > 0 ? $" (+{cloneIds.Count} дубль.)" : string.Empty;
-                _ok = $"Збережено {createdIds.Count} пар{suffix}.";
+                var extraCount = totalCount - primaryCount;
+                var suffix = extraCount > 0 ? $" (+{extraCount} дубль.)" : string.Empty;
+                _ok = $"Збережено {primaryCount} пар{suffix}.";
             }
-            _extraAssignments.Clear();
+            _extraGroups.Clear();
+            _extraTeachers.Clear();
             await Reload();
         }
         catch (ApiErrorException ex)
@@ -1037,23 +1026,49 @@
     // Видаляє активну чернетку.
     private async Task DeleteEdit()
     {
-        if (_edit?.Id is not int id) { _err = "Виберіть чернетку для видалення."; return; }
-        await DeleteByIdAsync(id);
+        if (_edit?.Id is not int id)
+        {
+            _err = "Виберіть чернетку для видалення.";
+            return;
+        }
+        var item = _items.FirstOrDefault(x => x.Id == id);
+        if (item is null)
+        {
+            _err = $"Пара #{id} не знайдена у поточному списку.";
+            return;
+        }
+        await DeleteSlotAsync(item);
     }
     private async Task DeleteItemAsync(TeacherDraftItemDto item)
     {
-        await DeleteByIdAsync(item.Id);
+        await DeleteSlotAsync(item);
     }
-    private async Task DeleteByIdAsync(int id)
+    // Видаляє всі записи пари в межах слоту та групи.
+    private async Task DeleteSlotAsync(TeacherDraftItemDto item)
     {
-        var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити пару #{id}? Цю дію неможливо скасувати.");
+        var batch = CollectSlotItems(item);
+        if (batch.Count == 0)
+        {
+            _err = "Не знайдено записів для видалення.";
+            return;
+        }
+        var confirmText = batch.Count == 1
+            ? $"Видалити пару #{item.Id}? Цю дію неможливо скасувати."
+            : $"Видалити пару та всіх викладачів у цьому слоті? Буде видалено {batch.Count} записів. Цю дію неможливо скасувати.";
+        var confirmed = await JS.InvokeAsync<bool>("confirm", confirmText);
         if (!confirmed) return;
         try
         {
-            await DraftsApi.Delete(id, confirm: true, unrestricted: _unrestrictedMode);
-            _ok = $"Видалено (Id = {id}).";
+            foreach (var entry in batch)
+            {
+                await DraftsApi.Delete(entry.Id, confirm: true, unrestricted: _unrestrictedMode);
+            }
+            _ok = batch.Count == 1
+                ? $"Видалено (Id = {item.Id})."
+                : $"Видалено {batch.Count} записів цієї пари.";
             _edit = null;
-            _extraAssignments.Clear();
+            _extraGroups.Clear();
+            _extraTeachers.Clear();
             await Reload();
         }
         catch (ApiErrorException ex)
@@ -1065,6 +1080,23 @@
             _err = ex.Message;
         }
     }
+    // Збирає всі записи, що належать до однієї пари.
+    private List<TeacherDraftItemDto> CollectSlotItems(TeacherDraftItemDto item)
+        => _items
+            .Where(x => IsSameSlot(item, x))
+            .OrderBy(x => x.Id)
+            .ToList();
+    // Перевіряє, чи належать записи до одного слоту та групи.
+    private static bool IsSameSlot(TeacherDraftItemDto left, TeacherDraftItemDto right)
+        => left.Date == right.Date
+           && left.TimeStart == right.TimeStart
+           && left.TimeEnd == right.TimeEnd
+           && left.GroupId == right.GroupId
+           && left.ModuleId == right.ModuleId
+           && left.LessonTypeId == right.LessonTypeId
+           && left.RoomId == right.RoomId
+           && left.IsSelfStudy == right.IsSelfStudy
+           && left.ModuleTopicId == right.ModuleTopicId;
     // Узгоджене відображення помилок API та конфліктів.
     private async Task HandleApiError(ApiErrorException ex)
     {
@@ -1180,21 +1212,92 @@
     private void CancelEdit()
     {
         _edit = null;
-        _extraAssignments.Clear();
+        _extraGroups.Clear();
+        _extraTeachers.Clear();
     }
-    // Додає додаткове призначення для дублювання заняття.
-    private void AddExtraAssignment()
+    // Додає додаткову групу для дублювання заняття.
+    private void AddExtraGroup()
     {
-        _extraAssignments.Add(new ExtraDraftSelection());
+        _extraGroups.Add(new ExtraGroupSelection());
     }
-    private void RemoveExtraAssignment(ExtraDraftSelection item)
+    private void RemoveExtraGroup(ExtraGroupSelection item)
     {
-        _extraAssignments.Remove(item);
+        _extraGroups.Remove(item);
     }
-    private sealed class ExtraDraftSelection
+    // Додає додаткового викладача для всіх дубльованих груп.
+    private void AddExtraTeacher()
+    {
+        _extraTeachers.Add(new ExtraTeacherSelection());
+    }
+    private void RemoveExtraTeacher(ExtraTeacherSelection item)
+    {
+        _extraTeachers.Remove(item);
+    }
+    private sealed class ExtraGroupSelection
     {
         public int? GroupId { get; set; }
+    }
+    private sealed class ExtraTeacherSelection
+    {
         public int? TeacherId { get; set; }
+    }
+    // Формує список запитів для дублювання по групах і викладачах.
+    private List<DraftUpsertRequest> BuildDuplicateRequests(
+        DraftUpsertRequest baseRequest,
+        IReadOnlyCollection<int> extraGroupIds,
+        IReadOnlyCollection<int> extraTeacherIds)
+    {
+        var groupIds = new HashSet<int> { baseRequest.GroupId };
+        foreach (var gid in extraGroupIds)
+        {
+            if (gid > 0)
+            {
+                groupIds.Add(gid);
+            }
+        }
+        var teacherIds = new HashSet<int>(extraTeacherIds.Where(id => id > 0));
+        if (baseRequest.TeacherId is int primaryTeacherId)
+        {
+            teacherIds.Remove(primaryTeacherId);
+        }
+        var requests = new List<DraftUpsertRequest>();
+        foreach (var groupId in groupIds)
+        {
+            var primary = NormalizeRequest(baseRequest with { Id = null, GroupId = groupId });
+            requests.Add(primary);
+            foreach (var teacherId in teacherIds)
+            {
+                var extra = NormalizeRequest(primary with { Id = null, TeacherId = teacherId });
+                requests.Add(extra);
+            }
+        }
+        return requests;
+    }
+    // Зберігає підготовлені запити та рахує основні записи.
+    private async Task<(int primaryCount, int totalCount)> UpsertDuplicateRequestsAsync(
+        IReadOnlyList<DraftUpsertRequest> requests,
+        DraftUpsertRequest primaryTemplate)
+    {
+        var primaryCount = 0;
+        var totalCount = 0;
+        foreach (var request in requests)
+        {
+            await DraftsApi.Upsert(request);
+            totalCount++;
+            if (IsPrimaryRequest(request, primaryTemplate))
+            {
+                primaryCount++;
+            }
+        }
+        return (primaryCount, totalCount);
+    }
+    private static bool IsPrimaryRequest(DraftUpsertRequest request, DraftUpsertRequest primaryTemplate)
+    {
+        return request.GroupId == primaryTemplate.GroupId
+            && request.TeacherId == primaryTemplate.TeacherId
+            && request.Date == primaryTemplate.Date
+            && request.TimeStart == primaryTemplate.TimeStart
+            && request.TimeEnd == primaryTemplate.TimeEnd;
     }
     private static DateOnly FirstMonday(DateOnly d)
         => d.AddDays(-(((int)d.DayOfWeek + 6) % 7));
@@ -1751,41 +1854,63 @@ else
         {
             <div class="extra-duplicates">
                 <div class="extra-duplicates-header">Дублювання пари</div>
-                <p class="extra-duplicates-hint">Вкажіть додаткові групи та викладачів, щоб автоматично створити копії під час збереження.</p>
-                @if (_extraAssignments.Count == 0)
-                {
-                    <div class="extra-duplicates-empty">Додаткові дублікати не вибрані.</div>
-                }
-                @foreach (var extra in _extraAssignments)
-                {
-                    <div class="extra-duplicates-row" @key="extra">
-                        <div>
-                            <label>Обрати додаткову групу</label>
-                            <select class="select" @onchange="e => extra.GroupId = int.TryParse((string?)e.Value, out var g) ? g : (int?)null">
-                                <option value="">(не вибрано)</option>
-                                @foreach (var g in _meta.Groups)
-                                {
-                                    <option value="@g.Id" selected="@(@g.Id == extra.GroupId)">@g.Name</option>
-                                }
-                            </select>
-                        </div>
-                        <div>
-                            <label>Обрати додаткового вчителя</label>
-                            <select class="select" @onchange="e => extra.TeacherId = int.TryParse((string?)e.Value, out var t) ? t : (int?)null">
-                                <option value="">(залишити основного)</option>
-                                @foreach (var t in teacherOptions)
-                                {
-                                    <option value="@t.Id" selected="@(@t.Id == extra.TeacherId)">@t.Name</option>
-                                }
-                            </select>
-                        </div>
-                        <button type="button"
-                                class="btn btn-ghost extra-duplicates-remove"
-                                title="Прибрати дубль"
-                                @onclick="() => RemoveExtraAssignment(extra)">×</button>
+                <p class="extra-duplicates-hint">Оберіть додаткові групи та викладачів — вони будуть додані до всіх дубльованих пар разом з основним викладачем.</p>
+                <div class="extra-duplicates-grid">
+                    <div class="extra-duplicates-section">
+                        <div class="extra-duplicates-title">Додаткові групи</div>
+                        @if (_extraGroups.Count == 0)
+                        {
+                            <div class="extra-duplicates-empty">Додаткові групи не вибрані.</div>
+                        }
+                        @foreach (var extra in _extraGroups)
+                        {
+                            <div class="extra-duplicates-row" @key="extra">
+                                <div>
+                                    <label>Обрати додаткову групу</label>
+                                    <select class="select" @onchange="e => extra.GroupId = int.TryParse((string?)e.Value, out var g) ? g : (int?)null">
+                                        <option value="">(не вибрано)</option>
+                                        @foreach (var g in _meta.Groups)
+                                        {
+                                            <option value="@g.Id" selected="@(@g.Id == extra.GroupId)">@g.Name</option>
+                                        }
+                                    </select>
+                                </div>
+                                <button type="button"
+                                        class="btn btn-ghost extra-duplicates-remove"
+                                        title="Прибрати групу"
+                                        @onclick="() => RemoveExtraGroup(extra)">×</button>
+                            </div>
+                        }
+                        <button type="button" class="btn btn-secondary extra-duplicates-add" @onclick="AddExtraGroup">Додати групу</button>
                     </div>
-                }
-                <button type="button" class="btn btn-secondary extra-duplicates-add" @onclick="AddExtraAssignment">Додати дубль</button>
+                    <div class="extra-duplicates-section">
+                        <div class="extra-duplicates-title">Додаткові викладачі (для всіх груп)</div>
+                        @if (_extraTeachers.Count == 0)
+                        {
+                            <div class="extra-duplicates-empty">Додаткові викладачі не вибрані.</div>
+                        }
+                        @foreach (var extra in _extraTeachers)
+                        {
+                            <div class="extra-duplicates-row" @key="extra">
+                                <div>
+                                    <label>Обрати додаткового викладача</label>
+                                    <select class="select" @onchange="e => extra.TeacherId = int.TryParse((string?)e.Value, out var t) ? t : (int?)null">
+                                        <option value="">(не вибрано)</option>
+                                        @foreach (var t in teacherOptions)
+                                        {
+                                            <option value="@t.Id" selected="@(@t.Id == extra.TeacherId)">@t.Name</option>
+                                        }
+                                    </select>
+                                </div>
+                                <button type="button"
+                                        class="btn btn-ghost extra-duplicates-remove"
+                                        title="Прибрати викладача"
+                                        @onclick="() => RemoveExtraTeacher(extra)">×</button>
+                            </div>
+                        }
+                        <button type="button" class="btn btn-secondary extra-duplicates-add" @onclick="AddExtraTeacher">Додати викладача</button>
+                    </div>
+                </div>
             </div>
         }
         <div class="editor-actions">
@@ -2373,6 +2498,20 @@ else
     }
     .extra-duplicates-header { font-weight: 700; color: #1d4ed8; }
     .extra-duplicates-hint { margin: 0; font-size: .85rem; color: #475569; }
+    .extra-duplicates-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 12px;
+    }
+    .extra-duplicates-section {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+    }
+    .extra-duplicates-title {
+        font-weight: 600;
+        color: #334155;
+    }
     .extra-duplicates-empty {
         padding: 8px 12px;
         border-radius: 8px;
@@ -2382,7 +2521,7 @@ else
     }
     .extra-duplicates-row {
         display: grid;
-        grid-template-columns: repeat(2, minmax(180px, 1fr)) auto;
+        grid-template-columns: minmax(180px, 1fr) auto;
         gap: 8px;
         align-items: end;
     }

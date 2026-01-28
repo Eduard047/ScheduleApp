@@ -69,15 +69,11 @@ public sealed class TeacherDraftsQueryService
                 .ToDictionaryAsync(
                     x => x.Id,
                     x => (topicId: x.ModuleTopicId, topicCode: string.IsNullOrWhiteSpace(x.TopicCode) ? null : x.TopicCode!.Trim()));
-        // Формує ключ для групування пар з однаковими викладачами.
+        // Формує ключ для групування викладачів у межах одного слоту та групи.
         static string ResolveTeacherGroupKey(TeacherDraftItem item)
         {
-            if (!string.IsNullOrWhiteSpace(item.BatchKey))
-            {
-                return $"batch:{item.BatchKey}";
-            }
             var roomPart = item.RoomId.HasValue ? item.RoomId.Value.ToString() : "none";
-            return $"slot:{item.Date:yyyyMMdd}|{item.StartTime:HHmm}|{item.EndTime:HHmm}|m{item.ModuleId}|lt{item.LessonTypeId}|r{roomPart}";
+            return $"slot:{item.Date:yyyyMMdd}|{item.StartTime:HHmm}|{item.EndTime:HHmm}|g{item.GroupId}|m{item.ModuleId}|lt{item.LessonTypeId}|r{roomPart}";
         }
         var teacherGroups = items
             .GroupBy(ResolveTeacherGroupKey)
