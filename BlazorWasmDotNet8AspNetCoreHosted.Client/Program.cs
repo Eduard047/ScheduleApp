@@ -14,5 +14,6 @@ builder.Services.AddScoped<BlazorWasmDotNet8AspNetCoreHosted.Client.Services.Tim
 builder.Services.AddScoped<IAdminApi, AdminApi>();
 builder.Services.AddScoped<IScheduleApi, ScheduleApi>();
 builder.Services.AddScoped<ITeacherDraftsApi, TeacherDraftsApi>();
+builder.Services.AddScoped<AdminScheduleLogService>();
 
 await builder.Build().RunAsync();

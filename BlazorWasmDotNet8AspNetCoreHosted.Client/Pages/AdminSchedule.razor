@@ -12,6 +12,7 @@
 @inject IScheduleApi Api
 @inject ITeacherDraftsApi Drafts
 @inject IJSRuntime JS
+@inject AdminScheduleLogService LogService
 
 <style>
     .gap-detail-item {
@@ -488,6 +489,12 @@ else
     private const string AutoGenStatusLocalStorageKey = "adminSchedule.autoGenStatus.local.v1";
     private const string AutoGenConfigStorageKey = "adminSchedule.autoGenConfig.v1";
     private const string AutoGenConfigLocalStorageKey = "adminSchedule.autoGenConfig.local.v1";
+    private const int LogLessonLimit = 300;
+    private const string LogActionAutogen = "autogen-week";
+    private const string LogActionFill = "fill-week";
+    private const string LogActionClearDrafts = "clear-drafts-week";
+    private const string LogActionClearSchedule = "clear-schedule-week";
+    private const string LogActionDelete = "delete-item";
     private static readonly JsonSerializerOptions AutoGenStatusJsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -901,6 +908,7 @@ else
             var summary = $"Автогенерація тижня у чернетки (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}.";
             await SetOkMessageAsync(summary, res.Warnings, res.GapDetails);
             await LoadWeek();
+            await LogAutoGenAsync(summary, res, weekStart, courseId, courseName, moduleHours, softFill: false);
         }
         catch (ApiErrorException ex)
         {
@@ -947,6 +955,7 @@ else
             var summary = $"Заповнення порожніх слотів тижня (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}.";
             await SetOkMessageAsync(summary, res.Warnings, res.GapDetails);
             await LoadWeek();
+            await LogAutoGenAsync(summary, res, weekStart, courseId, courseName, moduleHours, softFill: true);
         }
         catch (ApiErrorException ex)
         {
@@ -972,7 +981,9 @@ else
                 WeekStart: monday
             ));
             await LoadWeek();
-            await SetOkMessageAsync($"Видалено {deleted} чернеток за поточний тиждень.");
+            var summary = $"Видалено {deleted} чернеток за поточний тиждень.";
+            await SetOkMessageAsync(summary);
+            await LogWeekClearAsync(LogActionClearDrafts, "Очищення чернеток", summary, monday);
         }
         catch (ApiErrorException ex)
         {
@@ -997,7 +1008,9 @@ else
             var deleted = await Api.ClearWeek(new ClearWeekRequest(
                 WeekStart: monday
             ));
-            await SetOkMessageAsync($"Видалено {deleted} записів з опублікованого розкладу.");
+            var summary = $"Видалено {deleted} записів з опублікованого розкладу.";
+            await SetOkMessageAsync(summary);
+            await LogWeekClearAsync(LogActionClearSchedule, "Очищення розкладу", summary, monday);
         }
         catch (ApiErrorException ex)
         {
@@ -1163,6 +1176,156 @@ else
         error = null;
         SyncCurrentConflict();
     }
+    private async Task LogAutoGenAsync(string summary, AutoGenResult res, DateOnly weekStart, int courseId, string courseName, Dictionary<int, int> moduleHours, bool softFill)
+    {
+        var lessons = BuildDraftLessonSnapshot(out var trimmed);
+        var entry = new AdminScheduleLogEntry(
+            Id: Guid.NewGuid().ToString("N"),
+            Timestamp: DateTimeOffset.Now,
+            ActionCode: softFill ? LogActionFill : LogActionAutogen,
+            ActionLabel: softFill ? "Заповнення порожніх слотів" : "Автогенерація (чернетки)",
+            Summary: summary,
+            Success: true,
+            Error: null,
+            WeekStart: weekStart.ToString("yyyy-MM-dd"),
+            WeekEnd: weekStart.AddDays(6).ToString("yyyy-MM-dd"),
+            DaysPreset: FormatWeekPreset(_daysPreset),
+            AllowDaysOff: AllowDaysOffForPreset(),
+            CourseId: courseId,
+            CourseName: courseName,
+            ModuleHours: BuildModuleHours(moduleHours),
+            Warnings: res.Warnings?.Where(w => !string.IsNullOrWhiteSpace(w)).ToList() ?? new List<string>(),
+            GapDetails: res.GapDetails?.ToList() ?? new List<AutoGenGapDetail>(),
+            Lessons: lessons,
+            LessonsTrimmed: trimmed
+        );
+        await TryWriteLogAsync(entry);
+    }
+    private async Task LogWeekClearAsync(string actionCode, string actionLabel, string summary, DateOnly weekStart)
+    {
+        var entry = new AdminScheduleLogEntry(
+            Id: Guid.NewGuid().ToString("N"),
+            Timestamp: DateTimeOffset.Now,
+            ActionCode: actionCode,
+            ActionLabel: actionLabel,
+            Summary: summary,
+            Success: true,
+            Error: null,
+            WeekStart: weekStart.ToString("yyyy-MM-dd"),
+            WeekEnd: weekStart.AddDays(6).ToString("yyyy-MM-dd"),
+            DaysPreset: null,
+            AllowDaysOff: null,
+            CourseId: _selectedCourseId,
+            CourseName: _selectedCourseId is int courseId
+                ? meta?.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}"
+                : null,
+            ModuleHours: new List<AdminScheduleLogModuleHours>(),
+            Warnings: new List<string>(),
+            GapDetails: new List<AutoGenGapDetail>(),
+            Lessons: new List<AdminScheduleLogLesson>(),
+            LessonsTrimmed: false
+        );
+        await TryWriteLogAsync(entry);
+    }
+    private async Task LogDeleteAsync(string summary, TableItem item)
+    {
+        var lesson = new AdminScheduleLogLesson(
+            Id: item.Id,
+            Date: item.Date.ToString("yyyy-MM-dd"),
+            TimeStart: item.TimeStart,
+            TimeEnd: item.TimeEnd,
+            Group: SafeValue(item.Group),
+            Module: SafeValue(item.Module),
+            Teacher: SafeValue(item.Teacher),
+            Room: SafeValue(item.Room),
+            LessonType: item.LessonTypeName,
+            Status: item.StatusText,
+            Source: item.SourceLabel
+        );
+        var entry = new AdminScheduleLogEntry(
+            Id: Guid.NewGuid().ToString("N"),
+            Timestamp: DateTimeOffset.Now,
+            ActionCode: LogActionDelete,
+            ActionLabel: "Видалення заняття",
+            Summary: summary,
+            Success: true,
+            Error: null,
+            WeekStart: GetMonday(item.Date).ToString("yyyy-MM-dd"),
+            WeekEnd: null,
+            DaysPreset: null,
+            AllowDaysOff: null,
+            CourseId: null,
+            CourseName: null,
+            ModuleHours: new List<AdminScheduleLogModuleHours>(),
+            Warnings: new List<string>(),
+            GapDetails: new List<AutoGenGapDetail>(),
+            Lessons: new List<AdminScheduleLogLesson> { lesson },
+            LessonsTrimmed: false
+        );
+        await TryWriteLogAsync(entry);
+    }
+    private async Task TryWriteLogAsync(AdminScheduleLogEntry entry)
+    {
+        try
+        {
+            await LogService.AddAsync(entry);
+        }
+        catch (Exception)
+        {
+        }
+    }
+    private List<AdminScheduleLogLesson> BuildDraftLessonSnapshot(out bool trimmed)
+    {
+        var ordered = draftItems
+            .OrderBy(x => x.Date)
+            .ThenBy(x => x.TimeStart)
+            .ToList();
+        trimmed = ordered.Count > LogLessonLimit;
+        return ordered
+            .Take(LogLessonLimit)
+            .Select(draft => new AdminScheduleLogLesson(
+                Id: draft.Id,
+                Date: draft.Date.ToString("yyyy-MM-dd"),
+                TimeStart: draft.TimeStart,
+                TimeEnd: draft.TimeEnd,
+                Group: SafeValue(draft.Group),
+                Module: SafeValue(draft.Module),
+                Teacher: SafeValue(draft.Teacher),
+                Room: SafeValue(draft.Room),
+                LessonType: draft.LessonTypeName,
+                Status: FormatDraftStatus(draft.Status),
+                Source: "Чернетка"
+            ))
+            .ToList();
+    }
+    private List<AdminScheduleLogModuleHours> BuildModuleHours(Dictionary<int, int> moduleHours)
+    {
+        if (moduleHours.Count == 0)
+        {
+            return new();
+        }
+        var result = new List<AdminScheduleLogModuleHours>();
+        foreach (var (moduleId, hours) in moduleHours)
+        {
+            var module = meta?.Modules.FirstOrDefault(m => m.Id == moduleId);
+            var label = module is null
+                ? $"#{moduleId}"
+                : $"{module.Code} — {module.Name}";
+            result.Add(new AdminScheduleLogModuleHours(moduleId, label, hours));
+        }
+        return result
+            .OrderBy(x => x.ModuleName)
+            .ToList();
+    }
+    private static string FormatWeekPreset(WeekPreset preset)
+        => preset switch
+        {
+            WeekPreset.MonFri => "Пн–Пт",
+            WeekPreset.MonSat => "Пн–Сб",
+            _ => "Пн–Нд"
+        };
+    private static string SafeValue(string? value)
+        => string.IsNullOrWhiteSpace(value) ? "-" : value;
     private void OpenEditor(TableItem item)
     {
         _editItem = item;
@@ -1206,7 +1369,9 @@ else
                 await Api.Delete(current.Id);
             }
             await LoadWeek();
-            await SetOkMessageAsync($"Видалено заняття #{current.Id}.", persist: false);
+            var summary = $"Видалено заняття #{current.Id}.";
+            await SetOkMessageAsync(summary, persist: false);
+            await LogDeleteAsync(summary, current);
             CloseEditor();
         }
         catch (ApiErrorException ex)
