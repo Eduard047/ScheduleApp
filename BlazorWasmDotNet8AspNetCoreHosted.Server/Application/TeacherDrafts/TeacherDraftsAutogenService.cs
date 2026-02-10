@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using Microsoft.AspNetCore.Mvc;
@@ -40,6 +41,8 @@ public sealed class TeacherDraftsAutogenService
         bool IsSelfStudy, // Ознака самостійної роботи.
         double Penalty, // Сумарний штраф за правилами.
         List<string> Notes); // Пояснення нарахованих штрафів.
+    private sealed record SequenceItem(int CourseId, int ModuleId, int GroupOrder, int Order);
+    private sealed record MainModuleGroup(int GroupOrder, List<int> ModuleIds);
     // Уніфіковані відповіді для API.
     private static ActionResult<AutoGenResult> Ok(AutoGenResult value) => new OkObjectResult(value);
     private static ActionResult<AutoGenResult> BadRequest(object value) => new BadRequestObjectResult(value);
@@ -662,11 +665,12 @@ public sealed class TeacherDraftsAutogenService
         var sequenceItems = await _db.ModuleSequenceItems
             .Where(x => courseIds.Contains(x.CourseId))
             .OrderBy(x => x.Order)
+            .Select(x => new SequenceItem(x.CourseId, x.ModuleId, x.GroupOrder, x.Order))
             .ToListAsync();
         // Мапа курс -> основна послідовність модулів.
         var mainSequenceByCourse = sequenceItems
             .GroupBy(x => x.CourseId)
-            .ToDictionary(g => g.Key, g => g.Select(x => x.ModuleId).ToList());
+            .ToDictionary(g => g.Key, g => g.ToList());
         // Мапа курс -> модулі-наповнювачі (filler).
         var fillerByCourse = await _db.ModuleFillers
             .Where(x => courseIds.Contains(x.CourseId))
@@ -678,16 +682,17 @@ public sealed class TeacherDraftsAutogenService
             var ordered = new List<int>();
             var seen = new HashSet<int>();
             var planSet = new HashSet<int>(planModules);
-            if (mainSequenceByCourse.TryGetValue(courseId, out var mainSequence))
+        if (mainSequenceByCourse.TryGetValue(courseId, out var mainSequence))
+        {
+            foreach (var entry in mainSequence)
             {
-                foreach (var mid in mainSequence)
+                var mid = entry.ModuleId;
+                if (planSet.Contains(mid) && seen.Add(mid))
                 {
-                    if (planSet.Contains(mid) && seen.Add(mid))
-                    {
-                        ordered.Add(mid);
-                    }
+                    ordered.Add(mid);
                 }
             }
+        }
             if (fillerByCourse.TryGetValue(courseId, out var fillerSet) && fillerSet.Count > 0)
             {
                 foreach (var mid in planModules)
@@ -880,21 +885,32 @@ public sealed class TeacherDraftsAutogenService
             // Обідня перерва для курсу або глобальна (якщо не задано для курсу).
             var groupLunch = lunchesAll.FirstOrDefault(l => l.CourseId == grp.CourseId)
                           ?? lunchesAll.FirstOrDefault(l => l.CourseId == null);
-            // Якщо для курсу є власні слоти - беремо їх, інакше беремо глобальні.
-            var hasCourseSlots = await _db.TimeSlots.AsNoTracking().AnyAsync(s => s.CourseId == grp.CourseId && s.IsActive);
-            var slots = await _db.TimeSlots.AsNoTracking()
-                .Where(s => s.IsActive && (hasCourseSlots ? s.CourseId == grp.CourseId : s.CourseId == null))
+            var allSlots = await _db.TimeSlots.AsNoTracking()
+                .Where(s => s.IsActive && (s.CourseId == grp.CourseId || s.CourseId == null))
                 .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
                 .ToListAsync();
-            if (slots.Count == 0)
+            if (allSlots.Count == 0)
             {
                 warnings.Add($"Не знайдено жодного слоту розкладу (глобального або для курсу {grp.Course.Name}). Група {grp.Name} пропущена.");
                 continue;
             }
-            // Індекс слоту за часом для швидкого пошуку сусідніх слотів.
-            var slotIndexByTime = slots
-                .Select((slot, index) => new { slot, index })
-                .ToDictionary(x => (x.slot.Start, x.slot.End), x => x.index);
+            var resolvedByDay = TimeSlotsResolver.ResolveForWeek(allSlots, grp.CourseId);
+            List<TimeSlot> slots = new();
+            Dictionary<(TimeOnly Start, TimeOnly End), int> slotIndexByTime = new();
+            void ApplySlotsForDate(DateOnly date)
+            {
+                var dayOfWeek = date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
+                if (!resolvedByDay.TryGetValue(dayOfWeek, out var resolved) || resolved.Slots.Count == 0)
+                {
+                    slots = new List<TimeSlot>();
+                    slotIndexByTime = new Dictionary<(TimeOnly, TimeOnly), int>();
+                    return;
+                }
+                slots = resolved.Slots;
+                slotIndexByTime = slots
+                    .Select((slot, index) => new { slot, index })
+                    .ToDictionary(x => (x.slot.Start, x.slot.End), x => x.index);
+            }
             // Перевіряє, чи слот уже зайнятий у групи.
             bool SlotFilled(DateOnly date, TimeSlot slot) =>
                 busy.Any(b => b.GroupId == grp.Id && b.Date == date && b.StartTime == slot.Start && b.EndTime == slot.End);
@@ -1156,19 +1172,21 @@ public sealed class TeacherDraftsAutogenService
                     .FirstOrDefaultAsync();
                 if (anyModuleId != 0)
                 {
-                    var candidateSlots = slots
-                        .Where(sl => sl.Start <= groupLunch.Start && groupLunch.End <= sl.End)
-                        .ToList();
-                    if (candidateSlots.Count == 0)
-                    {
-                        candidateSlots = slots
-                            .Where(sl => sl.Start < groupLunch.End && groupLunch.Start < sl.End)
-                            .ToList();
-                    }
                     for (int d = 0; d < 7; d++)
                     {
                         var date = weekStart.AddDays(d);
                         if (!IsWorking(date, grp)) continue;
+                        ApplySlotsForDate(date);
+                        if (slots.Count == 0) continue;
+                        var candidateSlots = slots
+                            .Where(sl => sl.Start <= groupLunch.Start && groupLunch.End <= sl.End)
+                            .ToList();
+                        if (candidateSlots.Count == 0)
+                        {
+                            candidateSlots = slots
+                                .Where(sl => sl.Start < groupLunch.End && groupLunch.Start < sl.End)
+                                .ToList();
+                        }
                         foreach (var slot in candidateSlots)
                         {
                             var s = slot.Start;
@@ -1215,12 +1233,49 @@ public sealed class TeacherDraftsAutogenService
                 : new HashSet<int>();
             var fillerModulesOrdered = fillerLookup.OrderBy(x => x).ToList();
             var mainModulesOrdered = orderedModules.Where(mid => !fillerLookup.Contains(mid)).ToList();
-            var firstMainModuleId = mainModulesOrdered.Count > 0 ? mainModulesOrdered[0] : 0;
+            var mainModuleSet = new HashSet<int>(mainModulesOrdered);
+            var groupOrderByModule = new Dictionary<int, int>();
+            int maxGroupOrder = 0;
+            if (mainSequenceByCourse.TryGetValue(grp.CourseId, out var mainSequence))
+            {
+                foreach (var entry in mainSequence)
+                {
+                    if (!mainModuleSet.Contains(entry.ModuleId))
+                    {
+                        continue;
+                    }
+                    if (groupOrderByModule.TryAdd(entry.ModuleId, entry.GroupOrder))
+                    {
+                        if (entry.GroupOrder > maxGroupOrder)
+                        {
+                            maxGroupOrder = entry.GroupOrder;
+                        }
+                    }
+                }
+            }
+            foreach (var mid in mainModulesOrdered)
+            {
+                if (!groupOrderByModule.ContainsKey(mid))
+                {
+                    maxGroupOrder++;
+                    groupOrderByModule[mid] = maxGroupOrder;
+                }
+            }
+            var mainGroupsOrdered = mainModulesOrdered
+                .GroupBy(mid => groupOrderByModule[mid])
+                .OrderBy(g => g.Key)
+                .Select(g => new MainModuleGroup(g.Key, g.ToList()))
+                .ToList();
+            var firstMainModuleId = mainGroupsOrdered.Count > 0 && mainGroupsOrdered[0].ModuleIds.Count > 0
+                ? mainGroupsOrdered[0].ModuleIds[0]
+                : 0;
             var hasCompletedMainModules = mainModulesOrdered.Any(mid =>
                 factMap.TryGetValue((grp.Id, mid), out var completed) && completed > 0);
             // Для першої генерації курсу фіксуємо старт із першого головного модуля.
             // Для першої генерації намагаємось стартувати з першого головного модуля.
-            bool forceFirstMainModule = firstMainModuleId != 0
+            bool forceFirstMainModule = mainGroupsOrdered.Count > 0
+                && mainGroupsOrdered[0].ModuleIds.Count == 1
+                && firstMainModuleId != 0
                 && !hasCompletedMainModules
                 && RemainingFor(grp.Id, firstMainModuleId) > 0;
             bool firstMainPlaced = !forceFirstMainModule;
@@ -1235,6 +1290,8 @@ public sealed class TeacherDraftsAutogenService
             }
             // Детемінований генератор для стабільного випадкового вибору.
             var groupRandom = new Random(HashCode.Combine(weekStart.DayNumber, grp.Id, grp.CourseId));
+            var sequenceRandom = new Random(HashCode.Combine(weekStart.DayNumber, grp.Id, grp.CourseId, 17));
+            int? lastPrimaryModuleId = null;
             // Лічильник використання аудиторій цією групою (для рівномірності).
             var groupRoomUsage = busy
                 .Where(b => b.GroupId == grp.Id && b.Date >= weekStart && b.Date < weekEnd && b.RoomId != null)
@@ -1279,23 +1336,6 @@ public sealed class TeacherDraftsAutogenService
                 if (teacherPrev is int tb && tb != room.BuildingId) score += 1.0;
                 return score;
             }
-            // Рахуємо, скільки занять уже виконано з основних модулів.
-            int CountCompletedPrimary()
-            {
-                int total = 0;
-                foreach (var mid in mainModulesOrdered)
-                {
-                    if (factMap.TryGetValue((grp.Id, mid), out var c))
-                    {
-                        total += c;
-                    }
-                }
-                return total;
-            }
-            // Індекс наступного модуля у циклі основних модулів.
-            int nextModuleIndex = mainModulesOrdered.Count > 0
-                ? CountCompletedPrimary() % mainModulesOrdered.Count
-                : 0;
             // Перевіряє, чи є альтернатива для слоту, якщо модуль не вдається поставити.
             bool HasAvailableAlternativeForSlot(int currentModuleId, DateOnly date, TimeOnly start, TimeOnly end)
             {
@@ -1390,6 +1430,43 @@ public sealed class TeacherDraftsAutogenService
                 var rest = list.Where(mid => !preferred.Contains(mid)).ToList();
                 return preferred.Concat(rest);
             }
+            List<int> BuildOrderedModulesForDay(DateOnly date)
+            {
+                var rng = new Random(HashCode.Combine(weekStart.DayNumber, grp.Id, grp.CourseId, date.DayNumber, 23));
+                var ordered = new List<int>();
+                var seen = new HashSet<int>();
+                foreach (var group in mainGroupsOrdered)
+                {
+                    var groupModules = group.ModuleIds.ToList();
+                    for (var i = groupModules.Count - 1; i > 0; i--)
+                    {
+                        var j = rng.Next(i + 1);
+                        (groupModules[i], groupModules[j]) = (groupModules[j], groupModules[i]);
+                    }
+                    foreach (var mid in groupModules)
+                    {
+                        if (seen.Add(mid))
+                        {
+                            ordered.Add(mid);
+                        }
+                    }
+                }
+                foreach (var mid in fillerModulesOrdered)
+                {
+                    if (seen.Add(mid))
+                    {
+                        ordered.Add(mid);
+                    }
+                }
+                foreach (var mid in orderedModules)
+                {
+                    if (seen.Add(mid))
+                    {
+                        ordered.Add(mid);
+                    }
+                }
+                return ordered;
+            }
             // Підбирає аудиторії, які підходять під обмеження модуля і місткість групи.
             List<Room> CandidateRoomsFor(int mid)
             {
@@ -1423,28 +1500,40 @@ public sealed class TeacherDraftsAutogenService
             // Визначає, який модуль вважаємо пріоритетним на поточний день.
             int? ResolvePrimaryModule()
             {
-                if (mainModulesOrdered.Count == 0) return null;
+                if (mainGroupsOrdered.Count == 0) return null;
                 if (forceFirstMainModule && !firstMainPlaced && RemainingFor(grp.Id, firstMainModuleId) > 0)
                 {
                     return firstMainModuleId;
                 }
-                var preferredPrimary = mainModulesOrdered
-                    .FirstOrDefault(mid => RemainingFor(grp.Id, mid) > 0 && !UsedLastWeek(grp.Id, mid));
-                if (preferredPrimary != 0)
+                var currentGroup = mainGroupsOrdered
+                    .FirstOrDefault(g => g.ModuleIds.Any(mid => RemainingFor(grp.Id, mid) > 0));
+                if (currentGroup is null)
                 {
-                    return preferredPrimary;
+                    return null;
                 }
-                for (int offset = 0; offset < mainModulesOrdered.Count; offset++)
+                var candidates = currentGroup.ModuleIds
+                    .Where(mid => RemainingFor(grp.Id, mid) > 0)
+                    .ToList();
+                if (candidates.Count == 0)
                 {
-                    var idx = (nextModuleIndex + offset) % mainModulesOrdered.Count;
-                    var moduleId = mainModulesOrdered[idx];
-                    if (RemainingFor(grp.Id, moduleId) <= 0)
+                    return null;
+                }
+                var preferred = candidates
+                    .Where(mid => !UsedLastWeek(grp.Id, mid))
+                    .ToList();
+                if (preferred.Count > 0)
+                {
+                    candidates = preferred;
+                }
+                if (lastPrimaryModuleId is int last && candidates.Count > 1)
+                {
+                    var filtered = candidates.Where(mid => mid != last).ToList();
+                    if (filtered.Count > 0)
                     {
-                        continue;
+                        candidates = filtered;
                     }
-                    return moduleId;
                 }
-                return null;
+                return candidates[sequenceRandom.Next(candidates.Count)];
             }
             // Основна спроба розмістити модуль у межах конкретного дня.
             async Task<bool> TryPlaceModuleAsync(int moduleId, DateOnly date, bool isPrimary, bool allowRepeatPreviousDay = false, bool allowExtraSameDay = false, bool relaxed = false, bool preferEarliestSlot = false)
@@ -1953,14 +2042,9 @@ public sealed class TeacherDraftsAutogenService
                     firstMainDate = date;
                     firstMainStart = startTime;
                 }
-                // Рухаємо індекс основних модулів у циклі.
-                if (isPrimary && mainModulesOrdered.Count > 0)
+                if (isPrimary)
                 {
-                    var currentIdx = mainModulesOrdered.FindIndex(mid => mid == moduleId);
-                    if (currentIdx >= 0)
-                    {
-                        nextModuleIndex = (currentIdx + 1) % mainModulesOrdered.Count;
-                    }
+                    lastPrimaryModuleId = moduleId;
                 }
                 // Додаємо нотатки з причинами штрафів.
                 if (best.Notes.Count > 0)
@@ -1975,13 +2059,15 @@ public sealed class TeacherDraftsAutogenService
             {
                 var date = weekStart.AddDays(d);
                 if (!IsWorking(date, grp)) continue;
+                ApplySlotsForDate(date);
                 int maxPerDay = slots.Count;
                 if (maxPerDay == 0) continue;
                 var modulesAttemptedToday = new HashSet<int>();
+                var orderedModulesForDay = BuildOrderedModulesForDay(date);
                 // Допоміжний прохід: заповнення залишків з різними рівнями послаблень.
                 async Task FillWithRemainingModulesAsync(bool allowRepeatPreviousDay = false, bool allowExtraSameDay = false, bool relaxed = false)
                 {
-                    foreach (var moduleId in PreferNotUsedLastWeek(orderedModules))
+                    foreach (var moduleId in PreferNotUsedLastWeek(orderedModulesForDay))
                     {
                         if (CountFor(grp.Id, date) >= maxPerDay)
                         {

@@ -44,18 +44,17 @@ public sealed class RulesService(AppDbContext db)
         var start = TimeOnly.Parse(r.TimeStart);
         var end = TimeOnly.Parse(r.TimeEnd);
         if (end <= start) errors.Add("Час завершення має бути більшим за час початку.");
+        var dayOfWeek = r.Date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
         if (group is not null)
         {
-            var hasCourseSlots = await db.TimeSlots.AnyAsync(s => s.CourseId == group.CourseId && s.IsActive);
-            var effectiveSlots = await db.TimeSlots.AsNoTracking()
-                .Where(s => s.IsActive && (hasCourseSlots ? s.CourseId == group.CourseId : s.CourseId == null))
-                .Select(s => new { s.Start, s.End })
-                .ToListAsync();
-            if (effectiveSlots.Count > 0 && !effectiveSlots.Any(s => s.Start == start && s.End == end))
+            var resolved = await TimeSlotsResolver.ResolveForDayAsync(db, group.CourseId, dayOfWeek);
+            var effectiveSlots = resolved.Slots
+                .Select(s => (s.Start, s.End))
+                .ToList();
+            if (effectiveSlots.Count > 0 && !IsSlotRangeAllowed(start, end, effectiveSlots))
                 errors.Add("Обраний часовий проміжок не входить до дозволених слотів.");
         }
-        var dow = r.Date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
-        bool isWeekend = dow is DayOfWeek.Saturday or DayOfWeek.Sunday;
+        bool isWeekend = dayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday;
         var courseId = group?.CourseId;
         var cal = await FindCalendarExceptionAsync(r.Date, courseId, r.GroupId);
         bool isWorking = cal?.IsWorkingDay ?? !isWeekend;
@@ -185,18 +184,17 @@ public sealed class RulesService(AppDbContext db)
         var end = TimeOnly.Parse(r.TimeEnd);
         if (end <= start)
             AddError("time-window-invalid", "Некоректний час", $"Час завершення {r.TimeEnd} не може бути меншим або рівним часу початку {r.TimeStart}.");
+        var dayOfWeek = r.Date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
         if (group is not null)
         {
-            var hasCourseSlots = await db.TimeSlots.AnyAsync(s => s.CourseId == group.CourseId && s.IsActive);
-            var effectiveSlots = await db.TimeSlots.AsNoTracking()
-                .Where(s => s.IsActive && (hasCourseSlots ? s.CourseId == group.CourseId : s.CourseId == null))
-                .Select(s => new { s.Start, s.End })
-                .ToListAsync();
-            if (effectiveSlots.Count > 0 && !effectiveSlots.Any(s => s.Start == start && s.End == end))
+            var resolved = await TimeSlotsResolver.ResolveForDayAsync(db, group.CourseId, dayOfWeek);
+            var effectiveSlots = resolved.Slots
+                .Select(s => (s.Start, s.End))
+                .ToList();
+            if (effectiveSlots.Count > 0 && !IsSlotRangeAllowed(start, end, effectiveSlots))
                 AddError("slot-not-allowed", "Недозволений слот", $"Проміжок {r.TimeStart}-{r.TimeEnd} відсутній серед дозволених для курсу {group.Course.Name}.");
         }
-        var dow = r.Date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
-        bool isWeekend = dow is DayOfWeek.Saturday or DayOfWeek.Sunday;
+        bool isWeekend = dayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday;
         var courseId = group?.CourseId;
         var cal = await FindCalendarExceptionAsync(r.Date, courseId, r.GroupId);
         bool isWorking = cal?.IsWorkingDay ?? !isWeekend;
@@ -317,20 +315,33 @@ public sealed class RulesService(AppDbContext db)
         }
         if (requiresTeacher && r.TeacherId is int tWin)
         {
-            var dayEnum = r.Date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
             var windows = await db.TeacherWorkingHours
-                .Where(w => w.TeacherId == tWin && w.DayOfWeek == dayEnum)
+                .Where(w => w.TeacherId == tWin && w.DayOfWeek == dayOfWeek)
                 .Select(w => new { w.Start, w.End })
                 .ToListAsync();
             if (windows.Count > 0)
             {
                 bool fits = windows.Any(w => w.Start <= start && end <= w.End);
                 if (!fits)
-                    AddWarning("teacher-working-hours", "Поза робочими годинами", $"Інтервал {r.TimeStart}-{r.TimeEnd} виходить за межі робочих годин викладача для {dayEnum}.");
+                    AddWarning("teacher-working-hours", "Поза робочими годинами", $"Інтервал {r.TimeStart}-{r.TimeEnd} виходить за межі робочих годин викладача для {dayOfWeek}.");
             }
         }
         var report = new DraftValidationReportDto(DateTimeOffset.UtcNow, issues);
         return new DraftValidationResult(errors, warnings, report);
+    }
+    // Дозволяє проміжок, що складається з послідовних слотів за порядком.
+    private static bool IsSlotRangeAllowed(TimeOnly start, TimeOnly end, List<(TimeOnly Start, TimeOnly End)> slots)
+    {
+        if (slots.Count == 0) return true;
+        for (var i = 0; i < slots.Count; i++)
+        {
+            if (slots[i].Start != start) continue;
+            for (var j = i; j < slots.Count; j++)
+            {
+                if (slots[j].End == end) return true;
+            }
+        }
+        return false;
     }
     // Повертає найточніший календарний виняток для дати/курсу/групи.
     private async Task<CalendarException?> FindCalendarExceptionAsync(DateOnly date, int? courseId, int? groupId)

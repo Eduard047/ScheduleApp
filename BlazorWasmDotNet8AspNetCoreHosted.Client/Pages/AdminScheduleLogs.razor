@@ -1,0 +1,589 @@
+@* Журнал змін для адмінського розкладу *@
+@using System.Globalization
+@using System.Linq
+@using BlazorWasmDotNet8AspNetCoreHosted.Client.Services
+@using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
+@inject AdminScheduleLogService LogService
+@inject IJSRuntime JS
+
+<style>
+    .log-toolbar {
+        display: flex;
+        flex-direction: column;
+        gap: .75rem;
+    }
+    .log-toolbar-row {
+        display: grid;
+        gap: .75rem;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        align-items: end;
+    }
+    .log-header {
+        display: flex;
+        flex-direction: column;
+        gap: .25rem;
+    }
+    .log-meta {
+        font-size: .85rem;
+        color: #475569;
+    }
+    .log-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: .5rem;
+    }
+    .log-actions .btn {
+        white-space: nowrap;
+    }
+    .log-day-title {
+        font-weight: 600;
+        color: #0f172a;
+    }
+    .log-entry {
+        border: 1px solid rgba(148, 163, 184, 0.4);
+        border-radius: 12px;
+    }
+    .log-entry .badge {
+        font-size: .7rem;
+    }
+    .log-details {
+        border-top: 1px dashed rgba(100, 116, 139, 0.4);
+        margin-top: .75rem;
+        padding-top: .75rem;
+    }
+    .log-details .detail-title {
+        font-weight: 600;
+        margin-bottom: .35rem;
+    }
+    .log-chip {
+        background: rgba(59, 130, 246, 0.08);
+        color: #1d4ed8;
+        border-radius: 999px;
+        padding: .15rem .6rem;
+        font-size: .75rem;
+    }
+    .log-list {
+        list-style: none;
+        padding-left: 0;
+        margin-bottom: 0;
+    }
+    .log-list li {
+        padding: .25rem 0;
+        border-bottom: 1px solid rgba(203, 213, 225, 0.4);
+    }
+    .log-list li:last-child {
+        border-bottom: none;
+    }
+    .log-table th {
+        font-size: .75rem;
+        text-transform: uppercase;
+        letter-spacing: .02em;
+    }
+    .log-compact-note {
+        font-size: .8rem;
+        color: #64748b;
+    }
+    .log-issue-list {
+        list-style: none;
+        padding-left: 0;
+        margin-bottom: 0;
+    }
+    .log-issue-item {
+        display: flex;
+        gap: .6rem;
+        align-items: flex-start;
+        padding: .35rem 0;
+        border-bottom: 1px dashed rgba(148, 163, 184, 0.5);
+    }
+    .log-issue-item:last-child {
+        border-bottom: none;
+    }
+    .log-issue-badge {
+        font-size: .65rem;
+        text-transform: uppercase;
+        letter-spacing: .03em;
+        padding: .15rem .45rem;
+        border-radius: 999px;
+        white-space: nowrap;
+        font-weight: 600;
+    }
+    .issue-warning .log-issue-badge {
+        background: rgba(251, 191, 36, 0.2);
+        color: #92400e;
+    }
+    .issue-gap .log-issue-badge {
+        background: rgba(248, 113, 113, 0.16);
+        color: #991b1b;
+    }
+    .log-issue-muted {
+        color: #64748b;
+        font-size: .85em;
+        margin-top: .1rem;
+    }
+</style>
+
+@page "/admin/schedule-logs"
+
+<h3 class="mb-3">Журнал змін розкладу</h3>
+
+<div class="card p-3 mb-3">
+    <div class="log-toolbar">
+        <div class="d-flex flex-column flex-md-row justify-content-between align-items-start align-items-md-center gap-2">
+            <div class="log-header">
+                <div class="fw-semibold">Фільтри</div>
+                <div class="log-compact-note">Журнал зберігається локально у браузері цього робочого місця.</div>
+            </div>
+            <div class="d-flex gap-2">
+                <button class="btn btn-outline-secondary" @onclick="ReloadAsync">Оновити</button>
+                <button class="btn btn-outline-danger" @onclick="ClearLogsAsync" disabled="@(!_entries.Any())">Очистити</button>
+            </div>
+        </div>
+        <div class="log-toolbar-row">
+            <div>
+                <label class="form-label">Дата від</label>
+                <input type="date"
+                       class="form-control"
+                       value="@FormatDate(_fromDate)"
+                       @onchange="OnFromChanged" />
+            </div>
+            <div>
+                <label class="form-label">Дата до</label>
+                <input type="date"
+                       class="form-control"
+                       value="@FormatDate(_toDate)"
+                       @onchange="OnToChanged" />
+            </div>
+            <div style="min-width: 220px;">
+                <label class="form-label">Пошук</label>
+                <input class="form-control"
+                       placeholder="Курс, група, викладач, модуль, причина..."
+                       @bind="_search"
+                       @bind:event="oninput" />
+            </div>
+            <div class="d-flex align-items-end">
+                <button class="btn btn-outline-primary w-100" type="button" data-bs-toggle="collapse" data-bs-target="#logFiltersCollapse">
+                    Розширені фільтри
+                </button>
+            </div>
+        </div>
+        <div class="collapse" id="logFiltersCollapse">
+            <div class="mt-3">
+                <div class="d-flex align-items-center justify-content-between">
+                    <div class="fw-semibold">Типи дій</div>
+                    <button class="btn btn-sm btn-outline-secondary" @onclick="ClearActionFilters" disabled="@(_selectedActions.Count == 0)">Скинути</button>
+                </div>
+                <div class="log-actions mt-2">
+                    @foreach (var filter in ActionFilters)
+                    {
+                        <button class="btn btn-sm @(IsActionSelected(filter.Code) ? "btn-primary" : "btn-outline-primary")"
+                                @onclick="() => ToggleAction(filter.Code)">
+                            @filter.Label (@filter.Count)
+                        </button>
+                    }
+                    @if (!ActionFilters.Any())
+                    {
+                        <div class="text-muted small">Поки що немає записів.</div>
+                    }
+                </div>
+            </div>
+            <div class="form-check mt-3">
+                <input class="form-check-input" type="checkbox" id="onlyErrors" @bind="_onlyErrors" />
+                <label class="form-check-label" for="onlyErrors">Показувати лише записи з помилками</label>
+            </div>
+        </div>
+    </div>
+</div>
+
+@if (_loading)
+{
+    <div>Завантаження...</div>
+}
+else
+{
+    var filtered = FilteredEntries.ToList();
+    if (filtered.Count == 0)
+    {
+        <div class="alert alert-secondary">Немає записів для вибраних фільтрів.</div>
+    }
+    else
+    {
+        <div class="d-flex flex-column flex-md-row justify-content-between align-items-start align-items-md-center gap-2 mb-2">
+            <div class="small text-muted">Показано @filtered.Count із @_entries.Count записів.</div>
+            <button class="btn btn-sm btn-outline-primary" @onclick="ToggleAllDetails">
+                @(_expandedAll ? "Згорнути всі" : "Розгорнути всі")
+            </button>
+        </div>
+        @foreach (var group in GroupByDay(filtered))
+        {
+            <div class="mb-3">
+                <div class="log-day-title">@group.Key.ToString("dd.MM.yyyy", CultureInfo.InvariantCulture)
+                    <span class="text-muted small ms-2">@group.Count() записів</span>
+                </div>
+                <div class="d-flex flex-column gap-2 mt-2">
+                    @foreach (var entry in group)
+                    {
+                        var isExpanded = _expanded.Contains(entry.Id);
+                        <div class="card log-entry">
+                            <div class="card-body">
+                                <div class="d-flex flex-column flex-md-row justify-content-between align-items-start gap-3">
+                                    <div>
+                                        <div class="fw-semibold">@entry.ActionLabel</div>
+                                        <div class="text-muted small">@entry.Summary</div>
+                                        <div class="log-meta">@entry.Timestamp.ToLocalTime().ToString("dd.MM.yyyy HH:mm")</div>
+                                        @if (!string.IsNullOrWhiteSpace(entry.CourseName))
+                                        {
+                                            <div class="mt-1 log-chip">Курс: @entry.CourseName</div>
+                                        }
+                                    </div>
+                                    <div class="text-md-end d-flex flex-column gap-2">
+                                        <span class="badge @(entry.Success ? "bg-success" : "bg-danger")">@(entry.Success ? "Успіх" : "Помилка")</span>
+                                        <button class="btn btn-sm btn-outline-secondary" @onclick="() => ToggleDetails(entry.Id)">
+                                            @(isExpanded ? "Згорнути" : "Деталі")
+                                        </button>
+                                    </div>
+                                </div>
+                                @if (!entry.Success && !string.IsNullOrWhiteSpace(entry.Error))
+                                {
+                                    <div class="alert alert-danger mt-2 mb-0">@entry.Error</div>
+                                }
+                                @if (isExpanded)
+                                {
+                                    <div class="log-details">
+                                        <div class="row g-3 small">
+                                            <div class="col-12 col-lg-4">
+                                                <div class="detail-title">Діапазон</div>
+                                                <div>@FormatWeek(entry)</div>
+                                                @if (!string.IsNullOrWhiteSpace(entry.DaysPreset))
+                                                {
+                                                    <div>Дні: @entry.DaysPreset</div>
+                                                }
+                                                @if (entry.AllowDaysOff is not null)
+                                                {
+                                                    <div>Вихідні: @(entry.AllowDaysOff.Value ? "дозволено" : "заборонено")</div>
+                                                }
+                                            </div>
+                                            <div class="col-12 col-lg-4">
+                                                <div class="detail-title">Модулі та години</div>
+                                                @if (entry.ModuleHours.Count == 0)
+                                                {
+                                                    <div class="text-muted">Немає даних.</div>
+                                                }
+                                                else
+                                                {
+                                                    <ul class="log-list">
+                                                        @foreach (var module in entry.ModuleHours)
+                                                        {
+                                                            <li>@module.ModuleName — @module.Hours год.</li>
+                                                        }
+                                                    </ul>
+                                                }
+                                            </div>
+                                            <div class="col-12 col-lg-4">
+                                                <div class="detail-title">Проблеми</div>
+                                                @if (entry.Warnings.Count == 0 && entry.GapDetails.Count == 0)
+                                                {
+                                                    <div class="text-muted">Немає попереджень або пропусків.</div>
+                                                }
+                                                else
+                                                {
+                                                    <ul class="log-issue-list">
+                                                        @foreach (var warn in entry.Warnings)
+                                                        {
+                                                            <li class="log-issue-item issue-warning">
+                                                                <span class="log-issue-badge">Попередження</span>
+                                                                <div>@warn</div>
+                                                            </li>
+                                                        }
+                                                        @foreach (var gap in entry.GapDetails)
+                                                        {
+                                                            <li class="log-issue-item issue-gap">
+                                                                <span class="log-issue-badge">Слот</span>
+                                                                <div>
+                                                                    <div>@gap.GroupName — @gap.Date.ToString("dd.MM.yyyy") @gap.Start.ToString("HH:mm")–@gap.End.ToString("HH:mm") (@gap.SlotLabel)</div>
+                                                                    @if (!string.IsNullOrWhiteSpace(gap.Reason))
+                                                                    {
+                                                                        <div class="log-issue-muted">Причина: @gap.Reason</div>
+                                                                    }
+                                                                </div>
+                                                            </li>
+                                                        }
+                                                    </ul>
+                                                }
+                                            </div>
+                                        </div>
+                                        @if (entry.Lessons.Count > 0)
+                                        {
+                                            <div class="mt-3">
+                                                <div class="detail-title">Заняття</div>
+                                                @if (entry.LessonsTrimmed)
+                                                {
+                                                    <div class="text-muted small">Показано перші @entry.Lessons.Count записів.</div>
+                                                }
+                                                <div class="table-responsive mt-2">
+                                                    <table class="table table-sm align-middle log-table">
+                                                        <thead>
+                                                            <tr>
+                                                                <th>Дата</th>
+                                                                <th>Час</th>
+                                                                <th>Група</th>
+                                                                <th>Модуль</th>
+                                                                <th>Викладач</th>
+                                                                <th>Аудиторія</th>
+                                                                <th>Тип</th>
+                                                                <th>Статус</th>
+                                                                <th>Джерело</th>
+                                                            </tr>
+                                                        </thead>
+                                                        <tbody>
+                                                            @foreach (var lesson in entry.Lessons)
+                                                            {
+                                                                <tr>
+                                                                    <td>@lesson.Date</td>
+                                                                    <td>@lesson.TimeStart-@lesson.TimeEnd</td>
+                                                                    <td>@lesson.Group</td>
+                                                                    <td>@lesson.Module</td>
+                                                                    <td>@lesson.Teacher</td>
+                                                                    <td>@lesson.Room</td>
+                                                                    <td>@lesson.LessonType</td>
+                                                                    <td>@lesson.Status</td>
+                                                                    <td>@lesson.Source</td>
+                                                                </tr>
+                                                            }
+                                                        </tbody>
+                                                    </table>
+                                                </div>
+                                            </div>
+                                        }
+                                    </div>
+                                }
+                            </div>
+                        </div>
+                    }
+                </div>
+            </div>
+        }
+    }
+}
+
+@code
+{
+    private readonly List<AdminScheduleLogEntry> _entries = new();
+    private string _search = string.Empty;
+    private DateOnly? _fromDate;
+    private DateOnly? _toDate;
+    private bool _onlyErrors;
+    private bool _loading = true;
+    private bool _expandedAll;
+    private readonly HashSet<string> _selectedActions = new();
+    private readonly HashSet<string> _expanded = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        await ReloadAsync();
+        _loading = false;
+    }
+
+    private async Task ReloadAsync()
+    {
+        _entries.Clear();
+        _entries.AddRange(await LogService.LoadAsync());
+    }
+
+    private IEnumerable<AdminScheduleLogEntry> FilteredEntries
+    {
+        get
+        {
+            IEnumerable<AdminScheduleLogEntry> seq = _entries;
+            if (_fromDate is DateOnly from)
+            {
+                seq = seq.Where(entry => GetLocalDate(entry) >= from);
+            }
+            if (_toDate is DateOnly to)
+            {
+                seq = seq.Where(entry => GetLocalDate(entry) <= to);
+            }
+            if (_selectedActions.Count > 0)
+            {
+                seq = seq.Where(entry => _selectedActions.Contains(entry.ActionCode));
+            }
+            if (_onlyErrors)
+            {
+                seq = seq.Where(entry => !entry.Success);
+            }
+            if (!string.IsNullOrWhiteSpace(_search))
+            {
+                seq = seq.Where(entry => MatchesSearch(entry, _search));
+            }
+            return seq
+                .OrderByDescending(entry => entry.Timestamp);
+        }
+    }
+
+    private IEnumerable<LogActionFilter> ActionFilters
+        => _entries
+            .GroupBy(entry => entry.ActionCode)
+            .Select(group => new LogActionFilter(
+                Code: group.Key,
+                Label: group.First().ActionLabel,
+                Count: group.Count()))
+            .OrderByDescending(filter => filter.Count)
+            .ThenBy(filter => filter.Label)
+            .ToList();
+
+    private IEnumerable<IGrouping<DateOnly, AdminScheduleLogEntry>> GroupByDay(IEnumerable<AdminScheduleLogEntry> entries)
+        => entries
+            .GroupBy(entry => GetLocalDate(entry))
+            .OrderByDescending(group => group.Key);
+
+    private void ToggleAction(string code)
+    {
+        if (!_selectedActions.Add(code))
+        {
+            _selectedActions.Remove(code);
+        }
+    }
+
+    private void ClearActionFilters()
+    {
+        _selectedActions.Clear();
+    }
+
+    private bool IsActionSelected(string code)
+        => _selectedActions.Count == 0 || _selectedActions.Contains(code);
+
+    private void ToggleDetails(string id)
+    {
+        if (!_expanded.Add(id))
+        {
+            _expanded.Remove(id);
+        }
+    }
+
+    private void ToggleAllDetails()
+    {
+        _expandedAll = !_expandedAll;
+        _expanded.Clear();
+        if (_expandedAll)
+        {
+            foreach (var entry in FilteredEntries)
+            {
+                _expanded.Add(entry.Id);
+            }
+        }
+    }
+
+    private async Task ClearLogsAsync()
+    {
+        var confirm = await JS.InvokeAsync<bool>("confirm", "Очистити журнал змін? Дію не можна скасувати.");
+        if (!confirm)
+        {
+            return;
+        }
+        await LogService.ClearAsync();
+        _entries.Clear();
+    }
+
+    private static string FormatDate(DateOnly? date)
+        => date?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) ?? string.Empty;
+
+    private void OnFromChanged(ChangeEventArgs args)
+    {
+        if (DateOnly.TryParse(args.Value?.ToString(), out var value))
+        {
+            _fromDate = value;
+        }
+        else
+        {
+            _fromDate = null;
+        }
+    }
+
+    private void OnToChanged(ChangeEventArgs args)
+    {
+        if (DateOnly.TryParse(args.Value?.ToString(), out var value))
+        {
+            _toDate = value;
+        }
+        else
+        {
+            _toDate = null;
+        }
+    }
+
+    private static DateOnly GetLocalDate(AdminScheduleLogEntry entry)
+        => DateOnly.FromDateTime(entry.Timestamp.ToLocalTime().DateTime);
+
+    private static bool MatchesSearch(AdminScheduleLogEntry entry, string raw)
+    {
+        var needle = raw.Trim();
+        if (needle.Length == 0)
+        {
+            return true;
+        }
+        if (Contains(entry.ActionLabel, needle) || Contains(entry.Summary, needle) || Contains(entry.CourseName, needle))
+        {
+            return true;
+        }
+        if (Contains(entry.WeekStart, needle) || Contains(entry.WeekEnd, needle) || Contains(entry.DaysPreset, needle))
+        {
+            return true;
+        }
+        if (entry.Warnings.Any(warn => Contains(warn, needle)))
+        {
+            return true;
+        }
+        if (entry.GapDetails.Any(gap => Contains(gap.GroupName, needle) || Contains(gap.SlotLabel, needle) || Contains(gap.Reason, needle)))
+        {
+            return true;
+        }
+        if (entry.ModuleHours.Any(module => Contains(module.ModuleName, needle)))
+        {
+            return true;
+        }
+        if (entry.Lessons.Any(lesson =>
+                Contains(lesson.Group, needle)
+                || Contains(lesson.Module, needle)
+                || Contains(lesson.Teacher, needle)
+                || Contains(lesson.Room, needle)
+                || Contains(lesson.LessonType, needle)
+                || Contains(lesson.Status, needle)
+                || Contains(lesson.Source, needle)
+                || Contains(lesson.Date, needle)))
+        {
+            return true;
+        }
+        return Contains(entry.Error, needle);
+    }
+
+    private static bool Contains(string? value, string needle)
+        => !string.IsNullOrWhiteSpace(value)
+           && value.Contains(needle, StringComparison.OrdinalIgnoreCase);
+
+    private static string FormatWeek(AdminScheduleLogEntry entry)
+    {
+        var start = TryFormatDate(entry.WeekStart);
+        var end = TryFormatDate(entry.WeekEnd);
+        if (!string.IsNullOrWhiteSpace(start) && !string.IsNullOrWhiteSpace(end))
+        {
+            return $"Тиждень: {start} – {end}";
+        }
+        if (!string.IsNullOrWhiteSpace(start))
+        {
+            return $"Дата: {start}";
+        }
+        return "-";
+    }
+
+    private static string? TryFormatDate(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+        return DateOnly.TryParse(value, out var date)
+            ? date.ToString("dd.MM.yyyy", CultureInfo.InvariantCulture)
+            : value;
+    }
+
+    private sealed record LogActionFilter(string Code, string Label, int Count);
+}

@@ -179,14 +179,15 @@ public class ScheduleController : ControllerBase
         var sequenceItems = await _db.ModuleSequenceItems
             .Where(x => x.CourseId == groupInfo.CourseId)
             .OrderBy(x => x.Order)
-            .Select(x => new { x.ModuleId, x.Order })
+            .Select(x => new { x.ModuleId, x.Order, x.GroupOrder })
             .ToListAsync();
         var currentSequence = sequenceItems.FirstOrDefault(x => x.ModuleId == source.ModuleId);
         if (currentSequence is not null)
         {
             var predecessors = sequenceItems
-                .Where(x => x.Order < currentSequence.Order)
+                .Where(x => x.GroupOrder < currentSequence.GroupOrder)
                 .Select(x => x.ModuleId)
+                .Distinct()
                 .ToList();
             if (predecessors.Count > 0)
             {
@@ -207,28 +208,23 @@ public class ScheduleController : ControllerBase
                 }
             }
         }
-        var hasCourseSlots = await _db.TimeSlots.AsNoTracking().AnyAsync(s => s.IsActive && s.CourseId == groupInfo.CourseId);
-        var effectiveSlots = await _db.TimeSlots.AsNoTracking()
-            .Where(s => s.IsActive && (hasCourseSlots ? s.CourseId == groupInfo.CourseId : s.CourseId == null))
-            .OrderBy(s => s.SortOrder)
-            .ThenBy(s => s.Start)
-            .Select(s => new { s.Start, s.End })
-            .ToListAsync();
-        var candidateSlots = new List<(TimeOnly Start, TimeOnly End)> { (originalStart, originalEnd) };
-        foreach (var slot in effectiveSlots)
-        {
-            if (slot.Start == originalStart && slot.End == originalEnd) continue;
-            if (candidateSlots.Contains((slot.Start, slot.End))) continue;
-            candidateSlots.Add((slot.Start, slot.End));
-        }
-        if (candidateSlots.Count == 0)
-        {
-            candidateSlots.Add((originalStart, originalEnd));
-        }
         const int daySearchHorizon = 7; 
         for (int offset = 0; offset < daySearchHorizon; offset++)
         {
             var candidate = nextWeekStart.AddDays(offset);
+            var dayOfWeek = candidate.ToDateTime(TimeOnly.MinValue).DayOfWeek;
+            var resolvedSlots = await TimeSlotsResolver.ResolveForDayAsync(_db, groupInfo.CourseId, dayOfWeek);
+            var candidateSlots = new List<(TimeOnly Start, TimeOnly End)> { (originalStart, originalEnd) };
+            foreach (var slot in resolvedSlots.Slots)
+            {
+                if (slot.Start == originalStart && slot.End == originalEnd) continue;
+                if (candidateSlots.Contains((slot.Start, slot.End))) continue;
+                candidateSlots.Add((slot.Start, slot.End));
+            }
+            if (candidateSlots.Count == 0)
+            {
+                candidateSlots.Add((originalStart, originalEnd));
+            }
             foreach (var (slotStart, slotEnd) in candidateSlots)
             {
                 var candidateMoment = candidate.ToDateTime(slotStart);

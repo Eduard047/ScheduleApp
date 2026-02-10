@@ -32,7 +32,8 @@ public sealed class AdminModuleSequenceController(AppDbContext db) : ControllerB
                 x.ModuleId,
                 x.Module.Code,
                 x.Module.Title,
-                x.Order))
+                x.Order,
+                x.GroupOrder))
             .ToListAsync();
         var fillers = await db.ModuleFillers
             .AsNoTracking()
@@ -58,19 +59,21 @@ public sealed class AdminModuleSequenceController(AppDbContext db) : ControllerB
             .Where(mc => mc.CourseId == dto.CourseId)
             .Select(mc => mc.ModuleId)
             .ToListAsync();
-        var invalidMain = dto.MainModuleIds.Except(moduleIds).ToList();
+        var requestedMainIds = dto.MainModules.Select(x => x.ModuleId).ToList();
+        var invalidMain = requestedMainIds.Except(moduleIds).ToList();
         var invalidFillers = dto.FillerModuleIds.Except(moduleIds).ToList();
         if (invalidMain.Count > 0 || invalidFillers.Count > 0)
         {
             return BadRequest(new { message = "Є модулі, що не належать до вибраного курсу." });
         }
-        var orderedMain = new List<int>();
+        var orderedMain = new List<ModuleSequenceSaveItemDto>();
         var seen = new HashSet<int>();
-        foreach (var mid in dto.MainModuleIds)
+        foreach (var item in dto.MainModules)
         {
-            if (seen.Add(mid))
+            if (seen.Add(item.ModuleId))
             {
-                orderedMain.Add(mid);
+                var normalizedGroupOrder = item.GroupOrder > 0 ? item.GroupOrder : 1;
+                orderedMain.Add(new ModuleSequenceSaveItemDto(item.ModuleId, normalizedGroupOrder));
             }
         }
         var fillerUnique = dto.FillerModuleIds.Distinct().ToList();
@@ -83,11 +86,13 @@ public sealed class AdminModuleSequenceController(AppDbContext db) : ControllerB
             .ExecuteDeleteAsync();
         for (int i = 0; i < orderedMain.Count; i++)
         {
+            var entry = orderedMain[i];
             db.ModuleSequenceItems.Add(new ModuleSequenceItem
             {
                 CourseId = dto.CourseId,
-                ModuleId = orderedMain[i],
-                Order = i
+                ModuleId = entry.ModuleId,
+                Order = i,
+                GroupOrder = entry.GroupOrder
             });
         }
         foreach (var mid in fillerUnique)

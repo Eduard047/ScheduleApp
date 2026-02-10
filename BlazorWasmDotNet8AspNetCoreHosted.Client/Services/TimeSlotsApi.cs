@@ -13,26 +13,33 @@ public class TimeSlotsApi
     // Відповідь сирих слотів.
     private sealed record RawSlotsResponse(List<TimeSlotDto> course, List<TimeSlotDto> global);
     // Запит на збереження слотів.
-    private sealed record BulkSaveReq(int? CourseId, List<TimeSlotDto> Slots);
+    private sealed record BulkSaveReq(int? CourseId, int? DayOfWeek, List<TimeSlotDto> Slots);
     // Повертає ефективні слоти для курсу або глобальні.
-    public async Task<List<TimeSlotDto>> GetEffectiveAsync(int? courseId)
+    public async Task<List<TimeSlotDto>> GetEffectiveAsync(int? courseId, int? dayOfWeek = null, bool includeDayOverrides = false)
     {
-        var url = $"api/admin/config/slots{(courseId is null ? "" : $"?courseId={courseId}")}";
+        var query = new List<string>();
+        if (courseId is not null) query.Add($"courseId={courseId}");
+        if (dayOfWeek is not null) query.Add($"dayOfWeek={dayOfWeek}");
+        if (includeDayOverrides) query.Add("includeDayOverrides=true");
+        var url = "api/admin/config/slots" + (query.Count == 0 ? "" : $"?{string.Join("&", query)}");
         var res = await _http.GetFromJsonAsync<EffectiveSlotsResponse>(url);
         return res?.slots ?? new();
     }
     // Повертає сирі слоти для редагування.
-    public async Task<List<TimeSlotDto>> GetRawAsync(int? courseId)
+    public async Task<List<TimeSlotDto>> GetRawAsync(int? courseId, int? dayOfWeek = null)
     {
-        var url = $"api/admin/config/slots/raw{(courseId is null ? "" : $"?courseId={courseId}")}";
+        var query = new List<string>();
+        if (courseId is not null) query.Add($"courseId={courseId}");
+        if (dayOfWeek is not null) query.Add($"dayOfWeek={dayOfWeek}");
+        var url = "api/admin/config/slots/raw" + (query.Count == 0 ? "" : $"?{string.Join("&", query)}");
         var res = await _http.GetFromJsonAsync<RawSlotsResponse>(url);
         return (courseId is null) ? (res?.global ?? new()) : (res?.course ?? new());
     }
     // Зберігає список слотів.
-    public async Task SaveAsync(int? courseId, List<TimeSlotDto> slots)
+    public async Task SaveAsync(int? courseId, List<TimeSlotDto> slots, int? dayOfWeek = null)
     {
-        var payload = new BulkSaveReq(courseId, slots);
+        var payload = new BulkSaveReq(courseId, dayOfWeek, slots);
         var resp = await _http.PostAsJsonAsync("api/admin/config/slots/upsert-bulk", payload);
-        resp.EnsureSuccessStatusCode();
+        await resp.EnsureSuccessWithDetailsAsync();
     }
 }

@@ -46,8 +46,8 @@
             </div>
         </div>
         <div class="col-12 col-lg-4 text-muted small">
-            <div>Головні модулі викладаються у вказаному порядку.</div>
-            <div>Низькі пріоритети змішуються випадково без повторів два дні поспіль.</div>
+            <div>Блоки головних модулів викладаються у вказаному порядку.</div>
+            <div>Модулі всередині блоку змішуються випадково без повторів два дні поспіль.</div>
         </div>
     </div>
 </div>
@@ -93,12 +93,15 @@ else
                         }
                         else
                         {
+                            var groupOrders = BuildGroupOrders();
                             <ul class="list-group list-group-flush">
                                 @for (var i = 0; i < mainModules.Count; i++)
                                 {
                                     var index = i;
-                                    var mid = mainModules[index];
+                                    var entry = mainModules[index];
+                                    var mid = entry.ModuleId;
                                     var courseName = ModuleCourseName(mid);
+                                    var groupOrder = groupOrders[index];
                                     <li class="list-group-item d-flex justify-content-between align-items-center">
                                         <div class="d-flex align-items-start gap-2">
                                             <span class="badge bg-light text-muted">@(index + 1)</span>
@@ -107,6 +110,16 @@ else
                                                 @if (!string.IsNullOrWhiteSpace(courseName))
                                                 {
                                                     <div class="module-label-course text-muted small">@courseName</div>
+                                                }
+                                                <div class="text-muted small">Блок @groupOrder</div>
+                                                @if (index > 0)
+                                                {
+                                                    <div class="form-check form-switch mt-1">
+                                                        <input class="form-check-input" type="checkbox"
+                                                               checked="@entry.JoinPreviousGroup"
+                                                               @onchange="@((ChangeEventArgs e) => ToggleJoinPrevious(e, index))" />
+                                                        <label class="form-check-label small">В одному блоці з попереднім</label>
+                                                    </div>
                                                 }
                                             </div>
                                         </div>
@@ -153,7 +166,7 @@ else
                                     {
                                         var mid = mod.Id!.Value;
                                         var moduleCourse = ModuleCourseName(mid);
-                                        var inMain = mainModules.Contains(mid);
+                                        var inMain = mainModules.Any(entry => entry.ModuleId == mid);
                                         <tr>
                                             <td>@mid</td>
                                             <td>
@@ -195,7 +208,7 @@ else
     private List<CourseEditDto> courses = new();
     private List<ModuleEditDto> modules = new();
     private Dictionary<int, ModuleEditDto> moduleLookup = new();
-    private readonly List<int> mainModules = new();
+    private readonly List<MainModuleEntry> mainModules = new();
     private HashSet<int> fillerIds = new();
     private int _selectedCourseId;
     private bool isLoading;
@@ -275,15 +288,19 @@ else
                 .Where(m => m.Id.HasValue && ModuleBelongsToCourse(m, courseId))
                 .Select(m => m.Id!.Value)
                 .ToHashSet();
-            var ordered = new List<int>();
+            var ordered = new List<MainModuleEntry>();
             var seen = new HashSet<int>();
+            int? previousGroup = null;
             if (cfg is not null)
             {
-                foreach (var mid in cfg.MainSequence.Select(x => x.ModuleId))
+                foreach (var item in cfg.MainSequence)
                 {
+                    var mid = item.ModuleId;
                     if (allowed.Contains(mid) && seen.Add(mid))
                     {
-                        ordered.Add(mid);
+                        var joinPrevious = previousGroup.HasValue && item.GroupOrder == previousGroup.Value;
+                        ordered.Add(new MainModuleEntry(mid, joinPrevious));
+                        previousGroup = item.GroupOrder;
                     }
                 }
                 fillerIds = cfg.FillerModuleIds
@@ -294,9 +311,10 @@ else
             {
                 fillerIds.Clear();
             }
-            fillerIds.ExceptWith(ordered);
+            fillerIds.ExceptWith(ordered.Select(entry => entry.ModuleId));
             mainModules.Clear();
             mainModules.AddRange(ordered);
+            EnsureFirstMainGroup();
         }
         catch (Exception ex)
         {
@@ -342,10 +360,11 @@ else
     private void AddToMain(int moduleId)
     {
         if (!moduleLookup.ContainsKey(moduleId)) return;
-        if (mainModules.Contains(moduleId)) return;
+        if (mainModules.Any(entry => entry.ModuleId == moduleId)) return;
         ok = null;
-        mainModules.Add(moduleId);
+        mainModules.Add(new MainModuleEntry(moduleId, false));
         fillerIds.Remove(moduleId);
+        EnsureFirstMainGroup();
     }
     // Підіймає модуль у послідовності.
     private void MoveUp(int index)
@@ -353,6 +372,7 @@ else
         if (index <= 0 || index >= mainModules.Count) return;
         ok = null;
         (mainModules[index - 1], mainModules[index]) = (mainModules[index], mainModules[index - 1]);
+        EnsureFirstMainGroup();
     }
     // Опускає модуль у послідовності.
     private void MoveDown(int index)
@@ -360,6 +380,7 @@ else
         if (index < 0 || index >= mainModules.Count - 1) return;
         ok = null;
         (mainModules[index], mainModules[index + 1]) = (mainModules[index + 1], mainModules[index]);
+        EnsureFirstMainGroup();
     }
     // Видаляє модуль з основної послідовності.
     private void RemoveFromMain(int index)
@@ -367,11 +388,41 @@ else
         if (index < 0 || index >= mainModules.Count) return;
         ok = null;
         mainModules.RemoveAt(index);
+        EnsureFirstMainGroup();
+    }
+    private void ToggleJoinPrevious(ChangeEventArgs args, int index)
+    {
+        if (index <= 0 || index >= mainModules.Count) return;
+        ok = null;
+        var flag = args.Value is bool b && b;
+        mainModules[index].JoinPreviousGroup = flag;
+        EnsureFirstMainGroup();
+    }
+    private void EnsureFirstMainGroup()
+    {
+        if (mainModules.Count > 0)
+        {
+            mainModules[0].JoinPreviousGroup = false;
+        }
+    }
+    private List<int> BuildGroupOrders()
+    {
+        var orders = new List<int>(mainModules.Count);
+        int groupOrder = 0;
+        for (var i = 0; i < mainModules.Count; i++)
+        {
+            if (i == 0 || !mainModules[i].JoinPreviousGroup)
+            {
+                groupOrder++;
+            }
+            orders.Add(groupOrder);
+        }
+        return orders;
     }
     // Перемикає модуль у списку низького пріоритету.
     private void ToggleFiller(ChangeEventArgs args, int moduleId)
     {
-        if (mainModules.Contains(moduleId)) return;
+        if (mainModules.Any(entry => entry.ModuleId == moduleId)) return;
         ok = null;
         var flag = args.Value is bool b && b;
         if (flag)
@@ -389,7 +440,7 @@ else
         ok = null;
         fillerIds = CourseModules()
             .Select(m => m.Id!.Value)
-            .Where(id => !mainModules.Contains(id))
+            .Where(id => !mainModules.Any(entry => entry.ModuleId == id))
             .ToHashSet();
     }
     // Очищає список низьких пріоритетів.
@@ -444,9 +495,13 @@ else
         error = null;
         try
         {
+            var groupOrders = BuildGroupOrders();
+            var mainItems = mainModules
+                .Select((entry, index) => new ModuleSequenceSaveItemDto(entry.ModuleId, groupOrders[index]))
+                .ToList();
             var payload = new ModuleSequenceSaveRequestDto(
                 _selectedCourseId,
-                new List<int>(mainModules),
+                mainItems,
                 fillerIds
                     .Where(id => moduleLookup.TryGetValue(id, out var module) && ModuleBelongsToCourse(module, _selectedCourseId))
                     .ToList());
@@ -461,6 +516,16 @@ else
         {
             isSaving = false;
         }
+    }
+    private sealed class MainModuleEntry
+    {
+        public MainModuleEntry(int moduleId, bool joinPreviousGroup)
+        {
+            ModuleId = moduleId;
+            JoinPreviousGroup = joinPreviousGroup;
+        }
+        public int ModuleId { get; }
+        public bool JoinPreviousGroup { get; set; }
     }
 }
 
