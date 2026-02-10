@@ -1322,7 +1322,69 @@
     }
     private async Task DeleteItemAsync(TeacherDraftItemDto item)
     {
+        if (_bulkSelectedIds.Count > 1 && _bulkSelectedIds.Contains(item.Id))
+        {
+            await DeleteSelectedItemsAsync();
+            return;
+        }
         await DeleteSlotAsync(item);
+    }
+    // Видаляє всі виділені пари одним підтвердженням.
+    private async Task DeleteSelectedItemsAsync()
+    {
+        var selectedItems = _items
+            .Where(x => _bulkSelectedIds.Contains(x.Id))
+            .OrderBy(x => x.Date)
+            .ThenBy(x => x.TimeStart)
+            .ToList();
+        if (selectedItems.Count == 0)
+        {
+            _err = "Не знайдено виділених пар для видалення.";
+            return;
+        }
+        var lockedCount = selectedItems.Count(x => x.IsLocked);
+        if (lockedCount > 0 && !_unrestrictedMode)
+        {
+            _err = $"Серед виділених пар є заблоковані ({lockedCount}). Увімкніть режим без обмежень або зніміть їх з вибору.";
+            return;
+        }
+        var idsToDelete = new HashSet<int>();
+        foreach (var selected in selectedItems)
+        {
+            var batch = CollectSlotItems(selected);
+            foreach (var entry in batch)
+            {
+                idsToDelete.Add(entry.Id);
+            }
+        }
+        if (idsToDelete.Count == 0)
+        {
+            _err = "Не знайдено записів для видалення серед виділених пар.";
+            return;
+        }
+        var confirmText = $"Видалити {selectedItems.Count} виділених пар? Буде видалено {idsToDelete.Count} записів. Цю дію неможливо скасувати.";
+        var confirmed = await JS.InvokeAsync<bool>("confirm", confirmText);
+        if (!confirmed) return;
+        try
+        {
+            foreach (var id in idsToDelete.OrderBy(x => x))
+            {
+                await DraftsApi.Delete(id, confirm: true, unrestricted: _unrestrictedMode);
+            }
+            _ok = $"Видалено {selectedItems.Count} виділених пар ({idsToDelete.Count} записів).";
+            _edit = null;
+            _extraGroups.Clear();
+            _extraTeachers.Clear();
+            await Reload();
+        }
+        catch (ApiErrorException ex)
+        {
+            await HandleApiError(ex);
+        }
+        catch (Exception ex)
+        {
+            _err = ex.Message;
+        }
     }
     // Видаляє всі записи пари в межах слоту та групи.
     private async Task DeleteSlotAsync(TeacherDraftItemDto item)
