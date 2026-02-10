@@ -12,6 +12,7 @@
 @inject HttpClient Http
 @inject ITeacherDraftsApi DraftsApi
 @inject IJSRuntime JS
+@inject AdminScheduleLogService LogService
 
 <h3 class="page-title">
     Графік викладачів <span class="draft-pill">Чернетка</span>
@@ -94,6 +95,9 @@
     private DragPayload? _dragPayload;
     private SlotKey? _dragHover;
     private bool _isProcessingDrop;
+    private const int LogLessonLimit = 300;
+    private const string LogActionCreate = "create-item";
+    private const string LogActionDelete = "delete-item";
     private string CurrentConflictKey => $"{_weekStart:yyyy-MM-dd}|t:{_teacherId?.ToString() ?? "all"}|g:{_groupId?.ToString() ?? "all"}|r:{_roomId?.ToString() ?? "all"}|c:{_courseId?.ToString() ?? "all"}";
     // Фільтрує чернетки за поточними параметрами відбору.
     private IEnumerable<TeacherDraftItemDto> Filtered =>
@@ -1227,6 +1231,7 @@
         }
         try
         {
+            var createdItemsForLog = new List<CreatedDraftLogItem>();
             var payload = NormalizeRequest(_edit with
             {
                 LessonTypeId = lessonTypeId,
@@ -1258,12 +1263,14 @@
                 else if (!hasExtras)
                 {
                     var id = await DraftsApi.Upsert(primaryRequest);
+                    createdItemsForLog.Add(new CreatedDraftLogItem(id, primaryRequest));
                     _ok = $"Збережено (Id = {id}).";
                 }
                 else
                 {
                     var requests = BuildDuplicateRequests(primaryRequest, extraGroupIds, extraTeacherIds);
-                    var (primaryCount, totalCount) = await UpsertDuplicateRequestsAsync(requests, primaryRequest);
+                    var (primaryCount, totalCount, createdItems) = await UpsertDuplicateRequestsAsync(requests, primaryRequest);
+                    createdItemsForLog.AddRange(createdItems);
                     var extraCount = totalCount - primaryCount;
                     var suffix = extraCount > 0 ? $" (+{extraCount} дубль.)" : string.Empty;
                     _ok = $"Збережено {primaryCount} пар{suffix}.";
@@ -1286,6 +1293,7 @@
                     var result = await UpsertDuplicateRequestsAsync(requests, slotRequest);
                     primaryCount += result.primaryCount;
                     totalCount += result.totalCount;
+                    createdItemsForLog.AddRange(result.createdItems);
                 }
                 var extraCount = totalCount - primaryCount;
                 var suffix = extraCount > 0 ? $" (+{extraCount} дубль.)" : string.Empty;
@@ -1294,6 +1302,7 @@
             _extraGroups.Clear();
             _extraTeachers.Clear();
             await Reload();
+            await LogManualCreateAsync(createdItemsForLog);
         }
         catch (ApiErrorException ex)
         {
@@ -1349,12 +1358,14 @@
             return;
         }
         var idsToDelete = new HashSet<int>();
+        var deletedItemsMap = new Dictionary<int, TeacherDraftItemDto>();
         foreach (var selected in selectedItems)
         {
             var batch = CollectSlotItems(selected);
             foreach (var entry in batch)
             {
                 idsToDelete.Add(entry.Id);
+                deletedItemsMap.TryAdd(entry.Id, entry);
             }
         }
         if (idsToDelete.Count == 0)
@@ -1375,6 +1386,9 @@
             _edit = null;
             _extraGroups.Clear();
             _extraTeachers.Clear();
+            await LogManualDeleteAsync(
+                deletedItemsMap.Values.ToList(),
+                _ok ?? $"Видалено {selectedItems.Count} виділених пар ({idsToDelete.Count} записів).");
             await Reload();
         }
         catch (ApiErrorException ex)
@@ -1412,6 +1426,9 @@
             _edit = null;
             _extraGroups.Clear();
             _extraTeachers.Clear();
+            await LogManualDeleteAsync(
+                batch,
+                _ok ?? (batch.Count == 1 ? $"Видалено (Id = {item.Id})." : $"Видалено {batch.Count} записів цієї пари."));
             await Reload();
         }
         catch (ApiErrorException ex)
@@ -1617,22 +1634,27 @@
         return requests;
     }
     // Зберігає підготовлені запити та рахує основні записи.
-    private async Task<(int primaryCount, int totalCount)> UpsertDuplicateRequestsAsync(
+    private async Task<(int primaryCount, int totalCount, List<CreatedDraftLogItem> createdItems)> UpsertDuplicateRequestsAsync(
         IReadOnlyList<DraftUpsertRequest> requests,
         DraftUpsertRequest primaryTemplate)
     {
         var primaryCount = 0;
         var totalCount = 0;
+        var createdItems = new List<CreatedDraftLogItem>();
         foreach (var request in requests)
         {
-            await DraftsApi.Upsert(request);
+            var id = await DraftsApi.Upsert(request);
             totalCount++;
+            if (request.Id is null)
+            {
+                createdItems.Add(new CreatedDraftLogItem(id, request));
+            }
             if (IsPrimaryRequest(request, primaryTemplate))
             {
                 primaryCount++;
             }
         }
-        return (primaryCount, totalCount);
+        return (primaryCount, totalCount, createdItems);
     }
     private static bool IsPrimaryRequest(DraftUpsertRequest request, DraftUpsertRequest primaryTemplate)
     {
@@ -1642,6 +1664,190 @@
             && request.TimeStart == primaryTemplate.TimeStart
             && request.TimeEnd == primaryTemplate.TimeEnd;
     }
+    // Записує у журнал ручне створення занять.
+    private async Task LogManualCreateAsync(IReadOnlyCollection<CreatedDraftLogItem> createdItems)
+    {
+        if (createdItems.Count == 0)
+        {
+            return;
+        }
+        var ordered = createdItems
+            .OrderBy(x => x.Request.Date)
+            .ThenBy(x => x.Request.TimeStart, StringComparer.Ordinal)
+            .ThenBy(x => x.Request.TimeEnd, StringComparer.Ordinal)
+            .ThenBy(x => x.Request.GroupId)
+            .ToList();
+        var lessonsTrimmed = ordered.Count > LogLessonLimit;
+        var lessons = ordered
+            .Take(LogLessonLimit)
+            .Select(BuildCreatedLesson)
+            .ToList();
+        var courseId = ResolveSingleCourseId(ordered);
+        var summary = ordered.Count == 1
+            ? "Створено 1 заняття вручну."
+            : $"Створено {ordered.Count} занять вручну.";
+        var entry = new AdminScheduleLogEntry(
+            Id: Guid.NewGuid().ToString("N"),
+            Timestamp: DateTimeOffset.Now,
+            ActionCode: LogActionCreate,
+            ActionLabel: "Створення заняття",
+            Summary: summary,
+            Success: true,
+            Error: null,
+            WeekStart: _weekStart.ToString("yyyy-MM-dd"),
+            WeekEnd: _weekStart.AddDays(6).ToString("yyyy-MM-dd"),
+            DaysPreset: null,
+            AllowDaysOff: null,
+            CourseId: courseId,
+            CourseName: ResolveCourseName(courseId),
+            ModuleHours: new List<AdminScheduleLogModuleHours>(),
+            Warnings: new List<string>(),
+            GapDetails: new List<AutoGenGapDetail>(),
+            Lessons: lessons,
+            LessonsTrimmed: lessonsTrimmed
+        );
+        await TryWriteScheduleLogAsync(entry);
+    }
+    private AdminScheduleLogLesson BuildCreatedLesson(CreatedDraftLogItem createdItem)
+    {
+        var request = createdItem.Request;
+        return new AdminScheduleLogLesson(
+            Id: createdItem.Id,
+            Date: request.Date.ToString("yyyy-MM-dd"),
+            TimeStart: request.TimeStart,
+            TimeEnd: request.TimeEnd,
+            Group: ResolveLookupName(_meta?.Groups, request.GroupId),
+            Module: ResolveModuleName(request.ModuleId),
+            Teacher: ResolveLookupName(_meta?.Teachers, request.TeacherId),
+            Room: ResolveLookupName(_meta?.Rooms, request.RoomId),
+            LessonType: ResolveLessonTypeName(request.LessonTypeId),
+            Status: "Чернетка",
+            Source: "Чернетка"
+        );
+    }
+    // Записує у журнал ручне видалення занять.
+    private async Task LogManualDeleteAsync(IReadOnlyCollection<TeacherDraftItemDto> deletedItems, string summary)
+    {
+        if (deletedItems.Count == 0)
+        {
+            return;
+        }
+        var ordered = deletedItems
+            .OrderBy(x => x.Date)
+            .ThenBy(x => x.TimeStart, StringComparer.Ordinal)
+            .ThenBy(x => x.TimeEnd, StringComparer.Ordinal)
+            .ThenBy(x => x.GroupId)
+            .ThenBy(x => x.Id)
+            .ToList();
+        var lessonsTrimmed = ordered.Count > LogLessonLimit;
+        var lessons = ordered
+            .Take(LogLessonLimit)
+            .Select(item => new AdminScheduleLogLesson(
+                Id: item.Id,
+                Date: item.Date.ToString("yyyy-MM-dd"),
+                TimeStart: item.TimeStart,
+                TimeEnd: item.TimeEnd,
+                Group: SafeLogValue(item.Group),
+                Module: SafeLogValue(item.Module),
+                Teacher: SafeLogValue(item.Teacher),
+                Room: SafeLogValue(item.Room),
+                LessonType: SafeLogValue(item.LessonTypeName),
+                Status: FormatStatus(item.Status),
+                Source: "Чернетка"
+            ))
+            .ToList();
+        var courseId = ResolveSingleCourseIdByGroups(ordered.Select(item => item.GroupId));
+        var entry = new AdminScheduleLogEntry(
+            Id: Guid.NewGuid().ToString("N"),
+            Timestamp: DateTimeOffset.Now,
+            ActionCode: LogActionDelete,
+            ActionLabel: "Видалення заняття",
+            Summary: summary,
+            Success: true,
+            Error: null,
+            WeekStart: _weekStart.ToString("yyyy-MM-dd"),
+            WeekEnd: _weekStart.AddDays(6).ToString("yyyy-MM-dd"),
+            DaysPreset: null,
+            AllowDaysOff: null,
+            CourseId: courseId,
+            CourseName: ResolveCourseName(courseId),
+            ModuleHours: new List<AdminScheduleLogModuleHours>(),
+            Warnings: new List<string>(),
+            GapDetails: new List<AutoGenGapDetail>(),
+            Lessons: lessons,
+            LessonsTrimmed: lessonsTrimmed
+        );
+        await TryWriteScheduleLogAsync(entry);
+    }
+    private int? ResolveSingleCourseId(IReadOnlyCollection<CreatedDraftLogItem> createdItems)
+    {
+        if (_meta is null)
+        {
+            return null;
+        }
+        return ResolveSingleCourseIdByGroups(createdItems.Select(item => item.Request.GroupId));
+    }
+    private int? ResolveSingleCourseIdByGroups(IEnumerable<int> groupIds)
+    {
+        if (_meta is null)
+        {
+            return null;
+        }
+        var courseIds = groupIds
+            .Select(groupId => _meta.Groups.FirstOrDefault(group => group.Id == groupId)?.CourseId)
+            .Where(id => id is int)
+            .Select(id => id!.Value)
+            .Distinct()
+            .ToList();
+        return courseIds.Count == 1 ? courseIds[0] : null;
+    }
+    private string? ResolveCourseName(int? courseId)
+    {
+        if (courseId is not int id)
+        {
+            return null;
+        }
+        var name = _meta?.Courses.FirstOrDefault(course => course.Id == id)?.Name;
+        return string.IsNullOrWhiteSpace(name) ? $"#{id}" : name;
+    }
+    private string ResolveModuleName(int moduleId)
+    {
+        var module = _meta?.Modules.FirstOrDefault(item => item.Id == moduleId);
+        if (module is null)
+        {
+            return $"#{moduleId}";
+        }
+        return string.IsNullOrWhiteSpace(module.Code)
+            ? module.Name
+            : $"{module.Code} — {module.Name}";
+    }
+    private string ResolveLessonTypeName(int lessonTypeId)
+    {
+        var name = _meta?.LessonTypes.FirstOrDefault(item => item.Id == lessonTypeId)?.Name;
+        return string.IsNullOrWhiteSpace(name) ? $"#{lessonTypeId}" : name;
+    }
+    private static string ResolveLookupName(IEnumerable<LookupDto>? source, int? id)
+    {
+        if (id is not int value)
+        {
+            return "-";
+        }
+        var name = source?.FirstOrDefault(item => item.Id == value)?.Name;
+        return string.IsNullOrWhiteSpace(name) ? $"#{value}" : name;
+    }
+    private static string SafeLogValue(string? value)
+        => string.IsNullOrWhiteSpace(value) ? "-" : value;
+    private async Task TryWriteScheduleLogAsync(AdminScheduleLogEntry entry)
+    {
+        try
+        {
+            await LogService.AddAsync(entry);
+        }
+        catch (Exception)
+        {
+        }
+    }
+    private sealed record CreatedDraftLogItem(int Id, DraftUpsertRequest Request);
     private static DateOnly FirstMonday(DateOnly d)
         => d.AddDays(-(((int)d.DayOfWeek + 6) % 7));
     private DateOnly DayToDate(int dayNumber)
