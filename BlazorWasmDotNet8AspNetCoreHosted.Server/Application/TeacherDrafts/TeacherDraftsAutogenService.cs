@@ -243,12 +243,12 @@ public sealed class TeacherDraftsAutogenService
             .GroupBy(mb => mb.ModuleId)
             .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.BuildingId).ToHashSet());
         // Історичне вікно для перевірки повторів.
-        const int historyDaysForRepeats = 14;
+        const int historyMonthsForRepeats = 12;
         const int maxParallelGroupsPerModuleInSlot = 2;
-        var historyStart = weekStart.AddDays(-historyDaysForRepeats);
+        var historyStart = weekStart.AddMonths(-historyMonthsForRepeats);
         var lastWeekStart = weekStart.AddDays(-7);
-        // Завантажуємо вже зайняті слоти (поточні та історичні).
-        var busy = await _db.TeacherDraftItems
+        // Завантажуємо вже зайняті слоти з чернеток і опублікованого розкладу.
+        var busyDrafts = await _db.TeacherDraftItems
             .Include(x => x.Room)
             .Where(x => x.Date >= historyStart && x.Date < weekEnd)
             .Select(x => new BusySlot(
@@ -262,6 +262,23 @@ public sealed class TeacherDraftsAutogenService
                 x.ModuleId,
                 x.LessonTypeId))
             .ToListAsync();
+        var busySchedule = await _db.ScheduleItems
+            .Include(x => x.Room)
+            .Where(x => x.Date >= historyStart && x.Date < weekEnd)
+            .Select(x => new BusySlot(
+                x.GroupId,
+                x.TeacherId,
+                x.RoomId,
+                x.Date,
+                x.StartTime,
+                x.EndTime,
+                x.Room != null ? (int?)x.Room.BuildingId : null,
+                x.ModuleId,
+                x.LessonTypeId))
+            .ToListAsync();
+        var busy = busyDrafts
+            .Concat(busySchedule)
+            .ToList();
         // Фіксуємо, де вже використовувався пріоритетний тип на тижні.
         var hasPreferred = new HashSet<(int groupId, int moduleId)>(
             busy.Where(b => preferredFirstTypeId != 0 && b.LessonTypeId == preferredFirstTypeId)
@@ -928,7 +945,7 @@ public sealed class TeacherDraftsAutogenService
                     .Select((slot, index) => new { slot, index })
                     .ToDictionary(x => (x.slot.Start, x.slot.End), x => x.index);
             }
-            // Перевіряє, чи слот уже зайнятий у групи.
+            // Перевіряє, чи слот вже зайнятий у групи.
             bool SlotFilled(DateOnly date, TimeSlot slot) =>
                 busy.Any(b => b.GroupId == grp.Id && b.Date == date && b.StartTime == slot.Start && b.EndTime == slot.End);
             // Повертає викладача, який веде цей модуль у сусідньому слоті.
@@ -1560,7 +1577,7 @@ public sealed class TeacherDraftsAutogenService
             // Основна спроба розмістити модуль у межах конкретного дня.
             async Task<bool> TryPlaceModuleAsync(int moduleId, DateOnly date, bool isPrimary, bool allowRepeatPreviousDay = false, bool allowExtraSameDay = false, bool relaxed = false, bool preferEarliestSlot = true, TimeSlot? forcedSlot = null)
             {
-                // Якщо день уже заповнений або порушуємо правило першого головного модуля — виходимо.
+                // Якщо день вже заповнений або порушуємо правило першого головного модуля — виходимо.
                 if (CountFor(grp.Id, date) >= slots.Count)
                     return false;
                 if (forceFirstMainModule && !firstMainPlaced && moduleId != firstMainModuleId && !relaxed)
@@ -2067,7 +2084,7 @@ public sealed class TeacherDraftsAutogenService
                 // Збільшуємо лічильники створених записів і зайнятих слотів.
                 created++;
                 Inc(grp.Id, date);
-                // Фіксуємо, що пріоритетний тип уже використано для модуля.
+                // Фіксуємо, що пріоритетний тип вже використано для модуля.
                 if (preferredFirstTypeId != 0 && selectedLessonTypeId == preferredFirstTypeId)
                 {
                     hasPreferred.Add((grp.Id, moduleId));

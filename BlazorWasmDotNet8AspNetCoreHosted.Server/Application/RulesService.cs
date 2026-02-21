@@ -82,7 +82,7 @@ public sealed class RulesService(AppDbContext db)
                         && x.StartTime < end && start < x.EndTime)
             .AnyAsync();
         if (conflicts)
-            errors.Add("Знайдено конфлікт уже опублікованого розкладу.");
+            errors.Add("Знайдено конфлікт вже опублікованого розкладу.");
         if (requiresRoom && blocksRoom && r.RoomId is int)
         {
             var travel = await db.BuildingTravels.AsNoTracking()
@@ -267,7 +267,7 @@ public sealed class RulesService(AppDbContext db)
             if (blocksTeacher && r.TeacherId != null && c.TeacherId == r.TeacherId)
             {
                 var teacherName = c.Teacher?.FullName ?? $"ID {r.TeacherId}";
-                AddError("conflict-draft-teacher", "Викладач зайнятий у чернетці", $"Викладач {teacherName} уже запланований на чернетку {c.Module.Title} у слоті {slot}.");
+                AddError("conflict-draft-teacher", "Викладач зайнятий у чернетці", $"Викладач {teacherName} вже запланований на чернетку {c.Module.Title} у слоті {slot}.");
             }
             if (blocksRoom && r.RoomId != null && c.RoomId == r.RoomId && c.Room is not null)
             {

@@ -115,7 +115,7 @@ public class AdminTypesController(AppDbContext db) : ControllerBase
                 .Select(x => x.Id)
                 .FirstOrDefaultAsync();
             if (takenBy != 0 && takenBy != e.Id)
-                return Conflict(new { message = $"Колір '{newKey}' уже використовується типом #{takenBy}." });
+                return Conflict(new { message = $"Колір '{newKey}' вже використовується типом #{takenBy}." });
         }
         e.CssKey = newKey;
         e.RequiresRoom = dto.RequiresRoom;
