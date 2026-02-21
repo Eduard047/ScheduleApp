@@ -1558,12 +1558,12 @@ public sealed class TeacherDraftsAutogenService
                 return candidates[sequenceRandom.Next(candidates.Count)];
             }
             // Основна спроба розмістити модуль у межах конкретного дня.
-            async Task<bool> TryPlaceModuleAsync(int moduleId, DateOnly date, bool isPrimary, bool allowRepeatPreviousDay = false, bool allowExtraSameDay = false, bool relaxed = false, bool preferEarliestSlot = true)
+            async Task<bool> TryPlaceModuleAsync(int moduleId, DateOnly date, bool isPrimary, bool allowRepeatPreviousDay = false, bool allowExtraSameDay = false, bool relaxed = false, bool preferEarliestSlot = true, TimeSlot? forcedSlot = null)
             {
                 // Якщо день уже заповнений або порушуємо правило першого головного модуля — виходимо.
                 if (CountFor(grp.Id, date) >= slots.Count)
                     return false;
-                if (forceFirstMainModule && !firstMainPlaced && moduleId != firstMainModuleId)
+                if (forceFirstMainModule && !firstMainPlaced && moduleId != firstMainModuleId && !relaxed)
                     return false;
                 // Ключ для залишків по групі/модулю.
                 var remainingKey = (grp.Id, moduleId);
@@ -1674,7 +1674,10 @@ public sealed class TeacherDraftsAutogenService
                 var candidateRooms = CandidateRoomsFor(moduleId);
                 PlacementCandidate? best = null;
                 // Перебираємо слоти дня та шукаємо найкращого кандидата.
-                foreach (var sl in slots)
+                var slotsToEvaluate = forcedSlot is null
+                    ? slots
+                    : slots.Where(sl => sl.Start == forcedSlot.Start && sl.End == forcedSlot.End);
+                foreach (var sl in slotsToEvaluate)
                 {
                     if (CountFor(grp.Id, date) >= slots.Count) break;
                     var s = sl.Start;
@@ -1704,8 +1707,11 @@ public sealed class TeacherDraftsAutogenService
                         var isContiguousBlock = indexesWithCandidate[^1] - indexesWithCandidate[0] + 1 == indexesWithCandidate.Count;
                         if (!isContiguousBlock)
                         {
-                            RecordSlotFailureReason(date, sl, $"Модуль <{ModuleLabel()}> у межах дня ставимо суцільним блоком без повернення після перемикання на інший модуль.");
-                            continue;
+                            if (!relaxed)
+                            {
+                                RecordSlotFailureReason(date, sl, $"Модуль <{ModuleLabel()}> у межах дня ставимо суцільним блоком без повернення після перемикання на інший модуль.");
+                                continue;
+                            }
                         }
                     }
                     // Викладач у сусідньому слоті (для пріоритету суміжних пар).
@@ -2202,6 +2208,99 @@ public sealed class TeacherDraftsAutogenService
                     }
                     return false;
                 }
+                IEnumerable<int> BuildGapCandidateModules()
+                {
+                    var modulesWithRemaining = remainingByGroupModule
+                        .Where(kv => kv.Key.GroupId == grp.Id && kv.Value > 0)
+                        .Select(kv => kv.Key.ModuleId);
+                    return PreferNotUsedLastWeek(
+                        orderedModulesForDay
+                            .Concat(fillerModulesOrdered)
+                            .Concat(modulesWithRemaining)
+                            .Distinct());
+                }
+                async Task<bool> TryFillGapWithVariantsAsync(TimeSlot gap, bool allowRepeatPreviousDay, bool allowExtraSameDay, bool relaxed, bool bypassDistinctLimit)
+                {
+                    foreach (var moduleId in BuildGapCandidateModules())
+                    {
+                        if (RemainingFor(grp.Id, moduleId) <= 0)
+                        {
+                            continue;
+                        }
+                        if (!bypassDistinctLimit && !CanIntroduceModuleToday(moduleId))
+                        {
+                            continue;
+                        }
+                        var placed = await TryPlaceModuleAsync(
+                            moduleId,
+                            date,
+                            isPrimary: false,
+                            allowRepeatPreviousDay: allowRepeatPreviousDay,
+                            allowExtraSameDay: allowExtraSameDay,
+                            relaxed: relaxed,
+                            preferEarliestSlot: true,
+                            forcedSlot: gap);
+                        if (placed)
+                        {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                async Task<bool> TryExhaustiveGapFillAsync()
+                {
+                    bool anyPlaced = false;
+                    bool progress;
+                    int pass = 0;
+                    do
+                    {
+                        progress = false;
+                        pass++;
+                        var gaps = slots.Where(sl => !SlotFilled(date, sl)).ToList();
+                        foreach (var gap in gaps)
+                        {
+                            if (CountFor(grp.Id, date) >= maxPerDay)
+                            {
+                                break;
+                            }
+                            if (SlotFilled(date, gap))
+                            {
+                                continue;
+                            }
+                            var placed = await TryFillGapWithVariantsAsync(
+                                             gap,
+                                             allowRepeatPreviousDay: false,
+                                             allowExtraSameDay: false,
+                                             relaxed: false,
+                                             bypassDistinctLimit: false)
+                                         || await TryFillGapWithVariantsAsync(
+                                             gap,
+                                             allowRepeatPreviousDay: false,
+                                             allowExtraSameDay: true,
+                                             relaxed: false,
+                                             bypassDistinctLimit: false)
+                                         || await TryFillGapWithVariantsAsync(
+                                             gap,
+                                             allowRepeatPreviousDay: true,
+                                             allowExtraSameDay: true,
+                                             relaxed: true,
+                                             bypassDistinctLimit: false)
+                                         || await TryFillGapWithVariantsAsync(
+                                             gap,
+                                             allowRepeatPreviousDay: true,
+                                             allowExtraSameDay: true,
+                                             relaxed: true,
+                                             bypassDistinctLimit: true);
+                            if (!placed)
+                            {
+                                continue;
+                            }
+                            progress = true;
+                            anyPlaced = true;
+                        }
+                    } while (progress && pass < Math.Max(1, slots.Count * 2) && CountFor(grp.Id, date) < maxPerDay);
+                    return anyPlaced;
+                }
                 // Основний модуль дня (пріоритетний у логіці курсу).
                 var primaryModuleId = ResolvePrimaryModule();
                 bool placedPrimary = false;
@@ -2335,12 +2434,21 @@ public sealed class TeacherDraftsAutogenService
                         await FillWithRemainingModulesAsync(allowRepeatPreviousDay: true, allowExtraSameDay: true, relaxed: true);
                     }
                 }
+                if (CountFor(grp.Id, date) < maxPerDay)
+                {
+                    await TryExhaustiveGapFillAsync();
+                }
                 // Після заповнення пробуємо вирівняти прогалини.
                 if (CountFor(grp.Id, date) > 0 && CountDistinctModulesForDay(grp.Id, date) == 1)
                 {
                     warnings.Add($"[{date:yyyy-MM-dd}] {grp.Name}: вдалося розмістити лише один модуль за день; перевірте доступність викладачів, аудиторій та залишки годин інших модулів.");
                 }
-                TryShiftGaps(date);
+                var shifted = TryShiftGaps(date);
+                if (shifted && CountFor(grp.Id, date) < maxPerDay)
+                {
+                    await TryExhaustiveGapFillAsync();
+                    TryShiftGaps(date);
+                }
                 if (DayHasGaps(date, out var remainingGap) && remainingGap is not null)
                 {
                     WarnGap(date, remainingGap);
