@@ -244,6 +244,7 @@ public sealed class TeacherDraftsAutogenService
             .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.BuildingId).ToHashSet());
         // Історичне вікно для перевірки повторів.
         const int historyDaysForRepeats = 14;
+        const int maxParallelGroupsPerModuleInSlot = 2;
         var historyStart = weekStart.AddDays(-historyDaysForRepeats);
         var lastWeekStart = weekStart.AddDays(-7);
         // Завантажуємо вже зайняті слоти (поточні та історичні).
@@ -286,6 +287,15 @@ public sealed class TeacherDraftsAutogenService
                             && x.Date == date
                             && x.ModuleId == moduleId
                             && !excludedTypeIds.Contains(x.LessonTypeId));
+        int CountGroupsWithModuleInSlot(int moduleId, DateOnly date, TimeOnly start, TimeOnly end) =>
+            busy.Where(x => x.Date == date
+                            && x.ModuleId == moduleId
+                            && !excludedTypeIds.Contains(x.LessonTypeId)
+                            && x.StartTime < end
+                            && start < x.EndTime)
+                .Select(x => x.GroupId)
+                .Distinct()
+                .Count();
         void Inc(int gid, DateOnly date)
         {
             var key = (gid, date);
@@ -1097,6 +1107,10 @@ public sealed class TeacherDraftsAutogenService
                     {
                         continue;
                     }
+                    if (CountGroupsWithModuleInSlot(candidate.ModuleId, date, s, e) >= maxParallelGroupsPerModuleInSlot)
+                    {
+                        continue;
+                    }
                     bool peopleBusy = busy.Any(x => x.Date == date
                                                     && (x.GroupId == grp.Id || (tidCandidate is int t && x.TeacherId == t))
                                                     && !(x.GroupId == candidate.GroupId
@@ -1344,6 +1358,7 @@ public sealed class TeacherDraftsAutogenService
                     if (altModuleId == currentModuleId) continue;
                     if (RemainingFor(grp.Id, altModuleId) <= 0) continue;
                     if (HasRecentModule(grp.Id, altModuleId, date, windowDays: 2)) continue;
+                    if (CountGroupsWithModuleInSlot(altModuleId, date, start, end) >= maxParallelGroupsPerModuleInSlot) continue;
                     bool altSelfStudy = SelfStudyRemaining(grp.Id, altModuleId) > 0;
                     var altTids = (altSelfStudy
                             ? supervisorsForModule.Where(x => x.ModuleId == altModuleId).Select(x => x.TeacherId)
@@ -1679,6 +1694,10 @@ public sealed class TeacherDraftsAutogenService
                         continue;
                     }
                     // Уникаємо повторів модуля у вузькому часовому вікні.
+                    if (CountGroupsWithModuleInSlot(moduleId, date, s, e) >= maxParallelGroupsPerModuleInSlot)
+                    {
+                        continue;
+                    }
                     bool hasRecent = HasRecentModule(grp.Id, moduleId, date, windowDays: 2);
                     if (!allowRepeatPreviousDay && hasRecent && HasAvailableAlternativeForSlot(moduleId, date, s, e))
                     {
