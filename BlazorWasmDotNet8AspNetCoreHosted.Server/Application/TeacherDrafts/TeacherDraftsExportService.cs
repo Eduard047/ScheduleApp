@@ -90,9 +90,16 @@ public sealed class TeacherDraftsExportService
             .OrderBy(x => x.Start)
             .ThenBy(x => x.End)
             .ToList();
-        var lookup = enriched.ToDictionary(
-            x => (x.Item.Date, x.Start, x.End, x.Item.GroupId),
-            x => x.Item);
+        var lookup = enriched
+            .GroupBy(x => (x.Item.Date, x.Start, x.End, x.Item.GroupId))
+            .ToDictionary(
+                g => g.Key,
+                g => g.Select(x => x.Item)
+                    .OrderBy(x => x.Module, StringComparer.CurrentCultureIgnoreCase)
+                    .ThenBy(x => x.LessonTypeName, StringComparer.CurrentCultureIgnoreCase)
+                    .ThenBy(x => x.Teacher, StringComparer.CurrentCultureIgnoreCase)
+                    .ThenBy(x => x.Id)
+                    .ToList());
         var filterParts = new List<string>();
         if (!string.IsNullOrWhiteSpace(teacherLabel)) filterParts.Add($"Викладач: {teacherLabel}");
         if (!string.IsNullOrWhiteSpace(groupLabel)) filterParts.Add($"Група: {groupLabel}");
@@ -161,9 +168,16 @@ public sealed class TeacherDraftsExportService
                     for (var index = 0; index < groups.Count; index++)
                     {
                         var column = 3 + index;
-                        if (lookup.TryGetValue((day, slot.Start, slot.End, groups[index].Id), out var item))
+                        if (lookup.TryGetValue((day, slot.Start, slot.End, groups[index].Id), out var itemsForSlot))
                         {
-                            worksheet.Cell(row, column).Value = TeacherDraftsHelpers.BuildExportCell(item);
+                            var cellParts = itemsForSlot
+                                .Select(TeacherDraftsHelpers.BuildExportCell)
+                                .Where(text => !string.IsNullOrWhiteSpace(text))
+                                .Distinct(StringComparer.CurrentCulture)
+                                .ToList();
+                            worksheet.Cell(row, column).Value = string.Join(
+                                $"{Environment.NewLine}{Environment.NewLine}",
+                                cellParts);
                         }
                     }
                     row++;
