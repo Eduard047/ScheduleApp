@@ -229,8 +229,8 @@ public sealed class TeacherDraftsAutogenService
                 .Where(x => x.Date >= weekStart && x.Date < weekEnd && gids.Contains(x.GroupId) && !x.IsLocked)
                 .ExecuteDeleteAsync();
         }
-        // Конфігурації обідніх перерв і список аудиторій для підбору.
-        var lunchesAll = await _db.LunchConfigs.AsNoTracking().ToListAsync();
+        // Конфігурації ліміту слота для типу з прапорцем "Бажано першим у тижні" та список аудиторій для підбору.
+        var preferredFirstSlotLimitsAll = await _db.PreferredFirstSlotLimitConfigs.AsNoTracking().ToListAsync();
         var roomsAll = await _db.Rooms.AsNoTracking().ToListAsync();
         // Список модулів для формування допустимих аудиторій/будівель.
         var moduleIdsAll = await _db.Modules.Select(m => m.Id).ToListAsync();
@@ -608,25 +608,6 @@ public sealed class TeacherDraftsAutogenService
                    && lt.CountInPlan
                    && !excludedTypeIds.Contains(lessonTypeId);
         }
-        // Чи є тип заняття лекційним.
-        bool IsLectureType(int lessonTypeId) =>
-            typeById.TryGetValue(lessonTypeId, out var lt)
-            && string.Equals(lt.Code, "LECTURE", StringComparison.OrdinalIgnoreCase);
-        // Чи залишилися лекційні теми, які бажано поставити до обіду.
-        bool HasPendingLectureBeforeLunch(int gid)
-        {
-            foreach (var kvp in topicsByModule)
-            {
-                var mid = kvp.Key;
-                if (RemainingFor(gid, mid) <= 0) continue;
-                var topicCandidate = SelectNextTopicInOrder(gid, mid);
-                if (topicCandidate is not null && IsLectureType(topicCandidate.LessonTypeId))
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
         // Позначає тему як використану для конкретної групи.
         void MarkTopicUsed(int groupId, int moduleId, ModuleTopic topic)
         {
@@ -917,8 +898,11 @@ public sealed class TeacherDraftsAutogenService
         foreach (var grp in groups)
         {
             // Обідня перерва для курсу або глобальна (якщо не задано для курсу).
-            var groupLunch = lunchesAll.FirstOrDefault(l => l.CourseId == grp.CourseId)
-                          ?? lunchesAll.FirstOrDefault(l => l.CourseId == null);
+            var preferredFirstSlotLimit = preferredFirstSlotLimitsAll.FirstOrDefault(x => x.CourseId == grp.CourseId)
+                                       ?? preferredFirstSlotLimitsAll.FirstOrDefault(x => x.CourseId == null);
+            int? preferredFirstMaxSlotOrder = preferredFirstSlotLimit is not null && preferredFirstSlotLimit.MaxSlotOrder > 0
+                ? preferredFirstSlotLimit.MaxSlotOrder
+                : null;
             var allSlots = await _db.TimeSlots.AsNoTracking()
                 .Where(s => s.IsActive && (s.CourseId == grp.CourseId || s.CourseId == null))
                 .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
@@ -946,6 +930,28 @@ public sealed class TeacherDraftsAutogenService
                     .ToDictionary(x => (x.slot.Start, x.slot.End), x => x.index);
             }
             // Перевіряє, чи слот вже зайнятий у групи.
+            int GetSlotOrder(TimeOnly start, TimeOnly end)
+                => slotIndexByTime.TryGetValue((start, end), out var idx) ? idx + 1 : 0;
+            bool IsPreferredFirstProtectedSlot(TimeOnly start, TimeOnly end)
+            {
+                if (preferredFirstMaxSlotOrder is not int maxSlot || maxSlot <= 0)
+                    return false;
+                var slotOrder = GetSlotOrder(start, end);
+                return slotOrder > 0 && slotOrder <= maxSlot;
+            }
+            int? EarliestPreferredFirstSlotOrderForDate(DateOnly date)
+            {
+                if (preferredFirstTypeId == 0) return null;
+                var preferredOrders = busy
+                    .Where(b => b.GroupId == grp.Id
+                                && b.Date == date
+                                && b.LessonTypeId == preferredFirstTypeId)
+                    .Select(b => GetSlotOrder(b.StartTime, b.EndTime))
+                    .Where(order => order > 0)
+                    .OrderBy(order => order)
+                    .ToList();
+                return preferredOrders.Count == 0 ? null : preferredOrders[0];
+            }
             bool SlotFilled(DateOnly date, TimeSlot slot) =>
                 busy.Any(b => b.GroupId == grp.Id && b.Date == date && b.StartTime == slot.Start && b.EndTime == slot.End);
             // Повертає викладача, який веде цей модуль у сусідньому слоті.
@@ -1201,59 +1207,6 @@ public sealed class TeacherDraftsAutogenService
                 }
                 return moved;
             }
-            // Додаємо перерви (BREAK) у слотах, що перекривають обід.
-            if (typeBreakId.HasValue && groupLunch is not null)
-            {
-                var anyModuleId = await _db.ModuleCourses
-                    .Where(mc => mc.CourseId == grp.CourseId)
-                    .Select(mc => mc.ModuleId)
-                    .FirstOrDefaultAsync();
-                if (anyModuleId != 0)
-                {
-                    for (int d = 0; d < 7; d++)
-                    {
-                        var date = weekStart.AddDays(d);
-                        if (!IsWorking(date, grp)) continue;
-                        ApplySlotsForDate(date);
-                        if (slots.Count == 0) continue;
-                        var candidateSlots = slots
-                            .Where(sl => sl.Start <= groupLunch.Start && groupLunch.End <= sl.End)
-                            .ToList();
-                        if (candidateSlots.Count == 0)
-                        {
-                            candidateSlots = slots
-                                .Where(sl => sl.Start < groupLunch.End && groupLunch.Start < sl.End)
-                                .ToList();
-                        }
-                        foreach (var slot in candidateSlots)
-                        {
-                            var s = slot.Start;
-                            var e = slot.End;
-                            var hasBreak = busy.Any(b =>
-                                b.GroupId == grp.Id &&
-                                b.Date == date &&
-                                b.StartTime == s &&
-                                b.EndTime == e &&
-                                b.LessonTypeId == typeBreakId.Value);
-                            if (hasBreak) continue;
-                            var breakItem = new TeacherDraftItem
-                            {
-                                Date = date,
-                                DayOfWeek = date.ToDateTime(TimeOnly.MinValue).DayOfWeek,
-                                StartTime = s,
-                                EndTime = e,
-                                GroupId = grp.Id,
-                                ModuleId = anyModuleId,
-                                LessonTypeId = typeBreakId.Value,
-                                Status = DraftStatus.Draft,
-                                IsLocked = false
-                            };
-                            _db.TeacherDraftItems.Add(breakItem);
-                            busy.Add(new BusySlot(grp.Id, null, null, date, s, e, null, anyModuleId, typeBreakId.Value));
-                        }
-                    }
-                }
-            }
             // Формуємо список модулів для генерації у цій групі.
             var modules = hasModuleHourOverrides
                 ? remainingByGroupModule
@@ -1343,9 +1296,6 @@ public sealed class TeacherDraftsAutogenService
             // Штраф за 3-тю і наступні пари того ж модуля в один день (за 1-шу/2-гу не застосовується).
             // Збільшуйте, якщо потрібно уникати надмірної концентрації; зменшуйте/0 — щоб дозволяти більше пар в день.
             const double penaltyExtraSameDay = 6.0;
-            // Штраф за нелекційне заняття у слоті до обіду, якщо є (або очікуються) лекції до обідньої перерви.
-            // Збільшуйте, якщо потрібно сильніше резервувати "дообідні" слоти під лекції; зменшуйте/0 — послабити.
-            const double penaltyNonLecturePreLunch = 2.0;
             // Штраф за повтор одного й того ж часу (StartTime) для цього модуля в інші дні тижня.
             // Збільшуйте, якщо потрібен більш різноманітний розклад по годинах; зменшуйте/0 — дозволяти повтори.
             const double penaltySameSlotPattern = 1.5;
@@ -1358,7 +1308,9 @@ public sealed class TeacherDraftsAutogenService
             // Для інших типів (коли пріоритетний тип ще можна поставити цього дня): штрафуємо ранні слоти (щоб частіше ставилися після нього).
             // Збільшуйте, якщо потрібно сильніше наблизитися до "спочатку пріоритетний тип, потім інші"; зменшуйте/0 — вимкнути вплив.
             const double penaltyPreferredFirstTypeLateSlot = 1.5;
-            const double penaltyNonPreferredEarlySlotWhilePreferredPending = 1.5;
+            const double penaltyNonPreferredEarlySlotWhilePreferredPending = 12.0;
+            const double penaltyPreferredFirstBeyondLimitSlot = 20.0;
+            const double penaltyNonPreferredBeforeFirstPreferred = 18.0;
             // Штраф за загальне навантаження викладача на цьому курсі.
             double TeacherLoadPenalty(int teacherId) =>
                 TeacherLoadScore(teacherId, grp.CourseId) * 0.25;
@@ -1421,25 +1373,6 @@ public sealed class TeacherDraftsAutogenService
                             continue;
                         }
                         if (!TypeAllowed(altLtId)) continue;
-                        if (groupLunch is not null && IsLectureType(altLtId) && end > groupLunch.Start)
-                        {
-                            continue;
-                        }
-                        bool isPreLunchSlot = groupLunch is not null && end <= groupLunch.Start;
-                        if (isPreLunchSlot && !IsLectureType(altLtId))
-                        {
-                            var hasLectureBefore = busy.Any(b =>
-                                b.GroupId == grp.Id
-                                && b.Date == date
-                                && IsLectureType(b.LessonTypeId)
-                                && b.EndTime <= groupLunch!.Start
-                                && b.StartTime < start);
-                            var lecturesPending = HasPendingLectureBeforeLunch(grp.Id);
-                            if (hasLectureBefore || lecturesPending)
-                            {
-                                continue;
-                            }
-                        }
                         var requiresRoom = (typeById.TryGetValue(altLtId, out var ltMetaAlt) ? ltMetaAlt.RequiresRoom : (bool?)null) ?? true;
                         if (requiresRoom)
                         {
@@ -1739,12 +1672,12 @@ public sealed class TeacherDraftsAutogenService
                         RecordSlotFailureReason(date, sl, "Слот до першого головного модуля заблоковано.");
                         continue;
                     }
-                    // Слот зайнятий перервою/обідом.
+                    // Слот зайнятий перервою (BREAK).
                     bool slotBreak = busy.Any(b => b.GroupId == grp.Id && b.Date == date
                                                    && b.LessonTypeId == typeBreakId && b.StartTime == s && b.EndTime == e);
                     if (slotBreak)
                     {
-                        RecordSlotFailureReason(date, sl, $"Слот {slotLabel} зайнятий перервою/обідом.");
+                        RecordSlotFailureReason(date, sl, $"Слот {slotLabel} зайнятий перервою (BREAK).");
                         continue;
                     }
                     // Уникаємо повторів модуля у вузькому часовому вікні.
@@ -1808,23 +1741,41 @@ public sealed class TeacherDraftsAutogenService
                         RecordSlotFailureReason(date, sl, reason);
                         continue;
                     }
-                    // Нотатка, якщо пріоритетний тип опиняється після обіду (relaxed).
-                    string? preferredFirstAfterLunchNote = null;
+                    // Дуже сильно штрафуємо тип з прапорцем "Бажано першим у тижні" за вихід за межу слота, але не блокуємо жорстко.
+                    string? preferredFirstAfterLimitNote = null;
+                    double preferredFirstAfterLimitPenalty = 0;
                     if (preferredFirstEnabled
-                        && groupLunch is not null
+                        && preferredFirstMaxSlotOrder is int maxPreferredSlot
                         && ltypeId == preferredFirstTypeId
-                        && sl.End > groupLunch.Start)
+                        && GetSlotOrder(sl.Start, sl.End) > maxPreferredSlot)
                     {
-                        if (!relaxed)
+                        var slotOrder = GetSlotOrder(sl.Start, sl.End);
+                        var overLimitBy = Math.Max(1, slotOrder - maxPreferredSlot);
+                        preferredFirstAfterLimitPenalty = overLimitBy * penaltyPreferredFirstBeyondLimitSlot;
+                        preferredFirstAfterLimitNote = $"Тип з прапорцем \"Бажано першим у тижні\" поставлено після ліміту (слот №{slotOrder}, ліміт №{maxPreferredSlot})";
+                    }
+                    // Дуже сильно штрафуємо інші типи в ранніх слотах до першого заняття з прапорцем "Бажано першим у тижні", але не блокуємо жорстко.
+                    string? nonPreferredBeforeFirstPreferredNote = null;
+                    double nonPreferredBeforeFirstPreferredPenalty = 0;
+                    if (preferredFirstEnabled
+                        && ltypeId != preferredFirstTypeId
+                        && IsPreferredFirstProtectedSlot(sl.Start, sl.End))
+                    {
+                        var slotOrder = GetSlotOrder(sl.Start, sl.End);
+                        var earliestPreferredOrder = EarliestPreferredFirstSlotOrderForDate(date);
+                        if (earliestPreferredOrder is int placedPreferredOrder && slotOrder > 0 && slotOrder < placedPreferredOrder)
                         {
-                            var ltLabel = typeById.TryGetValue(ltypeId, out var lt)
-                                ? $"\"{lt.Name}\" ({lt.Code})"
-                                : $"#{ltypeId}";
-                            var reason = $"Тип занять {ltLabel} позначено як \"Бажано першим у тижні\", тому ставимо його лише до обідньої перерви ({groupLunch.Start:HH\\:mm}); слот {slotLabel} пропущено.";
-                            RecordSlotFailureReason(date, sl, reason);
-                            continue;
+                            nonPreferredBeforeFirstPreferredPenalty = Math.Max(1, placedPreferredOrder - slotOrder + 1) * penaltyNonPreferredBeforeFirstPreferred;
+                            nonPreferredBeforeFirstPreferredNote = $"Ранній слот перед першим заняттям з прапорцем \"Бажано першим у тижні\" (воно вже у слоті №{placedPreferredOrder})";
                         }
-                        preferredFirstAfterLunchNote = "Бажаний перший тип поставлено після обіду (relaxed)";
+                        if (earliestPreferredOrder is null && preferredFirstPendingToday)
+                        {
+                            var reserveWeight = preferredFirstMaxSlotOrder is int maxReservedSlot
+                                ? Math.Max(1, maxReservedSlot - Math.Max(1, slotOrder) + 1)
+                                : 1;
+                            nonPreferredBeforeFirstPreferredPenalty = reserveWeight * penaltyNonPreferredBeforeFirstPreferred;
+                            nonPreferredBeforeFirstPreferredNote = "Ранній слот бажано віддати під перше заняття з прапорцем \"Бажано першим у тижні\"";
+                        }
                     }
                     // За потреби фільтруємо викладачів за кафедрою теми.
                     var filteredTeacherIds = tids;
@@ -1864,9 +1815,15 @@ public sealed class TeacherDraftsAutogenService
                         // Накопичуємо штрафи та їх пояснення.
                         var penalties = new List<string>();
                         double penaltyScore = 0;
-                        if (!string.IsNullOrWhiteSpace(preferredFirstAfterLunchNote))
+                        if (!string.IsNullOrWhiteSpace(preferredFirstAfterLimitNote))
                         {
-                            penalties.Add(preferredFirstAfterLunchNote);
+                            penaltyScore += preferredFirstAfterLimitPenalty;
+                            penalties.Add(preferredFirstAfterLimitNote);
+                        }
+                        if (!string.IsNullOrWhiteSpace(nonPreferredBeforeFirstPreferredNote))
+                        {
+                            penaltyScore += nonPreferredBeforeFirstPreferredPenalty;
+                            penalties.Add(nonPreferredBeforeFirstPreferredNote);
                         }
                         if (preferredFirstEnabled)
                         {
@@ -1874,9 +1831,16 @@ public sealed class TeacherDraftsAutogenService
                             {
                                 penaltyScore += slotIndex * penaltyPreferredFirstTypeLateSlot;
                             }
-                            else if (preferredFirstPendingToday && penaltyNonPreferredEarlySlotWhilePreferredPending > 0)
+                            else if (preferredFirstPendingToday
+                                     && penaltyNonPreferredEarlySlotWhilePreferredPending > 0
+                                     && IsPreferredFirstProtectedSlot(s, e))
                             {
-                                penaltyScore += (slots.Count - 1 - slotIndex) * penaltyNonPreferredEarlySlotWhilePreferredPending;
+                                var slotOrder = GetSlotOrder(s, e);
+                                var reserveWeight = preferredFirstMaxSlotOrder is int maxReservedSlot
+                                    ? Math.Max(1, maxReservedSlot - slotOrder + 1)
+                                    : 1;
+                                penaltyScore += reserveWeight * penaltyNonPreferredEarlySlotWhilePreferredPending;
+                                penalties.Add("Ранній слот зарезервовано під тип з прапорцем \"Бажано першим у тижні\"");
                             }
                         }
                         // Штрафуємо повтори модуля в один день.
@@ -1903,34 +1867,6 @@ public sealed class TeacherDraftsAutogenService
                         }
                         // Чи потрібна аудиторія для цього типу заняття.
                         var requiresRoom = (typeById.TryGetValue(ltypeId, out var ltMeta) ? ltMeta.RequiresRoom : (bool?)null) ?? true;
-                        if (groupLunch is not null && IsLectureType(ltypeId) && sl.End > groupLunch.Start)
-                        {
-                            if (!relaxed)
-                            {
-                                var reason = $"Лекції слід ставити до обідньої перерви ({groupLunch.Start:HH\\:mm}), слот {slotLabel} пропущено.";
-                                slotIssues.Add(reason);
-                                RecordSlotFailureReason(date, sl, reason);
-                                continue;
-                            }
-                            penalties.Add("Лекцію поставлено після обіду (relaxed)");
-                        }
-                        // Обмеження до обідньої перерви для лекцій.
-                        bool isPreLunchSlot = groupLunch is not null && sl.End <= groupLunch.Start;
-                        if (isPreLunchSlot && !IsLectureType(ltypeId))
-                        {
-                            var hasLectureBefore = busy.Any(b =>
-                                b.GroupId == grp.Id
-                                && b.Date == date
-                                && IsLectureType(b.LessonTypeId)
-                                && b.EndTime <= groupLunch!.Start
-                                && b.StartTime < sl.Start);
-                            var lecturesPending = HasPendingLectureBeforeLunch(grp.Id);
-                            if (hasLectureBefore || lecturesPending)
-                            {
-                                penaltyScore += penaltyNonLecturePreLunch;
-                                penalties.Add("Слот до обіду зарезервовано під лекцію");
-                            }
-                        }
                         // Додаємо штраф за навантаження викладача.
                         penaltyScore += TeacherLoadPenalty(tidCandidate);
                         // Штрафуємо повтор однакового часу для модуля в інший день.

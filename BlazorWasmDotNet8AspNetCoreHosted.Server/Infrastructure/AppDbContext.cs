@@ -35,6 +35,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     public DbSet<ModuleCourse> ModuleCourses => Set<ModuleCourse>();
     // Додаткові конфігурації та чернетки викладачів.
     public DbSet<LunchConfig> LunchConfigs => Set<LunchConfig>();
+    public DbSet<PreferredFirstSlotLimitConfig> PreferredFirstSlotLimitConfigs => Set<PreferredFirstSlotLimitConfig>();
     public DbSet<CalendarException> CalendarExceptions => Set<CalendarException>();
     public DbSet<ModuleSequenceItem> ModuleSequenceItems => Set<ModuleSequenceItem>();
     public DbSet<ModuleFiller> ModuleFillers => Set<ModuleFiller>();
@@ -216,6 +217,16 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             e.HasIndex(x => new { x.CourseId, x.DayOfWeek, x.SortOrder }).IsUnique();
         });
         // Контролюємо чернетки викладачів і їхні залежності.
+        b.Entity<PreferredFirstSlotLimitConfig>(e =>
+        {
+            e.HasKey(x => x.Id);
+            e.HasOne(x => x.Course)
+                .WithMany()
+                .HasForeignKey(x => x.CourseId)
+                .OnDelete(DeleteBehavior.Cascade);
+            e.Property(x => x.MaxSlotOrder).HasDefaultValue(0);
+            e.HasIndex(x => x.CourseId).IsUnique();
+        });
         b.Entity<TeacherDraftItem>(e =>
         {
             e.HasKey(x => x.Id);

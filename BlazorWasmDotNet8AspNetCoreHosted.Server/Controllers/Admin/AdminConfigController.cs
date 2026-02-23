@@ -50,6 +50,48 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
         if (rows == 0) return NotFound();
         return NoContent();
     }
+    [HttpGet("preferred-first-slot-limit")]
+    // Повертає ліміт слота для типу з прапорцем "Бажано першим у тижні".
+    public async Task<ActionResult<PreferredFirstSlotLimitConfigEditDto>> PreferredFirstSlotLimitGet([FromQuery] int? courseId)
+    {
+        if (courseId is int cid && await db.Courses.FindAsync(cid) is null)
+            return BadRequest("Course not found");
+        var row = await db.PreferredFirstSlotLimitConfigs.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.CourseId == courseId);
+        return Ok(row is null
+            ? new PreferredFirstSlotLimitConfigEditDto(null, courseId, 0)
+            : new PreferredFirstSlotLimitConfigEditDto(row.Id, row.CourseId, row.MaxSlotOrder));
+    }
+    [HttpPost("preferred-first-slot-limit/upsert")]
+    // Створює або оновлює ліміт слота для типу з прапорцем "Бажано першим у тижні".
+    public async Task<ActionResult<int>> PreferredFirstSlotLimitUpsert(PreferredFirstSlotLimitConfigEditDto dto)
+    {
+        if (dto.CourseId is int cid && await db.Courses.FindAsync(cid) is null)
+            return BadRequest("Course not found");
+        if (dto.MaxSlotOrder < 0)
+            return BadRequest(new { message = "Ліміт слота не може бути від'ємним." });
+        if (dto.MaxSlotOrder == 0)
+        {
+            await db.PreferredFirstSlotLimitConfigs.Where(x => x.CourseId == dto.CourseId).ExecuteDeleteAsync();
+            return Ok(0);
+        }
+        var row = await db.PreferredFirstSlotLimitConfigs.FirstOrDefaultAsync(x => x.CourseId == dto.CourseId);
+        if (row is null)
+        {
+            row = new PreferredFirstSlotLimitConfig
+            {
+                CourseId = dto.CourseId,
+                MaxSlotOrder = dto.MaxSlotOrder
+            };
+            db.PreferredFirstSlotLimitConfigs.Add(row);
+        }
+        else
+        {
+            row.MaxSlotOrder = dto.MaxSlotOrder;
+        }
+        await db.SaveChangesAsync();
+        return Ok(row.Id);
+    }
     [HttpGet("calendar")]
     // Повертає календар винятків.
     public async Task<IReadOnlyList<CalendarExceptionEditDto>> CalendarList()

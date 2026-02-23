@@ -178,6 +178,17 @@ public record class LunchConfigEditDto
     public string End { get; set; } = "13:00";
 }
 
+// DTO для ліміту слота типу занять з прапорцем "Бажано першим у тижні".
+public record class PreferredFirstSlotLimitConfigEditDto
+{
+    public PreferredFirstSlotLimitConfigEditDto() { }
+    public PreferredFirstSlotLimitConfigEditDto(int? id, int? courseId, int maxSlotOrder)
+    { Id = id; CourseId = courseId; MaxSlotOrder = maxSlotOrder; }
+    public int? Id { get; set; }
+    public int? CourseId { get; set; }
+    public int MaxSlotOrder { get; set; } = 0;
+}
+
 // DTO для календарного винятку.
 public record class CalendarExceptionEditDto
 {

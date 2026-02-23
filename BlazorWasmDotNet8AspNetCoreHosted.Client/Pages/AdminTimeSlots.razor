@@ -59,6 +59,25 @@
     <div class="alert alert-success">@_ok</div>
 }
 
+<div class="card mb-3">
+    <div class="card-body">
+        <div class="d-flex justify-content-between align-items-center gap-3 flex-wrap">
+            <div>
+                <div class="fw-semibold">Ліміт слота для типу з прапорцем "Бажано першим у тижні"</div>
+                <div class="form-text">
+                    Вкажіть номер пари (слота), до якої автоген намагатиметься ставити цей тип занять раніше за інші. Значення <code>0</code> вимикає обмеження.
+                </div>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+                <label class="form-label mb-0" for="preferredFirstSlotLimit">До слота</label>
+                <input id="preferredFirstSlotLimit" class="form-control" style="width:110px"
+                       type="number" min="0" step="1" @bind="_preferredFirstMaxSlotOrder" />
+                <button class="btn btn-outline-primary" @onclick="SavePreferredFirstSlotLimit">Зберегти ліміт</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <div class="card">
     <div class="card-body">
         <div class="d-flex justify-content-between align-items-center mb-2">
@@ -76,7 +95,6 @@
                     <th style="width:90px">№</th>
                     <th style="width:140px">Старт</th>
                     <th style="width:140px">Фініш</th>
-                    <th style="width:120px">Обід</th>
                     <th style="width:140px">Активен</th>
                     <th></th>
                 </tr>
@@ -103,10 +121,6 @@
                                 <input class="form-control form-control-sm" style="width:120px"
                                        placeholder="09:45" @bind="r.End" />
                             </td>
-                            <td class="text-center">
-                                <input class="form-check-input" type="checkbox" checked="@r.IsLunch"
-                                       @onchange="e => ToggleLunch(r, e.Value is true)" />
-                            </td>
                             <td>
                                 <input class="form-check-input" type="checkbox" @bind="r.IsActive" />
                             </td>
@@ -119,7 +133,7 @@
             </tbody>
         </table>
         <div class="form-text">
-            Порада: Тримайте тривалості однаковими (наприклад, 45 хвилин). Оберіть один із слотів як обід — він займе місце пари автоматично.
+            Порада: Тримайте тривалості однаковими (наприклад, 45 хвилин). Автогенерація використовує ці слоти 1-в-1 без окремого обіднього конфігу.
         </div>
     </div>
 </div>
@@ -145,6 +159,7 @@
     private int? _copyFromDay;
     private List<LookupDto> _courses = new();
     private List<TimeSlotDto> _rows = new();
+    private int _preferredFirstMaxSlotOrder;
     private string? _error;
     private string? _ok;
     // Завантажує метадані курсів при старті сторінки.
@@ -152,6 +167,7 @@
     {
         var meta = await Http.GetFromJsonAsync<MetaResponseDto>("api/meta");
         _courses = meta?.Courses ?? new();
+        await LoadPreferredFirstSlotLimit();
     }
     // Завантажує сирі слоти для обраного рівня.
     private async Task LoadRaw()
@@ -160,7 +176,8 @@
         if (_scope == Scope.Course && _courseId is null) { _error = "Вибери курс."; return; }
         try
         {
-            _rows = await Api.GetRawAsync(_scope == Scope.Global ? null : _courseId, _dayOfWeek);
+            _rows = await Api.GetRawAsync(CurrentCourseId(), _dayOfWeek);
+            await LoadPreferredFirstSlotLimit();
         }
         catch (BlazorWasmDotNet8AspNetCoreHosted.Client.Services.ApiErrorException ex)
         {
@@ -194,8 +211,7 @@
                 SortOrder = s.SortOrder,
                 Start = s.Start,
                 End = s.End,
-                IsActive = s.IsActive,
-                IsLunch = s.IsLunch
+                IsActive = s.IsActive
             }).ToList();
         }
         catch (BlazorWasmDotNet8AspNetCoreHosted.Client.Services.ApiErrorException ex)
@@ -245,24 +261,6 @@
     // Перевіряє коректність часу у форматі HH:mm.
     private static bool TryTime(string s, out TimeOnly t) => TimeOnly.TryParseExact(s, "HH:mm", out t);
     // Позначає слот як обідній і знімає прапорець з інших.
-    private void ToggleLunch(TimeSlotDto slot, bool value)
-    {
-        if (value)
-        {
-            foreach (var r in _rows)
-            {
-                r.IsLunch = ReferenceEquals(r, slot);
-            }
-            if (!slot.IsActive)
-            {
-                slot.IsActive = true;
-            }
-        }
-        else
-        {
-            slot.IsLunch = false;
-        }
-    }
     // Валідатор слотів перед збереженням.
     private string? Validate()
     {
@@ -282,12 +280,52 @@
                 var overlap = as1 < be1 && bs1 < ae1;
                 if (overlap) return $"Перекриття між слотами {a.SortOrder} і {b.SortOrder}.";
             }
-        var lunch = _rows.Where(x => x.IsLunch).ToList();
-        if (lunch.Count > 1) return "Може бути лише один слот, позначений як обід.";
-        if (lunch.Count == 1 && !lunch[0].IsActive) return "Слот обіду має бути активним.";
         return null;
     }
     // Зберігає слоти та перезавантажує дані.
+    // Повертає курс для поточного рівня налаштування (null = глобально).
+    private int? CurrentCourseId() => _scope == Scope.Global ? null : _courseId;
+    // Завантажує ліміт слота для типу з прапорцем "Бажано першим у тижні".
+    private async Task LoadPreferredFirstSlotLimit()
+    {
+        try
+        {
+            var dto = await Api.GetPreferredFirstSlotLimitAsync(CurrentCourseId());
+            _preferredFirstMaxSlotOrder = Math.Max(0, dto.MaxSlotOrder);
+        }
+        catch
+        {
+            _preferredFirstMaxSlotOrder = 0;
+        }
+    }
+    // Зберігає ліміт слота для типу з прапорцем "Бажано першим у тижні".
+    private async Task SavePreferredFirstSlotLimit()
+    {
+        _error = _ok = null;
+        if (_scope == Scope.Course && _courseId is null)
+        {
+            _error = "Вибери курс.";
+            return;
+        }
+        if (_preferredFirstMaxSlotOrder < 0)
+        {
+            _error = "Ліміт слота не може бути від'ємним.";
+            return;
+        }
+        try
+        {
+            await Api.SavePreferredFirstSlotLimitAsync(CurrentCourseId(), _preferredFirstMaxSlotOrder);
+            _ok = "Ліміт збережено.";
+        }
+        catch (BlazorWasmDotNet8AspNetCoreHosted.Client.Services.ApiErrorException ex)
+        {
+            _error = ex.Errors.FirstOrDefault() ?? ex.Message;
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+    }
     private async Task Save()
     {
         _error = _ok = null;
@@ -295,11 +333,12 @@
         if (_error is not null) return;
         try
         {
-            var courseId = _scope == Scope.Global ? null : _courseId;
+            var courseId = CurrentCourseId();
             foreach (var row in _rows)
             {
                 row.CourseId = courseId;
                 row.DayOfWeek = _dayOfWeek;
+                row.IsLunch = false;
             }
             await Api.SaveAsync(courseId, _rows, _dayOfWeek);
             await LoadRaw();

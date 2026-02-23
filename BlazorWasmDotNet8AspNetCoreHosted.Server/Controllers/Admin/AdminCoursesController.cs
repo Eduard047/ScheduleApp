@@ -69,6 +69,7 @@ public class AdminCoursesController(AppDbContext db) : ControllerBase
             await db.TeacherCourseLoads.Where(l => l.CourseId == id).ExecuteDeleteAsync();
             await db.TimeSlots.Where(ts => ts.CourseId == id).ExecuteDeleteAsync();
             await db.LunchConfigs.Where(lc => lc.CourseId == id).ExecuteDeleteAsync();
+            await db.PreferredFirstSlotLimitConfigs.Where(pc => pc.CourseId == id).ExecuteDeleteAsync();
             if (moduleIdsLinked.Count > 0)
             {
                 var moduleCourseMap = await db.ModuleCourses.AsNoTracking()
