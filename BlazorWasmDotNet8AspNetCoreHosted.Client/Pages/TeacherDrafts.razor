@@ -607,6 +607,71 @@
         ApplyLessonType(ltId);
         ClearTopicForFinalAssessment();
     }
+    private void OnEditDateChanged(ChangeEventArgs e)
+    {
+        if (_edit is null) return;
+        var raw = e.Value?.ToString();
+        if (string.IsNullOrWhiteSpace(raw)) return;
+        if (!DateOnly.TryParseExact(raw, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var newDate)
+            && !DateOnly.TryParse(raw, out newDate))
+        {
+            return;
+        }
+        var previousSlots = DaySlotsFor(_edit.Date);
+        var startIndex = ResolveSlotStartIndex(previousSlots, _edit.TimeStart);
+        var endIndex = ResolveSlotEndIndex(previousSlots, _edit.TimeEnd, startIndex);
+        var updated = _edit with { Date = newDate };
+        var nextSlots = DaySlotsFor(newDate);
+        if (nextSlots.Count > 0)
+        {
+            var normalizedStartIndex = Math.Clamp(startIndex < 0 ? 0 : startIndex, 0, nextSlots.Count - 1);
+            var normalizedEndIndex = Math.Clamp(endIndex < 0 ? normalizedStartIndex : endIndex, normalizedStartIndex, nextSlots.Count - 1);
+            updated = updated with
+            {
+                TimeStart = nextSlots[normalizedStartIndex].Start,
+                TimeEnd = nextSlots[normalizedEndIndex].End
+            };
+        }
+        _edit = updated;
+    }
+    private void OnEditStartSlotChanged(ChangeEventArgs e)
+    {
+        if (_edit is null) return;
+        var slots = DaySlotsFor(_edit.Date);
+        if (slots.Count == 0) return;
+        var raw = e.Value?.ToString();
+        if (!int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var selectedNumber)) return;
+        var startIndex = selectedNumber - 1;
+        if (startIndex < 0 || startIndex >= slots.Count) return;
+        var endIndex = ResolveSlotEndIndex(slots, _edit.TimeEnd, startIndex);
+        endIndex = Math.Clamp(endIndex < 0 ? startIndex : endIndex, startIndex, slots.Count - 1);
+        _edit = _edit with
+        {
+            TimeStart = slots[startIndex].Start,
+            TimeEnd = slots[endIndex].End
+        };
+    }
+    private void OnEditEndSlotChanged(ChangeEventArgs e)
+    {
+        if (_edit is null) return;
+        var slots = DaySlotsFor(_edit.Date);
+        if (slots.Count == 0) return;
+        var raw = e.Value?.ToString();
+        if (!int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var selectedNumber)) return;
+        var endIndex = selectedNumber - 1;
+        if (endIndex < 0 || endIndex >= slots.Count) return;
+        var startIndex = ResolveSlotStartIndex(slots, _edit.TimeStart);
+        startIndex = Math.Clamp(startIndex < 0 ? 0 : startIndex, 0, slots.Count - 1);
+        if (endIndex < startIndex)
+        {
+            startIndex = endIndex;
+        }
+        _edit = _edit with
+        {
+            TimeStart = slots[startIndex].Start,
+            TimeEnd = slots[endIndex].End
+        };
+    }
     private List<SlotRow> DaySlotsFor(DateOnly date)
     {
         if (_slots.Count == 0) return _rows;
@@ -645,6 +710,57 @@
             return parsed;
         }
         return TimeOnly.Parse(value, CultureInfo.InvariantCulture);
+    }
+    private static int ResolveSlotStartIndex(List<SlotRow> slots, string start)
+    {
+        if (slots.Count == 0) return -1;
+        var exactIndex = slots.FindIndex(s => string.Equals(s.Start, start, StringComparison.Ordinal));
+        if (exactIndex >= 0) return exactIndex;
+        var targetTime = ParseSlotTime(start);
+        for (var index = 0; index < slots.Count; index++)
+        {
+            var slotStart = ParseSlotTime(slots[index].Start);
+            var slotEnd = ParseSlotTime(slots[index].End);
+            if (slotStart <= targetTime && targetTime < slotEnd)
+            {
+                return index;
+            }
+        }
+        for (var index = 0; index < slots.Count; index++)
+        {
+            var slotStart = ParseSlotTime(slots[index].Start);
+            if (slotStart > targetTime)
+            {
+                return Math.Max(0, index - 1);
+            }
+        }
+        return slots.Count - 1;
+    }
+    private static int ResolveSlotEndIndex(List<SlotRow> slots, string end, int minIndex = -1)
+    {
+        if (slots.Count == 0) return -1;
+        var normalizedMinIndex = Math.Max(minIndex, 0);
+        var exactIndex = slots.FindIndex(s => string.Equals(s.End, end, StringComparison.Ordinal));
+        if (exactIndex >= 0) return Math.Max(exactIndex, normalizedMinIndex);
+        var targetTime = ParseSlotTime(end);
+        for (var index = 0; index < slots.Count; index++)
+        {
+            var slotStart = ParseSlotTime(slots[index].Start);
+            var slotEnd = ParseSlotTime(slots[index].End);
+            if (slotStart < targetTime && targetTime <= slotEnd)
+            {
+                return Math.Max(index, normalizedMinIndex);
+            }
+        }
+        for (var index = 0; index < slots.Count; index++)
+        {
+            var slotEnd = ParseSlotTime(slots[index].End);
+            if (slotEnd >= targetTime)
+            {
+                return Math.Max(index, normalizedMinIndex);
+            }
+        }
+        return Math.Max(slots.Count - 1, normalizedMinIndex);
     }
     // Повертає послідовні слоти між обраними часами.
     private List<SlotRow> ResolveSlotRange(DateOnly date, string start, string end)
@@ -2842,25 +2958,68 @@ else
                     : null;
                 var teacherOptions = AllowedTeachersForTopic(selectedTopic);
                 var topicSelectionDisabled = IsFinalAssessment(_edit!.LessonTypeId);
+                var editDaySlots = DaySlotsFor(_edit!.Date);
+                var editStartSlotIndex = ResolveSlotStartIndex(editDaySlots, _edit!.TimeStart);
+                if (editDaySlots.Count > 0)
+                {
+                    editStartSlotIndex = Math.Clamp(editStartSlotIndex < 0 ? 0 : editStartSlotIndex, 0, editDaySlots.Count - 1);
+                }
+                var editEndSlotIndex = ResolveSlotEndIndex(editDaySlots, _edit!.TimeEnd, editStartSlotIndex);
+                if (editDaySlots.Count > 0)
+                {
+                    editEndSlotIndex = Math.Clamp(editEndSlotIndex < 0 ? editStartSlotIndex : editEndSlotIndex, editStartSlotIndex, editDaySlots.Count - 1);
+                }
             }
             <div class="editor-grid">
             <div class="editor-field">
                 <label>Дата</label>
                 <input type="date" class="select"
                        value="@_edit!.Date.ToString("yyyy-MM-dd")"
-                       @onchange="e => _edit = _edit! with { Date = DateOnly.Parse((string)e.Value!) }" />
+                       @onchange="OnEditDateChanged" />
             </div>
             <div class="editor-field">
-                <label>Початок</label>
-                <input type="time" class="select"
-                       value="@_edit!.TimeStart"
-                       @onchange="e => _edit = _edit! with { TimeStart = (string)e.Value! }" />
+                <label>З якої пари</label>
+                <select class="select"
+                        value="@(editStartSlotIndex >= 0 ? (editStartSlotIndex + 1).ToString(CultureInfo.InvariantCulture) : string.Empty)"
+                        @onchange="OnEditStartSlotChanged"
+                        disabled="@(editDaySlots.Count == 0)">
+                    @if (editDaySlots.Count == 0)
+                    {
+                        <option value="">Немає доступних пар</option>
+                    }
+                    else
+                    {
+                        @for (var slotIndex = 0; slotIndex < editDaySlots.Count; slotIndex++)
+                        {
+                            var slot = editDaySlots[slotIndex];
+                            <option value="@(slotIndex + 1)">
+                                @($"{slotIndex + 1:00} ({slot.Start}-{slot.End})")
+                            </option>
+                        }
+                    }
+                </select>
             </div>
             <div class="editor-field">
-                <label>Кінець</label>
-                <input type="time" class="select"
-                       value="@_edit!.TimeEnd"
-                       @onchange="e => _edit = _edit! with { TimeEnd = (string)e.Value! }" />
+                <label>До якої пари</label>
+                <select class="select"
+                        value="@(editEndSlotIndex >= 0 ? (editEndSlotIndex + 1).ToString(CultureInfo.InvariantCulture) : string.Empty)"
+                        @onchange="OnEditEndSlotChanged"
+                        disabled="@(editDaySlots.Count == 0)">
+                    @if (editDaySlots.Count == 0)
+                    {
+                        <option value="">Немає доступних пар</option>
+                    }
+                    else
+                    {
+                        @for (var slotIndex = Math.Max(editStartSlotIndex, 0); slotIndex < editDaySlots.Count; slotIndex++)
+                        {
+                            var slot = editDaySlots[slotIndex];
+                            <option value="@(slotIndex + 1)">
+                                @($"{slotIndex + 1:00} ({slot.Start}-{slot.End})")
+                            </option>
+                        }
+                    }
+                </select>
             </div>
             <div class="editor-field">
                 <label>Група</label>
