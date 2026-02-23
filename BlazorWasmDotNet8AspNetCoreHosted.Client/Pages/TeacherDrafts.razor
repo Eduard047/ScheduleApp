@@ -129,7 +129,34 @@
         _extraTeachers.Clear();
         _topicsCache.Clear();
         ClearBulkSelection();
-        _items = await DraftsApi.GetWeek(_weekStart, _teacherId);
+        var courseId = ResolveCourseIdForSlots();
+        var slotsUrl = "api/admin/config/slots?includeDayOverrides=true";
+        if (courseId is int cid)
+        {
+            slotsUrl += $"&courseId={cid}";
+        }
+        var draftsTask = DraftsApi.GetWeek(_weekStart, _teacherId);
+        var slotsTask = Http.GetFromJsonAsync<EffectiveSlotsResponse>(slotsUrl);
+        await Task.WhenAll(draftsTask, slotsTask);
+        ApplyLoadedDraftItems(await draftsTask);
+        var eff = await slotsTask;
+        _slots = eff?.slots ?? new();
+        _rows = _slots
+            .Select(s => new SlotRow(s.Start, s.End))
+            .GroupBy(x => (x.Start, x.End))
+            .Select(g => g.First())
+            .OrderBy(x => x.Start)
+            .ToList();
+    }
+    private async Task ReloadDraftItemsOnlyAsync()
+    {
+        await LoadConflictsAsync();
+        var items = await DraftsApi.GetWeek(_weekStart, _teacherId);
+        ApplyLoadedDraftItems(items);
+    }
+    private void ApplyLoadedDraftItems(IReadOnlyList<TeacherDraftItemDto> items)
+    {
+        _items = items.ToList();
         _warningReports.Clear();
         foreach (var draft in _items)
         {
@@ -144,20 +171,49 @@
             }
         }
         _expandedWarningSlots.RemoveWhere(id => !_warningReports.ContainsKey(id));
-        var courseId = ResolveCourseIdForSlots();
-        var slotsUrl = "api/admin/config/slots?includeDayOverrides=true";
-        if (courseId is int cid)
+        _bulkSelectedIds.RemoveWhere(id => !_items.Any(item => item.Id == id));
+        if (_bulkSelectedIds.Count == 0)
         {
-            slotsUrl += $"&courseId={cid}";
+            _bulkSelectedDayNumber = null;
+            if (_bulkEditOpen)
+            {
+                CloseBulkEdit();
+            }
         }
-        var eff = await Http.GetFromJsonAsync<EffectiveSlotsResponse>(slotsUrl);
-        _slots = eff?.slots ?? new();
-        _rows = _slots
-            .Select(s => new SlotRow(s.Start, s.End))
-            .GroupBy(x => (x.Start, x.End))
-            .Select(g => g.First())
-            .OrderBy(x => x.Start)
-            .ToList();
+        if (_edit?.Id is int editId && !_items.Any(item => item.Id == editId))
+        {
+            _edit = null;
+            _editTopicIds.Clear();
+        }
+        SyncCurrentConflict();
+    }
+    private void RemoveDraftItemsFromState(IEnumerable<int> ids)
+    {
+        var idSet = ids.ToHashSet();
+        if (idSet.Count == 0)
+        {
+            return;
+        }
+        _items.RemoveAll(item => idSet.Contains(item.Id));
+        foreach (var id in idSet)
+        {
+            _warningReports.Remove(id);
+            _expandedWarningSlots.Remove(id);
+            _bulkSelectedIds.Remove(id);
+        }
+        if (_bulkSelectedIds.Count == 0)
+        {
+            _bulkSelectedDayNumber = null;
+            if (_bulkEditOpen)
+            {
+                CloseBulkEdit();
+            }
+        }
+        if (_edit?.Id is int editId && idSet.Contains(editId))
+        {
+            _edit = null;
+            _editTopicIds.Clear();
+        }
         SyncCurrentConflict();
     }
     // Експортує поточний тиждень у формат Excel.
@@ -1481,7 +1537,7 @@
             {
                 _ok += $" Заблокованих: {skippedLocked}.";
             }
-            await Reload();
+            await ReloadDraftItemsOnlyAsync();
             ClearBulkSelection();
             CloseBulkEdit();
         }
@@ -1635,7 +1691,7 @@
             {
                 await SwapItemsAsync(sourceItem, targetItem, targetKey);
             }
-            await Reload();
+            await ReloadDraftItemsOnlyAsync();
         }
         catch (ApiErrorException ex)
         {
@@ -1850,7 +1906,11 @@
             }
             _extraGroups.Clear();
             _extraTeachers.Clear();
-            await Reload();
+            await ReloadDraftItemsOnlyAsync();
+            if (isNewDraft)
+            {
+                CancelEdit();
+            }
             await LogManualCreateAsync(createdItemsForLog);
         }
         catch (ApiErrorException ex)
@@ -1938,7 +1998,7 @@
             await LogManualDeleteAsync(
                 deletedItemsMap.Values.ToList(),
                 _ok ?? $"Видалено {selectedItems.Count} виділених пар ({idsToDelete.Count} записів).");
-            await Reload();
+            await ReloadDraftItemsOnlyAsync();
         }
         catch (ApiErrorException ex)
         {
@@ -1978,7 +2038,7 @@
             await LogManualDeleteAsync(
                 batch,
                 _ok ?? (batch.Count == 1 ? $"Видалено (Id = {item.Id})." : $"Видалено {batch.Count} записів цієї пари."));
-            await Reload();
+            RemoveDraftItemsFromState(batch.Select(x => x.Id));
         }
         catch (ApiErrorException ex)
         {

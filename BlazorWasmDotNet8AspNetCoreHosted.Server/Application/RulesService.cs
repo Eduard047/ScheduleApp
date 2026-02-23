@@ -16,14 +16,15 @@ public sealed class RulesService(AppDbContext db)
     {
         var errors = new List<string>();
         var warnings = new List<string>();
-        var group = await db.Groups.Include(g => g.Course).FirstOrDefaultAsync(x => x.Id == r.GroupId);
+        var group = await db.Groups.AsNoTracking().Include(g => g.Course).FirstOrDefaultAsync(x => x.Id == r.GroupId);
         if (group is null) errors.Add("Групу не знайдено.");
         var module = await db.Modules
+            .AsNoTracking()
             .Include(m => m.AllowedRooms)
             .Include(m => m.AllowedBuildings)
             .FirstOrDefaultAsync(x => x.Id == r.ModuleId);
         if (module is null) errors.Add("Модуль не знайдено.");
-        var ltype = await db.LessonTypes.FirstOrDefaultAsync(x => x.Id == r.LessonTypeId);
+        var ltype = await db.LessonTypes.AsNoTracking().FirstOrDefaultAsync(x => x.Id == r.LessonTypeId);
         if (ltype is null) errors.Add("Тип заняття не знайдено.");
         var requiresRoom = ltype?.RequiresRoom ?? true;
         var requiresTeacher = ltype?.RequiresTeacher ?? true;
@@ -34,7 +35,7 @@ public sealed class RulesService(AppDbContext db)
         {
             if (r.RoomId is int rid)
             {
-                room = await db.Rooms.Include(x => x.Building)
+                room = await db.Rooms.AsNoTracking().Include(x => x.Building)
                     .FirstOrDefaultAsync(x => x.Id == rid);
                 if (room is null) errors.Add("Аудиторію не знайдено.");
             }
@@ -71,19 +72,47 @@ public sealed class RulesService(AppDbContext db)
             if (allowedRoomIds.Count > 0 && !allowedRoomIds.Contains(room.Id))
                 errors.Add($"Аудиторія {room.Name} не входить до дозволених для цього модуля.");
         }
-        var conflicts = await db.ScheduleItems
-            .Where(x => x.Id != (r.Id ?? 0)
-                        && x.Date == r.Date
-                        && (
-                            x.GroupId == r.GroupId
-                            || (blocksRoom && r.RoomId != null && x.RoomId == r.RoomId)
-                            || (blocksTeacher && r.TeacherId != null && x.TeacherId == r.TeacherId)
-                        )
-                        && x.StartTime < end && start < x.EndTime)
-            .AnyAsync();
+        var currentId = r.Id ?? 0;
+        var canCheckTravel = requiresRoom && blocksRoom && r.RoomId is int;
+        List<ScheduleItem>? dayScheduleCandidates = null;
+        bool conflicts;
+        if (canCheckTravel)
+        {
+            dayScheduleCandidates = await db.ScheduleItems
+                .AsNoTracking()
+                .Include(x => x.Room).ThenInclude(rm => rm!.Building)
+                .Where(x => x.Id != currentId
+                            && x.Date == r.Date
+                            && (
+                                x.GroupId == r.GroupId
+                                || (r.TeacherId != null && x.TeacherId == r.TeacherId)
+                                || (r.RoomId != null && x.RoomId == r.RoomId)
+                            ))
+                .ToListAsync();
+            conflicts = dayScheduleCandidates.Any(x =>
+                x.StartTime < end && start < x.EndTime
+                && (
+                    x.GroupId == r.GroupId
+                    || (blocksRoom && r.RoomId != null && x.RoomId == r.RoomId)
+                    || (blocksTeacher && r.TeacherId != null && x.TeacherId == r.TeacherId)
+                ));
+        }
+        else
+        {
+            conflicts = await db.ScheduleItems
+                .Where(x => x.Id != currentId
+                            && x.Date == r.Date
+                            && (
+                                x.GroupId == r.GroupId
+                                || (blocksRoom && r.RoomId != null && x.RoomId == r.RoomId)
+                                || (blocksTeacher && r.TeacherId != null && x.TeacherId == r.TeacherId)
+                            )
+                            && x.StartTime < end && start < x.EndTime)
+                .AnyAsync();
+        }
         if (conflicts)
             errors.Add("Знайдено конфлікт вже опублікованого розкладу.");
-        if (requiresRoom && blocksRoom && r.RoomId is int)
+        if (canCheckTravel)
         {
             var travel = await db.BuildingTravels.AsNoTracking()
                 .ToDictionaryAsync(k => (k.FromBuildingId, k.ToBuildingId), v => v.Minutes);
@@ -94,11 +123,9 @@ public sealed class RulesService(AppDbContext db)
                 if (travel.TryGetValue((toId, fromId), out m)) return m;
                 return 10;
             }
-            var adj = await db.ScheduleItems
-                .Include(x => x.Room).ThenInclude(rm => rm!.Building)
-                .Where(x => x.Date == r.Date
-                            && (x.GroupId == r.GroupId || (r.TeacherId != null && x.TeacherId == r.TeacherId)))
-                .ToListAsync();
+            var adj = dayScheduleCandidates!
+                .Where(x => x.GroupId == r.GroupId || (r.TeacherId != null && x.TeacherId == r.TeacherId))
+                .ToList();
             foreach (var a in adj)
             {
                 if (a.Room is null) continue;
@@ -147,16 +174,17 @@ public sealed class RulesService(AppDbContext db)
             warnings.Add(description);
             issues.Add(new DraftValidationIssueDto("warning", code, title, description));
         }
-        var group = await db.Groups.Include(g => g.Course).FirstOrDefaultAsync(x => x.Id == r.GroupId);
+        var group = await db.Groups.AsNoTracking().Include(g => g.Course).FirstOrDefaultAsync(x => x.Id == r.GroupId);
         if (group is null)
             AddError("group-not-found", "Групу не знайдено", $"Група з ідентифікатором {r.GroupId} відсутня у базі даних.");
         var module = await db.Modules
+            .AsNoTracking()
             .Include(m => m.AllowedRooms)
             .Include(m => m.AllowedBuildings)
             .FirstOrDefaultAsync(x => x.Id == r.ModuleId);
         if (module is null)
             AddError("module-not-found", "Модуль не знайдено", $"Модуль з ідентифікатором {r.ModuleId} відсутній у базі.");
-        var ltype = await db.LessonTypes.FirstOrDefaultAsync(x => x.Id == r.LessonTypeId);
+        var ltype = await db.LessonTypes.AsNoTracking().FirstOrDefaultAsync(x => x.Id == r.LessonTypeId);
         if (ltype is null)
             AddError("lesson-type-not-found", "Тип заняття не знайдено", $"Тип заняття {r.LessonTypeId} не існує.");
         var requiresRoom = ltype?.RequiresRoom ?? true;
@@ -168,7 +196,7 @@ public sealed class RulesService(AppDbContext db)
         {
             if (r.RoomId is int rid)
             {
-                room = await db.Rooms.Include(x => x.Building)
+                room = await db.Rooms.AsNoTracking().Include(x => x.Building)
                     .FirstOrDefaultAsync(x => x.Id == rid);
                 if (room is null)
                     AddError("room-not-found", "Аудиторію не знайдено", $"Аудиторія з ідентифікатором {rid} відсутня.");
@@ -214,21 +242,28 @@ public sealed class RulesService(AppDbContext db)
             if (allowedRoomIds.Count > 0 && !allowedRoomIds.Contains(room.Id))
                 AddError("room-not-allowed", "Аудиторія заборонена", $"Аудиторія {room.Name} не входить до списку дозволених для модуля {module.Title}.");
         }
-        var officialConflicts = await db.ScheduleItems
+        var currentId = r.Id ?? 0;
+        var officialCandidates = await db.ScheduleItems
+            .AsNoTracking()
             .Include(x => x.Group)
             .Include(x => x.Module)
             .Include(x => x.Teacher)
             .Include(x => x.Room).ThenInclude(rm => rm!.Building)
-            .Where(x => x.Id != (r.Id ?? 0)
-                        && x.Date == r.Date
-                        && x.StartTime < end && start < x.EndTime
+            .Where(x => x.Date == r.Date
                         && (
                             x.GroupId == r.GroupId
-                            || (blocksTeacher && r.TeacherId != null && x.TeacherId == r.TeacherId)
-                            || (blocksRoom && r.RoomId != null && x.RoomId == r.RoomId)
+                            || (r.TeacherId != null && x.TeacherId == r.TeacherId)
+                            || (r.RoomId != null && x.RoomId == r.RoomId)
                         ))
             .ToListAsync();
-        foreach (var c in officialConflicts)
+        foreach (var c in officialCandidates.Where(x =>
+                     x.Id != currentId
+                     && x.StartTime < end && start < x.EndTime
+                     && (
+                         x.GroupId == r.GroupId
+                         || (blocksTeacher && r.TeacherId != null && x.TeacherId == r.TeacherId)
+                         || (blocksRoom && r.RoomId != null && x.RoomId == r.RoomId)
+                     )))
         {
             var slot = $"{c.StartTime:HH\\:mm}-{c.EndTime:HH\\:mm}";
             if (c.GroupId == r.GroupId)
@@ -244,22 +279,28 @@ public sealed class RulesService(AppDbContext db)
                 AddError("conflict-official-room", "Аудиторія зайнята", $"Аудиторія {c.Room.Name}{buildingName} використовується для заняття {c.Module.Title} у слоті {slot}.");
             }
         }
-        var draftConflicts = await db.TeacherDraftItems
+        var draftCandidates = await db.TeacherDraftItems
+            .AsNoTracking()
             .Include(x => x.Group)
             .Include(x => x.Module)
             .Include(x => x.Teacher)
             .Include(x => x.Room).ThenInclude(rm => rm!.Building)
-            .Where(x => x.Id != (r.Id ?? 0)
-                        && x.Date == r.Date
+            .Where(x => x.Date == r.Date
                         && x.Status == DraftStatus.Draft
-                        && x.StartTime < end && start < x.EndTime
                         && (
                             x.GroupId == r.GroupId
-                            || (blocksTeacher && r.TeacherId != null && x.TeacherId == r.TeacherId)
-                            || (blocksRoom && r.RoomId != null && x.RoomId == r.RoomId)
+                            || (r.TeacherId != null && x.TeacherId == r.TeacherId)
+                            || (r.RoomId != null && x.RoomId == r.RoomId)
                         ))
             .ToListAsync();
-        foreach (var c in draftConflicts)
+        foreach (var c in draftCandidates.Where(x =>
+                     x.Id != currentId
+                     && x.StartTime < end && start < x.EndTime
+                     && (
+                         x.GroupId == r.GroupId
+                         || (blocksTeacher && r.TeacherId != null && x.TeacherId == r.TeacherId)
+                         || (blocksRoom && r.RoomId != null && x.RoomId == r.RoomId)
+                     )))
         {
             var slot = $"{c.StartTime:HH\\:mm}-{c.EndTime:HH\\:mm}";
             if (c.GroupId == r.GroupId)
@@ -297,20 +338,13 @@ public sealed class RulesService(AppDbContext db)
                 if (end <= otherStart && gapAfter < need)
                     AddError($"travel-{scope}-after", "Недостатньо часу на перехід", $"{label} починається о {otherStart:HH\\:mm} в аудиторії {otherRoom.Name}. Для переходу потрібно {need} хвилин, доступно лише {gapAfter:N0} хв.");
             }
-            var relatedOfficial = await db.ScheduleItems
-                .Include(x => x.Room)
-                .Where(x => x.Date == r.Date && (x.GroupId == r.GroupId || (r.TeacherId != null && x.TeacherId == r.TeacherId)))
-                .ToListAsync();
-            foreach (var a in relatedOfficial)
+            foreach (var a in officialCandidates.Where(x =>
+                         x.GroupId == r.GroupId
+                         || (r.TeacherId != null && x.TeacherId == r.TeacherId)))
                 CheckTravel(a.StartTime, a.EndTime, a.Room, "official", "Опубліковане заняття");
-            var relatedDrafts = await db.TeacherDraftItems
-                .Include(x => x.Room)
-                .Where(x => x.Id != (r.Id ?? 0)
-                            && x.Status == DraftStatus.Draft
-                            && x.Date == r.Date
-                            && (x.GroupId == r.GroupId || (r.TeacherId != null && x.TeacherId == r.TeacherId)))
-                .ToListAsync();
-            foreach (var a in relatedDrafts)
+            foreach (var a in draftCandidates.Where(x =>
+                         x.Id != currentId
+                         && (x.GroupId == r.GroupId || (r.TeacherId != null && x.TeacherId == r.TeacherId))))
                 CheckTravel(a.StartTime, a.EndTime, a.Room, "draft", "Чернетка");
         }
         if (requiresTeacher && r.TeacherId is int tWin)

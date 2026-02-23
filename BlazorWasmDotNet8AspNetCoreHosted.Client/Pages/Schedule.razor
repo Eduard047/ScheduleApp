@@ -9,7 +9,7 @@
 
 @code {
 
-    private const string AppVersion = "1.1.20"; // Оновлюйте перед релізом
+    private const string AppVersion = "1.1.21"; // Оновлюйте перед релізом
     private MetaResponseDto? _meta;
     private int? _groupId;
     private int? _teacherId;
@@ -54,15 +54,16 @@
     // Перезавантажує розклад і тайм-слоти.
     private async Task Reload()
     {
-        _items = await Http.GetFromJsonAsync<List<ScheduleItemDto>>(
-            $"api/schedule?weekStart={_weekStart:yyyy-MM-dd}") ?? new();
+        var itemsTask = LoadScheduleItemsAsync();
         var courseId = ResolveCourseIdForSlots();
         var slotsUrl = "api/admin/config/slots?includeDayOverrides=true";
         if (courseId is int cid)
         {
             slotsUrl += $"&courseId={cid}";
         }
-        var eff = await Http.GetFromJsonAsync<EffectiveSlotsResponse>(slotsUrl);
+        var slotsTask = Http.GetFromJsonAsync<EffectiveSlotsResponse>(slotsUrl);
+        await Task.WhenAll(itemsTask, slotsTask);
+        var eff = await slotsTask;
         _slots = eff?.slots ?? new();
         _rows = _slots
             .Select(s => new SlotRow(s.Start, s.End))
@@ -74,6 +75,11 @@
         {
             CancelEdit();
         }
+    }
+    private async Task LoadScheduleItemsAsync()
+    {
+        _items = await Http.GetFromJsonAsync<List<ScheduleItemDto>>(
+            $"api/schedule?weekStart={_weekStart:yyyy-MM-dd}") ?? new();
     }
     // Вирівнює дату на понеділок поточного тижня.
     private static DateOnly FirstMonday(DateOnly d)
@@ -167,7 +173,7 @@
                 OverrideNonWorkingDay: false
             );
             await ScheduleApi.Upsert(payload);
-            await Reload();
+            await LoadScheduleItemsAsync();
             CancelEdit();
         }
         catch (ApiErrorException ex)

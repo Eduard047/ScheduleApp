@@ -1080,7 +1080,9 @@ else
             var deleted = await Drafts.ClearWeek(new ClearWeekRequest(
                 WeekStart: monday
             ));
-            await LoadWeek();
+            RemoveItemsFromState(
+                TableItemSource.Draft,
+                item => !item.IsLocked);
             var summary = $"Видалено {deleted} чернеток за поточний тиждень.";
             await SetOkMessageAsync(summary);
             await LogWeekClearAsync(LogActionClearDrafts, "Очищення чернеток", summary, monday);
@@ -1108,6 +1110,9 @@ else
             var deleted = await Api.ClearWeek(new ClearWeekRequest(
                 WeekStart: monday
             ));
+            RemoveItemsFromState(
+                TableItemSource.Published,
+                item => !item.IsLocked);
             var summary = $"Видалено {deleted} записів з опублікованого розкладу.";
             await SetOkMessageAsync(summary);
             await LogWeekClearAsync(LogActionClearSchedule, "Очищення розкладу", summary, monday);
@@ -1263,18 +1268,67 @@ else
     private async Task LoadWeek()
     {
         var monday = GetMonday(_selectedDate);
-        var draftData = await Drafts.GetWeek(monday, null);
-        var publishedData = await Api.GetWeek(monday);
+        var draftTask = Drafts.GetWeek(monday, null);
+        var publishedTask = Api.GetWeek(monday);
+        await Task.WhenAll(draftTask, publishedTask);
+        var draftData = await draftTask;
+        var publishedData = await publishedTask;
         draftItems.Clear();
         draftItems.AddRange(draftData);
         publishedItems.Clear();
         publishedItems.AddRange(publishedData);
+        RebuildTableItems();
+        ok ??= $"Завантажено {draftItems.Count} чернеток та {publishedItems.Count} опублікованих записів.";
+        error = null;
+    }
+    private void RebuildTableItems()
+    {
         tableItems.Clear();
         tableItems.AddRange(draftItems.Select(CreateTableItemFromDraft));
         tableItems.AddRange(publishedItems.Select(CreateTableItemFromPublished));
-        ok ??= $"Завантажено {draftItems.Count} чернеток та {publishedItems.Count} опублікованих записів.";
-        error = null;
         SyncCurrentConflict();
+    }
+    private void RemoveTableItemFromState(TableItem item)
+    {
+        if (item.Source == TableItemSource.Draft)
+        {
+            draftItems.RemoveAll(x => x.Id == item.Id);
+        }
+        else
+        {
+            publishedItems.RemoveAll(x => x.Id == item.Id);
+        }
+        RebuildTableItems();
+    }
+    private void RemoveItemsFromState(TableItemSource source, Func<TableItem, bool> predicate)
+    {
+        if (source == TableItemSource.Draft)
+        {
+            var ids = tableItems
+                .Where(item => item.Source == TableItemSource.Draft)
+                .Where(predicate)
+                .Select(item => item.Id)
+                .ToHashSet();
+            if (ids.Count == 0)
+            {
+                return;
+            }
+            draftItems.RemoveAll(x => ids.Contains(x.Id));
+        }
+        else
+        {
+            var ids = tableItems
+                .Where(item => item.Source == TableItemSource.Published)
+                .Where(predicate)
+                .Select(item => item.Id)
+                .ToHashSet();
+            if (ids.Count == 0)
+            {
+                return;
+            }
+            publishedItems.RemoveAll(x => ids.Contains(x.Id));
+        }
+        RebuildTableItems();
     }
     private async Task LogAutoGenAsync(
         string summary,
@@ -1477,7 +1531,7 @@ else
             {
                 await Api.Delete(current.Id);
             }
-            await LoadWeek();
+            RemoveTableItemFromState(current);
             var summary = $"Видалено заняття #{current.Id}.";
             await SetOkMessageAsync(summary, persist: false);
             await LogDeleteAsync(summary, current);
