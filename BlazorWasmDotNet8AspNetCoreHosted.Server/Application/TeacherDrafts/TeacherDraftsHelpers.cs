@@ -34,7 +34,7 @@ internal static class TeacherDraftsHelpers
         return string.IsNullOrWhiteSpace(topic.TopicCode) ? null : topic.TopicCode.Trim();
     }
     // Формує текст комірки для експорту у Excel.
-    internal static string BuildExportCell(TeacherDraftItemDto item)
+    internal static string BuildExportCell(TeacherDraftItemDto item, string? moduleCode = null)
     {
         if (IsBreakLesson(item.LessonTypeCode) || IsCanceledLesson(item.LessonTypeCode))
         {
@@ -43,17 +43,24 @@ internal static class TeacherDraftsHelpers
             if (item.Status == DraftStatusDto.Published) summary.Add("Опубліковано");
             return string.Join(Environment.NewLine, summary.Where(x => !string.IsNullOrWhiteSpace(x)));
         }
+
         var entries = new List<string>();
-        if (item.IsSelfStudy) entries.Add("Самостійна робота");
-        if (!string.IsNullOrWhiteSpace(item.Module)) entries.Add(item.Module);
+        var normalizedModuleCode = moduleCode?.Trim();
+        var moduleLabel = string.IsNullOrWhiteSpace(normalizedModuleCode)
+            ? item.Module
+            : (normalizedModuleCode.StartsWith("модуль", StringComparison.CurrentCultureIgnoreCase)
+                ? $"Модуль {normalizedModuleCode["модуль".Length..].TrimStart()}"
+                : $"Модуль {normalizedModuleCode}");
+        if (!string.IsNullOrWhiteSpace(moduleLabel)) entries.Add(moduleLabel);
         if (!string.IsNullOrWhiteSpace(item.TopicCode)) entries.Add(item.TopicCode);
+
+        var lessonLine = item.IsSelfStudy
+            ? $"{item.LessonTypeName} (Самостійна робота)"
+            : item.LessonTypeName;
+        if (!string.IsNullOrWhiteSpace(lessonLine)) entries.Add(lessonLine);
         if (!string.IsNullOrWhiteSpace(item.Teacher)) entries.Add(item.Teacher);
-        var lessonLine = item.LessonTypeName;
-        if (item.RequiresRoom && !string.IsNullOrWhiteSpace(item.Room))
-        {
-            lessonLine = $"{lessonLine} (ауд. {item.Room})";
-        }
-        entries.Add(lessonLine);
+        if (item.RequiresRoom && !string.IsNullOrWhiteSpace(item.Room)) entries.Add($"ауд. {item.Room}");
+
         if (item.IsRescheduled) entries.Add("Перенесено");
         if (item.Status == DraftStatusDto.Published) entries.Add("Опубліковано");
         return string.Join(Environment.NewLine, entries.Where(x => !string.IsNullOrWhiteSpace(x)));
