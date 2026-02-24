@@ -878,7 +878,6 @@ private PlanCourseVM planCourse = new();
             error = ex.Message;
         }
     }
-    ///
     // Відкриває панель планів для обраного модуля та завантажує дані.
     private async Task OpenPlans(ModuleEditDto m)
     {
@@ -1163,7 +1162,6 @@ private PlanCourseVM planCourse = new();
             error = ex.Message;
         }
     }
-    ///
     // Фільтрує перелік модулів за введеним рядком.
     private IEnumerable<ModuleEditDto> ApplyFilter(IEnumerable<ModuleEditDto> seq)
     {

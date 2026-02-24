@@ -135,6 +135,20 @@ else
                     <div class="small text-muted">@GetGenerationRangeDescription()</div>
                 </div>
                 <div class="d-flex flex-wrap gap-2 align-items-stretch">
+                    <div style="min-width: 180px;">
+                        <label class="form-label small mb-1">Від дати</label>
+                        <input type="date"
+                               class="form-control"
+                               value="@_generationFromDate.ToString("yyyy-MM-dd")"
+                               @onchange="OnGenerationFromDateChanged" />
+                    </div>
+                    <div style="min-width: 180px;">
+                        <label class="form-label small mb-1">До дати</label>
+                        <input type="date"
+                               class="form-control"
+                               value="@_generationToDate.ToString("yyyy-MM-dd")"
+                               @onchange="OnGenerationToDateChanged" />
+                    </div>
                     <select class="form-select flex-grow-1 flex-md-grow-0"
                             style="min-width: 220px;"
                             @bind="_selectedCourseId"
@@ -213,11 +227,11 @@ else
             else
             {
                 <div class="small text-muted mt-2">
-                    Оберіть курс, щоб налаштувати модулі та години для автогенерації тижня.
+                    Оберіть курс, щоб налаштувати модулі та години для автогенерації в обраному діапазоні.
                 </div>
             }
             <div class="small text-muted mt-2">
-                Чернетки оновлюються одразу для всіх груп тижня. Закріплені елементи залишаються без змін.<br />
+                Чернетки оновлюються одразу для всіх груп у вибраному діапазоні. Закріплені елементи залишаються без змін.<br />
                 Розклад очищується окремо і не зачіпає закріплені заняття.
             </div>
         </div>
@@ -477,6 +491,8 @@ else
     private int breakTypeId;
     private int canceledTypeId;
     private DateOnly _selectedDate = DateOnly.FromDateTime(DateTime.Today);
+    private DateOnly _generationFromDate = GetMonday(DateOnly.FromDateTime(DateTime.Today));
+    private DateOnly _generationToDate = GetMonday(DateOnly.FromDateTime(DateTime.Today));
     private WeekPreset _daysPreset = WeekPreset.MonFri;
     private int? _selectedCourseId;
     private readonly List<ModuleWeekRow> _moduleWeekRows = new();
@@ -540,6 +556,9 @@ else
             .Select(c => new { Date = DateOnly.ParseExact(c.Date, "yyyy-MM-dd", CultureInfo.InvariantCulture), c.IsWorkingDay })
             .GroupBy(x => x.Date)
             .ToDictionary(g => g.Key, g => g.First().IsWorkingDay);
+        var selectedWeekStart = GetMonday(_selectedDate);
+        _generationFromDate = selectedWeekStart;
+        _generationToDate = selectedWeekStart;
         await RestorePersistedAutoGenConfigAsync(restoreCourseSelection: true);
         if (_selectedCourseId is null && meta.Courses.Count == 1)
         {
@@ -584,9 +603,36 @@ else
     // Формує опис діапазону тижня для генерації.
     private string GetGenerationRangeDescription()
     {
-        var weekStart = GetMonday(_selectedDate);
-        var weekEnd = weekStart.AddDays(6);
-        return $"Тиждень: {weekStart:dd.MM.yyyy} – {weekEnd:dd.MM.yyyy}";
+        var (fromWeekStart, toWeekStart) = GetNormalizedGenerationWeekRange();
+        var totalWeeks = (toWeekStart.DayNumber - fromWeekStart.DayNumber) / 7 + 1;
+        var rangeEnd = toWeekStart.AddDays(6);
+        if (totalWeeks == 1)
+        {
+            return $"Тиждень: {fromWeekStart:dd.MM.yyyy} – {rangeEnd:dd.MM.yyyy}";
+        }
+        return $"Діапазон: {fromWeekStart:dd.MM.yyyy} – {rangeEnd:dd.MM.yyyy} ({totalWeeks} тижн.)";
+    }
+    // Нормалізує межі генерації до стартів тижня (понеділок).
+    private (DateOnly FromWeekStart, DateOnly ToWeekStart) GetNormalizedGenerationWeekRange()
+    {
+        var fromWeekStart = GetMonday(_generationFromDate);
+        var toWeekStart = GetMonday(_generationToDate);
+        if (toWeekStart < fromWeekStart)
+        {
+            (fromWeekStart, toWeekStart) = (toWeekStart, fromWeekStart);
+        }
+        return (fromWeekStart, toWeekStart);
+    }
+    // Формує список стартів тижня для автогенерації.
+    private List<DateOnly> BuildGenerationWeekStarts()
+    {
+        var (fromWeekStart, toWeekStart) = GetNormalizedGenerationWeekRange();
+        var weekStarts = new List<DateOnly>();
+        for (var week = fromWeekStart; week <= toWeekStart; week = week.AddDays(7))
+        {
+            weekStarts.Add(week);
+        }
+        return weekStarts;
     }
     // Скидає статуси повідомлень та, за потреби, збережений стан.
     private async Task ResetStatusAsync(bool clearPersisted = true)
@@ -873,7 +919,48 @@ else
         {
         }
     }
-    // Запускає автогенерацію чернеток для тижня.
+    // Запускає автогенерацію послідовно для кожного тижня в обраному діапазоні.
+    private async Task<(AutoGenResult Result, DateOnly RangeStartWeek, DateOnly RangeEndWeek, int WeekCount, bool AllowDaysOffUsed)> RunAutoGenForRangeAsync(
+        int courseId,
+        Dictionary<int, int> moduleHours,
+        bool clearExisting,
+        bool softFill)
+    {
+        var weekStarts = BuildGenerationWeekStarts();
+        var warnings = new List<string>();
+        var gapDetails = new List<AutoGenGapDetail>();
+        int created = 0;
+        int skipped = 0;
+        bool allowDaysOffUsed = false;
+        foreach (var weekStart in weekStarts)
+        {
+            var allowDaysOff = AllowDaysOffForPreset(weekStart);
+            allowDaysOffUsed |= allowDaysOff;
+            var res = await Drafts.AutogenWeek(new AutoGenRequest(
+                WeekStart: weekStart,
+                ClearExisting: clearExisting,
+                CourseId: courseId,
+                GroupId: null,
+                AllowOnDaysOff: allowDaysOff,
+                Days: _daysPreset,
+                ModuleHours: moduleHours,
+                SoftFill: softFill
+            ));
+            created += res.Created;
+            skipped += res.Skipped;
+            if (res.Warnings.Count > 0)
+            {
+                warnings.AddRange(res.Warnings);
+            }
+            if (res.GapDetails is { Count: > 0 })
+            {
+                gapDetails.AddRange(res.GapDetails);
+            }
+        }
+        var result = new AutoGenResult(created, skipped, warnings, gapDetails);
+        return (result, weekStarts[0], weekStarts[^1], weekStarts.Count, allowDaysOffUsed);
+    }
+    // Запускає автогенерацію чернеток для обраного діапазону.
     private async Task AutoGenDrafts()
     {
         await ResetStatusAsync();
@@ -894,21 +981,28 @@ else
                 return;
             }
             await PersistAutoGenConfigAsync();
-            var weekStart = GetMonday(_selectedDate);
-            var res = await Drafts.AutogenWeek(new AutoGenRequest(
-                WeekStart: weekStart,
-                ClearExisting: true,
-                CourseId: courseId,
-                GroupId: null,
-                AllowOnDaysOff: AllowDaysOffForPreset(),
-                Days: _daysPreset,
-                ModuleHours: moduleHours
-            ));
+            var (res, rangeStartWeek, rangeEndWeek, weekCount, allowDaysOff) = await RunAutoGenForRangeAsync(
+                courseId,
+                moduleHours,
+                clearExisting: true,
+                softFill: false);
             var courseName = meta?.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
-            var summary = $"Автогенерація тижня у чернетки (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}.";
+            var rangeEndDate = rangeEndWeek.AddDays(6);
+            var summary = weekCount == 1
+                ? $"Автогенерація тижня у чернетки (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}."
+                : $"Автогенерація діапазону {rangeStartWeek:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}.";
             await SetOkMessageAsync(summary, res.Warnings, res.GapDetails);
             await LoadWeek();
-            await LogAutoGenAsync(summary, res, weekStart, courseId, courseName, moduleHours, softFill: false);
+            await LogAutoGenAsync(
+                summary,
+                res,
+                rangeStartWeek,
+                rangeEndDate,
+                courseId,
+                courseName,
+                moduleHours,
+                softFill: false,
+                allowDaysOff: allowDaysOff);
         }
         catch (ApiErrorException ex)
         {
@@ -919,7 +1013,7 @@ else
             error = ex.Message;
         }
     }
-    // Заповнює порожні слоти чернеток на тиждень.
+    // Заповнює порожні слоти чернеток на обраному діапазоні.
     private async Task FillWeekDrafts()
     {
         await ResetStatusAsync();
@@ -940,22 +1034,28 @@ else
                 return;
             }
             await PersistAutoGenConfigAsync();
-            var weekStart = GetMonday(_selectedDate);
-            var res = await Drafts.AutogenWeek(new AutoGenRequest(
-                WeekStart: weekStart,
-                ClearExisting: false,
-                CourseId: courseId,
-                GroupId: null,
-                AllowOnDaysOff: AllowDaysOffForPreset(),
-                Days: _daysPreset,
-                ModuleHours: moduleHours,
-                SoftFill: true
-            ));
+            var (res, rangeStartWeek, rangeEndWeek, weekCount, allowDaysOff) = await RunAutoGenForRangeAsync(
+                courseId,
+                moduleHours,
+                clearExisting: false,
+                softFill: true);
             var courseName = meta?.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
-            var summary = $"Заповнення порожніх слотів тижня (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}.";
+            var rangeEndDate = rangeEndWeek.AddDays(6);
+            var summary = weekCount == 1
+                ? $"Заповнення порожніх слотів тижня (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}."
+                : $"Заповнення порожніх слотів у діапазоні {rangeStartWeek:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}.";
             await SetOkMessageAsync(summary, res.Warnings, res.GapDetails);
             await LoadWeek();
-            await LogAutoGenAsync(summary, res, weekStart, courseId, courseName, moduleHours, softFill: true);
+            await LogAutoGenAsync(
+                summary,
+                res,
+                rangeStartWeek,
+                rangeEndDate,
+                courseId,
+                courseName,
+                moduleHours,
+                softFill: true,
+                allowDaysOff: allowDaysOff);
         }
         catch (ApiErrorException ex)
         {
@@ -980,7 +1080,9 @@ else
             var deleted = await Drafts.ClearWeek(new ClearWeekRequest(
                 WeekStart: monday
             ));
-            await LoadWeek();
+            RemoveItemsFromState(
+                TableItemSource.Draft,
+                item => !item.IsLocked);
             var summary = $"Видалено {deleted} чернеток за поточний тиждень.";
             await SetOkMessageAsync(summary);
             await LogWeekClearAsync(LogActionClearDrafts, "Очищення чернеток", summary, monday);
@@ -1008,6 +1110,9 @@ else
             var deleted = await Api.ClearWeek(new ClearWeekRequest(
                 WeekStart: monday
             ));
+            RemoveItemsFromState(
+                TableItemSource.Published,
+                item => !item.IsLocked);
             var summary = $"Видалено {deleted} записів з опублікованого розкладу.";
             await SetOkMessageAsync(summary);
             await LogWeekClearAsync(LogActionClearSchedule, "Очищення розкладу", summary, monday);
@@ -1135,13 +1240,13 @@ else
         }
     }
     // Визначає, чи дозволені вихідні для обраного пресету.
-    private bool AllowDaysOffForPreset()
+    private bool AllowDaysOffForPreset(DateOnly weekStart)
     {
         return _daysPreset switch
         {
             WeekPreset.MonSun => true,
             WeekPreset.MonSat => true,
-            _ => WeekHasCalendarDayOff(GetMonday(_selectedDate))
+            _ => WeekHasCalendarDayOff(weekStart)
         };
     }
     // Перевіряє, чи є вихідні дні у календарі на тиждень.
@@ -1163,20 +1268,78 @@ else
     private async Task LoadWeek()
     {
         var monday = GetMonday(_selectedDate);
-        var draftData = await Drafts.GetWeek(monday, null);
-        var publishedData = await Api.GetWeek(monday);
+        var draftTask = Drafts.GetWeek(monday, null);
+        var publishedTask = Api.GetWeek(monday);
+        await Task.WhenAll(draftTask, publishedTask);
+        var draftData = await draftTask;
+        var publishedData = await publishedTask;
         draftItems.Clear();
         draftItems.AddRange(draftData);
         publishedItems.Clear();
         publishedItems.AddRange(publishedData);
+        RebuildTableItems();
+        ok ??= $"Завантажено {draftItems.Count} чернеток та {publishedItems.Count} опублікованих записів.";
+        error = null;
+    }
+    private void RebuildTableItems()
+    {
         tableItems.Clear();
         tableItems.AddRange(draftItems.Select(CreateTableItemFromDraft));
         tableItems.AddRange(publishedItems.Select(CreateTableItemFromPublished));
-        ok ??= $"Завантажено {draftItems.Count} чернеток та {publishedItems.Count} опублікованих записів.";
-        error = null;
         SyncCurrentConflict();
     }
-    private async Task LogAutoGenAsync(string summary, AutoGenResult res, DateOnly weekStart, int courseId, string courseName, Dictionary<int, int> moduleHours, bool softFill)
+    private void RemoveTableItemFromState(TableItem item)
+    {
+        if (item.Source == TableItemSource.Draft)
+        {
+            draftItems.RemoveAll(x => x.Id == item.Id);
+        }
+        else
+        {
+            publishedItems.RemoveAll(x => x.Id == item.Id);
+        }
+        RebuildTableItems();
+    }
+    private void RemoveItemsFromState(TableItemSource source, Func<TableItem, bool> predicate)
+    {
+        if (source == TableItemSource.Draft)
+        {
+            var ids = tableItems
+                .Where(item => item.Source == TableItemSource.Draft)
+                .Where(predicate)
+                .Select(item => item.Id)
+                .ToHashSet();
+            if (ids.Count == 0)
+            {
+                return;
+            }
+            draftItems.RemoveAll(x => ids.Contains(x.Id));
+        }
+        else
+        {
+            var ids = tableItems
+                .Where(item => item.Source == TableItemSource.Published)
+                .Where(predicate)
+                .Select(item => item.Id)
+                .ToHashSet();
+            if (ids.Count == 0)
+            {
+                return;
+            }
+            publishedItems.RemoveAll(x => ids.Contains(x.Id));
+        }
+        RebuildTableItems();
+    }
+    private async Task LogAutoGenAsync(
+        string summary,
+        AutoGenResult res,
+        DateOnly rangeStart,
+        DateOnly rangeEnd,
+        int courseId,
+        string courseName,
+        Dictionary<int, int> moduleHours,
+        bool softFill,
+        bool allowDaysOff)
     {
         var lessons = BuildDraftLessonSnapshot(out var trimmed);
         var entry = new AdminScheduleLogEntry(
@@ -1187,10 +1350,10 @@ else
             Summary: summary,
             Success: true,
             Error: null,
-            WeekStart: weekStart.ToString("yyyy-MM-dd"),
-            WeekEnd: weekStart.AddDays(6).ToString("yyyy-MM-dd"),
+            WeekStart: rangeStart.ToString("yyyy-MM-dd"),
+            WeekEnd: rangeEnd.ToString("yyyy-MM-dd"),
             DaysPreset: FormatWeekPreset(_daysPreset),
-            AllowDaysOff: AllowDaysOffForPreset(),
+            AllowDaysOff: allowDaysOff,
             CourseId: courseId,
             CourseName: courseName,
             ModuleHours: BuildModuleHours(moduleHours),
@@ -1368,7 +1531,7 @@ else
             {
                 await Api.Delete(current.Id);
             }
-            await LoadWeek();
+            RemoveTableItemFromState(current);
             var summary = $"Видалено заняття #{current.Id}.";
             await SetOkMessageAsync(summary, persist: false);
             await LogDeleteAsync(summary, current);
@@ -1399,6 +1562,24 @@ else
             await LoadWeek();
             await RestorePersistedAutoGenStatusAsync();
         }
+    }
+    // Обробляє зміну початку діапазону генерації.
+    private Task OnGenerationFromDateChanged(ChangeEventArgs args)
+    {
+        if (DateOnly.TryParse(args.Value?.ToString(), out var value))
+        {
+            _generationFromDate = value;
+        }
+        return Task.CompletedTask;
+    }
+    // Обробляє зміну завершення діапазону генерації.
+    private Task OnGenerationToDateChanged(ChangeEventArgs args)
+    {
+        if (DateOnly.TryParse(args.Value?.ToString(), out var value))
+        {
+            _generationToDate = value;
+        }
+        return Task.CompletedTask;
     }
     // Перемикає параметри сортування таблиці.
     private void ToggleSort(string field)

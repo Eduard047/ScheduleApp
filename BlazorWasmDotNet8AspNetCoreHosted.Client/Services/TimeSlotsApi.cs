@@ -36,6 +36,20 @@ public class TimeSlotsApi
         return (courseId is null) ? (res?.global ?? new()) : (res?.course ?? new());
     }
     // Зберігає список слотів.
+    // Повертає ліміт слота для типу з прапорцем "Бажано першим у тижні".
+    public async Task<PreferredFirstSlotLimitConfigEditDto> GetPreferredFirstSlotLimitAsync(int? courseId)
+    {
+        var query = courseId is null ? "" : $"?courseId={courseId}";
+        var res = await _http.GetFromJsonAsync<PreferredFirstSlotLimitConfigEditDto>($"api/admin/config/preferred-first-slot-limit{query}");
+        return res ?? new PreferredFirstSlotLimitConfigEditDto(null, courseId, 0);
+    }
+    // Зберігає ліміт слота для типу з прапорцем "Бажано першим у тижні".
+    public async Task SavePreferredFirstSlotLimitAsync(int? courseId, int maxSlotOrder)
+    {
+        var payload = new PreferredFirstSlotLimitConfigEditDto(null, courseId, maxSlotOrder);
+        var resp = await _http.PostAsJsonAsync("api/admin/config/preferred-first-slot-limit/upsert", payload);
+        await resp.EnsureSuccessWithDetailsAsync();
+    }
     public async Task SaveAsync(int? courseId, List<TimeSlotDto> slots, int? dayOfWeek = null)
     {
         var payload = new BulkSaveReq(courseId, dayOfWeek, slots);

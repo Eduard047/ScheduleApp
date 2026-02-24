@@ -26,6 +26,7 @@ public sealed class TeacherDraftsQueryService
     {
         var weekEnd = weekStart.AddDays(7);
         var q = _db.TeacherDraftItems
+            .AsNoTracking()
             .Include(x => x.Group).ThenInclude(g => g.Course)
             .Include(x => x.Module)
             .Include(x => x.ModuleTopic)

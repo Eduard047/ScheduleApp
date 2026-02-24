@@ -47,6 +47,7 @@ public class ScheduleController : ControllerBase
     {
         var weekEnd = weekStart.AddDays(7);
         var q = _db.ScheduleItems
+            .AsNoTracking()
             .Include(x => x.Group).ThenInclude(g => g.Course)
             .Include(x => x.Module)
             .Include(x => x.Teacher)
@@ -65,9 +66,9 @@ public class ScheduleController : ControllerBase
     // Створює або оновлює пару в розкладі з перевіркою правил.
     public async Task<ActionResult<int>> Upsert([FromBody] UpsertScheduleItemRequest r)
     {
-        await using var tx = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         var (errors, warnings) = await _rules.ValidateUpsertAsync(r);
         if (errors.Count > 0) return Conflict(new { message = "Validation failed", errors, warnings });
+        await using var tx = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         var lt = await _db.LessonTypes.FindAsync(r.LessonTypeId);
         if (lt is null) return BadRequest(new { message = "LessonType not found" });
         var ltCode = lt.Code ?? string.Empty;
@@ -299,6 +300,7 @@ public class ScheduleController : ControllerBase
     public async Task<IActionResult> Delete(int id)
     {
         var info = await _db.ScheduleItems
+            .AsNoTracking()
             .Where(x => x.Id == id)
             .Select(x => new { x.GroupId, x.ModuleId, x.TeacherId, CourseId = x.Group.CourseId })
             .FirstOrDefaultAsync();

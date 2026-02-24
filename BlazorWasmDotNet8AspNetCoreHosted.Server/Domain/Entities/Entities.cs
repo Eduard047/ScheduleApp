@@ -226,6 +226,14 @@ public class LunchConfig
     public TimeOnly End { get; set; }
 }
 
+public class PreferredFirstSlotLimitConfig
+{
+    public int Id { get; set; }
+    public int? CourseId { get; set; }
+    public Course? Course { get; set; }
+    public int MaxSlotOrder { get; set; }
+}
+
 public class TimeSlot
 {
     public int Id { get; set; }

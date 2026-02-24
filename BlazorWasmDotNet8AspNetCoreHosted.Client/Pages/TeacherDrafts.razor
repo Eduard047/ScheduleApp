@@ -63,6 +63,7 @@
         if (IsFinalAssessment(_edit.LessonTypeId))
         {
             _edit = _edit with { ModuleTopicId = null };
+            _editTopicIds.Clear();
         }
     }
     private DraftUpsertRequest? _edit;
@@ -79,6 +80,9 @@
     private int? _bulkSelectedDayNumber;
     private readonly HashSet<int> _bulkTeacherIds = new();
     private int? _bulkRoomId;
+    private int? _bulkModuleId;
+    private readonly HashSet<int> _bulkTopicIds = new();
+    private readonly HashSet<int> _editTopicIds = new();
     private bool _bulkApplying;
     private bool _bulkEditOpen;
     private ConflictDetails? _currentConflict;
@@ -89,6 +93,7 @@
         PropertyNameCaseInsensitive = true
     };
     private const string ConflictStorageKey = "teacherDrafts.conflicts.v1";
+    private const string MixedTopicLessonTypeError = "Можна обрати кілька тем лише з однаковим типом заняття.";
     private record SlotRow(string Start, string End) { public string Label => $"{Start}-{End}"; }
     private List<SlotRow> _rows = new();
     private static readonly string[] UkrainianDayNames = { "Неділя", "Понеділок", "Вівторок", "Середа", "Четвер", "П'ятниця", "Субота" };
@@ -124,7 +129,34 @@
         _extraTeachers.Clear();
         _topicsCache.Clear();
         ClearBulkSelection();
-        _items = await DraftsApi.GetWeek(_weekStart, _teacherId);
+        var courseId = ResolveCourseIdForSlots();
+        var slotsUrl = "api/admin/config/slots?includeDayOverrides=true";
+        if (courseId is int cid)
+        {
+            slotsUrl += $"&courseId={cid}";
+        }
+        var draftsTask = DraftsApi.GetWeek(_weekStart, _teacherId);
+        var slotsTask = Http.GetFromJsonAsync<EffectiveSlotsResponse>(slotsUrl);
+        await Task.WhenAll(draftsTask, slotsTask);
+        ApplyLoadedDraftItems(await draftsTask);
+        var eff = await slotsTask;
+        _slots = eff?.slots ?? new();
+        _rows = _slots
+            .Select(s => new SlotRow(s.Start, s.End))
+            .GroupBy(x => (x.Start, x.End))
+            .Select(g => g.First())
+            .OrderBy(x => x.Start)
+            .ToList();
+    }
+    private async Task ReloadDraftItemsOnlyAsync()
+    {
+        await LoadConflictsAsync();
+        var items = await DraftsApi.GetWeek(_weekStart, _teacherId);
+        ApplyLoadedDraftItems(items);
+    }
+    private void ApplyLoadedDraftItems(IReadOnlyList<TeacherDraftItemDto> items)
+    {
+        _items = items.ToList();
         _warningReports.Clear();
         foreach (var draft in _items)
         {
@@ -139,20 +171,49 @@
             }
         }
         _expandedWarningSlots.RemoveWhere(id => !_warningReports.ContainsKey(id));
-        var courseId = ResolveCourseIdForSlots();
-        var slotsUrl = "api/admin/config/slots?includeDayOverrides=true";
-        if (courseId is int cid)
+        _bulkSelectedIds.RemoveWhere(id => !_items.Any(item => item.Id == id));
+        if (_bulkSelectedIds.Count == 0)
         {
-            slotsUrl += $"&courseId={cid}";
+            _bulkSelectedDayNumber = null;
+            if (_bulkEditOpen)
+            {
+                CloseBulkEdit();
+            }
         }
-        var eff = await Http.GetFromJsonAsync<EffectiveSlotsResponse>(slotsUrl);
-        _slots = eff?.slots ?? new();
-        _rows = _slots
-            .Select(s => new SlotRow(s.Start, s.End))
-            .GroupBy(x => (x.Start, x.End))
-            .Select(g => g.First())
-            .OrderBy(x => x.Start)
-            .ToList();
+        if (_edit?.Id is int editId && !_items.Any(item => item.Id == editId))
+        {
+            _edit = null;
+            _editTopicIds.Clear();
+        }
+        SyncCurrentConflict();
+    }
+    private void RemoveDraftItemsFromState(IEnumerable<int> ids)
+    {
+        var idSet = ids.ToHashSet();
+        if (idSet.Count == 0)
+        {
+            return;
+        }
+        _items.RemoveAll(item => idSet.Contains(item.Id));
+        foreach (var id in idSet)
+        {
+            _warningReports.Remove(id);
+            _expandedWarningSlots.Remove(id);
+            _bulkSelectedIds.Remove(id);
+        }
+        if (_bulkSelectedIds.Count == 0)
+        {
+            _bulkSelectedDayNumber = null;
+            if (_bulkEditOpen)
+            {
+                CloseBulkEdit();
+            }
+        }
+        if (_edit?.Id is int editId && idSet.Contains(editId))
+        {
+            _edit = null;
+            _editTopicIds.Clear();
+        }
         SyncCurrentConflict();
     }
     // Експортує поточний тиждень у формат Excel.
@@ -224,6 +285,189 @@
     {
         if (moduleId <= 0 || topicId is null) return null;
         return TopicsForModule(moduleId).FirstOrDefault(t => t.Id == topicId);
+    }
+    private List<ModuleTopicViewDto> OrderedTopicsForModule(int moduleId)
+        => TopicsForModule(moduleId)
+            .OrderBy(t => t.Order)
+            .ThenBy(t => t.TopicCode, StringComparer.CurrentCultureIgnoreCase)
+            .ThenBy(t => t.Id)
+            .ToList();
+    private List<int> OrderedTopicIdsForModule(int moduleId, IEnumerable<int> topicIds)
+    {
+        var selected = topicIds.ToHashSet();
+        if (selected.Count == 0)
+        {
+            return new List<int>();
+        }
+        return OrderedTopicsForModule(moduleId)
+            .Where(t => selected.Contains(t.Id))
+            .Select(t => t.Id)
+            .ToList();
+    }
+    // Перевіряє, чи всі обрані теми належать до одного типу заняття.
+    private bool TopicsShareSingleLessonType(int moduleId, IReadOnlyCollection<int> topicIds, out int? lessonTypeId)
+    {
+        lessonTypeId = null;
+        if (topicIds.Count == 0)
+        {
+            return true;
+        }
+        var orderedTopics = OrderedTopicsForModule(moduleId)
+            .Where(topic => topicIds.Contains(topic.Id))
+            .ToList();
+        if (orderedTopics.Count == 0)
+        {
+            return true;
+        }
+        var firstLessonTypeId = orderedTopics[0].LessonTypeId;
+        if (orderedTopics.Any(topic => topic.LessonTypeId != firstLessonTypeId))
+        {
+            return false;
+        }
+        lessonTypeId = firstLessonTypeId;
+        return true;
+    }
+    private int? ResolvePrimaryEditTopicId()
+    {
+        if (_edit is null) return null;
+        var ordered = OrderedTopicIdsForModule(_edit.ModuleId, _editTopicIds);
+        return ordered.Count == 0 ? null : ordered[0];
+    }
+    private List<int> ResolveOrderedEditTopicIds()
+    {
+        if (_edit is null) return new List<int>();
+        return OrderedTopicIdsForModule(_edit.ModuleId, _editTopicIds);
+    }
+    private void ApplySelectedEditTopics()
+    {
+        if (_edit is null) return;
+        var primaryTopicId = ResolvePrimaryEditTopicId();
+        ApplyTopicSelection(primaryTopicId);
+        if (primaryTopicId is null && _edit.Id is null)
+        {
+            _edit = _edit with { LessonTypeId = 0 };
+        }
+        ClearTopicForFinalAssessment();
+    }
+    private void ToggleEditTopic(ChangeEventArgs args, int topicId)
+    {
+        if (_edit is null) return;
+        if (IsChecked(args))
+        {
+            var proposed = _editTopicIds.Append(topicId).ToHashSet();
+            if (!TopicsShareSingleLessonType(_edit.ModuleId, proposed, out _))
+            {
+                _err = MixedTopicLessonTypeError;
+                return;
+            }
+            _editTopicIds.Add(topicId);
+        }
+        else
+        {
+            _editTopicIds.Remove(topicId);
+        }
+        _err = null;
+        ApplySelectedEditTopics();
+    }
+    private void SelectAllEditTopics()
+    {
+        if (_edit is null) return;
+        var allTopicIds = OrderedTopicsForModule(_edit.ModuleId)
+            .Select(topic => topic.Id)
+            .ToList();
+        if (!TopicsShareSingleLessonType(_edit.ModuleId, allTopicIds, out _))
+        {
+            _err = MixedTopicLessonTypeError;
+            return;
+        }
+        _editTopicIds.Clear();
+        foreach (var topicId in allTopicIds)
+        {
+            _editTopicIds.Add(topicId);
+        }
+        _err = null;
+        ApplySelectedEditTopics();
+    }
+    private void ClearEditTopics()
+    {
+        if (_edit is null) return;
+        _editTopicIds.Clear();
+        _err = null;
+        ApplySelectedEditTopics();
+    }
+    private void ToggleBulkTopic(ChangeEventArgs args, int topicId)
+    {
+        if (IsChecked(args))
+        {
+            var moduleId = ResolveEffectiveBulkModuleId();
+            if (moduleId is int mid)
+            {
+                var proposed = _bulkTopicIds.Append(topicId).ToHashSet();
+                if (!TopicsShareSingleLessonType(mid, proposed, out _))
+                {
+                    _err = MixedTopicLessonTypeError;
+                    return;
+                }
+            }
+            _bulkTopicIds.Add(topicId);
+        }
+        else
+        {
+            _bulkTopicIds.Remove(topicId);
+        }
+        _err = null;
+    }
+    private void SelectAllBulkTopics()
+    {
+        var moduleId = ResolveEffectiveBulkModuleId();
+        if (moduleId is not int mid) return;
+        var allTopicIds = OrderedTopicsForModule(mid)
+            .Select(topic => topic.Id)
+            .ToList();
+        if (!TopicsShareSingleLessonType(mid, allTopicIds, out _))
+        {
+            _err = MixedTopicLessonTypeError;
+            return;
+        }
+        _bulkTopicIds.Clear();
+        foreach (var topicId in allTopicIds)
+        {
+            _bulkTopicIds.Add(topicId);
+        }
+        _err = null;
+    }
+    private void ClearBulkTopics()
+    {
+        _bulkTopicIds.Clear();
+        _err = null;
+    }
+    private int? ResolveSingleSelectedModuleId()
+    {
+        var moduleIds = _items
+            .Where(i => _bulkSelectedIds.Contains(i.Id))
+            .Select(i => i.ModuleId)
+            .Distinct()
+            .Take(2)
+            .ToList();
+        return moduleIds.Count == 1 ? moduleIds[0] : null;
+    }
+    private int? ResolveEffectiveBulkModuleId()
+    {
+        if (_bulkModuleId is int moduleId)
+        {
+            return moduleId;
+        }
+        return ResolveSingleSelectedModuleId();
+    }
+    private async Task OnBulkModuleChanged(ChangeEventArgs e)
+    {
+        _bulkModuleId = int.TryParse(e.Value?.ToString(), out var parsed) ? parsed : (int?)null;
+        _bulkTopicIds.Clear();
+        var effectiveModuleId = ResolveEffectiveBulkModuleId();
+        if (effectiveModuleId is int moduleId)
+        {
+            await EnsureTopicsLoaded(moduleId);
+        }
     }
     // Застосовує вибір теми й синхронізує залежні поля (тип заняття, викладач).
     private void ApplyTopicSelection(int? topicId)
@@ -362,6 +606,24 @@
             RoomId = normalizedRoomId
         };
     }
+    private DraftUpsertRequest ApplyTopicToRequest(DraftUpsertRequest request, int? topicId)
+    {
+        var normalizedTopicId = topicId;
+        if (normalizedTopicId is int topicValue && FindTopic(request.ModuleId, topicValue) is null)
+        {
+            normalizedTopicId = null;
+        }
+        var updated = request with { ModuleTopicId = normalizedTopicId };
+        if (normalizedTopicId is int resolvedTopicId)
+        {
+            var topic = FindTopic(request.ModuleId, resolvedTopicId);
+            if (topic is not null)
+            {
+                updated = updated with { LessonTypeId = topic.LessonTypeId };
+            }
+        }
+        return NormalizeRequest(updated);
+    }
     private static string DraftLessonModeLabel(bool requiresRoom)
         => requiresRoom ? "Аудиторна година" : "Без аудиторії";
     private async Task OnModuleChanged(ChangeEventArgs e)
@@ -369,7 +631,8 @@
         if (_edit is null) return;
         var moduleId = int.TryParse(e.Value?.ToString(), out var parsed) ? parsed : 0;
         await EnsureTopicsLoaded(moduleId);
-        var topics = TopicsForModule(moduleId);
+        var topics = OrderedTopicsForModule(moduleId);
+        _editTopicIds.Clear();
         _edit = _edit with { ModuleId = moduleId, ModuleTopicId = null };
         if (_edit.Id is null)
         {
@@ -384,25 +647,9 @@
         var firstTopic = topics.FirstOrDefault();
         if (firstTopic is not null)
         {
+            _editTopicIds.Add(firstTopic.Id);
             ApplyTopicSelection(firstTopic.Id);
         }
-    }
-    private async Task OnTopicChanged(ChangeEventArgs e)
-    {
-        if (_edit is null) return;
-        var topicId = int.TryParse(e.Value?.ToString(), out var parsed) ? parsed : (int?)null;
-        await EnsureTopicsLoaded(_edit.ModuleId);
-        if (topicId is null)
-        {
-            ApplyTopicSelection(null);
-            if (_edit.Id is null)
-            {
-                _edit = _edit with { LessonTypeId = 0 };
-            }
-            return;
-        }
-        ApplyTopicSelection(topicId);
-        ClearTopicForFinalAssessment();
     }
     private void OnLessonTypeChanged(ChangeEventArgs e)
     {
@@ -415,6 +662,71 @@
         }
         ApplyLessonType(ltId);
         ClearTopicForFinalAssessment();
+    }
+    private void OnEditDateChanged(ChangeEventArgs e)
+    {
+        if (_edit is null) return;
+        var raw = e.Value?.ToString();
+        if (string.IsNullOrWhiteSpace(raw)) return;
+        if (!DateOnly.TryParseExact(raw, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var newDate)
+            && !DateOnly.TryParse(raw, out newDate))
+        {
+            return;
+        }
+        var previousSlots = DaySlotsFor(_edit.Date);
+        var startIndex = ResolveSlotStartIndex(previousSlots, _edit.TimeStart);
+        var endIndex = ResolveSlotEndIndex(previousSlots, _edit.TimeEnd, startIndex);
+        var updated = _edit with { Date = newDate };
+        var nextSlots = DaySlotsFor(newDate);
+        if (nextSlots.Count > 0)
+        {
+            var normalizedStartIndex = Math.Clamp(startIndex < 0 ? 0 : startIndex, 0, nextSlots.Count - 1);
+            var normalizedEndIndex = Math.Clamp(endIndex < 0 ? normalizedStartIndex : endIndex, normalizedStartIndex, nextSlots.Count - 1);
+            updated = updated with
+            {
+                TimeStart = nextSlots[normalizedStartIndex].Start,
+                TimeEnd = nextSlots[normalizedEndIndex].End
+            };
+        }
+        _edit = updated;
+    }
+    private void OnEditStartSlotChanged(ChangeEventArgs e)
+    {
+        if (_edit is null) return;
+        var slots = DaySlotsFor(_edit.Date);
+        if (slots.Count == 0) return;
+        var raw = e.Value?.ToString();
+        if (!int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var selectedNumber)) return;
+        var startIndex = selectedNumber - 1;
+        if (startIndex < 0 || startIndex >= slots.Count) return;
+        var endIndex = ResolveSlotEndIndex(slots, _edit.TimeEnd, startIndex);
+        endIndex = Math.Clamp(endIndex < 0 ? startIndex : endIndex, startIndex, slots.Count - 1);
+        _edit = _edit with
+        {
+            TimeStart = slots[startIndex].Start,
+            TimeEnd = slots[endIndex].End
+        };
+    }
+    private void OnEditEndSlotChanged(ChangeEventArgs e)
+    {
+        if (_edit is null) return;
+        var slots = DaySlotsFor(_edit.Date);
+        if (slots.Count == 0) return;
+        var raw = e.Value?.ToString();
+        if (!int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var selectedNumber)) return;
+        var endIndex = selectedNumber - 1;
+        if (endIndex < 0 || endIndex >= slots.Count) return;
+        var startIndex = ResolveSlotStartIndex(slots, _edit.TimeStart);
+        startIndex = Math.Clamp(startIndex < 0 ? 0 : startIndex, 0, slots.Count - 1);
+        if (endIndex < startIndex)
+        {
+            startIndex = endIndex;
+        }
+        _edit = _edit with
+        {
+            TimeStart = slots[startIndex].Start,
+            TimeEnd = slots[endIndex].End
+        };
     }
     private List<SlotRow> DaySlotsFor(DateOnly date)
     {
@@ -455,6 +767,57 @@
         }
         return TimeOnly.Parse(value, CultureInfo.InvariantCulture);
     }
+    private static int ResolveSlotStartIndex(List<SlotRow> slots, string start)
+    {
+        if (slots.Count == 0) return -1;
+        var exactIndex = slots.FindIndex(s => string.Equals(s.Start, start, StringComparison.Ordinal));
+        if (exactIndex >= 0) return exactIndex;
+        var targetTime = ParseSlotTime(start);
+        for (var index = 0; index < slots.Count; index++)
+        {
+            var slotStart = ParseSlotTime(slots[index].Start);
+            var slotEnd = ParseSlotTime(slots[index].End);
+            if (slotStart <= targetTime && targetTime < slotEnd)
+            {
+                return index;
+            }
+        }
+        for (var index = 0; index < slots.Count; index++)
+        {
+            var slotStart = ParseSlotTime(slots[index].Start);
+            if (slotStart > targetTime)
+            {
+                return Math.Max(0, index - 1);
+            }
+        }
+        return slots.Count - 1;
+    }
+    private static int ResolveSlotEndIndex(List<SlotRow> slots, string end, int minIndex = -1)
+    {
+        if (slots.Count == 0) return -1;
+        var normalizedMinIndex = Math.Max(minIndex, 0);
+        var exactIndex = slots.FindIndex(s => string.Equals(s.End, end, StringComparison.Ordinal));
+        if (exactIndex >= 0) return Math.Max(exactIndex, normalizedMinIndex);
+        var targetTime = ParseSlotTime(end);
+        for (var index = 0; index < slots.Count; index++)
+        {
+            var slotStart = ParseSlotTime(slots[index].Start);
+            var slotEnd = ParseSlotTime(slots[index].End);
+            if (slotStart < targetTime && targetTime <= slotEnd)
+            {
+                return Math.Max(index, normalizedMinIndex);
+            }
+        }
+        for (var index = 0; index < slots.Count; index++)
+        {
+            var slotEnd = ParseSlotTime(slots[index].End);
+            if (slotEnd >= targetTime)
+            {
+                return Math.Max(index, normalizedMinIndex);
+            }
+        }
+        return Math.Max(slots.Count - 1, normalizedMinIndex);
+    }
     // Повертає послідовні слоти між обраними часами.
     private List<SlotRow> ResolveSlotRange(DateOnly date, string start, string end)
     {
@@ -485,6 +848,29 @@
         }
         return (slotIndex + 1).ToString("00");
     }
+    // Визначає, чи записи належать до одного заняття для редагування набору тем.
+    private static bool IsSameEditTopicScope(TeacherDraftItemDto left, TeacherDraftItemDto right)
+        => left.Date == right.Date
+           && left.TimeStart == right.TimeStart
+           && left.TimeEnd == right.TimeEnd
+           && left.GroupId == right.GroupId
+           && left.ModuleId == right.ModuleId
+           && left.LessonTypeId == right.LessonTypeId
+           && left.RoomId == right.RoomId
+           && left.IsSelfStudy == right.IsSelfStudy
+           && left.TeacherId == right.TeacherId;
+    // Повертає теми, що вже існують у межах поточного заняття.
+    private List<int> ResolveEditScopeTopicIds(TeacherDraftItemDto item)
+    {
+        var topicIds = _items
+            .Where(existing => IsSameEditTopicScope(item, existing))
+            .Select(existing => existing.ModuleTopicId)
+            .Where(topicId => topicId is int and > 0)
+            .Select(topicId => topicId!.Value)
+            .Distinct()
+            .ToList();
+        return OrderedTopicIdsForModule(item.ModuleId, topicIds);
+    }
     // Готує форму редагування для існуючої чернетки.
     private async Task StartEdit(TeacherDraftItemDto item)
     {
@@ -510,7 +896,20 @@
         );
         _edit = NormalizeRequest(initialRequest);
         ApplyLessonType(_edit.LessonTypeId);
-        ApplyTopicSelection(item.ModuleTopicId);
+        _editTopicIds.Clear();
+        var scopedTopicIds = ResolveEditScopeTopicIds(item);
+        if (scopedTopicIds.Count > 0)
+        {
+            foreach (var topicId in scopedTopicIds)
+            {
+                _editTopicIds.Add(topicId);
+            }
+        }
+        else if (item.ModuleTopicId is int topicId)
+        {
+            _editTopicIds.Add(topicId);
+        }
+        ApplySelectedEditTopics();
         EnsureAllowedLessonType();
         _extraGroups.Clear();
         _extraTeachers.Clear();
@@ -568,7 +967,8 @@
         );
         _edit = NormalizeRequest(draftRequest);
         ApplyLessonType(_edit.LessonTypeId);
-        ApplyTopicSelection(null);
+        _editTopicIds.Clear();
+        ApplySelectedEditTopics();
         EnsureAllowedLessonType();
     }
     private List<DateOnly> GetWeekDates()
@@ -654,11 +1054,53 @@
         }
         return caption;
     }
+    // Перевіряє, чи можна агрегувати записи в межах однієї клітинки розкладу.
+    private static bool IsSameCellDisplayScope(TeacherDraftItemDto left, TeacherDraftItemDto right)
+        => left.ModuleId == right.ModuleId
+           && left.LessonTypeId == right.LessonTypeId
+           && left.RoomId == right.RoomId
+           && left.IsSelfStudy == right.IsSelfStudy;
     // Будує словник для швидкого пошуку елементів у таблиці.
     private static Dictionary<(int DayNumber, string Start, string End, int GroupId), TeacherDraftItemDto> BuildLookup(IEnumerable<TeacherDraftItemDto> items)
         => items
             .GroupBy(i => (i.DayNumber, i.TimeStart, i.TimeEnd, i.GroupId))
-            .ToDictionary(g => g.Key, g => g.First());
+            .ToDictionary(g => g.Key, g =>
+            {
+                var ordered = g.OrderBy(item => item.Id).ToList();
+                var primary = ordered[0];
+                var related = ordered
+                    .Where(item => IsSameCellDisplayScope(primary, item))
+                    .ToList();
+                var topicCodes = related
+                    .Select(item => item.TopicCode?.Trim())
+                    .Where(code => !string.IsNullOrWhiteSpace(code))
+                    .Select(code => code!)
+                    .Distinct(StringComparer.CurrentCultureIgnoreCase)
+                    .OrderBy(code => code, StringComparer.CurrentCultureIgnoreCase)
+                    .ToList();
+                var teacherNames = related
+                    .SelectMany(item => item.TeacherNames ?? new List<string>())
+                    .Where(name => !string.IsNullOrWhiteSpace(name))
+                    .Distinct(StringComparer.CurrentCultureIgnoreCase)
+                    .ToList();
+                if (teacherNames.Count == 0)
+                {
+                    teacherNames = related
+                        .Select(item => item.Teacher?.Trim())
+                        .Where(name => !string.IsNullOrWhiteSpace(name))
+                        .Select(name => name!)
+                        .Distinct(StringComparer.CurrentCultureIgnoreCase)
+                        .ToList();
+                }
+                var topicCaption = topicCodes.Count == 0 ? primary.TopicCode : string.Join(", ", topicCodes);
+                var teacherCaption = teacherNames.Count == 0 ? primary.Teacher : string.Join(", ", teacherNames);
+                return primary with
+                {
+                    TopicCode = topicCaption,
+                    Teacher = teacherCaption,
+                    TeacherNames = teacherNames.Count > 0 ? teacherNames : primary.TeacherNames
+                };
+            });
     // Додає часові проміжки чернеток до базового списку слотів.
     private static List<SlotRow> MergeSlotRows(IEnumerable<SlotRow> baseRows, IEnumerable<TeacherDraftItemDto> items)
         => baseRows
@@ -805,6 +1247,13 @@
                 return;
             }
             _err = null;
+            _bulkTopicIds.Clear();
+            _bulkModuleId = null;
+            var moduleId = ResolveEffectiveBulkModuleId();
+            if (moduleId is int mid)
+            {
+                await EnsureTopicsLoaded(mid);
+            }
             _bulkEditOpen = true;
             return;
         }
@@ -816,20 +1265,22 @@
         _bulkEditOpen = false;
         _bulkTeacherIds.Clear();
         _bulkRoomId = null;
+        _bulkModuleId = null;
+        _bulkTopicIds.Clear();
+    }
+    // Розпізнає стан прапорця з події зміни.
+    private static bool IsChecked(ChangeEventArgs args)
+    {
+        if (args.Value is bool boolValue)
+        {
+            return boolValue;
+        }
+        return args.Value is string text && bool.TryParse(text, out var parsed) && parsed;
     }
     // Перемикає вибір викладача для масового редагування.
     private void ToggleBulkTeacher(ChangeEventArgs args, int teacherId)
     {
-        var isChecked = false;
-        if (args.Value is bool boolValue)
-        {
-            isChecked = boolValue;
-        }
-        else if (args.Value is string text && bool.TryParse(text, out var parsed))
-        {
-            isChecked = parsed;
-        }
-        if (isChecked) _bulkTeacherIds.Add(teacherId);
+        if (IsChecked(args)) _bulkTeacherIds.Add(teacherId);
         else _bulkTeacherIds.Remove(teacherId);
     }
     // Обирає всіх викладачів для масового редагування.
@@ -861,7 +1312,25 @@
         if (roomId is not int id) return "без змін";
         return _meta?.Rooms.FirstOrDefault(r => r.Id == id)?.Name ?? $"#{id}";
     }
-    // Виконує масове оновлення викладача/аудиторії для обраних пар.
+    // Повертає підпис для модуля.
+    private string ResolveModuleLabel(int? moduleId)
+    {
+        if (moduleId is not int id) return "без змін";
+        var module = FindModule(id);
+        return module is null ? $"#{id}" : ModuleOptionCaption(module);
+    }
+    private string ResolveTopicListLabel(int? moduleId, IReadOnlyCollection<int> topicIds)
+    {
+        if (topicIds.Count == 0) return "без змін";
+        if (moduleId is not int mid) return string.Join(", ", topicIds.Select(id => $"#{id}"));
+        var labels = OrderedTopicsForModule(mid)
+            .Where(t => topicIds.Contains(t.Id))
+            .Select(TopicOptionCaption)
+            .Where(label => !string.IsNullOrWhiteSpace(label))
+            .ToList();
+        return labels.Count == 0 ? "без змін" : string.Join(", ", labels);
+    }
+    // Виконує масове оновлення викладача/аудиторії/модуля/тем для обраних пар.
     private async Task ApplyBulkEditAsync()
     {
         if (_bulkApplying) return;
@@ -876,11 +1345,6 @@
             _err = "Оберіть хоча б одну пару.";
             return;
         }
-        if (_bulkTeacherIds.Count == 0 && _bulkRoomId is null)
-        {
-            _err = "Оберіть викладача або аудиторію.";
-            return;
-        }
         var selectedItems = _items.Where(i => _bulkSelectedIds.Contains(i.Id)).ToList();
         if (selectedItems.Count == 0)
         {
@@ -892,10 +1356,36 @@
             _err = "Не можна редагувати пари з різних днів.";
             return;
         }
+        var effectiveModuleId = ResolveEffectiveBulkModuleId();
+        var orderedBulkTopicIds = effectiveModuleId is int moduleIdForTopics
+            ? OrderedTopicIdsForModule(moduleIdForTopics, _bulkTopicIds)
+            : new List<int>();
+        if (_bulkTopicIds.Count > 0 && effectiveModuleId is null)
+        {
+            _err = "Щоб змінити теми, оберіть модуль або пари лише з одного модуля.";
+            return;
+        }
+        if (effectiveModuleId is int moduleIdForValidation
+            && orderedBulkTopicIds.Count > 1
+            && !TopicsShareSingleLessonType(moduleIdForValidation, orderedBulkTopicIds, out _))
+        {
+            _err = MixedTopicLessonTypeError;
+            return;
+        }
+        var moduleWillChange = _bulkModuleId is int;
+        var topicsWillChange = orderedBulkTopicIds.Count > 0;
+        if (_bulkTeacherIds.Count == 0 && _bulkRoomId is null && !moduleWillChange && !topicsWillChange)
+        {
+            _err = "Оберіть, що саме змінювати: викладачів, аудиторію, модуль або теми.";
+            return;
+        }
         var dayLabel = DayToDate(selectedItems.First().DayNumber).ToString("dd.MM.yyyy");
+        var moduleLabel = ResolveModuleLabel(_bulkModuleId ?? effectiveModuleId);
         var confirmText = $"Застосувати зміни до {selectedItems.Count} пар за {dayLabel}? " +
                           $"Викладачі: {ResolveTeacherListLabel()}. " +
-                          $"Аудиторія: {ResolveRoomLabel(_bulkRoomId)}.";
+                          $"Аудиторія: {ResolveRoomLabel(_bulkRoomId)}. " +
+                          $"Модуль: {moduleLabel}. " +
+                          $"Теми: {ResolveTopicListLabel(effectiveModuleId, orderedBulkTopicIds)}.";
         var confirmed = await JS.InvokeAsync<bool>("confirm", confirmText);
         if (!confirmed) return;
         _bulkApplying = true;
@@ -928,23 +1418,47 @@
                     skippedLocked++;
                     continue;
                 }
+                var targetModuleId = _bulkModuleId ?? item.ModuleId;
+                var topicIdsForSlot = orderedBulkTopicIds.Count == 0
+                    ? new List<int?> { _bulkModuleId is int ? null : item.ModuleTopicId }
+                    : orderedBulkTopicIds.Select(id => (int?)id).ToList();
                 var newRoomId = _bulkRoomId ?? item.RoomId;
-                var desiredTeachers = _bulkTeacherIds.ToList();
+                var desiredTeachers = _bulkTeacherIds
+                    .Distinct()
+                    .OrderBy(id => id)
+                    .ToList();
+                var desiredTeacherSet = desiredTeachers.ToHashSet();
                 if (desiredTeachers.Count == 0)
                 {
                     foreach (var entry in batch)
                     {
-                        if (newRoomId == entry.RoomId)
-                        {
-                            skipped++;
-                            continue;
-                        }
                         var slot = BuildSlotKey(entry);
                         var baseRequest = BuildUpsertRequest(entry, slot, _unrestrictedMode);
-                        var updatedRequest = baseRequest with { RoomId = newRoomId };
-                        var normalized = NormalizeRequest(updatedRequest);
-                        await DraftsApi.Upsert(normalized);
-                        updated++;
+                        var batchKey = baseRequest.BatchKey ?? item.BatchKey ?? $"bulk-{Guid.NewGuid():N}";
+                        for (var topicIndex = 0; topicIndex < topicIdsForSlot.Count; topicIndex++)
+                        {
+                            var topicIdForRequest = topicIdsForSlot[topicIndex];
+                            var isExtraTopic = topicIndex > 0;
+                            var updatedRequest = ApplyTopicToRequest(baseRequest with
+                            {
+                                Id = isExtraTopic ? null : baseRequest.Id,
+                                RoomId = newRoomId,
+                                ModuleId = targetModuleId,
+                                BatchKey = batchKey,
+                                IgnoreValidationErrors = isExtraTopic || _unrestrictedMode
+                            }, topicIdForRequest);
+                            if (!isExtraTopic
+                                && entry.RoomId == updatedRequest.RoomId
+                                && entry.ModuleId == updatedRequest.ModuleId
+                                && entry.ModuleTopicId == updatedRequest.ModuleTopicId
+                                && entry.LessonTypeId == updatedRequest.LessonTypeId)
+                            {
+                                skipped++;
+                                continue;
+                            }
+                            await DraftsApi.Upsert(updatedRequest);
+                            updated++;
+                        }
                     }
                 }
                 else
@@ -952,37 +1466,64 @@
                     var batchKey = item.BatchKey ?? $"bulk-{Guid.NewGuid():N}";
                     var existingByTeacher = batch
                         .Where(x => x.TeacherId is int)
-                        .ToDictionary(x => x.TeacherId!.Value, x => x);
+                        .GroupBy(x => x.TeacherId!.Value)
+                        .ToDictionary(g => g.Key, g => g.First());
                     foreach (var teacherId in desiredTeachers)
                     {
                         if (existingByTeacher.TryGetValue(teacherId, out var existing))
                         {
                             var slot = BuildSlotKey(existing);
                             var baseRequest = BuildUpsertRequest(existing, slot, _unrestrictedMode);
-                            var updatedRequest = baseRequest with { RoomId = newRoomId };
-                            var normalized = NormalizeRequest(updatedRequest);
-                            await DraftsApi.Upsert(normalized);
-                            updated++;
+                            for (var topicIndex = 0; topicIndex < topicIdsForSlot.Count; topicIndex++)
+                            {
+                                var topicIdForRequest = topicIdsForSlot[topicIndex];
+                                var isExtraTopic = topicIndex > 0;
+                                var updatedRequest = ApplyTopicToRequest(baseRequest with
+                                {
+                                    Id = isExtraTopic ? null : baseRequest.Id,
+                                    RoomId = newRoomId,
+                                    ModuleId = targetModuleId,
+                                    BatchKey = batchKey,
+                                    IgnoreValidationErrors = isExtraTopic || _unrestrictedMode
+                                }, topicIdForRequest);
+                                if (!isExtraTopic
+                                    && existing.RoomId == updatedRequest.RoomId
+                                    && existing.ModuleId == updatedRequest.ModuleId
+                                    && existing.ModuleTopicId == updatedRequest.ModuleTopicId
+                                    && existing.LessonTypeId == updatedRequest.LessonTypeId)
+                                {
+                                    skipped++;
+                                    continue;
+                                }
+                                await DraftsApi.Upsert(updatedRequest);
+                                updated++;
+                            }
                         }
                         else
                         {
                             var slot = BuildSlotKey(item);
                             var baseRequest = BuildUpsertRequest(item, slot, _unrestrictedMode);
-                            var createdRequest = baseRequest with
+                            for (var topicIndex = 0; topicIndex < topicIdsForSlot.Count; topicIndex++)
                             {
-                                Id = null,
-                                TeacherId = teacherId,
-                                RoomId = newRoomId,
-                                BatchKey = batchKey
-                            };
-                            var normalized = NormalizeRequest(createdRequest);
-                            await DraftsApi.Upsert(normalized);
-                            updated++;
+                                var topicIdForRequest = topicIdsForSlot[topicIndex];
+                                var isExtraTopic = topicIndex > 0;
+                                var createdRequest = ApplyTopicToRequest(baseRequest with
+                                {
+                                    Id = null,
+                                    TeacherId = teacherId,
+                                    RoomId = newRoomId,
+                                    BatchKey = batchKey,
+                                    ModuleId = targetModuleId,
+                                    IgnoreValidationErrors = isExtraTopic || _unrestrictedMode
+                                }, topicIdForRequest);
+                                await DraftsApi.Upsert(createdRequest);
+                                updated++;
+                            }
                         }
                     }
                     foreach (var extra in batch)
                     {
-                        if (extra.TeacherId is int existingId && desiredTeachers.Contains(existingId))
+                        if (extra.TeacherId is int existingId && desiredTeacherSet.Contains(existingId))
                         {
                             continue;
                         }
@@ -996,7 +1537,7 @@
             {
                 _ok += $" Заблокованих: {skippedLocked}.";
             }
-            await Reload();
+            await ReloadDraftItemsOnlyAsync();
             ClearBulkSelection();
             CloseBulkEdit();
         }
@@ -1013,7 +1554,7 @@
             _bulkApplying = false;
         }
     }
-    // Формує ключ слоту без аудиторії для уникнення дублювання.
+    // Формує ключ слоту для уникнення дублювання під час масового редагування.
     private static string BuildBulkSlotKey(TeacherDraftItemDto item)
         => $"{item.Date:yyyyMMdd}|{item.TimeStart}|{item.TimeEnd}|g{item.GroupId}|m{item.ModuleId}|lt{item.LessonTypeId}|ss{item.IsSelfStudy}|t{item.ModuleTopicId?.ToString() ?? "none"}";
     // Формує підпис списку викладачів.
@@ -1150,7 +1691,7 @@
             {
                 await SwapItemsAsync(sourceItem, targetItem, targetKey);
             }
-            await Reload();
+            await ReloadDraftItemsOnlyAsync();
         }
         catch (ApiErrorException ex)
         {
@@ -1232,11 +1773,24 @@
         try
         {
             var createdItemsForLog = new List<CreatedDraftLogItem>();
-            var payload = NormalizeRequest(_edit with
+            var orderedTopicIds = ResolveOrderedEditTopicIds();
+            if (IsFinalAssessment(lessonTypeId))
+            {
+                orderedTopicIds.Clear();
+            }
+            if (orderedTopicIds.Count > 1
+                && !TopicsShareSingleLessonType(_edit.ModuleId, orderedTopicIds, out _))
+            {
+                _err = MixedTopicLessonTypeError;
+                return;
+            }
+            var primaryTopicId = orderedTopicIds.Count == 0 ? (int?)null : orderedTopicIds[0];
+            var payload = ApplyTopicToRequest(_edit with
             {
                 LessonTypeId = lessonTypeId,
+                ModuleTopicId = primaryTopicId,
                 IgnoreValidationErrors = _unrestrictedMode
-            });
+            }, primaryTopicId);
             var slotRange = _edit.Id is null
                 ? ResolveSlotRange(payload.Date, payload.TimeStart, payload.TimeEnd)
                 : new List<SlotRow>();
@@ -1252,25 +1806,68 @@
             var resolvedBatchKey = (hasExtras || hasRange)
                 ? (payload.BatchKey ?? $"clone-{Guid.NewGuid():N}")
                 : payload.BatchKey;
+            var singleSlotTopicIds = orderedTopicIds.Count == 0
+                ? new List<int?> { primaryTopicId }
+                : orderedTopicIds.Select(id => (int?)id).ToList();
             if (!hasRange)
             {
-                var primaryRequest = NormalizeRequest(payload with { BatchKey = resolvedBatchKey });
+                var firstTopicId = singleSlotTopicIds[0];
+                var primaryRequest = ApplyTopicToRequest(payload with { BatchKey = resolvedBatchKey }, firstTopicId);
                 if (!isNewDraft)
                 {
                     var id = await DraftsApi.Upsert(primaryRequest);
+                    for (var topicIndex = 1; topicIndex < singleSlotTopicIds.Count; topicIndex++)
+                    {
+                        var extraTopicId = singleSlotTopicIds[topicIndex];
+                        var extraRequest = ApplyTopicToRequest(primaryRequest with
+                        {
+                            Id = null,
+                            BatchKey = resolvedBatchKey ?? primaryRequest.BatchKey ?? $"clone-{Guid.NewGuid():N}",
+                            IgnoreValidationErrors = true
+                        }, extraTopicId);
+                        await DraftsApi.Upsert(extraRequest);
+                    }
                     _ok = $"Збережено (Id = {id}).";
                 }
                 else if (!hasExtras)
                 {
-                    var id = await DraftsApi.Upsert(primaryRequest);
-                    createdItemsForLog.Add(new CreatedDraftLogItem(id, primaryRequest));
-                    _ok = $"Збережено (Id = {id}).";
+                    var createdCount = 0;
+                    int? lastCreatedId = null;
+                    for (var topicIndex = 0; topicIndex < singleSlotTopicIds.Count; topicIndex++)
+                    {
+                        var topicIdForRequest = singleSlotTopicIds[topicIndex];
+                        var request = ApplyTopicToRequest(primaryRequest with
+                        {
+                            Id = null,
+                            BatchKey = resolvedBatchKey ?? primaryRequest.BatchKey ?? $"clone-{Guid.NewGuid():N}",
+                            IgnoreValidationErrors = topicIndex > 0 || _unrestrictedMode
+                        }, topicIdForRequest);
+                        var id = await DraftsApi.Upsert(request);
+                        lastCreatedId = id;
+                        createdCount++;
+                        createdItemsForLog.Add(new CreatedDraftLogItem(id, request));
+                    }
+                    _ok = createdCount == 1 && lastCreatedId is int singleId
+                        ? $"Збережено (Id = {singleId})."
+                        : $"Збережено {createdCount} пар.";
                 }
                 else
                 {
-                    var requests = BuildDuplicateRequests(primaryRequest, extraGroupIds, extraTeacherIds);
-                    var (primaryCount, totalCount, createdItems) = await UpsertDuplicateRequestsAsync(requests, primaryRequest);
-                    createdItemsForLog.AddRange(createdItems);
+                    var primaryCount = 0;
+                    var totalCount = 0;
+                    foreach (var topicIdForRequest in singleSlotTopicIds)
+                    {
+                        var topicRequest = ApplyTopicToRequest(primaryRequest with
+                        {
+                            Id = null,
+                            BatchKey = resolvedBatchKey ?? primaryRequest.BatchKey ?? $"clone-{Guid.NewGuid():N}"
+                        }, topicIdForRequest);
+                        var requests = BuildDuplicateRequests(topicRequest, extraGroupIds, extraTeacherIds);
+                        var result = await UpsertDuplicateRequestsAsync(requests, topicRequest);
+                        primaryCount += result.primaryCount;
+                        totalCount += result.totalCount;
+                        createdItemsForLog.AddRange(result.createdItems);
+                    }
                     var extraCount = totalCount - primaryCount;
                     var suffix = extraCount > 0 ? $" (+{extraCount} дубль.)" : string.Empty;
                     _ok = $"Збережено {primaryCount} пар{suffix}.";
@@ -1280,20 +1877,28 @@
             {
                 var primaryCount = 0;
                 var totalCount = 0;
-                foreach (var slot in slotRange)
+                var slotTopicIds = orderedTopicIds.Count == 0
+                    ? new List<int?> { primaryTopicId }
+                    : orderedTopicIds.Select(id => (int?)id).ToList();
+                for (var slotIndex = 0; slotIndex < slotRange.Count; slotIndex++)
                 {
-                    var slotRequest = NormalizeRequest(payload with
+                    var slot = slotRange[slotIndex];
+                    foreach (var slotTopicId in slotTopicIds)
                     {
-                        Id = null,
-                        BatchKey = resolvedBatchKey,
-                        TimeStart = slot.Start,
-                        TimeEnd = slot.End
-                    });
-                    var requests = BuildDuplicateRequests(slotRequest, extraGroupIds, extraTeacherIds);
-                    var result = await UpsertDuplicateRequestsAsync(requests, slotRequest);
-                    primaryCount += result.primaryCount;
-                    totalCount += result.totalCount;
-                    createdItemsForLog.AddRange(result.createdItems);
+                        var slotRequest = ApplyTopicToRequest(payload with
+                        {
+                            Id = null,
+                            BatchKey = resolvedBatchKey,
+                            TimeStart = slot.Start,
+                            TimeEnd = slot.End,
+                            ModuleTopicId = slotTopicId
+                        }, slotTopicId);
+                        var requests = BuildDuplicateRequests(slotRequest, extraGroupIds, extraTeacherIds);
+                        var result = await UpsertDuplicateRequestsAsync(requests, slotRequest);
+                        primaryCount += result.primaryCount;
+                        totalCount += result.totalCount;
+                        createdItemsForLog.AddRange(result.createdItems);
+                    }
                 }
                 var extraCount = totalCount - primaryCount;
                 var suffix = extraCount > 0 ? $" (+{extraCount} дубль.)" : string.Empty;
@@ -1301,7 +1906,11 @@
             }
             _extraGroups.Clear();
             _extraTeachers.Clear();
-            await Reload();
+            await ReloadDraftItemsOnlyAsync();
+            if (isNewDraft)
+            {
+                CancelEdit();
+            }
             await LogManualCreateAsync(createdItemsForLog);
         }
         catch (ApiErrorException ex)
@@ -1361,7 +1970,7 @@
         var deletedItemsMap = new Dictionary<int, TeacherDraftItemDto>();
         foreach (var selected in selectedItems)
         {
-            var batch = CollectSlotItems(selected);
+            var batch = CollectSlotItemsForDelete(selected);
             foreach (var entry in batch)
             {
                 idsToDelete.Add(entry.Id);
@@ -1389,7 +1998,7 @@
             await LogManualDeleteAsync(
                 deletedItemsMap.Values.ToList(),
                 _ok ?? $"Видалено {selectedItems.Count} виділених пар ({idsToDelete.Count} записів).");
-            await Reload();
+            await ReloadDraftItemsOnlyAsync();
         }
         catch (ApiErrorException ex)
         {
@@ -1403,7 +2012,7 @@
     // Видаляє всі записи пари в межах слоту та групи.
     private async Task DeleteSlotAsync(TeacherDraftItemDto item)
     {
-        var batch = CollectSlotItems(item);
+        var batch = CollectSlotItemsForDelete(item);
         if (batch.Count == 0)
         {
             _err = "Не знайдено записів для видалення.";
@@ -1429,7 +2038,7 @@
             await LogManualDeleteAsync(
                 batch,
                 _ok ?? (batch.Count == 1 ? $"Видалено (Id = {item.Id})." : $"Видалено {batch.Count} записів цієї пари."));
-            await Reload();
+            RemoveDraftItemsFromState(batch.Select(x => x.Id));
         }
         catch (ApiErrorException ex)
         {
@@ -1446,6 +2055,12 @@
             .Where(x => IsSameSlot(item, x))
             .OrderBy(x => x.Id)
             .ToList();
+    // Збирає всі записи пари для видалення незалежно від теми заняття.
+    private List<TeacherDraftItemDto> CollectSlotItemsForDelete(TeacherDraftItemDto item)
+        => _items
+            .Where(x => IsSameSlotForDelete(item, x))
+            .OrderBy(x => x.Id)
+            .ToList();
     // Перевіряє, чи належать записи до одного слоту та групи.
     private static bool IsSameSlot(TeacherDraftItemDto left, TeacherDraftItemDto right)
         => left.Date == right.Date
@@ -1457,6 +2072,16 @@
            && left.RoomId == right.RoomId
            && left.IsSelfStudy == right.IsSelfStudy
            && left.ModuleTopicId == right.ModuleTopicId;
+    // Перевіряє, чи належать записи до однієї пари без урахування теми.
+    private static bool IsSameSlotForDelete(TeacherDraftItemDto left, TeacherDraftItemDto right)
+        => left.Date == right.Date
+           && left.TimeStart == right.TimeStart
+           && left.TimeEnd == right.TimeEnd
+           && left.GroupId == right.GroupId
+           && left.ModuleId == right.ModuleId
+           && left.LessonTypeId == right.LessonTypeId
+           && left.RoomId == right.RoomId
+           && left.IsSelfStudy == right.IsSelfStudy;
     // Узгоджене відображення помилок API та конфліктів.
     private async Task HandleApiError(ApiErrorException ex)
     {
@@ -2283,6 +2908,12 @@ else
                 </div>
                 <button class="btn btn-ghost editor-close" type="button" @onclick="CloseBulkEdit">×</button>
             </div>
+            @{
+                var effectiveBulkModuleId = ResolveEffectiveBulkModuleId();
+                var bulkTopics = effectiveBulkModuleId is int moduleId
+                    ? OrderedTopicsForModule(moduleId)
+                    : new List<ModuleTopicViewDto>();
+            }
             <div class="editor-grid">
                 <div class="editor-field editor-field--wide">
                     <label>Викладачі (можна кілька)</label>
@@ -2314,6 +2945,48 @@ else
                         }
                     </select>
                 </div>
+                <div class="editor-field editor-field--wide">
+                    <label>Модуль</label>
+                    <select class="select" @onchange="OnBulkModuleChanged">
+                        <option value="" selected="@(_bulkModuleId is null)">Без змін</option>
+                        @foreach (var module in _meta.Modules.OrderBy(m => m.Code, StringComparer.CurrentCultureIgnoreCase).ThenBy(m => m.Name, StringComparer.CurrentCultureIgnoreCase))
+                        {
+                            <option value="@module.Id" selected="@(_bulkModuleId == module.Id)">@ModuleOptionCaption(module)</option>
+                        }
+                    </select>
+                    <div class="bulk-editor-hint">Якщо модуль не вибрано, теми можна змінити лише коли всі обрані пари з одного модуля.</div>
+                </div>
+                <div class="editor-field editor-field--wide">
+                    <label>Теми заняття (можна кілька)</label>
+                    @if (effectiveBulkModuleId is null)
+                    {
+                        <div class="bulk-editor-hint">Оберіть модуль, щоб змінити теми.</div>
+                    }
+                    else if (bulkTopics.Count == 0)
+                    {
+                        <div class="bulk-editor-hint">Для обраного модуля теми відсутні.</div>
+                    }
+                    else
+                    {
+                        <div class="bulk-editor-teachers">
+                            @foreach (var topic in bulkTopics)
+                            {
+                                var selected = _bulkTopicIds.Contains(topic.Id);
+                                <label class="bulk-editor-teacher-row">
+                                    <input type="checkbox"
+                                           checked="@selected"
+                                           @onchange="(e) => ToggleBulkTopic(e, topic.Id)" />
+                                    <span>@TopicOptionCaption(topic)</span>
+                                </label>
+                            }
+                        </div>
+                        <div class="bulk-editor-actions">
+                            <button class="btn btn-ghost btn-sm" type="button" @onclick="SelectAllBulkTopics">Обрати всі</button>
+                            <button class="btn btn-ghost btn-sm" type="button" @onclick="ClearBulkTopics">Очистити</button>
+                        </div>
+                        <div class="bulk-editor-hint">Усі обрані теми будуть додані до кожної обраної пари. Дозволені лише теми з однаковим типом заняття.</div>
+                    }
+                </div>
             </div>
             <div class="editor-actions">
                 <button class="btn btn-primary" type="button" @onclick="ApplyBulkEditAsync" disabled="@_bulkApplying">
@@ -2337,33 +3010,76 @@ else
                 <button type="button" class="btn btn-ghost editor-close" title="Закрити" @onclick="CancelEdit">×</button>
             </div>
             @{
-                var moduleTopics = TopicsForModule(_edit!.ModuleId);
+                var moduleTopics = OrderedTopicsForModule(_edit!.ModuleId);
+                var selectedTopicIds = OrderedTopicIdsForModule(_edit!.ModuleId, _editTopicIds);
                 var selectedModule = _meta.Modules.FirstOrDefault(m => m.Id == _edit!.ModuleId);
-                var selectedTopic = _edit!.ModuleTopicId is int topicId
-                    ? moduleTopics.FirstOrDefault(t => t.Id == topicId)
+                var selectedTopic = selectedTopicIds.Count > 0
+                    ? moduleTopics.FirstOrDefault(t => t.Id == selectedTopicIds[0])
                     : null;
                 var teacherOptions = AllowedTeachersForTopic(selectedTopic);
-                var lessonTypes = AllowedLessonTypes;
-                var selectedLessonType = lessonTypes.FirstOrDefault(lt => lt.Id == _edit!.LessonTypeId) ?? lessonTypes.FirstOrDefault();
+                var topicSelectionDisabled = IsFinalAssessment(_edit!.LessonTypeId);
+                var editDaySlots = DaySlotsFor(_edit!.Date);
+                var editStartSlotIndex = ResolveSlotStartIndex(editDaySlots, _edit!.TimeStart);
+                if (editDaySlots.Count > 0)
+                {
+                    editStartSlotIndex = Math.Clamp(editStartSlotIndex < 0 ? 0 : editStartSlotIndex, 0, editDaySlots.Count - 1);
+                }
+                var editEndSlotIndex = ResolveSlotEndIndex(editDaySlots, _edit!.TimeEnd, editStartSlotIndex);
+                if (editDaySlots.Count > 0)
+                {
+                    editEndSlotIndex = Math.Clamp(editEndSlotIndex < 0 ? editStartSlotIndex : editEndSlotIndex, editStartSlotIndex, editDaySlots.Count - 1);
+                }
             }
             <div class="editor-grid">
             <div class="editor-field">
                 <label>Дата</label>
                 <input type="date" class="select"
                        value="@_edit!.Date.ToString("yyyy-MM-dd")"
-                       @onchange="e => _edit = _edit! with { Date = DateOnly.Parse((string)e.Value!) }" />
+                       @onchange="OnEditDateChanged" />
             </div>
             <div class="editor-field">
-                <label>Початок</label>
-                <input type="time" class="select"
-                       value="@_edit!.TimeStart"
-                       @onchange="e => _edit = _edit! with { TimeStart = (string)e.Value! }" />
+                <label>З якої пари</label>
+                <select class="select"
+                        value="@(editStartSlotIndex >= 0 ? (editStartSlotIndex + 1).ToString(CultureInfo.InvariantCulture) : string.Empty)"
+                        @onchange="OnEditStartSlotChanged"
+                        disabled="@(editDaySlots.Count == 0)">
+                    @if (editDaySlots.Count == 0)
+                    {
+                        <option value="">Немає доступних пар</option>
+                    }
+                    else
+                    {
+                        @for (var slotIndex = 0; slotIndex < editDaySlots.Count; slotIndex++)
+                        {
+                            var slot = editDaySlots[slotIndex];
+                            <option value="@(slotIndex + 1)">
+                                @($"{slotIndex + 1:00} ({slot.Start}-{slot.End})")
+                            </option>
+                        }
+                    }
+                </select>
             </div>
             <div class="editor-field">
-                <label>Кінець</label>
-                <input type="time" class="select"
-                       value="@_edit!.TimeEnd"
-                       @onchange="e => _edit = _edit! with { TimeEnd = (string)e.Value! }" />
+                <label>До якої пари</label>
+                <select class="select"
+                        value="@(editEndSlotIndex >= 0 ? (editEndSlotIndex + 1).ToString(CultureInfo.InvariantCulture) : string.Empty)"
+                        @onchange="OnEditEndSlotChanged"
+                        disabled="@(editDaySlots.Count == 0)">
+                    @if (editDaySlots.Count == 0)
+                    {
+                        <option value="">Немає доступних пар</option>
+                    }
+                    else
+                    {
+                        @for (var slotIndex = Math.Max(editStartSlotIndex, 0); slotIndex < editDaySlots.Count; slotIndex++)
+                        {
+                            var slot = editDaySlots[slotIndex];
+                            <option value="@(slotIndex + 1)">
+                                @($"{slotIndex + 1:00} ({slot.Start}-{slot.End})")
+                            </option>
+                        }
+                    }
+                </select>
             </div>
             <div class="editor-field">
                 <label>Група</label>
@@ -2401,30 +3117,54 @@ else
             </div>
             <div class="editor-field editor-field--wide">
                 <label>
-                    Тема заняття
+                    Теми заняття
                     @if (!string.IsNullOrWhiteSpace(selectedTopic?.TopicCode))
                     {
                         <span class="editor-code">@selectedTopic?.TopicCode</span>
                     }
                 </label>
-                <select class="select"
-                        disabled="@(moduleTopics.Count == 0)"
-                        @onchange="OnTopicChanged">
-                    @if (moduleTopics.Count == 0)
+                @if (moduleTopics.Count == 0)
+                {
+                    <div class="bulk-editor-hint">Теми заняття відсутні.</div>
+                }
+                else
+                {
+                    <div class="bulk-editor-teachers">
+                        @foreach (var topic in moduleTopics)
+                        {
+                            var selected = selectedTopicIds.Contains(topic.Id);
+                            <label class="bulk-editor-teacher-row">
+                                <input type="checkbox"
+                                       checked="@selected"
+                                       disabled="@topicSelectionDisabled"
+                                       @onchange="(e) => ToggleEditTopic(e, topic.Id)" />
+                                <span>@TopicOptionCaption(topic)</span>
+                            </label>
+                        }
+                    </div>
+                    <div class="bulk-editor-actions">
+                        <button class="btn btn-ghost btn-sm"
+                                type="button"
+                                @onclick="SelectAllEditTopics"
+                                disabled="@topicSelectionDisabled">
+                            Обрати всі
+                        </button>
+                        <button class="btn btn-ghost btn-sm"
+                                type="button"
+                                @onclick="ClearEditTopics"
+                                disabled="@topicSelectionDisabled">
+                            Очистити
+                        </button>
+                    </div>
+                    @if (topicSelectionDisabled)
                     {
-                        <option value="" selected disabled>— Теми заняття відсутні —</option>
+                        <div class="bulk-editor-hint">Для підсумкового контролю тема заняття не використовується.</div>
                     }
                     else
                     {
-                        <option value="">(Без теми)</option>
-                        @foreach (var topic in moduleTopics)
-                        {
-                            <option value="@topic.Id" selected="@(@topic.Id == _edit!.ModuleTopicId)">
-                                @TopicOptionCaption(topic)
-                            </option>
-                        }
+                        <div class="bulk-editor-hint">Під час збереження всі обрані теми додаються до кожної пари. Дозволені лише теми з однаковим типом заняття.</div>
                     }
-                </select>
+                }
             </div>
             <div class="editor-field">
                 <label>Тип заняття</label>
@@ -3296,3 +4036,4 @@ else
         word-break: break-word;
     }
 </style>
+

@@ -65,6 +65,18 @@ public sealed class TeacherDraftsExportService
         {
             groups.Add(new GroupInfo(sectionId, groupLabel));
         }
+        var moduleIds = drafts
+            .Select(d => d.ModuleId)
+            .Distinct()
+            .ToList();
+        var moduleCodeLookup = moduleIds.Count == 0
+            ? new Dictionary<int, string>()
+            : await _db.Modules.AsNoTracking()
+                .Where(m => moduleIds.Contains(m.Id))
+                .Select(m => new { m.Id, m.Code })
+                .ToDictionaryAsync(
+                    m => m.Id,
+                    m => string.IsNullOrWhiteSpace(m.Code) ? string.Empty : m.Code.Trim());
         var weekDays = Enumerable.Range(0, 7)
             .Select(offset => weekStart.AddDays(offset))
             .ToList();
@@ -72,9 +84,14 @@ public sealed class TeacherDraftsExportService
         var rawSlots = await _db.TimeSlots.AsNoTracking()
             .Where(s => s.CourseId == null)
             .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
-            .Select(s => new { s.Start, s.End })
+            .Select(s => new { s.Start, s.End, s.SortOrder })
             .ToListAsync();
         var globalSlots = rawSlots.Select(s => (s.Start, s.End)).ToList();
+        var slotNumberLookup = rawSlots
+            .GroupBy(s => (s.Start, s.End))
+            .ToDictionary(
+                g => g.Key,
+                g => g.Select(x => x.SortOrder).FirstOrDefault(number => number > 0));
         var enriched = drafts
             .Select(d => new
             {
@@ -90,9 +107,16 @@ public sealed class TeacherDraftsExportService
             .OrderBy(x => x.Start)
             .ThenBy(x => x.End)
             .ToList();
-        var lookup = enriched.ToDictionary(
-            x => (x.Item.Date, x.Start, x.End, x.Item.GroupId),
-            x => x.Item);
+        var lookup = enriched
+            .GroupBy(x => (x.Item.Date, x.Start, x.End, x.Item.GroupId))
+            .ToDictionary(
+                g => g.Key,
+                g => g.Select(x => x.Item)
+                    .OrderBy(x => x.Module, StringComparer.CurrentCultureIgnoreCase)
+                    .ThenBy(x => x.LessonTypeName, StringComparer.CurrentCultureIgnoreCase)
+                    .ThenBy(x => x.Teacher, StringComparer.CurrentCultureIgnoreCase)
+                    .ThenBy(x => x.Id)
+                    .ToList());
         var filterParts = new List<string>();
         if (!string.IsNullOrWhiteSpace(teacherLabel)) filterParts.Add($"Викладач: {teacherLabel}");
         if (!string.IsNullOrWhiteSpace(groupLabel)) filterParts.Add($"Група: {groupLabel}");
@@ -121,7 +145,7 @@ public sealed class TeacherDraftsExportService
         }
         const int tableHeaderRow = 4;
         worksheet.Cell(tableHeaderRow, 1).Value = "День тижня";
-        worksheet.Cell(tableHeaderRow, 2).Value = "Час";
+        worksheet.Cell(tableHeaderRow, 2).Value = "Пара";
         if (groups.Count > 0)
         {
             for (var index = 0; index < groups.Count; index++)
@@ -155,15 +179,30 @@ public sealed class TeacherDraftsExportService
             foreach (var day in weekDays)
             {
                 var dayStartRow = row;
-                foreach (var slot in slotPeriods)
+                for (var slotIndex = 0; slotIndex < slotPeriods.Count; slotIndex++)
                 {
-                    worksheet.Cell(row, 2).Value = $"{slot.Start:HH:mm} - {slot.End:HH:mm}";
+                    var slot = slotPeriods[slotIndex];
+                    var slotNumber = slotNumberLookup.TryGetValue((slot.Start, slot.End), out var mappedSlotNumber) && mappedSlotNumber > 0
+                        ? mappedSlotNumber
+                        : slotIndex + 1;
+                    worksheet.Cell(row, 2).Value = slotNumber;
                     for (var index = 0; index < groups.Count; index++)
                     {
                         var column = 3 + index;
-                        if (lookup.TryGetValue((day, slot.Start, slot.End, groups[index].Id), out var item))
+                        if (lookup.TryGetValue((day, slot.Start, slot.End, groups[index].Id), out var itemsForSlot))
                         {
-                            worksheet.Cell(row, column).Value = TeacherDraftsHelpers.BuildExportCell(item);
+                            var cellParts = itemsForSlot
+                                .Select(item =>
+                                {
+                                    moduleCodeLookup.TryGetValue(item.ModuleId, out var moduleCode);
+                                    return TeacherDraftsHelpers.BuildExportCell(item, moduleCode);
+                                })
+                                .Where(text => !string.IsNullOrWhiteSpace(text))
+                                .Distinct(StringComparer.CurrentCulture)
+                                .ToList();
+                            worksheet.Cell(row, column).Value = string.Join(
+                                $"{Environment.NewLine}{Environment.NewLine}",
+                                cellParts);
                         }
                     }
                     row++;
