@@ -930,7 +930,7 @@ public sealed class TeacherDraftsAutogenService
             var resolvedByDay = TimeSlotsResolver.ResolveForWeek(allSlots, grp.CourseId);
             List<TimeSlot> slots = new();
             Dictionary<(TimeOnly Start, TimeOnly End), int> slotIndexByTime = new();
-            // Максимальна кількість пар одного модуля підряд у межах дня.
+            // Максимальна кількість пар одного модуля у межах дня.
             const int maxConsecutiveModuleSlotsPerDay = 5;
             void ApplySlotsForDate(DateOnly date)
             {
@@ -1009,6 +1009,96 @@ public sealed class TeacherDraftsAutogenService
                 if (prevTeacherId is int pt && nextTeacherId is int nt && pt == nt)
                     return pt;
                 return prevTeacherId ?? nextTeacherId;
+            }
+            // Повертає аудиторію суміжного слота для того самого модуля (щоб тримати одну аудиторію в блоці).
+            int? GetAdjacentSameModuleRoomId(DateOnly date, TimeSlot slot, int moduleId)
+            {
+                if (!slotIndexByTime.TryGetValue((slot.Start, slot.End), out var slotIndex))
+                    return null;
+                int? prevRoomId = null;
+                if (slotIndex > 0)
+                {
+                    var prevSlot = slots[slotIndex - 1];
+                    prevRoomId = busy
+                        .Where(b => b.GroupId == grp.Id
+                                    && b.Date == date
+                                    && b.ModuleId == moduleId
+                                    && b.StartTime == prevSlot.Start
+                                    && b.EndTime == prevSlot.End
+                                    && b.RoomId != null
+                                    && !excludedTypeIds.Contains(b.LessonTypeId))
+                        .Select(b => b.RoomId)
+                        .FirstOrDefault();
+                }
+                int? nextRoomId = null;
+                if (slotIndex + 1 < slots.Count)
+                {
+                    var nextSlot = slots[slotIndex + 1];
+                    nextRoomId = busy
+                        .Where(b => b.GroupId == grp.Id
+                                    && b.Date == date
+                                    && b.ModuleId == moduleId
+                                    && b.StartTime == nextSlot.Start
+                                    && b.EndTime == nextSlot.End
+                                    && b.RoomId != null
+                                    && !excludedTypeIds.Contains(b.LessonTypeId))
+                        .Select(b => b.RoomId)
+                        .FirstOrDefault();
+                }
+                if (prevRoomId is int pr && nextRoomId is int nr && pr == nr)
+                    return pr;
+                return prevRoomId ?? nextRoomId;
+            }
+            // Жорстка перевірка денних правил для модуля:
+            // 1) не більше 5 пар на день;
+            // 2) модуль не можна "розривати" іншим модулем і потім повертатися до нього.
+            bool ViolatesModuleDayHardRules(DateOnly date, int moduleId, TimeOnly candidateStart, TimeOnly candidateEnd, out string reason)
+            {
+                var dayLessons = busy
+                    .Where(b => b.GroupId == grp.Id
+                                && b.Date == date
+                                && !excludedTypeIds.Contains(b.LessonTypeId))
+                    .Select(b => (Start: b.StartTime, End: b.EndTime, ModuleId: b.ModuleId))
+                    .Distinct()
+                    .ToList();
+                if (!dayLessons.Any(x => x.Start == candidateStart && x.End == candidateEnd))
+                {
+                    dayLessons.Add((candidateStart, candidateEnd, moduleId));
+                }
+                var modulePerDayCount = dayLessons.Count(x => x.ModuleId == moduleId);
+                if (modulePerDayCount > maxConsecutiveModuleSlotsPerDay)
+                {
+                    reason = $"Модуль <{ModuleTitleLabel(moduleId)}> не можна ставити більш ніж {maxConsecutiveModuleSlotsPerDay} пар у межах дня.";
+                    return true;
+                }
+                var orderedLessons = dayLessons
+                    .OrderBy(x => x.Start)
+                    .ThenBy(x => x.End)
+                    .ToList();
+                int moduleSegments = 0;
+                bool inModuleSegment = false;
+                foreach (var lesson in orderedLessons)
+                {
+                    if (lesson.ModuleId == moduleId)
+                    {
+                        if (!inModuleSegment)
+                        {
+                            moduleSegments++;
+                            inModuleSegment = true;
+                            if (moduleSegments > 1)
+                            {
+                                reason = $"Модуль <{ModuleTitleLabel(moduleId)}> у межах дня ставимо суцільним блоком без повернення після перемикання на інший модуль.";
+                                return true;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        inModuleSegment = false;
+                    }
+                }
+                reason = string.Empty;
+                return false;
             }
             // Перевіряє, чи є порожні слоти у день.
             bool DayHasGaps(DateOnly date, out TimeSlot? firstGap)
@@ -1719,6 +1809,8 @@ public sealed class TeacherDraftsAutogenService
                     }
                     // Викладач у сусідньому слоті (для пріоритету суміжних пар).
                     var preferredAdjacentTeacherId = GetAdjacentSameModuleTeacherId(date, sl, moduleId);
+                    // Аудиторія у сусідньому слоті (для фіксації однієї аудиторії в блоці модуля).
+                    var preferredAdjacentRoomId = GetAdjacentSameModuleRoomId(date, sl, moduleId);
                     // Не дозволяємо ставити інші модулі до першого головного.
                     if (forceFirstMainModule && firstMainPlaced && moduleId != firstMainModuleId && IsBeforeFirstMain(date, s))
                     {
@@ -1731,6 +1823,11 @@ public sealed class TeacherDraftsAutogenService
                     if (slotBreak)
                     {
                         RecordSlotFailureReason(date, sl, $"Слот {slotLabel} зайнятий перервою (BREAK).");
+                        continue;
+                    }
+                    if (ViolatesModuleDayHardRules(date, moduleId, s, e, out var hardRuleReason))
+                    {
+                        RecordSlotFailureReason(date, sl, hardRuleReason);
                         continue;
                     }
                     // Уникаємо повторів модуля у вузькому часовому вікні.
@@ -1947,6 +2044,10 @@ public sealed class TeacherDraftsAutogenService
                             // Перевіряємо кожну аудиторію на зайнятість.
                             foreach (var rm in candidateRooms)
                             {
+                                if (preferredAdjacentRoomId is int preferredRoomId && rm.Id != preferredRoomId)
+                                {
+                                    continue;
+                                }
                                 bool roomBusy = busy.Any(x => x.Date == date
                                                               && x.RoomId == rm.Id
                                                               && x.StartTime < e && s < x.EndTime);
