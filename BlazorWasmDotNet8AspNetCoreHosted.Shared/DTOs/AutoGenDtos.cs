@@ -21,7 +21,9 @@ public record AutoGenRequest(
     bool AllowOnDaysOff = false,
     WeekPreset Days = WeekPreset.MonFri,
     Dictionary<int, int>? ModuleHours = null,
-    bool SoftFill = false
+    bool SoftFill = false,
+    DateOnly? RangeStartDate = null,
+    DateOnly? RangeEndDate = null
 );
 
 // DTO деталі пропущеного слота.

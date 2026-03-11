@@ -138,6 +138,20 @@ public sealed class TeacherDraftsAutogenService
         // Межі тижня, що планується.
         var weekStart = r.WeekStart;
         var weekEnd = weekStart.AddDays(7);
+        var weekEndInclusive = weekEnd.AddDays(-1);
+        // Опційно обрізаємо генерацію межами діапазону в межах тижня.
+        var rangeStartDate = r.RangeStartDate ?? weekStart;
+        var rangeEndDate = r.RangeEndDate ?? weekEndInclusive;
+        if (rangeStartDate < weekStart) rangeStartDate = weekStart;
+        if (rangeEndDate > weekEndInclusive) rangeEndDate = weekEndInclusive;
+        if (rangeEndDate < rangeStartDate)
+        {
+            return BadRequest(new AutoGenResult(0, 0, new()
+            {
+                "Невірний діапазон дат автогенерації: дата завершення менша за дату початку."
+            }));
+        }
+        var rangeEndDateExclusive = rangeEndDate.AddDays(1);
         // Режим "м'якого заповнення" дозволяє послаблювати частину правил.
         var softFill = r.SoftFill;
         // Перевіряємо, чи день тижня дозволений у вибраному пресеті.
@@ -158,6 +172,7 @@ public sealed class TeacherDraftsAutogenService
         // Перевіряємо, чи дата робоча для конкретної групи з урахуванням винятків.
         bool IsWorking(DateOnly d, Group grp)
         {
+            if (d < rangeStartDate || d > rangeEndDate) return false;
             var scoped = TeacherDraftsHelpers.ResolveCalendarOverride(calendar, d, grp.CourseId, grp.Id);
             if (scoped.HasValue) return scoped.Value;
             var dow = d.ToDateTime(TimeOnly.MinValue).DayOfWeek;
@@ -226,7 +241,7 @@ public sealed class TeacherDraftsAutogenService
         {
             var gids = groups.Select(g => g.Id).ToList();
             await _db.TeacherDraftItems
-                .Where(x => x.Date >= weekStart && x.Date < weekEnd && gids.Contains(x.GroupId) && !x.IsLocked)
+                .Where(x => x.Date >= rangeStartDate && x.Date < rangeEndDateExclusive && gids.Contains(x.GroupId) && !x.IsLocked)
                 .ExecuteDeleteAsync();
         }
         // Конфігурації ліміту слота для типу з прапорцем "Бажано першим у тижні" та список аудиторій для підбору.
@@ -915,6 +930,8 @@ public sealed class TeacherDraftsAutogenService
             var resolvedByDay = TimeSlotsResolver.ResolveForWeek(allSlots, grp.CourseId);
             List<TimeSlot> slots = new();
             Dictionary<(TimeOnly Start, TimeOnly End), int> slotIndexByTime = new();
+            // Максимальна кількість пар одного модуля підряд у межах дня.
+            const int maxConsecutiveModuleSlotsPerDay = 5;
             void ApplySlotsForDate(DateOnly date)
             {
                 var dayOfWeek = date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
@@ -1132,6 +1149,40 @@ public sealed class TeacherDraftsAutogenService
                     }
                     var s = gap.Start;
                     var e = gap.End;
+                    if (!slotIndexByTime.TryGetValue((candidate.StartTime, candidate.EndTime), out var candidateOldSlotIndex)
+                        || !slotIndexByTime.TryGetValue((s, e), out var candidateNewSlotIndex))
+                    {
+                        continue;
+                    }
+                    var moduleIndexesAfterShift = busy
+                        .Where(b => b.GroupId == grp.Id
+                                    && b.Date == date
+                                    && b.ModuleId == candidate.ModuleId
+                                    && !excludedTypeIds.Contains(b.LessonTypeId))
+                        .Select(b => slotIndexByTime.TryGetValue((b.StartTime, b.EndTime), out var idx) ? idx : -1)
+                        .Where(idx => idx >= 0 && idx != candidateOldSlotIndex)
+                        .Append(candidateNewSlotIndex)
+                        .Distinct()
+                        .OrderBy(idx => idx)
+                        .ToList();
+                    if (moduleIndexesAfterShift.Count > maxConsecutiveModuleSlotsPerDay)
+                    {
+                        RecordSlotFailureReason(
+                            date,
+                            gap,
+                            $"Модуль <{ModuleTitleLabel(candidate.ModuleId)}> не можна ставити більш ніж {maxConsecutiveModuleSlotsPerDay} пари підряд у межах дня.");
+                        continue;
+                    }
+                    var keepsContiguousBlock = moduleIndexesAfterShift.Count == 0
+                        || moduleIndexesAfterShift[^1] - moduleIndexesAfterShift[0] + 1 == moduleIndexesAfterShift.Count;
+                    if (!keepsContiguousBlock)
+                    {
+                        RecordSlotFailureReason(
+                            date,
+                            gap,
+                            $"Модуль <{ModuleTitleLabel(candidate.ModuleId)}> у межах дня ставимо суцільним блоком без повернення після перемикання на інший модуль.");
+                        continue;
+                    }
                     int? tidCandidate = candidate.TeacherId;
                     if (tidCandidate is int tidVal && !TeacherFitsWorkingHours(tidVal, date, s, e))
                     {
@@ -1657,11 +1708,13 @@ public sealed class TeacherDraftsAutogenService
                         var isContiguousBlock = indexesWithCandidate[^1] - indexesWithCandidate[0] + 1 == indexesWithCandidate.Count;
                         if (!isContiguousBlock)
                         {
-                            if (!relaxed)
-                            {
-                                RecordSlotFailureReason(date, sl, $"Модуль <{ModuleLabel()}> у межах дня ставимо суцільним блоком без повернення після перемикання на інший модуль.");
-                                continue;
-                            }
+                            RecordSlotFailureReason(date, sl, $"Модуль <{ModuleLabel()}> у межах дня ставимо суцільним блоком без повернення після перемикання на інший модуль.");
+                            continue;
+                        }
+                        if (indexesWithCandidate.Count > maxConsecutiveModuleSlotsPerDay)
+                        {
+                            RecordSlotFailureReason(date, sl, $"Модуль <{ModuleLabel()}> не можна ставити більш ніж {maxConsecutiveModuleSlotsPerDay} пари підряд у межах дня.");
+                            continue;
                         }
                     }
                     // Викладач у сусідньому слоті (для пріоритету суміжних пар).
@@ -2074,13 +2127,22 @@ public sealed class TeacherDraftsAutogenService
                 var modulesAttemptedToday = new HashSet<int>();
                 var orderedModulesForDay = BuildOrderedModulesForDay(date);
                 int preferredMaxDistinctModulesPerDay = maxPerDay >= 8 ? 3 : 2;
-                bool CanIntroduceModuleToday(int moduleId)
+                int maxDistinctModulesPerDay = Math.Min(5, maxPerDay);
+                bool CanIntroduceModuleToday(int moduleId, bool bypassPreferredLimit = false)
                 {
                     if (CountModuleForDay(grp.Id, date, moduleId) > 0)
                     {
                         return true;
                     }
                     var distinctToday = CountDistinctModulesForDay(grp.Id, date);
+                    if (distinctToday >= maxDistinctModulesPerDay)
+                    {
+                        return false;
+                    }
+                    if (bypassPreferredLimit)
+                    {
+                        return true;
+                    }
                     if (distinctToday < preferredMaxDistinctModulesPerDay)
                     {
                         return true;
@@ -2180,7 +2242,7 @@ public sealed class TeacherDraftsAutogenService
                         {
                             continue;
                         }
-                        if (!bypassDistinctLimit && !CanIntroduceModuleToday(moduleId))
+                        if (!CanIntroduceModuleToday(moduleId, bypassPreferredLimit: bypassDistinctLimit))
                         {
                             continue;
                         }

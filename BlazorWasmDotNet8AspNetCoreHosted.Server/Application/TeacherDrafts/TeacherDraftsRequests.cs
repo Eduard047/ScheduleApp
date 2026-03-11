@@ -13,7 +13,9 @@ public sealed record DraftAutoGenRequest(
     bool AllowOnDaysOff = false, // Дозволяти генерацію у вихідні.
     WeekPreset Days = WeekPreset.MonFri, // Набір днів для генерації.
     Dictionary<int, int>? ModuleHours = null, // Ручні години по модулях (модуль -> години).
-    bool SoftFill = false // Дозволити заповнення за м'якими правилами.
+    bool SoftFill = false, // Дозволити заповнення за м'якими правилами.
+    DateOnly? RangeStartDate = null, // Опційний початок діапазону в межах тижня.
+    DateOnly? RangeEndDate = null // Опційне завершення діапазону в межах тижня.
 );
 
 public sealed record ApproveWeekRequest(
