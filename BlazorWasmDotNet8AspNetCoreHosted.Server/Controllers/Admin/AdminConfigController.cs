@@ -248,9 +248,19 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
                 }
                 else
                 {
-                    rows = await baseQuery.Where(s => s.CourseId == null && s.DayOfWeek == null)
-                        .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
-                        .ToListAsync();
+                    var hasAnyCourseSlots = await baseQuery.AnyAsync(s => s.CourseId == cid);
+                    if (hasAnyCourseSlots)
+                    {
+                        // Якщо для курсу є власні слоти, не підмішуємо глобальний шаблон.
+                        usingCourseSpecific = true;
+                        rows = new List<TimeSlot>();
+                    }
+                    else
+                    {
+                        rows = await baseQuery.Where(s => s.CourseId == null && s.DayOfWeek == null)
+                            .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
+                            .ToListAsync();
+                    }
                 }
             }
             else
