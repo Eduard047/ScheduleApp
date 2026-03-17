@@ -3146,7 +3146,7 @@ else
                        @onchange="OnEditDateChanged" />
             </div>
             <div class="editor-field">
-                <label>З якої пари</label>
+                <label>З якої години</label>
                 <select class="select"
                         value="@(editStartSlotIndex >= 0 ? (editStartSlotIndex + 1).ToString(CultureInfo.InvariantCulture) : string.Empty)"
                         @onchange="OnEditStartSlotChanged"
@@ -3168,7 +3168,7 @@ else
                 </select>
             </div>
             <div class="editor-field">
-                <label>До якої пари</label>
+                <label>До якої години</label>
                 <select class="select"
                         value="@(editEndSlotIndex >= 0 ? (editEndSlotIndex + 1).ToString(CultureInfo.InvariantCulture) : string.Empty)"
                         @onchange="OnEditEndSlotChanged"
