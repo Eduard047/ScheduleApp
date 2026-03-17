@@ -9,7 +9,7 @@
 
 @code {
 
-    private const string AppVersion = "1.1.27"; // Оновлюйте перед релізом
+    private const string AppVersion = "1.1.28"; // Оновлюйте перед релізом
     private MetaResponseDto? _meta;
     private int? _groupId;
     private int? _teacherId;
@@ -108,6 +108,72 @@
         "BREAK" => "brk",
         _ => ""
     };
+    // Перевіряє, чи тип заняття є лекцією для візуального об'єднання.
+    private static bool IsLectureTypeForMerge(ScheduleItemDto item)
+    {
+        var code = item.LessonTypeCode?.Trim();
+        if (!string.IsNullOrWhiteSpace(code))
+        {
+            if (string.Equals(code, "LECTURE", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(code, "LECT", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(code, "LEC", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        var name = item.LessonTypeName?.Trim();
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+        return name.Contains("ЛЕКЦ", StringComparison.CurrentCultureIgnoreCase)
+               || name.Contains("LECTURE", StringComparison.OrdinalIgnoreCase);
+    }
+    // Перевіряє збіг викладача для об'єднаної лекції.
+    private static bool HasSameTeacherForMerge(ScheduleItemDto left, ScheduleItemDto right)
+    {
+        if (left.TeacherId.HasValue || right.TeacherId.HasValue)
+        {
+            return left.TeacherId == right.TeacherId;
+        }
+        return string.Equals(left.Teacher?.Trim(), right.Teacher?.Trim(), StringComparison.CurrentCultureIgnoreCase);
+    }
+    // Перевіряє, чи записи можна показати як одну об'єднану лекцію.
+    private static bool CanMergeLecturePresentation(ScheduleItemDto left, ScheduleItemDto right)
+    {
+        if (!IsLectureTypeForMerge(left) || !IsLectureTypeForMerge(right))
+        {
+            return false;
+        }
+        return left.ModuleId == right.ModuleId
+               && left.LessonTypeId == right.LessonTypeId
+               && left.RoomId == right.RoomId
+               && HasSameTeacherForMerge(left, right);
+    }
+    // Вибирає основний запис слота для відображення картки.
+    private static ScheduleItemDto? SelectDisplayItem(List<ScheduleItemDto> slotItems)
+        => slotItems
+            .OrderBy(item => item.Id)
+            .FirstOrDefault();
+    // Формує перелік груп для об'єднаної лекції в межах одного слота.
+    private static List<string> ResolveMergedLectureGroups(List<ScheduleItemDto> slotItems, ScheduleItemDto? anchor)
+    {
+        if (anchor is null)
+        {
+            return new List<string>();
+        }
+        return slotItems
+            .Where(item => CanMergeLecturePresentation(anchor, item))
+            .Select(item => item.Group?.Trim())
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Select(name => name!)
+            .Distinct(StringComparer.CurrentCultureIgnoreCase)
+            .OrderBy(name => name, StringComparer.CurrentCultureIgnoreCase)
+            .ToList();
+    }
+    // Визначає, чи є слот візуально об'єднаною лекцією для кількох груп.
+    private static bool IsMergedLectureSlot(List<string> mergedGroups)
+        => mergedGroups.Count > 1;
     private static string LessonModeLabel(bool requiresRoom) => requiresRoom ? "Аудиторна година" : "Без аудиторії";
     private string ModuleCourseCaption(int moduleId)
     {
@@ -265,15 +331,20 @@ else
                             </th>
                             @foreach (var d in DaysMonFirst)
                             {
-                                var item = Filtered.FirstOrDefault(x =>
-                                x.DayNumber == d &&
-                                x.TimeStart == row.Start &&
-                                x.TimeEnd == row.End);
+                                var slotItems = Filtered
+                                    .Where(x =>
+                                        x.DayNumber == d &&
+                                        x.TimeStart == row.Start &&
+                                        x.TimeEnd == row.End)
+                                    .ToList();
+                                var item = SelectDisplayItem(slotItems);
+                                var mergedGroups = ResolveMergedLectureGroups(slotItems, item);
+                                var isMergedLecture = IsMergedLectureSlot(mergedGroups);
                                 <td class="cell">
                                     @if (item is not null)
                                     {
                                         var colorCss = item.LessonTypeCss ?? CssByCode(item.LessonTypeCode);
-                                        <div class="card @colorCss">
+                                        <div class="card @colorCss @(isMergedLecture ? "card--merged-lecture" : string.Empty)">
                                             <div class="card-top">
                                                 <span class="badge">@item.LessonTypeName</span>
                                                 @if (item.IsLocked)
@@ -304,6 +375,12 @@ else
                                             @if (!isBreak && !string.IsNullOrWhiteSpace(item.Group))
                                             {
                                                 <div class="sub">@item.Group</div>
+                                            }
+                                            @if (!isBreak && isMergedLecture)
+                                            {
+                                                <div class="merged-lecture-label">
+                                                    Об'єднана лекція (@mergedGroups.Count груп): @string.Join(", ", mergedGroups)
+                                                </div>
                                             }
                                             @if (!isBreak)
                                             {
@@ -517,6 +594,10 @@ else
             overflow-wrap: anywhere;
             hyphens: auto;
         }
+    .card--merged-lecture {
+        box-shadow: 0 0 0 2px #3b82f6 inset, 0 1px 0 rgba(16,24,40,.04);
+        background-image: linear-gradient(180deg, rgba(239,246,255,.55) 0%, rgba(255,255,255,1) 100%);
+    }
     .card-top {
         display: flex;
         justify-content: space-between;
@@ -546,6 +627,17 @@ else
     }
     .sub {
         color: #334155;
+    }
+    .merged-lecture-label {
+        margin-top: .2rem;
+        margin-bottom: .15rem;
+        padding: .25rem .45rem;
+        border-radius: 8px;
+        background: #dbeafe;
+        color: #1d4ed8;
+        font-size: .75rem;
+        font-weight: 600;
+        line-height: 1.35;
     }
     .meta {
         color: #475569;

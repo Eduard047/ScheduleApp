@@ -111,7 +111,7 @@ public sealed class RulesService(AppDbContext db)
                 .AnyAsync();
         }
         if (conflicts)
-            errors.Add("Знайдено конфлікт вже опублікованого розкладу.");
+            errors.Add($"Знайдено конфлікт вже опублікованого розкладу на дату {r.Date:dd.MM.yyyy}.");
         if (canCheckTravel)
         {
             var travel = await db.BuildingTravels.AsNoTracking()
@@ -243,6 +243,7 @@ public sealed class RulesService(AppDbContext db)
                 AddError("room-not-allowed", "Аудиторія заборонена", $"Аудиторія {room.Name} не входить до списку дозволених для модуля {module.Title}.");
         }
         var currentId = r.Id ?? 0;
+        var dateLabel = r.Date.ToString("dd.MM.yyyy");
         var officialCandidates = await db.ScheduleItems
             .AsNoTracking()
             .Include(x => x.Group)
@@ -267,16 +268,16 @@ public sealed class RulesService(AppDbContext db)
         {
             var slot = $"{c.StartTime:HH\\:mm}-{c.EndTime:HH\\:mm}";
             if (c.GroupId == r.GroupId)
-                AddError("conflict-official-group", "Група зайнята", $"Група {c.Group.Name} має опубліковане заняття {c.Module.Title} у слоті {slot}.");
+                AddError("conflict-official-group", "Група зайнята", $"Група {c.Group.Name} має опубліковане заняття {c.Module.Title} на {dateLabel} у слоті {slot}.");
             if (blocksTeacher && r.TeacherId != null && c.TeacherId == r.TeacherId)
             {
                 var teacherName = c.Teacher?.FullName ?? $"ID {r.TeacherId}";
-                AddError("conflict-official-teacher", "Викладач зайнятий", $"Викладач {teacherName} проводить заняття {c.Module.Title} для групи {c.Group.Name} у слоті {slot}.");
+                AddError("conflict-official-teacher", "Викладач зайнятий", $"Викладач {teacherName} проводить заняття {c.Module.Title} для групи {c.Group.Name} на {dateLabel} у слоті {slot}.");
             }
             if (blocksRoom && r.RoomId != null && c.RoomId == r.RoomId && c.Room is not null)
             {
                 var buildingName = c.Room.Building?.Name is { Length: > 0 } b ? $" ({b})" : string.Empty;
-                AddError("conflict-official-room", "Аудиторія зайнята", $"Аудиторія {c.Room.Name}{buildingName} використовується для заняття {c.Module.Title} у слоті {slot}.");
+                AddError("conflict-official-room", "Аудиторія зайнята", $"Аудиторія {c.Room.Name}{buildingName} використовується для заняття {c.Module.Title} на {dateLabel} у слоті {slot}.");
             }
         }
         var draftCandidates = await db.TeacherDraftItems
@@ -304,16 +305,16 @@ public sealed class RulesService(AppDbContext db)
         {
             var slot = $"{c.StartTime:HH\\:mm}-{c.EndTime:HH\\:mm}";
             if (c.GroupId == r.GroupId)
-                AddError("conflict-draft-group", "Група вже має чернетку", $"Група {c.Group.Name} вже має чернетку {c.Module.Title} у слоті {slot}.");
+                AddError("conflict-draft-group", "Група вже має чернетку", $"Група {c.Group.Name} вже має чернетку {c.Module.Title} на {dateLabel} у слоті {slot}.");
             if (blocksTeacher && r.TeacherId != null && c.TeacherId == r.TeacherId)
             {
                 var teacherName = c.Teacher?.FullName ?? $"ID {r.TeacherId}";
-                AddError("conflict-draft-teacher", "Викладач зайнятий у чернетці", $"Викладач {teacherName} вже запланований на чернетку {c.Module.Title} у слоті {slot}.");
+                AddError("conflict-draft-teacher", "Викладач зайнятий у чернетці", $"Викладач {teacherName} вже запланований на чернетку {c.Module.Title} на {dateLabel} у слоті {slot}.");
             }
             if (blocksRoom && r.RoomId != null && c.RoomId == r.RoomId && c.Room is not null)
             {
                 var buildingName = c.Room.Building?.Name is { Length: > 0 } b ? $" ({b})" : string.Empty;
-                AddError("conflict-draft-room", "Аудиторія зайнята у чернетці", $"Аудиторія {c.Room.Name}{buildingName} вже використовується для чернетки {c.Module.Title} у слоті {slot}.");
+                AddError("conflict-draft-room", "Аудиторія зайнята у чернетці", $"Аудиторія {c.Room.Name}{buildingName} вже використовується для чернетки {c.Module.Title} на {dateLabel} у слоті {slot}.");
             }
         }
         if (requiresRoom && blocksRoom && room is not null)
