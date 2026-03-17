@@ -139,7 +139,7 @@ public sealed class TeacherDraftsAutogenService
             return name.Contains("LECTURE", StringComparison.Ordinal)
                 || name.Contains("ЛЕКЦ", StringComparison.Ordinal)
                 || name.Contains("ЛЕКЦІ", StringComparison.Ordinal)
-                || name.Contains("ЛЕКЦИ", StringComparison.Ordinal);
+                || name.Contains("ЛЕКЦІЇ", StringComparison.Ordinal);
         }
         var lectureTypeIds = types
             .Where(IsLectureTypeMeta)
@@ -1483,35 +1483,22 @@ public sealed class TeacherDraftsAutogenService
             var groupRandom = new Random(HashCode.Combine(weekStart.DayNumber, grp.Id, grp.CourseId));
             var sequenceRandom = new Random(HashCode.Combine(weekStart.DayNumber, grp.Id, grp.CourseId, 17));
             int? lastPrimaryModuleId = null;
-            // Лічильник використання аудиторій цією групою (для рівномірності).
+            // Лічильник використання аудиторій поточною групою.
             var groupRoomUsage = busy
                 .Where(b => b.GroupId == grp.Id && b.Date >= weekStart && b.Date < weekEnd && b.RoomId != null)
                 .GroupBy(b => b.RoomId!.Value)
                 .ToDictionary(g => g.Key, g => g.Count());
-            // Ваги штрафів/пріоритетів для вибору найкращої комбінації у слоті.
-            // Чим більше значення штрафу — тим сильніше автогенерація уникає ситуації; 0 вимикає вплив.
-            // Штраф за повторення того ж модуля у попередній день.
-            // Збільшуйте, якщо потрібно рідше ставити модуль у сусідні дні; зменшуйте/0 — щоб дозволяти частіше.
-            const double penaltySameModulePrevDay = 10.0;
-            // Штраф за 3-тю і наступні пари того ж модуля в один день (за 1-шу/2-гу не застосовується).
-            // Збільшуйте, якщо потрібно уникати надмірної концентрації; зменшуйте/0 — щоб дозволяти більше пар в день.
-            const double penaltyExtraSameDay = 6.0;
-            // Штраф за повтор одного й того ж часу (StartTime) для цього модуля в інші дні тижня.
-            // Збільшуйте, якщо потрібен більш різноманітний розклад по годинах; зменшуйте/0 — дозволяти повтори.
-            const double penaltySameSlotPattern = 1.5;
-            // Пріоритет зберігати одного викладача для двох послідовних слотів одного модуля.
-            // Якщо найкращий варіант з "тим самим викладачем" гірший за глобально найкращий більш ніж на це значення — дозволяємо зміну.
-            // Збільшуйте, якщо хочете частіше отримувати "один викладач на дві пари підряд"; 0 — вимкнути пріоритет.
-            const double maxExtraPenaltyPreferSameTeacherForConsecutiveModule = 6.0;
-            // Пріоритет для типу занять, позначеного як "Бажано першим у тижні".
-            // Для цього типу: штрафуємо пізніші слоти (щоб частіше ставився раніше у день).
-            // Для інших типів (коли пріоритетний тип ще можна поставити цього дня): штрафуємо ранні слоти (щоб частіше ставилися після нього).
-            // Збільшуйте, якщо потрібно сильніше наблизитися до "спочатку пріоритетний тип, потім інші"; зменшуйте/0 — вимкнути вплив.
-            const double penaltyPreferredFirstTypeLateSlot = 1.5;
-            const double penaltyNonPreferredEarlySlotWhilePreferredPending = 12.0;
-            const double penaltyPreferredFirstBeyondLimitSlot = 20.0;
-            const double penaltyNonPreferredBeforeFirstPreferred = 18.0;
-            // Штраф за загальне навантаження викладача на цьому курсі.
+            // Ваги штрафів для вибору найкращого кандидата у слоті.
+            // 0 вимикає вплив конкретного правила.
+            const double penaltySameModulePrevDay = 10.0; // Повтор того ж модуля у сусідній день.
+            const double penaltyExtraSameDay = 6.0; // Третя і наступні пари модуля за день.
+            const double penaltySameSlotPattern = 1.5; // Повтор однакового StartTime для модуля в інші дні.
+            const double maxExtraPenaltyPreferSameTeacherForConsecutiveModule = 6.0; // Перевага одного викладача на суміжні слоти модуля.
+            const double penaltyPreferredFirstTypeLateSlot = 1.5; // Пізній слот для типу "бажано першим".
+            const double penaltyNonPreferredEarlySlotWhilePreferredPending = 12.0; // Ранній непріоритетний тип, поки пріоритетний ще не поставлено.
+            const double penaltyPreferredFirstBeyondLimitSlot = 20.0; // Вихід пріоритетного типу за ліміт номера слоту.
+            const double penaltyNonPreferredBeforeFirstPreferred = 18.0; // Непріоритетний тип перед першим пріоритетним у межах дня.
+            // Штраф за загальне навантаження викладача на курсі.
             double TeacherLoadPenalty(int teacherId) =>
                 TeacherLoadScore(teacherId, grp.CourseId) * 0.25;
             // Штраф за зміну будівлі для групи або викладача.
