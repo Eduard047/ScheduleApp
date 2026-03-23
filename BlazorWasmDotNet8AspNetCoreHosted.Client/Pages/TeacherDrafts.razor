@@ -1,4 +1,4 @@
-@page "/teacher-drafts"
+﻿@page "/teacher-drafts"
 @using System;
 @using Microsoft.AspNetCore.Components;
 @using System.Globalization
@@ -983,16 +983,20 @@
             var match = _meta.Groups.FirstOrDefault(g => g.Id == gid);
             return match is null ? new List<LookupDto>() : new List<LookupDto> { match };
         }
+        if (_courseId is int cid)
+        {
+            var groupsByCourse = _meta.Groups
+                .Where(g => g.CourseId == cid)
+                .OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase)
+                .ToList();
+            if (groupsByCourse.Count > 0)
+            {
+                return groupsByCourse;
+            }
+        }
         var ids = filtered.Select(i => i.GroupId).Distinct().ToHashSet();
         if (ids.Count == 0)
         {
-            if (_courseId is int cid)
-            {
-                return _meta.Groups
-                    .Where(g => g.CourseId == cid)
-                    .OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase)
-                    .ToList();
-            }
             return _meta.Groups.OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
         }
         var source = _meta.Groups.Where(g => ids.Contains(g.Id));
@@ -1060,6 +1064,94 @@
            && left.LessonTypeId == right.LessonTypeId
            && left.RoomId == right.RoomId
            && left.IsSelfStudy == right.IsSelfStudy;
+    // Перевіряє, чи тип заняття можна візуально об'єднати між групами як лекцію.
+    private static bool IsLectureTypeForGroupMerge(TeacherDraftItemDto item)
+    {
+        if (item.IsSelfStudy || IsBreak(item) || IsCanceled(item))
+        {
+            return false;
+        }
+        var code = item.LessonTypeCode?.Trim();
+        if (!string.IsNullOrWhiteSpace(code))
+        {
+            if (string.Equals(code, "LECTURE", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(code, "LECT", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(code, "LEC", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        var name = item.LessonTypeName?.Trim();
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+        return name.Contains("ЛЕКЦ", StringComparison.CurrentCultureIgnoreCase)
+               || name.Contains("LECTURE", StringComparison.OrdinalIgnoreCase);
+    }
+    // Перевіряє, чи в обох елементів збігається призначення викладача.
+    private static bool HasSameTeacherForGroupMerge(TeacherDraftItemDto left, TeacherDraftItemDto right)
+    {
+        if (left.TeacherId.HasValue || right.TeacherId.HasValue)
+        {
+            return left.TeacherId == right.TeacherId;
+        }
+        var leftTeacher = left.Teacher?.Trim();
+        var rightTeacher = right.Teacher?.Trim();
+        return string.Equals(leftTeacher, rightTeacher, StringComparison.CurrentCultureIgnoreCase);
+    }
+    // Перевіряє, чи дві клітинки можна показати як одну спільну лекцію.
+    private static bool CanMergeLectureAcrossGroups(TeacherDraftItemDto left, TeacherDraftItemDto right)
+    {
+        if (!IsLectureTypeForGroupMerge(left) || !IsLectureTypeForGroupMerge(right))
+        {
+            return false;
+        }
+        return left.ModuleId == right.ModuleId
+               && left.LessonTypeId == right.LessonTypeId
+               && left.RoomId == right.RoomId
+               && left.ModuleTopicId == right.ModuleTopicId
+               && HasSameTeacherForGroupMerge(left, right);
+    }
+    // Обчислює ширину об'єднаного блоку лекції (в кількості групових колонок).
+    private static int ResolveGroupMergeSpan(
+        Dictionary<(int DayNumber, string Start, string End, int GroupId), TeacherDraftItemDto> lookup,
+        int dayNumber,
+        SlotRow slot,
+        IReadOnlyList<LookupDto> groups,
+        int startGroupIndex)
+    {
+        if (startGroupIndex < 0 || startGroupIndex >= groups.Count)
+        {
+            return 1;
+        }
+        var anchorGroup = groups[startGroupIndex];
+        var anchorItem = FindItem(lookup, dayNumber, slot, anchorGroup.Id);
+        if (anchorItem is null || !IsLectureTypeForGroupMerge(anchorItem))
+        {
+            return 1;
+        }
+        var span = 1;
+        for (var index = startGroupIndex + 1; index < groups.Count; index++)
+        {
+            var nextItem = FindItem(lookup, dayNumber, slot, groups[index].Id);
+            if (nextItem is null || !CanMergeLectureAcrossGroups(anchorItem, nextItem))
+            {
+                break;
+            }
+            span++;
+        }
+        return span;
+    }
+    // Формує підпис переліку груп, що входять до спільної лекції.
+    private static string BuildMergedGroupsLabel(IReadOnlyList<LookupDto> groups, int startGroupIndex, int span)
+    {
+        if (span <= 1 || startGroupIndex < 0 || startGroupIndex >= groups.Count)
+        {
+            return string.Empty;
+        }
+        return string.Join(", ", groups.Skip(startGroupIndex).Take(span).Select(group => group.Name));
+    }
     // Будує словник для швидкого пошуку елементів у таблиці.
     private static Dictionary<(int DayNumber, string Start, string End, int GroupId), TeacherDraftItemDto> BuildLookup(IEnumerable<TeacherDraftItemDto> items)
         => items
@@ -2711,12 +2803,8 @@ else
             <table class="teacher-drafts-table">
                 <thead>
                     <tr>
-                        <th colspan="2" class="td-head-block">Дні тижня / години</th>
-                        <th colspan="@groups.Count" class="td-head-groups">Навчальні групи</th>
-                    </tr>
-                    <tr>
                         <th class="td-day-col">День</th>
-                        <th class="td-slot-col">Пара</th>
+                        <th class="td-slot-col">Година</th>
                         @foreach (var group in groups)
                         {
                             <th class="td-group-col">@group.Name</th>
@@ -2743,15 +2831,23 @@ else
                                     <div class="td-slot-number">@GetSlotNumberLabel(slot, slotIndex)</div>
                                     <div class="td-slot-time">@slot.Label</div>
                                 </th>
-                                @foreach (var group in groups)
+                                @for (var groupIndex = 0; groupIndex < groups.Count; groupIndex++)
                                 {
+                                    var group = groups[groupIndex];
+                                    var mergeSpan = ResolveGroupMergeSpan(lookup, dayNumber, slot, groups, groupIndex);
                                     var item = FindItem(lookup, dayNumber, slot, group.Id);
+                                    var mergedGroupLabel = BuildMergedGroupsLabel(groups, groupIndex, mergeSpan);
                                     var cellCss = GetCellCss(item);
                                     var slotKey = new SlotKey(dayNumber, slot.Start, slot.End, group.Id);
                                     var tdCss = GetCellFrameCss(slotKey, item);
+                                    if (mergeSpan > 1 && item is not null)
+                                    {
+                                        tdCss += " td-cell--merged";
+                                    }
                                     var wrapperCss = BuildCellContainerCss(cellCss, slotKey, item);
                                     var canDrag = CanDragItem(item);
                                     <td class="@tdCss"
+                                        colspan="@(mergeSpan > 1 ? mergeSpan : 1)"
                                         @ondragover="e => OnSlotDragOver(slotKey, item, e)" @ondragover:preventDefault
                                         @ondragenter="() => OnSlotDragEnter(slotKey, item)"
                                         @ondragleave="() => OnSlotDragLeave(slotKey)"
@@ -2834,6 +2930,10 @@ else
                                                         <span>Ауд. @item.Room</span>
                                                     }
                                                 </div>
+                                                @if (mergeSpan > 1 && !string.IsNullOrWhiteSpace(mergedGroupLabel))
+                                                {
+                                                    <div class="td-merged-groups" title="@mergedGroupLabel">Об'єднана лекція: @mergedGroupLabel</div>
+                                                }
                                                 @if (item.IsRescheduled)
                                                 {
                                                     <div class="td-cell-flag">Перенесено</div>
@@ -2885,6 +2985,10 @@ else
                                             }
                                         </div>
                                     </td>
+                                    if (mergeSpan > 1)
+                                    {
+                                        groupIndex += mergeSpan - 1;
+                                    }
                                 }
                             </tr>
                         }
@@ -3038,7 +3142,7 @@ else
                        @onchange="OnEditDateChanged" />
             </div>
             <div class="editor-field">
-                <label>З якої пари</label>
+                <label>З якої години</label>
                 <select class="select"
                         value="@(editStartSlotIndex >= 0 ? (editStartSlotIndex + 1).ToString(CultureInfo.InvariantCulture) : string.Empty)"
                         @onchange="OnEditStartSlotChanged"
@@ -3060,7 +3164,7 @@ else
                 </select>
             </div>
             <div class="editor-field">
-                <label>До якої пари</label>
+                <label>До якої години</label>
                 <select class="select"
                         value="@(editEndSlotIndex >= 0 ? (editEndSlotIndex + 1).ToString(CultureInfo.InvariantCulture) : string.Empty)"
                         @onchange="OnEditEndSlotChanged"
@@ -3482,17 +3586,26 @@ else
         margin-top: .15rem;
     }
     .teacher-drafts-table-wrapper {
-        overflow-x: auto;
+        --td-day-col-width: 160px;
+        --td-slot-col-width: 125px;
+        overflow: auto;
+        max-height: clamp(420px, 72vh, 920px);
+        overscroll-behavior: contain;
+        scrollbar-gutter: stable both-edges;
         border: 1px solid #e2e8f0;
         border-radius: 16px;
-        background: #fff;
-        padding: 1rem;
+        background: #f8fafc;
+        padding: 0 1rem 1rem;
+        position: relative;
+        isolation: isolate;
     }
     .teacher-drafts-table {
-        width: 100%;
+        width: max-content;
+        min-width: 100%;
         border-collapse: collapse;
         table-layout: fixed;
         font-size: .9rem;
+        background: #fff;
     }
     .teacher-drafts-table th,
     .teacher-drafts-table td {
@@ -3507,25 +3620,73 @@ else
         font-weight: 700;
         font-size: .85rem;
     }
-    .td-head-block,
-    .td-head-groups {
-        text-transform: uppercase;
+    .teacher-drafts-table thead {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        background: #f8fafc;
+        box-shadow: inset 0 -1px 0 #d9e2ec;
+    }
+    .teacher-drafts-table thead::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: #f8fafc;
+        z-index: 0;
+        pointer-events: none;
+    }
+    .teacher-drafts-table thead::after {
+        content: none;
+    }
+    .teacher-drafts-table thead th {
+        position: relative;
+        z-index: 1;
+        background: #f8fafc;
+        background-clip: padding-box;
     }
     .td-group-col {
         font-weight: 600;
         text-align: center;
+        min-width: 250px;
+        width: 250px;
     }
     .td-day-col {
-        width: 160px;
+        width: var(--td-day-col-width);
+        min-width: var(--td-day-col-width);
     }
     .td-slot-col {
-        width: 125px;
+        width: var(--td-slot-col-width);
+        min-width: var(--td-slot-col-width);
+    }
+    .teacher-drafts-table :is(th, td).td-day-col {
+        position: sticky;
+        left: 0;
+        z-index: 12;
+    }
+    .teacher-drafts-table :is(th, td).td-slot-col {
+        position: sticky;
+        left: var(--td-day-col-width);
+        z-index: 11;
+    }
+    .teacher-drafts-table thead .td-day-col,
+    .teacher-drafts-table thead .td-slot-col {
+        z-index: 21;
+        background: #f8fafc;
+    }
+    .teacher-drafts-table tbody .td-day-col,
+    .teacher-drafts-table tbody .td-slot-col {
+        box-shadow: 1px 0 0 #d9e2ec;
     }
     .td-cell {
-        min-width: 270px;
+        min-width: 250px;
+        width: 250px;
         background: #fff;
         overflow-x: hidden;
         overflow-y: visible;
+    }
+    .td-cell--merged {
+        box-shadow: inset 0 0 0 2px #3b82f6;
+        background: linear-gradient(180deg, #f8fbff 0%, #eef6ff 100%);
     }
     .td-day-cell,
     .td-slot-cell {
@@ -3553,6 +3714,13 @@ else
         -webkit-user-select: none;
         font-size: .78rem;
         color: #64748b;
+    }
+    .td-merged-groups {
+        margin-top: .15rem;
+        font-size: .72rem;
+        line-height: 1.35;
+        color: #1d4ed8;
+        font-weight: 600;
     }
     .td-cell-body {
         min-height: 120px;
@@ -3830,6 +3998,9 @@ else
         .editor-field--wide { grid-column: span 1; }
         .editor-field--room-left { grid-column: span 1; }
         .editor-lock { justify-content: flex-start; }
+        .teacher-drafts-table-wrapper {
+            max-height: clamp(360px, 66vh, 760px);
+        }
     }
     .editor-lock {
         flex-direction: row;

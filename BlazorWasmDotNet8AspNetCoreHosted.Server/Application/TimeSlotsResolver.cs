@@ -56,6 +56,8 @@ public static class TimeSlotsResolver
                 {
                     return new ResolvedTimeSlots(true, false, courseAny);
                 }
+                // Якщо курс має власну конфігурацію, глобальні слоти не підмішуємо.
+                return new ResolvedTimeSlots(true, false, new List<TimeSlot>());
             }
         }
 

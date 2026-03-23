@@ -145,7 +145,7 @@ public sealed class TeacherDraftsExportService
         }
         const int tableHeaderRow = 4;
         worksheet.Cell(tableHeaderRow, 1).Value = "День тижня";
-        worksheet.Cell(tableHeaderRow, 2).Value = "Пара";
+        worksheet.Cell(tableHeaderRow, 2).Value = "Година";
         if (groups.Count > 0)
         {
             for (var index = 0; index < groups.Count; index++)

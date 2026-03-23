@@ -55,6 +55,13 @@
         margin-left: 1.25rem;
         margin-top: .05rem;
     }
+    .contiguous-module-block-warning {
+        border-left: 4px solid #b45309;
+        background: #fffbeb;
+        color: #78350f;
+        border-radius: .35rem;
+        padding: .45rem .65rem;
+    }
     .lesson-editor-overlay {
         position: fixed;
         inset: 0;
@@ -242,9 +249,20 @@ else
                     <div>@ok</div>
                     @{
                         var warningsTotal = okWarnings.Count + _latestGapDetails.Count;
+                        var contiguousModuleBlockWarnings = CountContiguousModuleBlockWarnings();
                     }
                     @if (warningsTotal > 0)
                     {
+                        @if (contiguousModuleBlockWarnings > 0)
+                        {
+                            <div class="contiguous-module-block-warning small">
+                                <div class="fw-semibold">Окреме попередження про суцільний блок модуля</div>
+                                <div>
+                                    Виявлено @contiguousModuleBlockWarnings випадок(ів), коли автогенерація не заповнила слот через правило:
+                                    один модуль у межах дня ставиться суцільним блоком.
+                                </div>
+                            </div>
+                        }
                         <div>
                             <button type="button"
                                     class="btn btn-sm btn-outline-dark"
@@ -511,6 +529,7 @@ else
     private const string LogActionClearDrafts = "clear-drafts-week";
     private const string LogActionClearSchedule = "clear-schedule-week";
     private const string LogActionDelete = "delete-item";
+    private const string ContiguousModuleBlockReasonMarker = "суцільним блоком без повернення після перемикання на інший модуль";
     private static readonly JsonSerializerOptions AutoGenStatusJsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -603,14 +622,14 @@ else
     // Формує опис діапазону тижня для генерації.
     private string GetGenerationRangeDescription()
     {
-        var (fromWeekStart, toWeekStart) = GetNormalizedGenerationWeekRange();
-        var totalWeeks = (toWeekStart.DayNumber - fromWeekStart.DayNumber) / 7 + 1;
-        var rangeEnd = toWeekStart.AddDays(6);
-        if (totalWeeks == 1)
+        var (fromDate, toDate) = GetNormalizedGenerationDateRange();
+        var totalWeeks = BuildGenerationWeekStarts().Count;
+        var fromWeekStart = GetMonday(fromDate);
+        if (totalWeeks == 1 && fromDate == fromWeekStart && toDate == fromWeekStart.AddDays(6))
         {
-            return $"Тиждень: {fromWeekStart:dd.MM.yyyy} – {rangeEnd:dd.MM.yyyy}";
+            return $"Тиждень: {fromDate:dd.MM.yyyy} – {toDate:dd.MM.yyyy}";
         }
-        return $"Діапазон: {fromWeekStart:dd.MM.yyyy} – {rangeEnd:dd.MM.yyyy} ({totalWeeks} тижн.)";
+        return $"Діапазон: {fromDate:dd.MM.yyyy} – {toDate:dd.MM.yyyy} ({totalWeeks} тижн.)";
     }
     // Нормалізує межі генерації до стартів тижня (понеділок).
     private (DateOnly FromWeekStart, DateOnly ToWeekStart) GetNormalizedGenerationWeekRange()
@@ -622,6 +641,17 @@ else
             (fromWeekStart, toWeekStart) = (toWeekStart, fromWeekStart);
         }
         return (fromWeekStart, toWeekStart);
+    }
+    // Нормалізує фактичні межі діапазону генерації за датами.
+    private (DateOnly FromDate, DateOnly ToDate) GetNormalizedGenerationDateRange()
+    {
+        var fromDate = _generationFromDate;
+        var toDate = _generationToDate;
+        if (toDate < fromDate)
+        {
+            (fromDate, toDate) = (toDate, fromDate);
+        }
+        return (fromDate, toDate);
     }
     // Формує список стартів тижня для автогенерації.
     private List<DateOnly> BuildGenerationWeekStarts()
@@ -675,6 +705,25 @@ else
         var message = warning[..idx].Trim();
         var reason = warning[(idx + marker.Length)..].Trim();
         return (string.IsNullOrWhiteSpace(message) ? warning : message, string.IsNullOrWhiteSpace(reason) ? null : reason);
+    }
+    // Рахує випадки, коли слот не заповнено через правило суцільного блоку модуля.
+    private int CountContiguousModuleBlockWarnings()
+    {
+        var gapMatches = _latestGapDetails.Count(g => ContainsContiguousModuleBlockReason(g.Reason));
+        if (gapMatches > 0)
+        {
+            return gapMatches;
+        }
+        return okWarnings.Count(ContainsContiguousModuleBlockReason);
+    }
+    // Перевіряє, чи текст містить причину про заборону розриву модуля в межах дня.
+    private static bool ContainsContiguousModuleBlockReason(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+        return text.Contains(ContiguousModuleBlockReasonMarker, StringComparison.OrdinalIgnoreCase);
     }
     // Зберігає повідомлення про автогенерацію у сховищі.
     private async Task PersistAutoGenStatusAsync()
@@ -920,31 +969,38 @@ else
         }
     }
     // Запускає автогенерацію послідовно для кожного тижня в обраному діапазоні.
-    private async Task<(AutoGenResult Result, DateOnly RangeStartWeek, DateOnly RangeEndWeek, int WeekCount, bool AllowDaysOffUsed)> RunAutoGenForRangeAsync(
+    private async Task<(AutoGenResult Result, DateOnly RangeStartDate, DateOnly RangeEndDate, int WeekCount)> RunAutoGenForRangeAsync(
         int courseId,
         Dictionary<int, int> moduleHours,
         bool clearExisting,
         bool softFill)
     {
+        var (fromDate, toDate) = GetNormalizedGenerationDateRange();
         var weekStarts = BuildGenerationWeekStarts();
         var warnings = new List<string>();
         var gapDetails = new List<AutoGenGapDetail>();
         int created = 0;
         int skipped = 0;
-        bool allowDaysOffUsed = false;
         foreach (var weekStart in weekStarts)
         {
-            var allowDaysOff = AllowDaysOffForPreset(weekStart);
-            allowDaysOffUsed |= allowDaysOff;
+            var weekEnd = weekStart.AddDays(6);
+            var rangeStartDate = fromDate > weekStart ? fromDate : weekStart;
+            var rangeEndDate = toDate < weekEnd ? toDate : weekEnd;
+            if (rangeEndDate < rangeStartDate)
+            {
+                continue;
+            }
             var res = await Drafts.AutogenWeek(new AutoGenRequest(
                 WeekStart: weekStart,
                 ClearExisting: clearExisting,
                 CourseId: courseId,
                 GroupId: null,
-                AllowOnDaysOff: allowDaysOff,
+                AllowOnDaysOff: false,
                 Days: _daysPreset,
                 ModuleHours: moduleHours,
-                SoftFill: softFill
+                SoftFill: softFill,
+                RangeStartDate: rangeStartDate,
+                RangeEndDate: rangeEndDate
             ));
             created += res.Created;
             skipped += res.Skipped;
@@ -958,7 +1014,7 @@ else
             }
         }
         var result = new AutoGenResult(created, skipped, warnings, gapDetails);
-        return (result, weekStarts[0], weekStarts[^1], weekStarts.Count, allowDaysOffUsed);
+        return (result, fromDate, toDate, weekStarts.Count);
     }
     // Запускає автогенерацію чернеток для обраного діапазону.
     private async Task AutoGenDrafts()
@@ -981,28 +1037,30 @@ else
                 return;
             }
             await PersistAutoGenConfigAsync();
-            var (res, rangeStartWeek, rangeEndWeek, weekCount, allowDaysOff) = await RunAutoGenForRangeAsync(
+            var (res, rangeStartDate, rangeEndDate, weekCount) = await RunAutoGenForRangeAsync(
                 courseId,
                 moduleHours,
                 clearExisting: true,
                 softFill: false);
             var courseName = meta?.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
-            var rangeEndDate = rangeEndWeek.AddDays(6);
-            var summary = weekCount == 1
+            var rangeWeekStart = GetMonday(rangeStartDate);
+            var isSingleFullWeek = weekCount == 1
+                && rangeStartDate == rangeWeekStart
+                && rangeEndDate == rangeWeekStart.AddDays(6);
+            var summary = isSingleFullWeek
                 ? $"Автогенерація тижня у чернетки (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}."
-                : $"Автогенерація діапазону {rangeStartWeek:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}.";
+                : $"Автогенерація діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}.";
             await SetOkMessageAsync(summary, res.Warnings, res.GapDetails);
             await LoadWeek();
             await LogAutoGenAsync(
                 summary,
                 res,
-                rangeStartWeek,
+                rangeStartDate,
                 rangeEndDate,
                 courseId,
                 courseName,
                 moduleHours,
-                softFill: false,
-                allowDaysOff: allowDaysOff);
+                softFill: false);
         }
         catch (ApiErrorException ex)
         {
@@ -1034,28 +1092,30 @@ else
                 return;
             }
             await PersistAutoGenConfigAsync();
-            var (res, rangeStartWeek, rangeEndWeek, weekCount, allowDaysOff) = await RunAutoGenForRangeAsync(
+            var (res, rangeStartDate, rangeEndDate, weekCount) = await RunAutoGenForRangeAsync(
                 courseId,
                 moduleHours,
                 clearExisting: false,
                 softFill: true);
             var courseName = meta?.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
-            var rangeEndDate = rangeEndWeek.AddDays(6);
-            var summary = weekCount == 1
+            var rangeWeekStart = GetMonday(rangeStartDate);
+            var isSingleFullWeek = weekCount == 1
+                && rangeStartDate == rangeWeekStart
+                && rangeEndDate == rangeWeekStart.AddDays(6);
+            var summary = isSingleFullWeek
                 ? $"Заповнення порожніх слотів тижня (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}."
-                : $"Заповнення порожніх слотів у діапазоні {rangeStartWeek:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}.";
+                : $"Заповнення порожніх слотів у діапазоні {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}.";
             await SetOkMessageAsync(summary, res.Warnings, res.GapDetails);
             await LoadWeek();
             await LogAutoGenAsync(
                 summary,
                 res,
-                rangeStartWeek,
+                rangeStartDate,
                 rangeEndDate,
                 courseId,
                 courseName,
                 moduleHours,
-                softFill: true,
-                allowDaysOff: allowDaysOff);
+                softFill: true);
         }
         catch (ApiErrorException ex)
         {
@@ -1239,29 +1299,6 @@ else
             await PersistConflictsAsync();
         }
     }
-    // Визначає, чи дозволені вихідні для обраного пресету.
-    private bool AllowDaysOffForPreset(DateOnly weekStart)
-    {
-        return _daysPreset switch
-        {
-            WeekPreset.MonSun => true,
-            WeekPreset.MonSat => true,
-            _ => WeekHasCalendarDayOff(weekStart)
-        };
-    }
-    // Перевіряє, чи є вихідні дні у календарі на тиждень.
-    private bool WeekHasCalendarDayOff(DateOnly monday)
-    {
-        for (var offset = 0; offset < 7; offset++)
-        {
-            var date = monday.AddDays(offset);
-            if (_calendarLookup.TryGetValue(date, out var isWorkingDay) && !isWorkingDay)
-            {
-                return true;
-            }
-        }
-        return false;
-    }
     // Повертає понеділок поточного тижня.
     private static DateOnly GetMonday(DateOnly d) => d.AddDays(-(((int)d.DayOfWeek + 6) % 7));
     // Завантажує чернетки та опублікований розклад за тиждень.
@@ -1338,8 +1375,7 @@ else
         int courseId,
         string courseName,
         Dictionary<int, int> moduleHours,
-        bool softFill,
-        bool allowDaysOff)
+        bool softFill)
     {
         var lessons = BuildDraftLessonSnapshot(out var trimmed);
         var entry = new AdminScheduleLogEntry(
@@ -1353,7 +1389,7 @@ else
             WeekStart: rangeStart.ToString("yyyy-MM-dd"),
             WeekEnd: rangeEnd.ToString("yyyy-MM-dd"),
             DaysPreset: FormatWeekPreset(_daysPreset),
-            AllowDaysOff: allowDaysOff,
+            AllowDaysOff: null,
             CourseId: courseId,
             CourseName: courseName,
             ModuleHours: BuildModuleHours(moduleHours),

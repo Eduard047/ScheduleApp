@@ -3,19 +3,20 @@
 @using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
 @inject HttpClient Http
 @inject BlazorWasmDotNet8AspNetCoreHosted.Client.Services.TimeSlotsApi Api
+@inject IJSRuntime JS
 
 <h3>Слоти часу</h3>
 
 <div class="mb-3">
     <label class="form-label">Рівень</label>
     <div class="d-flex gap-2 flex-wrap">
-        <select class="form-select" style="max-width: 280px" @bind="_scope">
+        <select class="form-select" style="max-width: 280px" @bind="_scope" @bind:after="OnScopeChangedAsync">
             <option value="Global">Глобально (для всіх курсів)</option>
             <option value="Course">Тільки для обраного курсу</option>
         </select>
         @if (_scope == Scope.Course)
         {
-            <select class="form-select" style="max-width: 360px" @bind="_courseId">
+            <select class="form-select" style="max-width: 360px" @bind="_courseId" @bind:after="OnCourseChangedAsync">
                 <option value="">- оберіть курс -</option>
                 @foreach (var c in _courses)
                 {
@@ -23,31 +24,45 @@
                 }
             </select>
         }
-        <select class="form-select" style="max-width: 240px" @bind="_dayOfWeek">
+        <select class="form-select" style="max-width: 240px" @bind="_dayOfWeek" @bind:after="OnDayChangedAsync">
             <option value="">Усі дні (за замовчуванням)</option>
             @foreach (var day in DayOptions)
             {
                 <option value="@day.Value">@day.Label</option>
             }
         </select>
-        <button class="btn btn-outline-secondary" @onclick="LoadRaw">Завантажити</button>
+        <button class="btn btn-outline-secondary" @onclick="LoadRaw">Оновити</button>
     </div>
-    <div class="form-text">Оберіть день, завантажте або скопіюйте шаблон, відредагуйте та збережіть.</div>
+    <div class="form-text">Редагуєте: <strong>@GetContextLabel()</strong>.</div>
 </div>
 
-<div class="mb-3">
-    <label class="form-label">Копіювання шаблону</label>
-    <div class="d-flex gap-2 flex-wrap">
-        <select class="form-select" style="max-width: 240px" @bind="_copyFromDay">
-            <option value="">Шаблон за замовчуванням (усі дні)</option>
-            @foreach (var day in DayOptions)
-            {
-                <option value="@day.Value">@day.Label</option>
-            }
-        </select>
-        <button class="btn btn-outline-info" @onclick="CopyFromDay">Скопіювати у поточний день</button>
+<div class="card mb-3">
+    <div class="card-body">
+        <div class="fw-semibold mb-2">Копіювання з шаблону</div>
+        <div class="row g-2 align-items-end">
+            <div class="col-12 col-lg-6">
+                <label class="form-label mb-1">Шаблон-джерело</label>
+                <select class="form-select" @bind="_copySourceMode" @bind:after="OnCopySettingsChangedAsync">
+                    <option value="@CopySourceMode.CurrentScopeOnly">Шаблон поточного рівня</option>
+                    @if (_scope == Scope.Course)
+                    {
+                        <option value="@CopySourceMode.GlobalOnly">Глобальний шаблон</option>
+                    }
+                </select>
+            </div>
+            <div class="col-12 col-lg-3">
+                <div class="form-text mb-1">Куди копіюємо</div>
+                <div class="border rounded p-2 bg-light">@GetContextLabel()</div>
+            </div>
+            <div class="col-12 col-lg-3 d-grid gap-2">
+                <button class="btn btn-primary" @onclick="CopyTemplateToEditor" disabled="@(!CanCopyToEditor)">Копіювати шаблон в редактор</button>
+                <button class="btn btn-outline-primary" @onclick="SaveEditorAsTemplateAsync" disabled="@(!CanSaveEditorAsTemplate)">Створити/оновити шаблон</button>
+            </div>
+        </div>
+        <div class="form-text mt-2">Шаблон — це слоти без прив'язки до дня (режим «Усі дні»).</div>
+        <div class="form-text">Щоб створити шаблон: підготуйте слоти у редакторі нижче, потім натисніть «Створити/оновити шаблон».</div>
+        <div class="form-text">@GetCopyHint()</div>
     </div>
-    <div class="form-text">Копіювання бере ефективні слоти з вибраного дня.</div>
 </div>
 
 @if (_error is not null)
@@ -80,13 +95,17 @@
 
 <div class="card">
     <div class="card-body">
-        <div class="d-flex justify-content-between align-items-center mb-2">
-            <div class="form-text">
-                Слоти використовуються автогенерацією 1-в-1. Перекритя недопустимі. Час вводиться у форматі <code>HH:mm</code>.
+        <div class="d-flex justify-content-between align-items-center mb-2 gap-2 flex-wrap">
+            <div>
+                <div class="form-text">
+                    Слоти використовуються автогенерацією 1-в-1. Перекриття недопустимі. Час вводиться у форматі <code>HH:mm</code>.
+                </div>
+                <div class="form-text mt-1">@GetEditorStateHint()</div>
             </div>
             <div>
-                <button class="btn btn-sm btn-outline-primary me-2" @onclick="AddRow">Додати слот</button>
-                <button class="btn btn-sm btn-primary" @onclick="Save">Зберегти</button>
+                <button class="btn btn-sm btn-outline-primary me-2" @onclick="AddRow" disabled="@IsScopeSelectionIncomplete">Додати слот</button>
+                <button class="btn btn-sm btn-outline-secondary me-2" @onclick="RevertChanges" disabled="@(!HasUnsavedChanges)">Скасувати зміни</button>
+                <button class="btn btn-sm btn-primary" @onclick="Save" disabled="@(!CanSaveChanges)">Зберегти</button>
             </div>
         </div>
         <table class="table table-sm align-middle">
@@ -95,7 +114,7 @@
                     <th style="width:90px">№</th>
                     <th style="width:140px">Старт</th>
                     <th style="width:140px">Фініш</th>
-                    <th style="width:140px">Активен</th>
+                    <th style="width:140px">Активний</th>
                     <th></th>
                 </tr>
             </thead>
@@ -153,31 +172,142 @@
         (0, "Неділя")
     };
     enum Scope { Global, Course }
+    enum CopySourceMode { CurrentScopeOnly, GlobalOnly }
     private Scope _scope = Scope.Global;
     private int? _courseId;
     private int? _dayOfWeek;
-    private int? _copyFromDay;
+    private CopySourceMode _copySourceMode = CopySourceMode.CurrentScopeOnly;
     private List<LookupDto> _courses = new();
     private List<TimeSlotDto> _rows = new();
+    private List<TimeSlotDto> _loadedRowsSnapshot = new();
+    private List<TimeSlotDto> _copyPreviewRows = new();
     private int _preferredFirstMaxSlotOrder;
     private string? _error;
     private string? _ok;
+    private bool IsScopeSelectionIncomplete => _scope == Scope.Course && _courseId is null;
+    private bool CanCopyToEditor => !IsScopeSelectionIncomplete
+                                    && _copyPreviewRows.Count > 0;
+    private bool CanSaveEditorAsTemplate => !IsScopeSelectionIncomplete && _rows.Count > 0;
+    private bool HasUnsavedChanges => !AreRowsEquivalent(_rows, _loadedRowsSnapshot);
+    private bool CanSaveChanges => !IsScopeSelectionIncomplete && HasUnsavedChanges;
     // Завантажує метадані курсів при старті сторінки.
     protected override async Task OnInitializedAsync()
     {
         var meta = await Http.GetFromJsonAsync<MetaResponseDto>("api/meta");
         _courses = meta?.Courses ?? new();
-        await LoadPreferredFirstSlotLimit();
+        await LoadRaw();
+    }
+    // Оновлює контекст при перемиканні рівня.
+    private async Task OnScopeChangedAsync()
+    {
+        if (_scope == Scope.Global)
+        {
+            _courseId = null;
+            _copySourceMode = CopySourceMode.CurrentScopeOnly;
+        }
+        await LoadRaw();
+    }
+    // Оновлює дані після вибору курсу.
+    private async Task OnCourseChangedAsync()
+    {
+        await LoadRaw();
+    }
+    // Оновлює дані після вибору дня.
+    private async Task OnDayChangedAsync()
+    {
+        await LoadRaw();
+    }
+    // Оновлює попередній перегляд після зміни джерела копіювання.
+    private async Task OnCopySettingsChangedAsync()
+    {
+        await LoadCopyPreviewAsync();
     }
     // Завантажує сирі слоти для обраного рівня.
     private async Task LoadRaw()
     {
         _error = _ok = null;
-        if (_scope == Scope.Course && _courseId is null) { _error = "Вибери курс."; return; }
+        if (IsScopeSelectionIncomplete)
+        {
+            _rows = new();
+            _loadedRowsSnapshot = new();
+            _copyPreviewRows = new();
+            _preferredFirstMaxSlotOrder = 0;
+            return;
+        }
         try
         {
             _rows = await Api.GetRawAsync(CurrentCourseId(), _dayOfWeek);
+            _loadedRowsSnapshot = CloneRows(_rows);
             await LoadPreferredFirstSlotLimit();
+            await LoadCopyPreviewAsync();
+        }
+        catch (BlazorWasmDotNet8AspNetCoreHosted.Client.Services.ApiErrorException ex)
+        {
+            _rows = new();
+            _loadedRowsSnapshot = new();
+            _copyPreviewRows = new();
+            _error = ex.Errors.FirstOrDefault() ?? ex.Message;
+        }
+        catch (Exception ex)
+        {
+            _rows = new();
+            _loadedRowsSnapshot = new();
+            _copyPreviewRows = new();
+            _error = ex.Message;
+        }
+    }
+    // Завантажує попередній перегляд джерела копіювання.
+    private async Task LoadCopyPreviewAsync()
+    {
+        if (IsScopeSelectionIncomplete)
+        {
+            _copyPreviewRows = new();
+            return;
+        }
+        try
+        {
+            var sourceCourseId = ResolveCopySourceCourseId();
+            _copyPreviewRows = await Api.GetRawAsync(sourceCourseId, dayOfWeek: null);
+        }
+        catch
+        {
+            _copyPreviewRows = new();
+        }
+    }
+    // Копіює шаблон-джерело у поточний контекст редактора.
+    private async Task CopyTemplateToEditor()
+    {
+        _error = _ok = null;
+        if (IsScopeSelectionIncomplete)
+        {
+            _error = "Оберіть курс для копіювання шаблону.";
+            return;
+        }
+        if (HasUnsavedChanges)
+        {
+            var confirmed = await JS.InvokeAsync<bool>("confirm", "У редакторі є незбережені зміни. Замінити їх шаблоном?");
+            if (!confirmed) return;
+        }
+        try
+        {
+            var targetCourseId = CurrentCourseId();
+            var source = _copyPreviewRows;
+            if (source.Count == 0)
+            {
+                _error = $"У шаблоні-джерелі «{GetCopySourceLabel()}» немає слотів.";
+                return;
+            }
+            _rows = source.Select(s => new TimeSlotDto
+            {
+                Id = 0,
+                CourseId = targetCourseId,
+                DayOfWeek = _dayOfWeek,
+                SortOrder = s.SortOrder,
+                Start = s.Start,
+                End = s.End,
+                IsActive = s.IsActive
+            }).ToList();
+            _ok = "Шаблон завантажено в редактор. Натисніть «Зберегти», щоб застосувати зміни.";
         }
         catch (BlazorWasmDotNet8AspNetCoreHosted.Client.Services.ApiErrorException ex)
         {
@@ -188,31 +318,49 @@
             _error = ex.Message;
         }
     }
-    // Копіює ефективні слоти з обраного дня.
-    private async Task CopyFromDay()
+    // Зберігає поточні слоти редактора як шаблон (без прив'язки до дня).
+    private async Task SaveEditorAsTemplateAsync()
     {
         _error = _ok = null;
-        if (_scope == Scope.Course && _courseId is null) { _error = "Вибери курс."; return; }
+        if (IsScopeSelectionIncomplete)
+        {
+            _error = "Оберіть курс, щоб зберегти шаблон.";
+            return;
+        }
+        if (_rows.Count == 0)
+        {
+            _error = "У редакторі немає слотів для створення шаблону.";
+            return;
+        }
+        _error = Validate();
+        if (_error is not null) return;
         try
         {
-            var courseId = _scope == Scope.Global ? null : _courseId;
-            var source = await Api.GetEffectiveAsync(courseId, _copyFromDay);
-            if (source.Count == 0)
+            var courseId = CurrentCourseId();
+            var templateRows = CloneRows(_rows);
+            foreach (var row in templateRows)
             {
-                _rows = new List<TimeSlotDto>();
-                _error = "Немає слотів для копіювання.";
-                return;
+                row.CourseId = courseId;
+                row.DayOfWeek = null;
+                row.IsLunch = false;
             }
-            _rows = source.Select(s => new TimeSlotDto
+            var existingTemplate = await Api.GetRawAsync(courseId, dayOfWeek: null);
+            if (existingTemplate.Count > 0)
             {
-                Id = 0,
-                CourseId = courseId,
-                DayOfWeek = _dayOfWeek,
-                SortOrder = s.SortOrder,
-                Start = s.Start,
-                End = s.End,
-                IsActive = s.IsActive
-            }).ToList();
+                if (AreRowsEquivalent(existingTemplate, templateRows))
+                {
+                    _copySourceMode = CopySourceMode.CurrentScopeOnly;
+                    await LoadCopyPreviewAsync();
+                    _ok = "Шаблон вже актуальний.";
+                    return;
+                }
+                var confirmed = await JS.InvokeAsync<bool>("confirm", "Шаблон вже існує. Перезаписати його поточними слотами?");
+                if (!confirmed) return;
+            }
+            await Api.SaveAsync(courseId, templateRows, dayOfWeek: null);
+            _copySourceMode = CopySourceMode.CurrentScopeOnly;
+            await LoadCopyPreviewAsync();
+            _ok = "Шаблон збережено. Тепер його можна копіювати у будь-який день.";
         }
         catch (BlazorWasmDotNet8AspNetCoreHosted.Client.Services.ApiErrorException ex)
         {
@@ -258,8 +406,53 @@
     }
     // Видаляє рядок слота зі списку.
     private void RemoveRow(TimeSlotDto r) => _rows.Remove(r);
+    // Повертає редактор до останньої завантаженої/збереженої версії.
+    private void RevertChanges()
+    {
+        if (!HasUnsavedChanges) return;
+        _rows = CloneRows(_loadedRowsSnapshot);
+        _ok = "Зміни в редакторі скасовано.";
+    }
     // Перевіряє коректність часу у форматі HH:mm.
     private static bool TryTime(string s, out TimeOnly t) => TimeOnly.TryParseExact(s, "HH:mm", out t);
+    // Клонує список слотів, щоб уникнути побічних змін через прив'язку.
+    private static List<TimeSlotDto> CloneRows(IEnumerable<TimeSlotDto> rows)
+        => rows.Select(r => new TimeSlotDto
+        {
+            Id = r.Id,
+            CourseId = r.CourseId,
+            DayOfWeek = r.DayOfWeek,
+            SortOrder = r.SortOrder,
+            Start = r.Start,
+            End = r.End,
+            IsActive = r.IsActive,
+            IsLunch = r.IsLunch
+        }).ToList();
+    // Порівнює два набори слотів для визначення незбережених змін.
+    private static bool AreRowsEquivalent(IReadOnlyCollection<TimeSlotDto> left, IReadOnlyCollection<TimeSlotDto> right)
+    {
+        if (left.Count != right.Count) return false;
+        var leftNormalized = left
+            .OrderBy(r => r.SortOrder)
+            .ThenBy(r => r.Start, StringComparer.Ordinal)
+            .ThenBy(r => r.End, StringComparer.Ordinal)
+            .Select(r => (r.SortOrder, Start: r.Start?.Trim() ?? string.Empty, End: r.End?.Trim() ?? string.Empty, r.IsActive))
+            .ToList();
+        var rightNormalized = right
+            .OrderBy(r => r.SortOrder)
+            .ThenBy(r => r.Start, StringComparer.Ordinal)
+            .ThenBy(r => r.End, StringComparer.Ordinal)
+            .Select(r => (r.SortOrder, Start: r.Start?.Trim() ?? string.Empty, End: r.End?.Trim() ?? string.Empty, r.IsActive))
+            .ToList();
+        for (var i = 0; i < leftNormalized.Count; i++)
+        {
+            if (leftNormalized[i] != rightNormalized[i])
+            {
+                return false;
+            }
+        }
+        return true;
+    }
     // Позначає слот як обідній і знімає прапорець з інших.
     // Валідатор слотів перед збереженням.
     private string? Validate()
@@ -285,6 +478,63 @@
     // Зберігає слоти та перезавантажує дані.
     // Повертає курс для поточного рівня налаштування (null = глобально).
     private int? CurrentCourseId() => _scope == Scope.Global ? null : _courseId;
+    // Визначає курс-джерело для копіювання.
+    private int? ResolveCopySourceCourseId()
+        => _copySourceMode == CopySourceMode.GlobalOnly ? null : CurrentCourseId();
+    // Повертає назву курсу для підписів.
+    private string GetCourseName(int? courseId)
+    {
+        if (courseId is not int cid) return "усі курси";
+        return _courses.FirstOrDefault(c => c.Id == cid)?.Name ?? $"Курс #{cid}";
+    }
+    // Повертає текстовий підпис дня.
+    private string GetDayLabel(int? dayOfWeek)
+    {
+        if (dayOfWeek is null) return "шаблон за замовчуванням (усі дні)";
+        var day = DayOptions.FirstOrDefault(d => d.Value == dayOfWeek);
+        return string.IsNullOrWhiteSpace(day.Label) ? $"День #{dayOfWeek}" : day.Label;
+    }
+    // Повертає підпис активного контексту редагування.
+    private string GetContextLabel()
+    {
+        var scopeLabel = _scope == Scope.Global
+            ? "глобальний шаблон"
+            : _courseId is int
+                ? $"курс «{GetCourseName(_courseId)}»"
+                : "курс не обрано";
+        return $"{scopeLabel}, {GetDayLabel(_dayOfWeek)}";
+    }
+    // Повертає підпис джерела для копіювання.
+    private string GetCopySourceLabel()
+    {
+        if (_copySourceMode == CopySourceMode.GlobalOnly)
+        {
+            return "глобальний шаблон";
+        }
+        return _scope == Scope.Global
+            ? "поточний глобальний шаблон"
+            : _courseId is int
+                ? $"поточний курс «{GetCourseName(_courseId)}»"
+                : "поточний курс (не обрано)";
+    }
+    // Повертає підказку до блоку копіювання.
+    private string GetCopyHint()
+    {
+        if (IsScopeSelectionIncomplete)
+        {
+            return "Оберіть курс, щоб працювати з копіюванням.";
+        }
+        if (_copyPreviewRows.Count == 0)
+        {
+            return $"У шаблоні «{GetCopySourceLabel()}» немає слотів. Спочатку створіть шаблон кнопкою вище.";
+        }
+        return $"У шаблоні «{GetCopySourceLabel()}»: {_copyPreviewRows.Count} слот(ів). Кроки: «Копіювати шаблон в редактор» → «Зберегти».";
+    }
+    // Повертає короткий статус редактора слотів.
+    private string GetEditorStateHint()
+        => HasUnsavedChanges
+            ? $"Є незбережені зміни. Слотів у редакторі: {_rows.Count}."
+            : $"Слотів у редакторі: {_rows.Count}.";
     // Завантажує ліміт слота для типу з прапорцем "Бажано першим у тижні".
     private async Task LoadPreferredFirstSlotLimit()
     {
@@ -329,6 +579,11 @@
     private async Task Save()
     {
         _error = _ok = null;
+        if (!CanSaveChanges)
+        {
+            _ok = "Немає змін для збереження.";
+            return;
+        }
         _error = Validate();
         if (_error is not null) return;
         try
