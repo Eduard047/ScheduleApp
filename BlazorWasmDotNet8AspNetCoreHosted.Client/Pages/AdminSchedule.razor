@@ -969,7 +969,7 @@ else
         }
     }
     // Запускає автогенерацію послідовно для кожного тижня в обраному діапазоні.
-    private async Task<(AutoGenResult Result, DateOnly RangeStartDate, DateOnly RangeEndDate, int WeekCount, bool AllowDaysOffUsed)> RunAutoGenForRangeAsync(
+    private async Task<(AutoGenResult Result, DateOnly RangeStartDate, DateOnly RangeEndDate, int WeekCount)> RunAutoGenForRangeAsync(
         int courseId,
         Dictionary<int, int> moduleHours,
         bool clearExisting,
@@ -981,7 +981,6 @@ else
         var gapDetails = new List<AutoGenGapDetail>();
         int created = 0;
         int skipped = 0;
-        bool allowDaysOffUsed = false;
         foreach (var weekStart in weekStarts)
         {
             var weekEnd = weekStart.AddDays(6);
@@ -991,14 +990,12 @@ else
             {
                 continue;
             }
-            var allowDaysOff = AllowDaysOffForPreset(weekStart);
-            allowDaysOffUsed |= allowDaysOff;
             var res = await Drafts.AutogenWeek(new AutoGenRequest(
                 WeekStart: weekStart,
                 ClearExisting: clearExisting,
                 CourseId: courseId,
                 GroupId: null,
-                AllowOnDaysOff: allowDaysOff,
+                AllowOnDaysOff: false,
                 Days: _daysPreset,
                 ModuleHours: moduleHours,
                 SoftFill: softFill,
@@ -1017,7 +1014,7 @@ else
             }
         }
         var result = new AutoGenResult(created, skipped, warnings, gapDetails);
-        return (result, fromDate, toDate, weekStarts.Count, allowDaysOffUsed);
+        return (result, fromDate, toDate, weekStarts.Count);
     }
     // Запускає автогенерацію чернеток для обраного діапазону.
     private async Task AutoGenDrafts()
@@ -1040,7 +1037,7 @@ else
                 return;
             }
             await PersistAutoGenConfigAsync();
-            var (res, rangeStartDate, rangeEndDate, weekCount, allowDaysOff) = await RunAutoGenForRangeAsync(
+            var (res, rangeStartDate, rangeEndDate, weekCount) = await RunAutoGenForRangeAsync(
                 courseId,
                 moduleHours,
                 clearExisting: true,
@@ -1063,8 +1060,7 @@ else
                 courseId,
                 courseName,
                 moduleHours,
-                softFill: false,
-                allowDaysOff: allowDaysOff);
+                softFill: false);
         }
         catch (ApiErrorException ex)
         {
@@ -1096,7 +1092,7 @@ else
                 return;
             }
             await PersistAutoGenConfigAsync();
-            var (res, rangeStartDate, rangeEndDate, weekCount, allowDaysOff) = await RunAutoGenForRangeAsync(
+            var (res, rangeStartDate, rangeEndDate, weekCount) = await RunAutoGenForRangeAsync(
                 courseId,
                 moduleHours,
                 clearExisting: false,
@@ -1119,8 +1115,7 @@ else
                 courseId,
                 courseName,
                 moduleHours,
-                softFill: true,
-                allowDaysOff: allowDaysOff);
+                softFill: true);
         }
         catch (ApiErrorException ex)
         {
@@ -1304,29 +1299,6 @@ else
             await PersistConflictsAsync();
         }
     }
-    // Визначає, чи дозволені вихідні для обраного пресету.
-    private bool AllowDaysOffForPreset(DateOnly weekStart)
-    {
-        return _daysPreset switch
-        {
-            WeekPreset.MonSun => true,
-            WeekPreset.MonSat => true,
-            _ => WeekHasCalendarDayOff(weekStart)
-        };
-    }
-    // Перевіряє, чи є вихідні дні у календарі на тиждень.
-    private bool WeekHasCalendarDayOff(DateOnly monday)
-    {
-        for (var offset = 0; offset < 7; offset++)
-        {
-            var date = monday.AddDays(offset);
-            if (_calendarLookup.TryGetValue(date, out var isWorkingDay) && !isWorkingDay)
-            {
-                return true;
-            }
-        }
-        return false;
-    }
     // Повертає понеділок поточного тижня.
     private static DateOnly GetMonday(DateOnly d) => d.AddDays(-(((int)d.DayOfWeek + 6) % 7));
     // Завантажує чернетки та опублікований розклад за тиждень.
@@ -1403,8 +1375,7 @@ else
         int courseId,
         string courseName,
         Dictionary<int, int> moduleHours,
-        bool softFill,
-        bool allowDaysOff)
+        bool softFill)
     {
         var lessons = BuildDraftLessonSnapshot(out var trimmed);
         var entry = new AdminScheduleLogEntry(
@@ -1418,7 +1389,7 @@ else
             WeekStart: rangeStart.ToString("yyyy-MM-dd"),
             WeekEnd: rangeEnd.ToString("yyyy-MM-dd"),
             DaysPreset: FormatWeekPreset(_daysPreset),
-            AllowDaysOff: allowDaysOff,
+            AllowDaysOff: null,
             CourseId: courseId,
             CourseName: courseName,
             ModuleHours: BuildModuleHours(moduleHours),

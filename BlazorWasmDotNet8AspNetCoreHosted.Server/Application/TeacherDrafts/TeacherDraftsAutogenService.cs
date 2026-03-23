@@ -192,12 +192,14 @@ public sealed class TeacherDraftsAutogenService
         bool IsWorking(DateOnly d, Group grp)
         {
             if (d < rangeStartDate || d > rangeEndDate) return false;
-            var scoped = TeacherDraftsHelpers.ResolveCalendarOverride(calendar, d, grp.CourseId, grp.Id);
-            if (scoped.HasValue) return scoped.Value;
             var dow = d.ToDateTime(TimeOnly.MinValue).DayOfWeek;
-            if (!DayAllowed(dow) && !r.AllowOnDaysOff) return false;
-            if (r.AllowOnDaysOff) return true;
-            return dow != DayOfWeek.Saturday && dow != DayOfWeek.Sunday;
+            if (!DayAllowed(dow)) return false;
+            var scoped = TeacherDraftsHelpers.ResolveCalendarOverride(calendar, d, grp.CourseId, grp.Id);
+            if (scoped.HasValue)
+            {
+                return scoped.Value || r.AllowOnDaysOff;
+            }
+            return true;
         }
         // Нормалізуємо фільтри: 0 або null означає "без фільтра".
         int? courseId = (r.CourseId > 0) ? r.CourseId : null;
