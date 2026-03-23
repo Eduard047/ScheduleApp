@@ -326,7 +326,10 @@ public sealed class TeacherDraftsAutogenService
             .ToList();
         // Фіксуємо, де вже використовувався пріоритетний тип на тижні.
         var hasPreferred = new HashSet<(int groupId, int moduleId)>(
-            busy.Where(b => preferredFirstTypeId != 0 && b.LessonTypeId == preferredFirstTypeId)
+            busy.Where(b => preferredFirstTypeId != 0
+                            && b.LessonTypeId == preferredFirstTypeId
+                            && b.Date >= weekStart
+                            && b.Date < weekEnd)
                 .Select(b => (b.GroupId, b.ModuleId)));
         // Збираємо модулі, що були минулого тижня (для зменшення повторів).
         var lastWeekModulesByGroup = busy
@@ -735,6 +738,18 @@ public sealed class TeacherDraftsAutogenService
                 return (fallbackType, null);
             }
             return (types.First().Id, null);
+        }
+        int PeekLessonTypeForDate(int groupIdPick, int courseIdPick, int moduleIdPick, DateOnly date)
+        {
+            var savedLtIndex = ltIndex;
+            try
+            {
+                return PickLessonType(groupIdPick, courseIdPick, moduleIdPick, date).LessonTypeId;
+            }
+            finally
+            {
+                ltIndex = savedLtIndex;
+            }
         }
         // Послідовність модулів для основного порядку в курсі.
         var sequenceItems = await _db.ModuleSequenceItems
@@ -1496,10 +1511,11 @@ public sealed class TeacherDraftsAutogenService
             const double penaltyExtraSameDay = 6.0; // Третя і наступні пари модуля за день.
             const double penaltySameSlotPattern = 1.5; // Повтор однакового StartTime для модуля в інші дні.
             const double maxExtraPenaltyPreferSameTeacherForConsecutiveModule = 6.0; // Перевага одного викладача на суміжні слоти модуля.
-            const double penaltyPreferredFirstTypeLateSlot = 1.5; // Пізній слот для типу "бажано першим".
-            const double penaltyNonPreferredEarlySlotWhilePreferredPending = 12.0; // Ранній непріоритетний тип, поки пріоритетний ще не поставлено.
-            const double penaltyPreferredFirstBeyondLimitSlot = 20.0; // Вихід пріоритетного типу за ліміт номера слоту.
-            const double penaltyNonPreferredBeforeFirstPreferred = 18.0; // Непріоритетний тип перед першим пріоритетним у межах дня.
+            const double penaltyPreferredFirstTypeLateSlot = 2.4; // Пізній слот для типу "бажано першим".
+            const double penaltyNonPreferredEarlySlotWhilePreferredPending = 18.0; // Ранній непріоритетний тип, поки пріоритетний ще не поставлено.
+            const double penaltyPreferredFirstBeyondLimitSlot = 28.0; // Вихід пріоритетного типу за ліміт номера слоту.
+            const double penaltyNonPreferredBeforeFirstPreferred = 26.0; // Непріоритетний тип перед першим пріоритетним у межах дня.
+            const double bonusPreferredFirstInProtectedSlot = 8.0; // Додатковий бонус для пріоритетного типу в межах ранніх слотів.
             // Штраф за загальне навантаження викладача на курсі.
             double TeacherLoadPenalty(int teacherId) =>
                 TeacherLoadScore(teacherId, grp.CourseId) * 0.25;
@@ -1800,18 +1816,10 @@ public sealed class TeacherDraftsAutogenService
                     foreach (var mid in orderedModules)
                     {
                         if (RemainingFor(grp.Id, mid) <= 0) continue;
-                        var savedLtIndex = ltIndex;
-                        try
+                        if (PeekLessonTypeForDate(grp.Id, grp.CourseId, mid, date) == preferredFirstTypeId)
                         {
-                            if (PickLessonType(grp.Id, grp.CourseId, mid, date).LessonTypeId == preferredFirstTypeId)
-                            {
-                                preferredFirstPendingToday = true;
-                                break;
-                            }
-                        }
-                        finally
-                        {
-                            ltIndex = savedLtIndex;
+                            preferredFirstPendingToday = true;
+                            break;
                         }
                     }
                 }
@@ -1894,6 +1902,7 @@ public sealed class TeacherDraftsAutogenService
                 // Кандидатні аудиторії для модуля.
                 var candidateRooms = CandidateRoomsFor(moduleId);
                 PlacementCandidate? best = null;
+                double bestEffectivePenalty = double.MaxValue;
                 // Перебираємо слоти дня та шукаємо найкращого кандидата.
                 var slotsToEvaluate = forcedSlot is null
                     ? slots
@@ -2110,6 +2119,16 @@ public sealed class TeacherDraftsAutogenService
                             if (ltypeId == preferredFirstTypeId && penaltyPreferredFirstTypeLateSlot > 0)
                             {
                                 penaltyScore += slotIndex * penaltyPreferredFirstTypeLateSlot;
+                                if (bonusPreferredFirstInProtectedSlot > 0
+                                    && IsPreferredFirstProtectedSlot(s, e))
+                                {
+                                    var slotOrder = GetSlotOrder(s, e);
+                                    var reserveWeight = preferredFirstMaxSlotOrder is int maxReservedSlot
+                                        ? Math.Max(1, maxReservedSlot - Math.Max(1, slotOrder) + 1)
+                                        : 1;
+                                    penaltyScore -= reserveWeight * bonusPreferredFirstInProtectedSlot;
+                                    penalties.Add("Ранній слот підсилює тип з прапорцем \"Бажано першим у тижні\"");
+                                }
                             }
                             else if (preferredFirstPendingToday
                                      && penaltyNonPreferredEarlySlotWhilePreferredPending > 0
@@ -2245,14 +2264,15 @@ public sealed class TeacherDraftsAutogenService
                                 localBest = bestPreferred;
                             }
                         }
+                        var effectivePenalty = localBest.Penalty;
                         if (preferEarliestSlot)
                         {
-                            best = localBest;
-                            break;
+                            effectivePenalty += slotIndex * 0.20;
                         }
-                        if (best is null || localBest.Penalty < best.Penalty)
+                        if (best is null || effectivePenalty < bestEffectivePenalty)
                         {
                             best = localBest;
+                            bestEffectivePenalty = effectivePenalty;
                         }
                     }
                     // Якщо кандидатів немає, фіксуємо причини відмов.
@@ -2401,6 +2421,20 @@ public sealed class TeacherDraftsAutogenService
                 if (maxPerDay == 0) continue;
                 var modulesAttemptedToday = new HashSet<int>();
                 var orderedModulesForDay = BuildOrderedModulesForDay(date);
+                if (preferredFirstTypeId != 0)
+                {
+                    var preferredModulesForDay = orderedModulesForDay
+                        .Where(mid => RemainingFor(grp.Id, mid) > 0)
+                        .Where(mid => PeekLessonTypeForDate(grp.Id, grp.CourseId, mid, date) == preferredFirstTypeId)
+                        .ToList();
+                    if (preferredModulesForDay.Count > 0)
+                    {
+                        var preferredModuleSet = preferredModulesForDay.ToHashSet();
+                        orderedModulesForDay = preferredModulesForDay
+                            .Concat(orderedModulesForDay.Where(mid => !preferredModuleSet.Contains(mid)))
+                            .ToList();
+                    }
+                }
                 int preferredMaxDistinctModulesPerDay = maxPerDay >= 8 ? 3 : 2;
                 int maxDistinctModulesPerDay = Math.Min(5, maxPerDay);
                 bool CanIntroduceModuleToday(int moduleId, bool bypassPreferredLimit = false)
