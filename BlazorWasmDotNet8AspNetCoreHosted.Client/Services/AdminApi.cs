@@ -97,6 +97,13 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         // Видаляє модуль.
         public async Task DeleteModule(int id)
             => await Ensure(await _http.DeleteAsync(WithConfirm($"api/admin/modules/{id}")));
+        // Перетворює модуль на окремий екземпляр для конкретного курсу.
+        public async Task<int> EnsureCourseScopedModule(int moduleId, int courseId)
+        {
+            var resp = await _http.PostAsync($"api/admin/modules/{moduleId}/ensure-course-scope?courseId={courseId}", null);
+            await Ensure(resp);
+            return (await resp.Content.ReadFromJsonAsync<int>())!;
+        }
         // Теми модуля для вибору в навчальних планах.
         public async Task<List<ModuleTopicViewDto>> GetModuleTopics(int moduleId)
             => await _http.GetFromJsonAsync<List<ModuleTopicViewDto>>($"api/admin/modules/{moduleId}/topics") ?? new();

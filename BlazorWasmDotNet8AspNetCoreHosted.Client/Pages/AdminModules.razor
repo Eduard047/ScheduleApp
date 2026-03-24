@@ -143,33 +143,34 @@
             <input class="form-control" @bind="form.Title" />
         </div>
         <div class="col-12">
-            <div class="d-flex justify-content-between align-items-center mb-1">
-                <label class="form-label mb-0">Курси модуля</label>
-                <button type="button"
-                        class="btn btn-sm btn-outline-secondary"
-                        @onclick="SelectAllCourses"
-                        disabled="@(!courses.Any())">Обрати всі</button>
-            </div>
+            <label class="form-label">Курс модуля</label>
             <div class="form-text small mb-2">
-                Оберіть усі курси, до яких належить модуль.
+                Один модуль належить лише одному курсу.
             </div>
-            <div class="course-chip-grid">
-                @foreach (var c in courses)
-                {
-                    var cid = c.Id;
-                    var isSelected = IsCourseSelected(cid);
-                    <button type="button"
-                            class="course-chip btn btn-sm @(isSelected ? "btn-primary" : "btn-outline-primary")"
-                            @onclick="() => ToggleCourse(cid)">
-                        @c.Name
-                    </button>
-                }
-            </div>
-            @if (SelectedCourseNames.Any())
+            @if (!courses.Any())
             {
-                <div class="mt-2 small text-muted">
-                    Обрані курси: @string.Join(", ", SelectedCourseNames)
+                <div class="border rounded p-2 bg-light text-muted small">Курси відсутні.</div>
+            }
+            else
+            {
+                <div class="course-chip-grid">
+                    @foreach (var c in courses.OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase))
+                    {
+                        var cid = c.Id;
+                        var selected = IsCourseSelected(cid);
+                        <button type="button"
+                                class="course-chip btn btn-sm @(selected ? "btn-primary" : "btn-outline-primary")"
+                                @onclick="() => SelectCourse(cid)">
+                            @c.Name
+                        </button>
+                    }
                 </div>
+                @if (form.CourseId > 0)
+                {
+                    <div class="mt-2 small text-muted">
+                        Обраний курс: @NameOfCourse(form.CourseId)
+                    </div>
+                }
             }
         </div>
         <div class="col-12 col-lg-6">
@@ -500,10 +501,6 @@
     };
     private List<LookupDto> courses = new();
     private List<LookupDto> departments = new();
-    private IEnumerable<string> SelectedCourseNames
-        => CurrentCourseIds()
-            .Select(NameOfCourse)
-            .Where(name => !string.IsNullOrWhiteSpace(name));
     private List<RoomEditDto> rooms = new();
     private List<RoomEditDto> allRooms = new();
     private List<BuildingEditDto> buildings = new();
@@ -614,9 +611,10 @@ private PlanCourseVM planCourse = new();
     // Отримує список модулів, супровідні довідники та налаштовує стан форми.
     private async Task Load()
     {
+        error = null;
+        ok = null;
         try
         {
-            ok = "Дані модулів завантажено.";
             items = await Admin.GetModules();
             var meta = await Admin.GetMeta();
             courses = meta.Courses ?? new();
@@ -626,8 +624,13 @@ private PlanCourseVM planCourse = new();
             buildings = await Admin.GetBuildings();
             EnsureBuildingsCoverSelectedRooms();
             UpdateVisibleRooms();
+            ok = "Дані модулів завантажено.";
         }
-        catch (Exception ex) { error = ex.Message; }
+        catch (Exception ex)
+        {
+            ok = null;
+            error = ex.Message;
+        }
     }
     // Додає або вилучає ідентифікатор зі списку залежно від прапорця.
     private static void Toggle(List<int> list, int id, bool on)
@@ -685,60 +688,37 @@ private PlanCourseVM planCourse = new();
     private string NameOfCourse(int id) => courses.FirstOrDefault(c => c.Id == id)?.Name ?? $"#{id}";
     // Повертає всі курси, вибрані в поточній формі.
     private List<int> CurrentCourseIds()
-    {
-        var result = new List<int>();
-        if (form.CourseId > 0)
-        {
-            result.Add(form.CourseId);
-        }
-        if (form.CloneCourseIds is { Count: > 0 })
-        {
-            foreach (var id in form.CloneCourseIds)
-            {
-                if (id > 0 && !result.Contains(id))
-                {
-                    result.Add(id);
-                }
-            }
-        }
-        return result;
-    }
+        => form.CourseId > 0 ? new List<int> { form.CourseId } : new List<int>();
     // Збирає ідентифікатори курсів, прив'язаних до переданого модуля.
     private static List<int> ModuleCourseIds(ModuleEditDto module)
     {
-        var result = new List<int>();
-        if (module.CourseId > 0)
+        if (module.CourseId <= 0)
         {
-            result.Add(module.CourseId);
+            return new List<int>();
         }
-        if (module.CloneCourseIds is { Count: > 0 })
-        {
-            foreach (var id in module.CloneCourseIds)
-            {
-                if (id > 0 && !result.Contains(id))
-                {
-                    result.Add(id);
-                }
-            }
-        }
-        return result;
+        return new List<int> { module.CourseId };
     }
     // Оновлює DTO модуля списком вибраних курсів.
     private static void ApplySelectedCourses(ModuleEditDto target, IEnumerable<int> courseIds)
     {
-        var normalized = courseIds?
+        var normalizedCourseId = courseIds?
             .Where(id => id > 0)
-            .Distinct()
-            .ToList() ?? new List<int>();
-        target.CourseId = normalized.FirstOrDefault();
-        target.CloneCourseIds = normalized.Skip(1).ToList();
+            .FirstOrDefault() ?? 0;
+        target.CourseId = normalizedCourseId;
+        target.CloneCourseIds = new List<int>();
     }
     // Застосовує вибрані курси до поточної форми модуля.
-    private void ApplySelectedCourses(IEnumerable<int> courseIds)
+    private void SetSelectedCourses(IEnumerable<int> courseIds)
         => ApplySelectedCourses(form, courseIds);
-    // Перевіряє, чи входить курс до переліку вибраних.
+    // Перевіряє, чи курс обрано у формі модуля.
     private bool IsCourseSelected(int courseId)
-        => courseId > 0 && (form.CourseId == courseId || form.CloneCourseIds.Contains(courseId));
+        => courseId > 0 && form.CourseId == courseId;
+    // Встановлює єдиний обраний курс модуля.
+    private void SelectCourse(int courseId)
+    {
+        if (courseId <= 0) return;
+        SetSelectedCourses(new[] { courseId });
+    }
     // Формує текстовий список курсів, пов'язаних із модулем.
     private string ModuleCourseSummary(ModuleEditDto module)
     {
@@ -765,8 +745,7 @@ private PlanCourseVM planCourse = new();
     private void Edit(ModuleEditDto m)
     {
         form = new(m.Id, m.Code, m.Title, m.CourseId, new List<int>(m.AllowedRoomIds), new List<int>(m.AllowedBuildingIds), m.Credits);
-        form.CloneCourseIds = new List<int>(m.CloneCourseIds ?? new());
-        ApplySelectedCourses(ModuleCourseIds(m));
+        SetSelectedCourses(ModuleCourseIds(m));
         EnsureBuildingsCoverSelectedRooms();
         UpdateVisibleRooms();
     }
@@ -781,7 +760,7 @@ private PlanCourseVM planCourse = new();
                 error = "Оберіть принаймні один курс для модуля.";
                 return;
             }
-            ApplySelectedCourses(selectedCourses);
+            SetSelectedCourses(selectedCourses);
             await Admin.UpsertModule(form);
             await Load();
             ok = "Модуль успішно збережено.";
@@ -892,7 +871,8 @@ private PlanCourseVM planCourse = new();
             var moduleCredits = m.Credits;
             if (plansModuleId is int moduleId && selectedPlanCourseId > 0)
             {
-                await LoadPlanDetails(moduleId, selectedPlanCourseId, moduleCredits);
+                await EnsurePlanModuleSeparated(moduleId, selectedPlanCourseId);
+                await LoadPlanDetails(plansModuleId ?? moduleId, selectedPlanCourseId, moduleCredits);
             }
             else
             {
@@ -998,9 +978,32 @@ private PlanCourseVM planCourse = new();
         if (!planCourseIds.Contains(nextCourseId)) return;
         if (nextCourseId <= 0 || nextCourseId == selectedPlanCourseId) return;
         selectedPlanCourseId = nextCourseId;
+        await EnsurePlanModuleSeparated(plansModuleId.Value, selectedPlanCourseId);
         var module = items.FirstOrDefault(x => x.Id == plansModuleId);
         var credits = module?.Credits ?? planCourse.Credits;
         await LoadPlanDetails(plansModuleId.Value, selectedPlanCourseId, credits);
+        await LoadTopics(plansModuleId.Value);
+    }
+    // За потреби розділяє модуль між курсами та перемикає модальне вікно на курсо-специфічний запис.
+    private async Task EnsurePlanModuleSeparated(int currentModuleId, int courseId)
+    {
+        if (courseId <= 0) return;
+        var scopedModuleId = await Admin.EnsureCourseScopedModule(currentModuleId, courseId);
+        if (scopedModuleId <= 0)
+        {
+            return;
+        }
+        if (scopedModuleId != currentModuleId)
+        {
+            plansModuleId = scopedModuleId;
+            await Load();
+            var scopedModule = items.FirstOrDefault(x => x.Id == scopedModuleId);
+            if (scopedModule is not null)
+            {
+                plansModuleTitle = $"{scopedModule.Code} - {scopedModule.Title}";
+                plansModuleCode = scopedModule.Code ?? plansModuleCode;
+            }
+        }
     }
     // Ініціалізує форму теми з типовими значеннями для вказаного модуля.
     private void ResetTopicForm(int moduleId)
@@ -1233,21 +1236,6 @@ private PlanCourseVM planCourse = new();
             .ToList();
         form.AllowedRoomIds = allIds;
     }
-    // Позначає всі курси у списку, щоб швидко застосувати їх до модуля.
-    private void SelectAllCourses()
-    {
-        var allIds = courses
-            .Select(c => c.Id)
-            .Where(id => id > 0)
-            .Distinct()
-            .ToList();
-        var currentPrimary = form.CourseId;
-        if (currentPrimary > 0 && allIds.Remove(currentPrimary))
-        {
-            allIds.Insert(0, currentPrimary);
-        }
-        ApplySelectedCourses(allIds);
-    }
     // Дозволяє всі будівлі для модуля одним кліком.
     private void SelectAllBuildings()
     {
@@ -1259,21 +1247,6 @@ private PlanCourseVM planCourse = new();
             .ToList();
         form.AllowedBuildingIds = allIds;
         UpdateVisibleRooms();
-    }
-    // Перемикає належність курсу до вибраного переліку.
-    private void ToggleCourse(int courseId)
-    {
-        if (courseId <= 0) return;
-        var selected = CurrentCourseIds();
-        if (selected.Contains(courseId))
-        {
-            selected.Remove(courseId);
-        }
-        else
-        {
-            selected.Add(courseId);
-        }
-        ApplySelectedCourses(selected);
     }
     // Порівнює коди тем з урахуванням числових сегментів.
     private static int CompareTopicCodes(string? left, string? right)
@@ -1338,6 +1311,7 @@ private PlanCourseVM planCourse = new();
     }
     .course-chip {
         min-width: 120px;
+        font-weight: 600;
     }
     .sortable-th {
         cursor: pointer;

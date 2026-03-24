@@ -29,6 +29,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         Task<List<ModuleEditDto>> GetModules();
         Task<int> UpsertModule(ModuleEditDto dto);
         Task DeleteModule(int id);
+        Task<int> EnsureCourseScopedModule(int moduleId, int courseId);
         Task<List<ModuleTopicViewDto>> GetModuleTopics(int moduleId);
         Task<int> UpsertModuleTopic(int moduleId, ModuleTopicDto dto);
         Task DeleteModuleTopic(int moduleId, int topicId);
