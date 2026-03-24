@@ -18,6 +18,9 @@ public sealed class DocxImportService
     private static readonly Regex TopicCodeRegex = new(@"\d+(?:\.\d+){2,}", RegexOptions.Compiled);
     private static readonly Regex LetterTopicCodeRegex = new(@"[A-Za-zА-Яа-яІіЇїЄєҐґ]+\.?((\d+\.?)+)", RegexOptions.Compiled);
     private static readonly Regex LetteredModulePrefixRegex = new(@"[A-Za-zА-Яа-яІіЇїЄєҐґ]+\.?((\d+\.?)+)", RegexOptions.Compiled);
+    private static readonly Regex NumericDottedCodeRegex = new(@"^\d+(?:\.\d+)+$", RegexOptions.Compiled);
+    private static readonly Regex LetterPrefixedCodeRegex = new(@"^[A-Za-zА-Яа-яІіЇїЄєҐґ]+\.?(?<tail>\d+(?:\.\d+)*)$", RegexOptions.Compiled);
+    private static readonly Regex NumericModuleCodeRegex = new(@"^\d+(?:\.\d+)*$", RegexOptions.Compiled);
     // Зчитує DOCX і формує результат імпорту з опційним застосуванням у БД.
     public async Task<DocxImportResultDto> ImportAsync(IFormFile file, AppDbContext db, bool apply, CancellationToken ct)
     {
@@ -135,6 +138,7 @@ public sealed class DocxImportService
             string? modulePrefix = null;
             string? moduleCode = null;
             var moduleCodeFromLetter = false;
+            var moduleCodeFromOrder = false;
             if (modulePrefixMatch.Success)
             {
                 modulePrefix = modulePrefixMatch.Value;
@@ -192,6 +196,7 @@ public sealed class DocxImportService
             if (moduleCode is null && tableIndex < moduleOrder.Count)
             {
                 moduleCode = moduleOrder[tableIndex];
+                moduleCodeFromOrder = true;
                 modulePrefix ??= moduleCode;
             }
             if (modulePrefix is not null &&
@@ -200,6 +205,8 @@ public sealed class DocxImportService
                 !knownModuleCodes.Contains(modulePrefix))
             {
                 var isSameTree = moduleCodeFromLetter
+                    ? true
+                    : hasLetterPrefix && moduleCodeFromOrder
                     ? true
                     : moduleCode.Contains('.')
                     ? modulePrefix.StartsWith(moduleCode + ".", StringComparison.OrdinalIgnoreCase)
@@ -257,10 +264,10 @@ public sealed class DocxImportService
                 if (cells.All(string.IsNullOrWhiteSpace)) continue;
                 if (cells.Count == 1 && !string.IsNullOrWhiteSpace(cells[0]))
                 {
-                    var headerPrefix = Regex.Match(cells[0], @"\d+(?:\.\d+)+");
+                    var headerPrefix = Regex.Match(cells[0], @"(?:[A-Za-zА-Яа-яІіЇїЄєҐґ]+\.?)?\d+(?:\.\d+)+");
                     if (headerPrefix.Success)
                     {
-                        modulePrefix = headerPrefix.Value.Trim().Trim('.');
+                        modulePrefix = NormalizeLetterPrefixedCode(headerPrefix.Value, moduleCodeValue);
                         order = 1; // новий блок тем у тій самій таблиці — починаємо нумерацію заново
                     }
                     continue;
@@ -311,10 +318,20 @@ public sealed class DocxImportService
     private static async Task ApplyAsync(AppDbContext db, Course course, List<DocxImportModuleDto> modules, DocxImportResultDto result, CancellationToken ct)
     {
         var moduleCodes = modules.Select(m => m.Code).ToList();
-        var existingModules = await db.Modules
+        // Підбираємо модулі лише в межах поточного курсу, щоб однакові коди в різних курсах не змішувалися.
+        var existingModuleCandidates = await db.Modules
             .Include(m => m.ModuleCourses)
-            .Where(m => moduleCodes.Contains(m.Code))
-            .ToDictionaryAsync(m => m.Code, StringComparer.OrdinalIgnoreCase, ct);
+            .Where(m => m.CourseId == course.Id && moduleCodes.Contains(m.Code))
+            .OrderBy(m => m.Id)
+            .ToListAsync(ct);
+        var existingModules = new Dictionary<string, Module>(StringComparer.OrdinalIgnoreCase);
+        foreach (var candidate in existingModuleCandidates)
+        {
+            if (!existingModules.TryAdd(candidate.Code, candidate))
+            {
+                result.Warnings.Add($"Для коду модуля \"{candidate.Code}\" знайдено дубль у курсі #{course.Id}; використано запис з меншим ідентифікатором.");
+            }
+        }
         foreach (var module in modules)
         {
             if (existingModules.TryGetValue(module.Code, out var entity))
@@ -410,6 +427,31 @@ public sealed class DocxImportService
             var existingTopics = await db.ModuleTopics
                 .Where(t => t.ModuleId == entity.Id)
                 .ToListAsync(ct);
+            var existingCodes = existingTopics
+                .Select(t => t.TopicCode)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var normalizedLegacyCodes = false;
+            foreach (var existingTopic in existingTopics)
+            {
+                var normalizedCode = NormalizeLetterPrefixedCode(existingTopic.TopicCode, module.Code);
+                if (string.Equals(existingTopic.TopicCode, normalizedCode, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                if (existingCodes.Contains(normalizedCode))
+                {
+                    // Якщо нормалізований код уже зайнятий, лишаємо поточний, щоб не створити конфлікт унікальності.
+                    continue;
+                }
+                existingCodes.Remove(existingTopic.TopicCode);
+                existingTopic.TopicCode = normalizedCode;
+                existingCodes.Add(normalizedCode);
+                normalizedLegacyCodes = true;
+            }
+            if (normalizedLegacyCodes)
+            {
+                await db.SaveChangesAsync(ct);
+            }
             var existingByCode = existingTopics.ToDictionary(t => t.TopicCode, StringComparer.OrdinalIgnoreCase);
             var parsedCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var parsedEntities = new List<(ModuleTopic topic, int desiredOrder)>();
@@ -469,10 +511,19 @@ public sealed class DocxImportService
                 .Select(t => t.topic)
                 .Concat(remaining)
                 .ToList();
-            var order = 1;
-            foreach (var t in ordered)
+            // Двофазне оновлення порядку запобігає циклу при перестановках унікального індексу (ModuleId, Order).
+            var needsTwoPhaseOrderUpdate = ordered.Where((t, idx) => t.Order != idx + 1).Any();
+            if (needsTwoPhaseOrderUpdate)
             {
-                t.Order = order++;
+                for (var i = 0; i < ordered.Count; i++)
+                {
+                    ordered[i].Order = 100000 + i;
+                }
+                await db.SaveChangesAsync(ct);
+            }
+            for (var i = 0; i < ordered.Count; i++)
+            {
+                ordered[i].Order = i + 1;
             }
             await db.SaveChangesAsync(ct);
         }
@@ -573,17 +624,42 @@ public sealed class DocxImportService
             if (!string.IsNullOrWhiteSpace(token))
             {
                 var cleaned = token.Trim().Trim('.');
-                if (Regex.IsMatch(cleaned, @"^\d+(?:\.\d+)+$"))
+                if (NumericDottedCodeRegex.IsMatch(cleaned))
                 {
                     return cleaned;
                 }
-                if (Regex.IsMatch(cleaned, @"^[A-Za-zА-Яа-яІіЇїЄєҐґ]+\.?\d+(?:\.\d+)*$"))
+                if (LetterPrefixedCodeRegex.IsMatch(cleaned))
                 {
-                    return cleaned;
+                    return NormalizeLetterPrefixedCode(cleaned, moduleCode);
                 }
             }
         }
         var prefix = string.IsNullOrWhiteSpace(modulePrefix) ? moduleCode : modulePrefix;
-        return $"{prefix}.{order}";
+        var normalizedPrefix = string.IsNullOrWhiteSpace(prefix)
+            ? moduleCode
+            : NormalizeLetterPrefixedCode(prefix, moduleCode);
+        return $"{normalizedPrefix}.{order}";
+    }
+    // Нормалізує коди формату "Д.1.1.1" до числового коду модуля, наприклад "13.1.1.1".
+    private static string NormalizeLetterPrefixedCode(string rawCode, string? moduleCode)
+    {
+        var cleaned = rawCode.Trim().Trim('.');
+        if (string.IsNullOrWhiteSpace(cleaned))
+        {
+            return cleaned;
+        }
+        if (string.IsNullOrWhiteSpace(moduleCode) || !NumericModuleCodeRegex.IsMatch(moduleCode))
+        {
+            return cleaned;
+        }
+        var match = LetterPrefixedCodeRegex.Match(cleaned);
+        if (!match.Success)
+        {
+            return cleaned;
+        }
+        var tail = match.Groups["tail"].Value.Trim().Trim('.');
+        return string.IsNullOrWhiteSpace(tail)
+            ? moduleCode
+            : $"{moduleCode}.{tail}";
     }
 }

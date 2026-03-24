@@ -2795,12 +2795,13 @@ else
     }
     else
     {
-        <div class="teacher-drafts-print-header">
-            <div class="teacher-drafts-print-title">Розклад навчальних занять (чернетка)</div>
-            <div class="teacher-drafts-print-dates">Тиждень № @isoWeek | @monday.ToString("dd.MM.yyyy") - @monday.AddDays(6).ToString("dd.MM.yyyy")</div>
-        </div>
-        <div class="teacher-drafts-table-wrapper">
-            <table class="teacher-drafts-table">
+        <div class="teacher-drafts-grid-shell">
+            <div class="teacher-drafts-print-header">
+                <div class="teacher-drafts-print-title">Розклад навчальних занять (чернетка)</div>
+                <div class="teacher-drafts-print-dates">Тиждень № @isoWeek | @monday.ToString("dd.MM.yyyy") - @monday.AddDays(6).ToString("dd.MM.yyyy")</div>
+            </div>
+            <div class="teacher-drafts-table-wrapper">
+                <table class="teacher-drafts-table">
                 <thead>
                     <tr>
                         <th class="td-day-col">День</th>
@@ -2994,7 +2995,8 @@ else
                         }
                     }
                 </tbody>
-            </table>
+                </table>
+            </div>
         </div>
     }
 }
@@ -3571,9 +3573,18 @@ else
     .empty {
         color: #64748b;
     }
+    .teacher-drafts-grid-shell {
+        width: calc(100% + 1rem);
+        max-width: none;
+        margin-left: -.5rem;
+        margin-right: -.5rem;
+        display: flex;
+        flex-direction: column;
+    }
     .teacher-drafts-print-header {
         text-align: center;
-        margin: 1.2rem 0 .8rem;
+        margin: 1.2rem 0 .5rem;
+        padding: 0 .5rem;
     }
     .teacher-drafts-print-title {
         text-transform: uppercase;
@@ -3590,14 +3601,16 @@ else
         --td-slot-col-width: 125px;
         overflow: auto;
         max-height: clamp(420px, 72vh, 920px);
-        overscroll-behavior: contain;
+        min-height: 320px;
+        overscroll-behavior: auto;
         scrollbar-gutter: stable both-edges;
         border: 1px solid #e2e8f0;
-        border-radius: 16px;
+        border-radius: 10px;
         background: #f8fafc;
-        padding: 0 1rem 1rem;
+        padding: 0 .25rem .25rem;
         position: relative;
         isolation: isolate;
+        margin-bottom: 0;
     }
     .teacher-drafts-table {
         width: max-content;
@@ -4000,6 +4013,8 @@ else
         .editor-lock { justify-content: flex-start; }
         .teacher-drafts-table-wrapper {
             max-height: clamp(360px, 66vh, 760px);
+            min-height: 260px;
+            padding: 0 .2rem .2rem;
         }
     }
     .editor-lock {
