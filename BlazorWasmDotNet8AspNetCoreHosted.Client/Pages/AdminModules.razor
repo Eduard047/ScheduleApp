@@ -133,108 +133,13 @@
 </div>
 
 <div class="card p-3 mb-3">
-    <div class="row g-2">
-        <div class="col-12 col-md-3">
-            <label class="form-label">Код</label>
-            <input class="form-control" @bind="form.Code" />
-        </div>
-        <div class="col-12 col-md-5">
-            <label class="form-label">Назва</label>
-            <input class="form-control" @bind="form.Title" />
-        </div>
-        <div class="col-12">
-            <label class="form-label">Курс модуля</label>
-            <div class="form-text small mb-2">
-                Один модуль належить лише одному курсу.
-            </div>
-            @if (!courses.Any())
-            {
-                <div class="border rounded p-2 bg-light text-muted small">Курси відсутні.</div>
-            }
-            else
-            {
-                <div class="course-chip-grid">
-                    @foreach (var c in courses.OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase))
-                    {
-                        var cid = c.Id;
-                        var selected = IsCourseSelected(cid);
-                        <button type="button"
-                                class="course-chip btn btn-sm @(selected ? "btn-primary" : "btn-outline-primary")"
-                                @onclick="() => SelectCourse(cid)">
-                            @c.Name
-                        </button>
-                    }
-                </div>
-                @if (form.CourseId > 0)
-                {
-                    <div class="mt-2 small text-muted">
-                        Обраний курс: @NameOfCourse(form.CourseId)
-                    </div>
-                }
-            }
-        </div>
-        <div class="col-12 col-lg-6">
-            <div class="d-flex justify-content-between align-items-center mb-1">
-                <label class="form-label mb-0">Дозволені корпуси</label>
-                <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="SelectAllBuildings">Обрати всі</button>
-            </div>
-            <div class="border rounded p-2" style="max-height:200px;overflow:auto;">
-                @foreach (var b in buildings)
-                {
-                    var bid = b.Id ?? 0;
-                    <div class="form-check">
-                        <input class="form-check-input" type="checkbox"
-                               checked="@form.AllowedBuildingIds.Contains(bid)"
-                               @onchange="e => ToggleBuilding(bid, (bool)e.Value!)" id="bld_@bid" />
-                        <label class="form-check-label" for="bld_@bid">@b.Name</label>
-                    </div>
-                }
-            </div>
-        </div>
-        <div class="col-12 col-lg-6">
-            <div class="d-flex justify-content-between align-items-center mb-1">
-                <label class="form-label mb-0">Дозволені аудиторії</label>
-                <button type="button" class="btn btn-sm btn-outline-secondary"
-                        @onclick="SelectAllRooms"
-                        disabled="@(!rooms.Any())">Обрати всі</button>
-            </div>
-            @if (!rooms.Any())
-            {
-                <div class="border rounded p-2 bg-light text-muted small">Оберіть корпус, щоб побачити перелік аудиторій.</div>
-            }
-            else
-            {
-                <div class="border rounded p-2" style="max-height:200px;overflow:auto;">
-                    @foreach (var r in rooms)
-                    {
-                        var rid = r.Id ?? 0;
-                        if (rid <= 0)
-                        {
-                            continue;
-                        }
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox"
-                                   checked="@form.AllowedRoomIds.Contains(rid)"
-                                   @onchange="e => Toggle(form.AllowedRoomIds, rid, (bool)e.Value!)" id="room_@rid" />
-                            <label class="form-check-label" for="room_@rid">@r.Name</label>
-                        </div>
-                    }
-                </div>
-            }
-        </div>
-        <div class="col-12 d-grid mt-2">
-            <button class="btn btn-primary" @onclick="Save">Зберегти</button>
-        </div>
-    </div>
-</div>
-
-<div class="card p-3 mb-3">
-    <div class="d-flex justify-content-between align-items-center mb-2 gap-2">
-        <div class="text-muted small">Відібрано: @SortedAndFiltered.Count() з @items.Count</div>
-        <div class="input-group" style="max-width:320px;">
+    <div class="d-flex justify-content-between align-items-center mb-2 gap-2 flex-wrap">
+        <button class="btn btn-primary" @onclick="OpenCreateModule">Додати модуль</button>
+        <div class="input-group ms-auto" style="max-width:320px;">
             <span class="input-group-text">Пошук</span>
             <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / код / назва / курс / кредити" />
         </div>
+        <div class="text-muted small">Відібрано: @SortedAndFiltered.Count() з @items.Count</div>
     </div>
     <div class="table-responsive">
         <table class="table table-sm align-middle">
@@ -277,7 +182,7 @@
                                     @onclick="() => OpenPlans(m)">
                                 План модуля
                             </button>
-                            <button class="btn btn-sm btn-outline-primary me-2" @onclick="() => Edit(m)">
+                            <button class="btn btn-sm btn-outline-primary me-2" @onclick="() => OpenEditModule(m)">
                                 Редагувати
                             </button>
                             <button class="btn btn-sm btn-outline-danger" @onclick="() => Delete(m.Id!.Value)">
@@ -290,6 +195,117 @@
         </table>
     </div>
 </div>
+
+@if (moduleEditorOpen)
+{
+    <div class="editor-overlay" @onclick="CloseModuleEditor">
+        <div class="editor editor-modal module-editor" role="dialog" aria-modal="true" @onclick:stopPropagation="true">
+            <div class="editor-modal-head">
+                <div>
+                    <div class="editor-title">@((form.Id is null ? "Створення модуля" : $"Редагування модуля #{form.Id}"))</div>
+                    <div class="editor-subtitle">Налаштуйте курс, дозволені корпуси та аудиторії для модуля.</div>
+                </div>
+                <button type="button" class="btn btn-outline-secondary editor-close" title="Закрити" @onclick="CloseModuleEditor">×</button>
+            </div>
+            <div class="module-editor-body">
+                <div class="row g-3">
+                    <div class="col-12 col-md-3">
+                        <label class="form-label">Код</label>
+                        <input class="form-control" @bind="form.Code" />
+                    </div>
+                    <div class="col-12 col-md-5">
+                        <label class="form-label">Назва</label>
+                        <input class="form-control" @bind="form.Title" />
+                    </div>
+                    <div class="col-12">
+                        <label class="form-label">Курс модуля</label>
+                        <div class="form-text small mb-2">
+                            Один модуль належить лише одному курсу.
+                        </div>
+                        @if (!courses.Any())
+                        {
+                            <div class="border rounded p-2 bg-light text-muted small">Курси відсутні.</div>
+                        }
+                        else
+                        {
+                            <div class="course-chip-grid">
+                                @foreach (var c in courses.OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase))
+                                {
+                                    var cid = c.Id;
+                                    var selected = IsCourseSelected(cid);
+                                    <button type="button"
+                                            class="course-chip btn btn-sm @(selected ? "btn-primary" : "btn-outline-primary")"
+                                            @onclick="() => SelectCourse(cid)">
+                                        @c.Name
+                                    </button>
+                                }
+                            </div>
+                            @if (form.CourseId > 0)
+                            {
+                                <div class="mt-2 small text-muted">
+                                    Обраний курс: @NameOfCourse(form.CourseId)
+                                </div>
+                            }
+                        }
+                    </div>
+                    <div class="col-12 col-lg-6">
+                        <div class="d-flex justify-content-between align-items-center mb-1">
+                            <label class="form-label mb-0">Дозволені корпуси</label>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="SelectAllBuildings">Обрати всі</button>
+                        </div>
+                        <div class="border rounded p-2" style="max-height:200px;overflow:auto;">
+                            @foreach (var b in buildings)
+                            {
+                                var bid = b.Id ?? 0;
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox"
+                                           checked="@form.AllowedBuildingIds.Contains(bid)"
+                                           @onchange="e => ToggleBuilding(bid, (bool)e.Value!)" id="module_bld_@bid" />
+                                    <label class="form-check-label" for="module_bld_@bid">@b.Name</label>
+                                </div>
+                            }
+                        </div>
+                    </div>
+                    <div class="col-12 col-lg-6">
+                        <div class="d-flex justify-content-between align-items-center mb-1">
+                            <label class="form-label mb-0">Дозволені аудиторії</label>
+                            <button type="button" class="btn btn-sm btn-outline-secondary"
+                                    @onclick="SelectAllRooms"
+                                    disabled="@(!rooms.Any())">Обрати всі</button>
+                        </div>
+                        @if (!rooms.Any())
+                        {
+                            <div class="border rounded p-2 bg-light text-muted small">Оберіть корпус, щоб побачити перелік аудиторій.</div>
+                        }
+                        else
+                        {
+                            <div class="border rounded p-2" style="max-height:200px;overflow:auto;">
+                                @foreach (var r in rooms)
+                                {
+                                    var rid = r.Id ?? 0;
+                                    if (rid <= 0)
+                                    {
+                                        continue;
+                                    }
+                                    <div class="form-check">
+                                        <input class="form-check-input" type="checkbox"
+                                               checked="@form.AllowedRoomIds.Contains(rid)"
+                                               @onchange="e => Toggle(form.AllowedRoomIds, rid, (bool)e.Value!)" id="module_room_@rid" />
+                                        <label class="form-check-label" for="module_room_@rid">@r.Name</label>
+                                    </div>
+                                }
+                            </div>
+                        }
+                    </div>
+                </div>
+            </div>
+            <div class="editor-actions">
+                <button class="btn btn-primary" @onclick="Save">Зберегти</button>
+                <button class="btn btn-outline-secondary" @onclick="CloseModuleEditor">Скасувати</button>
+            </div>
+        </div>
+    </div>
+}
 
 @if (plansModuleId is not null)
 {
@@ -343,52 +359,16 @@
                 <hr />
                 <div class="card module-topics-card p-3 mb-3">
                     <div class="module-topics-header">
-                        <h6 class="mb-0">Керування заняттями</h6>
-                        <p class="small text-muted mb-0">Вкажіть код у форматі <code>1.1.1.1</code> та заповніть інші поля.</p>
-                    </div>
-                    <div class="row g-3 align-items-end">
-                        <div class="col-12 col-lg-3">
-                            <label class="form-label text-nowrap">Код заняття</label>
-                            <input class="form-control" @bind="topicCodeInput" />
+                        <div>
+                            <h6 class="mb-0">Керування заняттями</h6>
+                            <p class="small text-muted mb-0">Редагування теми відкривається в окремому вікні поверх плану.</p>
                         </div>
-                        <div class="col-12 col-lg-3">
-                            <label class="form-label text-nowrap">Тип заняття</label>
-                            <select class="form-select" @bind="topicForm.LessonTypeId">
-                                <option value="0">- Оберіть тип заняття -</option>
-                                @foreach (var lt in lessonTypes)
-                                {
-                                    <option value="@lt.Id">@lt.Name</option>
-                                }
-                            </select>
-                        </div>
-                        <div class="col-12 col-lg-3">
-                            <label class="form-label text-nowrap">Кафедра</label>
-                            <select class="form-select"
-                                    value="@topicForm.DepartmentId"
-                                    @onchange="e => topicForm.DepartmentId = int.TryParse(e.Value?.ToString(), out var v) && v > 0 ? v : (int?)null">
-                                <option value="">— Не вказано —</option>
-                                @foreach (var dep in departments.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase))
-                                {
-                                    <option value="@dep.Id" selected="@(topicForm.DepartmentId == dep.Id)">@dep.Name</option>
-                                }
-                            </select>
-                        </div>
-                        <div class="col-12 col-sm-4 col-lg-2">
-                            <label class="form-label text-nowrap">Годин аудиторних</label>
-                            <input type="number" min="0" class="form-control" @bind="topicForm.AuditoriumHours" @bind:after="SyncTotalHours" />
-                        </div>
-                        <div class="col-12 col-sm-4 col-lg-2">
-                            <label class="form-label text-nowrap">Годин самостійних</label>
-                            <input type="number" min="0" class="form-control" @bind="topicForm.SelfStudyHours" @bind:after="SyncTotalHours" />
-                        </div>
-                        <div class="col-12 col-sm-4 col-lg-2">
-                            <label class="form-label text-nowrap">Всього</label>
-                            <input type="number" min="0" class="form-control" value="@topicForm.TotalHours" readonly />
-                        </div>
-                    </div>
-                    <div class="module-topics-actions d-flex flex-wrap gap-2 mt-3">
-                        <button type="button" class="btn btn-sm btn-primary" @onclick="SaveTopic" disabled="@(!plansModuleId.HasValue)">Зберегти заняття</button>
-                        <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="ClearTopicForm" disabled="@(!plansModuleId.HasValue)">Очистити поля</button>
+                        <button type="button"
+                                class="btn btn-sm btn-primary"
+                                @onclick="OpenCreateTopic"
+                                disabled="@(!plansModuleId.HasValue)">
+                            Додати заняття
+                        </button>
                     </div>
                     <div class="table-responsive mt-3">
                         <table class="table table-sm align-middle module-topics-table">
@@ -471,6 +451,65 @@
                         </table>
                     </div>
                 </div>
+                @if (topicEditorOpen)
+                {
+                    <div class="editor-overlay topic-editor-overlay" @onclick="CloseTopicEditor">
+                        <div class="editor editor-modal topic-editor" role="dialog" aria-modal="true" @onclick:stopPropagation="true">
+                            <div class="editor-modal-head">
+                                <div>
+                                    <div class="editor-title">@(topicForm.Id is null ? "Створення теми заняття" : $"Редагування теми #{topicForm.Id}")</div>
+                                    <div class="editor-subtitle">Вкажіть код у форматі <code>1.1.1.1</code> та заповніть параметри теми.</div>
+                                </div>
+                                <button type="button" class="btn btn-outline-secondary editor-close" title="Закрити" @onclick="CloseTopicEditor">×</button>
+                            </div>
+                            <div class="row g-3 align-items-end">
+                                <div class="col-12 col-lg-4">
+                                    <label class="form-label text-nowrap">Код заняття</label>
+                                    <input class="form-control" @bind="topicCodeInput" />
+                                </div>
+                                <div class="col-12 col-lg-4">
+                                    <label class="form-label text-nowrap">Тип заняття</label>
+                                    <select class="form-select" @bind="topicForm.LessonTypeId">
+                                        <option value="0">- Оберіть тип заняття -</option>
+                                        @foreach (var lt in lessonTypes)
+                                        {
+                                            <option value="@lt.Id">@lt.Name</option>
+                                        }
+                                    </select>
+                                </div>
+                                <div class="col-12 col-lg-4">
+                                    <label class="form-label text-nowrap">Кафедра</label>
+                                    <select class="form-select"
+                                            value="@topicForm.DepartmentId"
+                                            @onchange="e => topicForm.DepartmentId = int.TryParse(e.Value?.ToString(), out var v) && v > 0 ? v : (int?)null">
+                                        <option value="">— Не вказано —</option>
+                                        @foreach (var dep in departments.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase))
+                                        {
+                                            <option value="@dep.Id" selected="@(topicForm.DepartmentId == dep.Id)">@dep.Name</option>
+                                        }
+                                    </select>
+                                </div>
+                                <div class="col-12 col-md-4">
+                                    <label class="form-label text-nowrap">Годин аудиторних</label>
+                                    <input type="number" min="0" class="form-control" @bind="topicForm.AuditoriumHours" @bind:after="SyncTotalHours" />
+                                </div>
+                                <div class="col-12 col-md-4">
+                                    <label class="form-label text-nowrap">Годин самостійних</label>
+                                    <input type="number" min="0" class="form-control" @bind="topicForm.SelfStudyHours" @bind:after="SyncTotalHours" />
+                                </div>
+                                <div class="col-12 col-md-4">
+                                    <label class="form-label text-nowrap">Всього</label>
+                                    <input type="number" min="0" class="form-control" value="@topicForm.TotalHours" readonly />
+                                </div>
+                            </div>
+                            <div class="editor-actions">
+                                <button type="button" class="btn btn-primary" @onclick="SaveTopic" disabled="@(!plansModuleId.HasValue)">Зберегти заняття</button>
+                                <button type="button" class="btn btn-outline-secondary" @onclick="ClearTopicForm" disabled="@(!plansModuleId.HasValue)">Очистити поля</button>
+                                <button type="button" class="btn btn-outline-secondary" @onclick="CloseTopicEditor">Скасувати</button>
+                            </div>
+                        </div>
+                    </div>
+                }
             </div>
         </div>
     </div>
@@ -488,17 +527,8 @@
     private string? clearError;
     private string? clearOk;
     private List<ModuleEditDto> items = new();
-    private ModuleEditDto form = new()
-    {
-        Id = null,
-        Code = string.Empty,
-        Title = string.Empty,
-        CourseId = 0,
-        AllowedRoomIds = new(),
-        AllowedBuildingIds = new(),
-        CloneCourseIds = new(),
-        Credits = 0
-    };
+    private ModuleEditDto form = NewModuleForm();
+    private bool moduleEditorOpen;
     private List<LookupDto> courses = new();
     private List<LookupDto> departments = new();
     private List<RoomEditDto> rooms = new();
@@ -511,17 +541,41 @@ private List<int> planCourseIds = new();
 private int selectedPlanCourseId;
 private string plansModuleTitle = "";
 private string plansModuleCode = "";
-private PlanCourseVM planCourse = new();
+    private PlanCourseVM planCourse = new();
 
     private List<ModuleTopicViewDto> moduleTopics = new();
     private ModuleTopicFormVM topicForm = new();
     private string topicCodeInput = string.Empty;
+    private bool topicEditorOpen;
     // Дозволяємо літери/цифри/крапки/дефіси, щоб підтримати коди на кшталт КП.1.1
     private static readonly Regex TopicCodePattern = new(@"^[A-Za-zА-Яа-яІіЇїЄєҐґ0-9._-]+$");
     private const string CourseField = "CourseName";
     private string sortField = nameof(ModuleEditDto.Title);
     private bool sortAsc = true;
     private string? filter;
+    private static ModuleEditDto NewModuleForm() => new()
+    {
+        Id = null,
+        Code = string.Empty,
+        Title = string.Empty,
+        CourseId = 0,
+        AllowedRoomIds = new(),
+        AllowedBuildingIds = new(),
+        CloneCourseIds = new(),
+        Credits = 0
+    };
+    private void OpenCreateModule()
+    {
+        form = NewModuleForm();
+        moduleEditorOpen = true;
+        UpdateVisibleRooms();
+    }
+    private void CloseModuleEditor()
+    {
+        moduleEditorOpen = false;
+        form = NewModuleForm();
+        UpdateVisibleRooms();
+    }
     // Завантажує дані модулів і довідників під час першого відкриття сторінки.
     protected override async Task OnInitializedAsync() => await Load();
     private int ImportedTopicsCount => importResult?.Modules?.Sum(m => m.Topics?.Count ?? 0) ?? 0;
@@ -742,12 +796,13 @@ private PlanCourseVM planCourse = new();
         return parts.Count == 0 ? "—" : string.Join("; ", parts);
     }
     // Заповнює форму даними модуля для редагування.
-    private void Edit(ModuleEditDto m)
+    private void OpenEditModule(ModuleEditDto m)
     {
         form = new(m.Id, m.Code, m.Title, m.CourseId, new List<int>(m.AllowedRoomIds), new List<int>(m.AllowedBuildingIds), m.Credits);
         SetSelectedCourses(ModuleCourseIds(m));
         EnsureBuildingsCoverSelectedRooms();
         UpdateVisibleRooms();
+        moduleEditorOpen = true;
     }
     // Перевіряє введені дані та зберігає модуль через API.
     private async Task Save()
@@ -764,18 +819,7 @@ private PlanCourseVM planCourse = new();
             await Admin.UpsertModule(form);
             await Load();
             ok = "Модуль успішно збережено.";
-            form = new()
-            {
-                Id = null,
-                Code = string.Empty,
-                Title = string.Empty,
-                CourseId = 0,
-                AllowedRoomIds = new(),
-                AllowedBuildingIds = new(),
-                CloneCourseIds = new(),
-                Credits = 0
-            };
-            UpdateVisibleRooms();
+            CloseModuleEditor();
         }
         catch (Exception ex) { error = ex.Message; }
     }
@@ -903,6 +947,7 @@ private PlanCourseVM planCourse = new();
         plansModuleCode = "";
         planCourse = new();
         moduleTopics.Clear();
+        topicEditorOpen = false;
         ResetTopicForm(0);
     }
     // Зберігає налаштування плану годин для вибраного курсу.
@@ -1026,6 +1071,17 @@ private PlanCourseVM planCourse = new();
         };
         topicCodeInput = string.Empty;
     }
+    private void OpenCreateTopic()
+    {
+        if (plansModuleId is null) return;
+        ResetTopicForm(plansModuleId.Value);
+        topicEditorOpen = true;
+    }
+    private void CloseTopicEditor()
+    {
+        topicEditorOpen = false;
+        ResetTopicForm(plansModuleId ?? 0);
+    }
     // Підтримує сумарну кількість годин у відповідності до складових.
     private void SyncTotalHours()
     {
@@ -1089,6 +1145,7 @@ private PlanCourseVM planCourse = new();
             SelfStudyBySupervisor = topic.SelfStudyBySupervisor,
         };
         topicCodeInput = topicForm.TopicCode;
+        topicEditorOpen = true;
     }
     // Валідує та зберігає тему модуля, оновлює список.
     private async Task SaveTopic()
@@ -1140,6 +1197,7 @@ private PlanCourseVM planCourse = new();
             await Admin.UpsertModuleTopic(moduleId, payload);
             ok = "Заняття збережено.";
             await LoadTopics(moduleId);
+            topicEditorOpen = false;
         }
         catch (Exception ex)
         {
@@ -1304,6 +1362,55 @@ private PlanCourseVM planCourse = new();
 
 <style>
 
+    .editor-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(15, 23, 42, 0.5);
+        backdrop-filter: blur(2px);
+        display: flex;
+        justify-content: center;
+        align-items: flex-start;
+        padding: 72px 18px 24px;
+        overflow-y: auto;
+        z-index: 2500;
+    }
+    .editor {
+        margin-top: 14px;
+        background: #fff;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 14px;
+        width: min(1100px, 100%);
+        box-shadow: 0 20px 50px rgba(15, 23, 42, 0.25);
+    }
+    .editor-modal-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+    }
+    .editor-title { font-weight: 800; font-size: 1.1rem; }
+    .editor-subtitle { color: #475569; font-size: .92rem; margin-top: 4px; }
+    .editor-close { min-width: 44px; height: 44px; font-size: 1.3rem; padding: 0 .6rem; }
+    .module-editor-body {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+    }
+    .topic-editor-overlay {
+        z-index: 3200;
+    }
+    .topic-editor {
+        width: min(920px, 100%);
+    }
+    .editor-actions {
+        margin-top: 14px;
+        display: flex;
+        gap: 10px;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+    }
     .course-chip-grid {
         display: flex;
         flex-wrap: wrap;
