@@ -18,6 +18,7 @@ public record AutoGenRequest(
     bool ClearExisting = true,
     int? CourseId = null,
     int? GroupId = null,
+    List<int>? GroupIds = null,
     bool AllowOnDaysOff = false,
     WeekPreset Days = WeekPreset.MonFri,
     Dictionary<int, int>? ModuleHours = null,

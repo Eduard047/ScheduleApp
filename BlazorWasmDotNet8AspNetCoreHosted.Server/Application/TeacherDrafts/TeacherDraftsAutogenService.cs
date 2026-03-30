@@ -203,7 +203,22 @@ public sealed class TeacherDraftsAutogenService
         }
         // Нормалізуємо фільтри: 0 або null означає "без фільтра".
         int? courseId = (r.CourseId > 0) ? r.CourseId : null;
-        int? groupId = (r.GroupId > 0) ? r.GroupId : null;
+        var requestedGroupIds = new HashSet<int>();
+        if (r.GroupId is int singleGroupId && singleGroupId > 0)
+        {
+            requestedGroupIds.Add(singleGroupId);
+        }
+        if (r.GroupIds is not null)
+        {
+            foreach (var candidateGroupId in r.GroupIds)
+            {
+                if (candidateGroupId > 0)
+                {
+                    requestedGroupIds.Add(candidateGroupId);
+                }
+            }
+        }
+        bool hasGroupFilter = requestedGroupIds.Count > 0;
         // Ручні години по модулях (якщо задані в запиті).
         var moduleHoursByModuleId = r.ModuleHours?
             .Where(kv => kv.Value > 0)
@@ -219,14 +234,29 @@ public sealed class TeacherDraftsAutogenService
                 message = "Для генерації за модулями потрібно обрати курс."
             });
         }
-        // Завантажуємо групи з урахуванням фільтрів курсу та групи.
+        // Завантажуємо групи з урахуванням фільтрів курсу та груп.
         var groups = await _db.Groups
             .Include(x => x.Course)
             .Where(x => courseId == null || x.CourseId == courseId)
-            .Where(x => groupId == null || x.Id == groupId)
+            .Where(x => !hasGroupFilter || requestedGroupIds.Contains(x.Id))
             .ToListAsync();
+        if (hasGroupFilter)
+        {
+            var foundGroupIds = groups.Select(g => g.Id).ToHashSet();
+            var skippedGroupIds = requestedGroupIds
+                .Where(id => !foundGroupIds.Contains(id))
+                .OrderBy(id => id)
+                .ToList();
+            if (skippedGroupIds.Count > 0)
+            {
+                initWarnings.Add($"Ігноровано групи, що не належать вибраному курсу або не існують: {string.Join(", ", skippedGroupIds)}.");
+            }
+        }
         if (groups.Count == 0)
-            return Ok(new AutoGenResult(0, 0, new() { "Групи не знайдено." }));
+        {
+            initWarnings.Add("Групи не знайдено.");
+            return Ok(new AutoGenResult(0, 0, initWarnings));
+        }
         var selectedGroupsById = groups.ToDictionary(g => g.Id);
         var selectedGroupsByCourse = groups
             .GroupBy(g => g.CourseId)

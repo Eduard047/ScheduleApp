@@ -9,6 +9,7 @@ public sealed record DraftAutoGenRequest(
     bool ClearExisting = true, // Очищати існуючі чернетки перед генерацією.
     int? CourseId = null, // Фільтр за курсом.
     int? GroupId = null, // Фільтр за групою.
+    List<int>? GroupIds = null, // Фільтр за переліком груп.
     int? TeacherId = null, // Фільтр за викладачем.
     bool AllowOnDaysOff = false, // Дозволяти генерацію у вихідні.
     WeekPreset Days = WeekPreset.MonFri, // Набір днів для генерації.
