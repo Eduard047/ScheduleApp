@@ -280,7 +280,7 @@ else
                 <div class="d-flex flex-column gap-2">
                     <div>@ok</div>
                     @{
-                        var warningsTotal = okWarnings.Count + _latestGapDetails.Count;
+                        var warningsTotal = okWarnings.Count;
                         var contiguousModuleBlockWarnings = CountContiguousModuleBlockWarnings();
                     }
                     @if (warningsTotal > 0)
@@ -760,9 +760,9 @@ else
     private async Task SetOkMessageAsync(string message, IEnumerable<string>? warnings = null, IEnumerable<AutoGenGapDetail>? gapDetails = null, bool persist = true)
     {
         ok = message;
-        okWarnings = warnings?.Where(w => !string.IsNullOrWhiteSpace(w)).ToList() ?? new List<string>();
-        okWarningsExpanded = false;
         _latestGapDetails = gapDetails?.ToList() ?? new List<AutoGenGapDetail>();
+        okWarnings = BuildSlotGapWarnings(warnings, _latestGapDetails);
+        okWarningsExpanded = false;
         if (persist)
         {
             await PersistAutoGenStatusAsync();
@@ -786,6 +786,52 @@ else
         var reason = warning[(idx + marker.Length)..].Trim();
         return (string.IsNullOrWhiteSpace(message) ? warning : message, string.IsNullOrWhiteSpace(reason) ? null : reason);
     }
+    private static List<string> BuildSlotGapWarnings(IEnumerable<string>? warnings, IEnumerable<AutoGenGapDetail>? gapDetails)
+    {
+        var result = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        if (gapDetails is not null)
+        {
+            foreach (var gap in gapDetails)
+            {
+                var warning = BuildSlotGapWarning(gap);
+                if (seen.Add(warning))
+                {
+                    result.Add(warning);
+                }
+            }
+        }
+        if (warnings is null)
+        {
+            return result;
+        }
+        foreach (var warning in warnings)
+        {
+            if (string.IsNullOrWhiteSpace(warning))
+            {
+                continue;
+            }
+            var normalized = warning.Trim();
+            if (!IsSlotGapWarning(normalized))
+            {
+                continue;
+            }
+            if (seen.Add(normalized))
+            {
+                result.Add(normalized);
+            }
+        }
+        return result;
+    }
+    private static string BuildSlotGapWarning(AutoGenGapDetail gap)
+    {
+        var message = $"Автогенерація не заповнила слот {gap.SlotLabel} для групи {gap.GroupName} на {gap.Date:yyyy-MM-dd}.";
+        return string.IsNullOrWhiteSpace(gap.Reason)
+            ? message
+            : $"{message} Причина: {gap.Reason}";
+    }
+    private static bool IsSlotGapWarning(string warning)
+        => warning.Contains("не заповнила слот", StringComparison.OrdinalIgnoreCase);
     // Рахує випадки, коли слот не заповнено через правило суцільного блоку модуля.
     private int CountContiguousModuleBlockWarnings()
     {
@@ -1507,6 +1553,9 @@ else
         bool softFill)
     {
         var lessons = BuildDraftLessonSnapshot(out var trimmed);
+        var logWarnings = res.GapDetails is { Count: > 0 }
+            ? new List<string>()
+            : BuildSlotGapWarnings(res.Warnings, null);
         var entry = new AdminScheduleLogEntry(
             Id: Guid.NewGuid().ToString("N"),
             Timestamp: DateTimeOffset.Now,
@@ -1522,7 +1571,7 @@ else
             CourseId: courseId,
             CourseName: courseName,
             ModuleHours: BuildModuleHours(moduleHours),
-            Warnings: res.Warnings?.Where(w => !string.IsNullOrWhiteSpace(w)).ToList() ?? new List<string>(),
+            Warnings: logWarnings,
             GapDetails: res.GapDetails?.ToList() ?? new List<AutoGenGapDetail>(),
             Lessons: lessons,
             LessonsTrimmed: trimmed
