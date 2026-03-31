@@ -24,6 +24,109 @@ public sealed class TeacherDraftsExportService
     }
     // Допоміжна модель для груп у звіті.
     private sealed record GroupInfo(int Id, string Name);
+    private static bool IsLectureTypeForGroupMerge(TeacherDraftItemDto item)
+    {
+        if (item.IsSelfStudy
+            || string.Equals(item.LessonTypeCode, "BREAK", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(item.LessonTypeCode, "CANCELED", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+        var code = item.LessonTypeCode?.Trim();
+        if (!string.IsNullOrWhiteSpace(code))
+        {
+            if (string.Equals(code, "LECTURE", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(code, "LECT", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(code, "LEC", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        var name = item.LessonTypeName?.Trim();
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+        return name.Contains("ЛЕКЦ", StringComparison.CurrentCultureIgnoreCase)
+               || name.Contains("LECTURE", StringComparison.OrdinalIgnoreCase);
+    }
+    private static bool HasSameTeacherForGroupMerge(TeacherDraftItemDto left, TeacherDraftItemDto right)
+    {
+        if (left.TeacherId.HasValue || right.TeacherId.HasValue)
+        {
+            return left.TeacherId == right.TeacherId;
+        }
+        var leftTeacher = left.Teacher?.Trim();
+        var rightTeacher = right.Teacher?.Trim();
+        return string.Equals(leftTeacher, rightTeacher, StringComparison.CurrentCultureIgnoreCase);
+    }
+    private static bool CanMergeLectureAcrossGroups(TeacherDraftItemDto left, TeacherDraftItemDto right)
+    {
+        if (!IsLectureTypeForGroupMerge(left) || !IsLectureTypeForGroupMerge(right))
+        {
+            return false;
+        }
+        return left.ModuleId == right.ModuleId
+               && left.LessonTypeId == right.LessonTypeId
+               && left.RoomId == right.RoomId
+               && left.ModuleTopicId == right.ModuleTopicId
+               && HasSameTeacherForGroupMerge(left, right);
+    }
+    private static string BuildExportCellText(
+        IReadOnlyList<TeacherDraftItemDto> itemsForSlot,
+        IReadOnlyDictionary<int, string> moduleCodeLookup)
+    {
+        var cellParts = itemsForSlot
+            .Select(item =>
+            {
+                moduleCodeLookup.TryGetValue(item.ModuleId, out var moduleCode);
+                return TeacherDraftsHelpers.BuildExportCell(item, moduleCode);
+            })
+            .Where(text => !string.IsNullOrWhiteSpace(text))
+            .Distinct(StringComparer.CurrentCulture)
+            .ToList();
+        return string.Join($"{Environment.NewLine}{Environment.NewLine}", cellParts);
+    }
+    private static TeacherDraftItemDto SelectMergeAnchor(IReadOnlyList<TeacherDraftItemDto> itemsForSlot)
+        => itemsForSlot
+            .OrderBy(item => item.Id)
+            .First();
+    private static int ResolveGroupMergeSpan(
+        DateOnly day,
+        TimeOnly start,
+        TimeOnly end,
+        IReadOnlyList<GroupInfo> groups,
+        int startGroupIndex,
+        IReadOnlyDictionary<(DateOnly Date, TimeOnly Start, TimeOnly End, int GroupId), TeacherDraftItemDto> mergeAnchorLookup,
+        IReadOnlyDictionary<(DateOnly Date, TimeOnly Start, TimeOnly End, int GroupId), string> cellTextLookup)
+    {
+        if (startGroupIndex < 0 || startGroupIndex >= groups.Count)
+        {
+            return 1;
+        }
+        var anchorKey = (day, start, end, groups[startGroupIndex].Id);
+        if (!mergeAnchorLookup.TryGetValue(anchorKey, out var anchorItem)
+            || !cellTextLookup.TryGetValue(anchorKey, out var anchorText)
+            || string.IsNullOrWhiteSpace(anchorText)
+            || !IsLectureTypeForGroupMerge(anchorItem))
+        {
+            return 1;
+        }
+        var span = 1;
+        for (var index = startGroupIndex + 1; index < groups.Count; index++)
+        {
+            var nextKey = (day, start, end, groups[index].Id);
+            if (!mergeAnchorLookup.TryGetValue(nextKey, out var nextItem)
+                || !CanMergeLectureAcrossGroups(anchorItem, nextItem)
+                || !cellTextLookup.TryGetValue(nextKey, out var nextText)
+                || string.IsNullOrWhiteSpace(nextText))
+            {
+                break;
+            }
+            span++;
+        }
+        return span;
+    }
     // Формує Excel-файл з розкладом чернеток.
     public async Task<FileContentResult> ExportAsync(
         DateOnly weekStart,
@@ -117,6 +220,12 @@ public sealed class TeacherDraftsExportService
                     .ThenBy(x => x.Teacher, StringComparer.CurrentCultureIgnoreCase)
                     .ThenBy(x => x.Id)
                     .ToList());
+        var cellTextLookup = lookup.ToDictionary(
+            pair => pair.Key,
+            pair => BuildExportCellText(pair.Value, moduleCodeLookup));
+        var mergeAnchorLookup = lookup.ToDictionary(
+            pair => pair.Key,
+            pair => SelectMergeAnchor(pair.Value));
         var filterParts = new List<string>();
         if (!string.IsNullOrWhiteSpace(teacherLabel)) filterParts.Add($"Викладач: {teacherLabel}");
         if (!string.IsNullOrWhiteSpace(groupLabel)) filterParts.Add($"Група: {groupLabel}");
@@ -186,24 +295,28 @@ public sealed class TeacherDraftsExportService
                         ? mappedSlotNumber
                         : slotIndex + 1;
                     worksheet.Cell(row, 2).Value = slotNumber;
-                    for (var index = 0; index < groups.Count; index++)
+                    for (var index = 0; index < groups.Count;)
                     {
                         var column = 3 + index;
-                        if (lookup.TryGetValue((day, slot.Start, slot.End, groups[index].Id), out var itemsForSlot))
+                        var key = (day, slot.Start, slot.End, groups[index].Id);
+                        var mergeSpan = ResolveGroupMergeSpan(
+                            day,
+                            slot.Start,
+                            slot.End,
+                            groups,
+                            index,
+                            mergeAnchorLookup,
+                            cellTextLookup);
+                        if (cellTextLookup.TryGetValue(key, out var cellText) && !string.IsNullOrWhiteSpace(cellText))
                         {
-                            var cellParts = itemsForSlot
-                                .Select(item =>
-                                {
-                                    moduleCodeLookup.TryGetValue(item.ModuleId, out var moduleCode);
-                                    return TeacherDraftsHelpers.BuildExportCell(item, moduleCode);
-                                })
-                                .Where(text => !string.IsNullOrWhiteSpace(text))
-                                .Distinct(StringComparer.CurrentCulture)
-                                .ToList();
-                            worksheet.Cell(row, column).Value = string.Join(
-                                $"{Environment.NewLine}{Environment.NewLine}",
-                                cellParts);
+                            worksheet.Cell(row, column).Value = cellText;
                         }
+                        if (mergeSpan > 1)
+                        {
+                            var mergeRange = worksheet.Range(row, column, row, column + mergeSpan - 1);
+                            mergeRange.Merge();
+                        }
+                        index += mergeSpan;
                     }
                     row++;
                 }
