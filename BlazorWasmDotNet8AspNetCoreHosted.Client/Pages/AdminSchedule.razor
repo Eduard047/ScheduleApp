@@ -183,6 +183,38 @@ else
             @if (_selectedCourseId is int)
             {
                 <div class="mt-3">
+                    <div class="d-flex flex-column flex-md-row align-items-start align-items-md-center justify-content-between gap-2 mb-2">
+                        <div class="fw-semibold">Групи для автогенерації</div>
+                        <div class="btn-group btn-group-sm" role="group" aria-label="Вибір груп курсу">
+                            <button type="button" class="btn btn-outline-secondary" @onclick="SelectAllCourseGroupsAsync">
+                                Усі
+                            </button>
+                            <button type="button" class="btn btn-outline-secondary" @onclick="ClearCourseGroupsSelectionAsync">
+                                Жодної
+                            </button>
+                        </div>
+                    </div>
+                    <div class="d-flex flex-wrap gap-3">
+                        @foreach (var row in _courseGroupRows)
+                        {
+                            <label class="form-check mb-0 d-flex align-items-center gap-2">
+                                <input class="form-check-input m-0"
+                                       type="checkbox"
+                                       @bind="row.Selected"
+                                       @bind:after="PersistAutoGenConfigAsync" />
+                                <span class="form-check-label">@row.Caption</span>
+                            </label>
+                        }
+                        @if (_courseGroupRows.Count == 0)
+                        {
+                            <span class="text-muted small">Для цього курсу немає доступних груп.</span>
+                        }
+                    </div>
+                    <div class="small text-muted mt-2">
+                        Автогенерація створює заняття лише для обраних груп.
+                    </div>
+                </div>
+                <div class="mt-3">
                     <div class="fw-semibold mb-2">Модулі та години на тиждень</div>
                     <div class="table-responsive">
                         <table class="table table-sm align-middle mb-0">
@@ -227,7 +259,7 @@ else
                         </table>
                     </div>
                     <div class="small text-muted mt-2">
-                        Вкажіть, які модулі мають бути на поточному тижні, і скільки годин потрібно згенерувати для всіх груп курсу.
+                        Вкажіть, які модулі мають бути на поточному тижні, і скільки годин потрібно згенерувати для обраних груп курсу.
                     </div>
                 </div>
             }
@@ -238,7 +270,7 @@ else
                 </div>
             }
             <div class="small text-muted mt-2">
-                Чернетки оновлюються одразу для всіх груп у вибраному діапазоні. Закріплені елементи залишаються без змін.<br />
+                Чернетки оновлюються для вибраних груп у вибраному діапазоні. Закріплені елементи залишаються без змін.<br />
                 Розклад очищується окремо і не зачіпає закріплені заняття.
             </div>
         </div>
@@ -248,7 +280,7 @@ else
                 <div class="d-flex flex-column gap-2">
                     <div>@ok</div>
                     @{
-                        var warningsTotal = okWarnings.Count + _latestGapDetails.Count;
+                        var warningsTotal = okWarnings.Count;
                         var contiguousModuleBlockWarnings = CountContiguousModuleBlockWarnings();
                     }
                     @if (warningsTotal > 0)
@@ -514,6 +546,7 @@ else
     private WeekPreset _daysPreset = WeekPreset.MonFri;
     private int? _selectedCourseId;
     private readonly List<ModuleWeekRow> _moduleWeekRows = new();
+    private readonly List<CourseGroupRow> _courseGroupRows = new();
     private string? ok;
     private string? error;
     private List<string> okWarnings = new();
@@ -583,6 +616,7 @@ else
         {
             _selectedCourseId = meta.Courses[0].Id;
             BuildModuleWeekRows();
+            BuildCourseGroupRows();
         }
         breakTypeId = meta.LessonTypes.FirstOrDefault(x => x.Code == "BREAK")?.Id ?? 0;
         canceledTypeId = meta.LessonTypes.FirstOrDefault(x => x.Code == "CANCELED")?.Id ?? 0;
@@ -595,11 +629,13 @@ else
     private bool IsCanceled(int lessonTypeId) => lessonTypeId == canceledTypeId;
     private bool CanAutoGen
         => _selectedCourseId is int
-           && _moduleWeekRows.Any(row => row.Selected && row.Hours > 0);
+           && _moduleWeekRows.Any(row => row.Selected && row.Hours > 0)
+           && _courseGroupRows.Any(row => row.Selected);
     // Реагує на зміну обраного курсу для автогенерації.
     private async Task OnSelectedCourseChanged()
     {
         BuildModuleWeekRows();
+        BuildCourseGroupRows();
         await RestorePersistedAutoGenConfigAsync(restoreCourseSelection: false);
         await PersistAutoGenConfigAsync();
     }
@@ -619,6 +655,50 @@ else
             .ToList();
         _moduleWeekRows.AddRange(modules);
     }
+    // Формує список груп для поточного курсу.
+    private void BuildCourseGroupRows()
+    {
+        _courseGroupRows.Clear();
+        if (meta is null || _selectedCourseId is not int courseId)
+        {
+            return;
+        }
+        var groups = meta.Groups
+            .Where(g => g.CourseId == courseId)
+            .OrderBy(g => g.Name)
+            .Select(g => new CourseGroupRow(g.Id, g.Name))
+            .ToList();
+        foreach (var row in groups)
+        {
+            row.Selected = true;
+        }
+        _courseGroupRows.AddRange(groups);
+    }
+    // Обирає всі групи поточного курсу.
+    private async Task SelectAllCourseGroupsAsync()
+    {
+        foreach (var row in _courseGroupRows)
+        {
+            row.Selected = true;
+        }
+        await PersistAutoGenConfigAsync();
+    }
+    // Скидає вибір груп поточного курсу.
+    private async Task ClearCourseGroupsSelectionAsync()
+    {
+        foreach (var row in _courseGroupRows)
+        {
+            row.Selected = false;
+        }
+        await PersistAutoGenConfigAsync();
+    }
+    // Повертає ідентифікатори вибраних груп для автогенерації.
+    private List<int> GetSelectedGroupIds()
+        => _courseGroupRows
+            .Where(row => row.Selected)
+            .Select(row => row.GroupId)
+            .Distinct()
+            .ToList();
     // Формує опис діапазону тижня для генерації.
     private string GetGenerationRangeDescription()
     {
@@ -680,9 +760,9 @@ else
     private async Task SetOkMessageAsync(string message, IEnumerable<string>? warnings = null, IEnumerable<AutoGenGapDetail>? gapDetails = null, bool persist = true)
     {
         ok = message;
-        okWarnings = warnings?.Where(w => !string.IsNullOrWhiteSpace(w)).ToList() ?? new List<string>();
-        okWarningsExpanded = false;
         _latestGapDetails = gapDetails?.ToList() ?? new List<AutoGenGapDetail>();
+        okWarnings = BuildSlotGapWarnings(warnings, _latestGapDetails);
+        okWarningsExpanded = false;
         if (persist)
         {
             await PersistAutoGenStatusAsync();
@@ -706,6 +786,52 @@ else
         var reason = warning[(idx + marker.Length)..].Trim();
         return (string.IsNullOrWhiteSpace(message) ? warning : message, string.IsNullOrWhiteSpace(reason) ? null : reason);
     }
+    private static List<string> BuildSlotGapWarnings(IEnumerable<string>? warnings, IEnumerable<AutoGenGapDetail>? gapDetails)
+    {
+        var result = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        if (gapDetails is not null)
+        {
+            foreach (var gap in gapDetails)
+            {
+                var warning = BuildSlotGapWarning(gap);
+                if (seen.Add(warning))
+                {
+                    result.Add(warning);
+                }
+            }
+        }
+        if (warnings is null)
+        {
+            return result;
+        }
+        foreach (var warning in warnings)
+        {
+            if (string.IsNullOrWhiteSpace(warning))
+            {
+                continue;
+            }
+            var normalized = warning.Trim();
+            if (!IsSlotGapWarning(normalized))
+            {
+                continue;
+            }
+            if (seen.Add(normalized))
+            {
+                result.Add(normalized);
+            }
+        }
+        return result;
+    }
+    private static string BuildSlotGapWarning(AutoGenGapDetail gap)
+    {
+        var message = $"Автогенерація не заповнила слот {gap.SlotLabel} для групи {gap.GroupName} на {gap.Date:yyyy-MM-dd}.";
+        return string.IsNullOrWhiteSpace(gap.Reason)
+            ? message
+            : $"{message} Причина: {gap.Reason}";
+    }
+    private static bool IsSlotGapWarning(string warning)
+        => warning.Contains("не заповнила слот", StringComparison.OrdinalIgnoreCase);
     // Рахує випадки, коли слот не заповнено через правило суцільного блоку модуля.
     private int CountContiguousModuleBlockWarnings()
     {
@@ -864,7 +990,15 @@ else
                             );
                         }
                     );
-                weekConfig.Courses[courseId] = new PersistedCourseAutoGenConfig(Modules: moduleConfig);
+                var selectedGroupIds = _courseGroupRows
+                    .Where(row => row.Selected)
+                    .Select(row => row.GroupId)
+                    .Distinct()
+                    .ToList();
+                weekConfig.Courses[courseId] = new PersistedCourseAutoGenConfig(
+                    Modules: moduleConfig,
+                    SelectedGroupIds: selectedGroupIds
+                );
             }
             configs[CurrentWeekKey] = weekConfig;
             await SavePersistedAutoGenConfigsAsync(configs);
@@ -887,6 +1021,7 @@ else
             {
                 _selectedCourseId = persistedCourseId;
                 BuildModuleWeekRows();
+                BuildCourseGroupRows();
             }
         }
         if (_selectedCourseId is not int courseId)
@@ -896,6 +1031,10 @@ else
         if (_moduleWeekRows.Count == 0)
         {
             BuildModuleWeekRows();
+        }
+        if (_courseGroupRows.Count == 0)
+        {
+            BuildCourseGroupRows();
         }
         if (!weekConfig.Courses.TryGetValue(courseId, out var courseConfig))
         {
@@ -910,6 +1049,22 @@ else
                 row.Selected = persisted.Selected;
                 row.Hours = persisted.Hours;
             }
+        }
+        var persistedGroupIds = courseConfig.SelectedGroupIds;
+        if (persistedGroupIds is null)
+        {
+            foreach (var row in _courseGroupRows)
+            {
+                row.Selected = true;
+            }
+            return;
+        }
+        var persistedSet = persistedGroupIds
+            .Where(groupId => groupId > 0)
+            .ToHashSet();
+        foreach (var row in _courseGroupRows)
+        {
+            row.Selected = persistedSet.Contains(row.GroupId);
         }
     }
     // Завантажує збережені налаштування автогенерації.
@@ -971,12 +1126,17 @@ else
     // Запускає автогенерацію послідовно для кожного тижня в обраному діапазоні.
     private async Task<(AutoGenResult Result, DateOnly RangeStartDate, DateOnly RangeEndDate, int WeekCount)> RunAutoGenForRangeAsync(
         int courseId,
+        IReadOnlyList<int> groupIds,
         Dictionary<int, int> moduleHours,
         bool clearExisting,
         bool softFill)
     {
         var (fromDate, toDate) = GetNormalizedGenerationDateRange();
         var weekStarts = BuildGenerationWeekStarts();
+        var normalizedGroupIds = groupIds
+            .Where(groupId => groupId > 0)
+            .Distinct()
+            .ToList();
         var warnings = new List<string>();
         var gapDetails = new List<AutoGenGapDetail>();
         int created = 0;
@@ -995,6 +1155,7 @@ else
                 ClearExisting: clearExisting,
                 CourseId: courseId,
                 GroupId: null,
+                GroupIds: normalizedGroupIds,
                 AllowOnDaysOff: false,
                 Days: _daysPreset,
                 ModuleHours: moduleHours,
@@ -1036,9 +1197,16 @@ else
                 error = "Оберіть хоча б один модуль і вкажіть години > 0.";
                 return;
             }
+            var selectedGroupIds = GetSelectedGroupIds();
+            if (selectedGroupIds.Count == 0)
+            {
+                error = "Оберіть хоча б одну групу для автогенерації.";
+                return;
+            }
             await PersistAutoGenConfigAsync();
             var (res, rangeStartDate, rangeEndDate, weekCount) = await RunAutoGenForRangeAsync(
                 courseId,
+                selectedGroupIds,
                 moduleHours,
                 clearExisting: true,
                 softFill: false);
@@ -1048,8 +1216,8 @@ else
                 && rangeStartDate == rangeWeekStart
                 && rangeEndDate == rangeWeekStart.AddDays(6);
             var summary = isSingleFullWeek
-                ? $"Автогенерація тижня у чернетки (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}."
-                : $"Автогенерація діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}.";
+                ? $"Автогенерація тижня у чернетки (курс: {courseName}, груп: {selectedGroupIds.Count}): створено {res.Created}, пропущено {res.Skipped}."
+                : $"Автогенерація діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): створено {res.Created}, пропущено {res.Skipped}.";
             await SetOkMessageAsync(summary, res.Warnings, res.GapDetails);
             await LoadWeek();
             await LogAutoGenAsync(
@@ -1091,9 +1259,16 @@ else
                 error = "Оберіть хоча б один модуль і вкажіть години > 0.";
                 return;
             }
+            var selectedGroupIds = GetSelectedGroupIds();
+            if (selectedGroupIds.Count == 0)
+            {
+                error = "Оберіть хоча б одну групу для заповнення порожніх слотів.";
+                return;
+            }
             await PersistAutoGenConfigAsync();
             var (res, rangeStartDate, rangeEndDate, weekCount) = await RunAutoGenForRangeAsync(
                 courseId,
+                selectedGroupIds,
                 moduleHours,
                 clearExisting: false,
                 softFill: true);
@@ -1103,8 +1278,8 @@ else
                 && rangeStartDate == rangeWeekStart
                 && rangeEndDate == rangeWeekStart.AddDays(6);
             var summary = isSingleFullWeek
-                ? $"Заповнення порожніх слотів тижня (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}."
-                : $"Заповнення порожніх слотів у діапазоні {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}): створено {res.Created}, пропущено {res.Skipped}.";
+                ? $"Заповнення порожніх слотів тижня (курс: {courseName}, груп: {selectedGroupIds.Count}): створено {res.Created}, пропущено {res.Skipped}."
+                : $"Заповнення порожніх слотів у діапазоні {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): створено {res.Created}, пропущено {res.Skipped}.";
             await SetOkMessageAsync(summary, res.Warnings, res.GapDetails);
             await LoadWeek();
             await LogAutoGenAsync(
@@ -1378,6 +1553,9 @@ else
         bool softFill)
     {
         var lessons = BuildDraftLessonSnapshot(out var trimmed);
+        var logWarnings = res.GapDetails is { Count: > 0 }
+            ? new List<string>()
+            : BuildSlotGapWarnings(res.Warnings, null);
         var entry = new AdminScheduleLogEntry(
             Id: Guid.NewGuid().ToString("N"),
             Timestamp: DateTimeOffset.Now,
@@ -1393,7 +1571,7 @@ else
             CourseId: courseId,
             CourseName: courseName,
             ModuleHours: BuildModuleHours(moduleHours),
-            Warnings: res.Warnings?.Where(w => !string.IsNullOrWhiteSpace(w)).ToList() ?? new List<string>(),
+            Warnings: logWarnings,
             GapDetails: res.GapDetails?.ToList() ?? new List<AutoGenGapDetail>(),
             Lessons: lessons,
             LessonsTrimmed: trimmed
@@ -1738,12 +1916,19 @@ else
         public bool Selected { get; set; }
         public int Hours { get; set; }
     }
+    private sealed class CourseGroupRow(int groupId, string caption)
+    {
+        public int GroupId { get; } = groupId;
+        public string Caption { get; } = caption;
+        public bool Selected { get; set; }
+    }
     private sealed record PersistedWeekAutoGenConfig(
         int? SelectedCourseId,
         Dictionary<int, PersistedCourseAutoGenConfig> Courses
     );
     private sealed record PersistedCourseAutoGenConfig(
-        Dictionary<int, PersistedModuleSelection> Modules
+        Dictionary<int, PersistedModuleSelection> Modules,
+        List<int>? SelectedGroupIds = null
     );
     private sealed record PersistedModuleSelection(
         bool Selected,
