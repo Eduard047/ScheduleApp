@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.Json;
 using System.Threading.Tasks;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
@@ -44,6 +45,17 @@ public sealed class TeacherDraftsAutogenService
         int TotalSharedGroupCount, // Повний розмір спільного потоку разом із вже наявними групами.
         double Penalty, // Сумарний штраф за правилами.
         List<string> Notes); // Пояснення нарахованих штрафів.
+    private sealed record IncompletePlacementCandidate(
+        TimeSlot Slot,
+        int? TeacherId,
+        Room? Room,
+        int LessonTypeId,
+        ModuleTopic? Topic,
+        bool IsSelfStudy,
+        double Penalty,
+        bool MissingTeacher,
+        bool MissingRoom,
+        List<string> Notes);
     private sealed record SequenceItem(int CourseId, int ModuleId, int GroupOrder, int Order);
     private sealed record MainModuleGroup(int GroupOrder, List<int> ModuleIds);
     // Уніфіковані відповіді для API.
@@ -63,6 +75,31 @@ public sealed class TeacherDraftsAutogenService
                 TeacherLoadPenaltyWeight: dto.TeacherLoadPenaltyWeight,
                 BuildingDistancePenaltyWeight: dto.BuildingDistancePenaltyWeight);
     // Викликає автогенерацію чернеток для одного тижня.
+    private static string? BuildIncompleteDraftWarningJson(bool missingTeacher, bool missingRoom)
+    {
+        var issues = new List<DraftValidationIssueDto>();
+        if (missingTeacher)
+        {
+            issues.Add(new DraftValidationIssueDto(
+                Severity: "warning",
+                Code: "teacher-required",
+                Title: "Потрібен викладач",
+                Description: "У чернетці пара збережена без викладача. Перед публікацією потрібно призначити викладача."));
+        }
+        if (missingRoom)
+        {
+            issues.Add(new DraftValidationIssueDto(
+                Severity: "warning",
+                Code: "room-required",
+                Title: "Потрібна аудиторія",
+                Description: "У чернетці пара збережена без аудиторії. Перед публікацією потрібно призначити аудиторію."));
+        }
+        if (issues.Count == 0)
+        {
+            return null;
+        }
+        return JsonSerializer.Serialize(new DraftValidationReportDto(DateTimeOffset.UtcNow, issues));
+    }
     public Task<ActionResult<AutoGenResult>> DraftAutoGenWeek(DraftAutoGenRequest r)
         => DraftAutoGen(r);
     // Автоматично генерує чернетки для кожного тижня в межах місяця.
@@ -79,6 +116,7 @@ public sealed class TeacherDraftsAutogenService
             TeacherId: r.TeacherId,
             AllowOnDaysOff: r.AllowOnDaysOff,
             Days: r.Days,
+            AllowIncompleteDrafts: r.AllowIncompleteDrafts,
             PreferredFirstMaxSlotOrderOverride: r.PreferredFirstMaxSlotOrderOverride,
             GroupRoomPreferences: r.GroupRoomPreferences,
             SoftOptions: MapSoftOptions(r.SoftOptions)
@@ -98,6 +136,7 @@ public sealed class TeacherDraftsAutogenService
             TeacherId: r.TeacherId,
             AllowOnDaysOff: r.AllowOnDaysOff,
             Days: r.Days,
+            AllowIncompleteDrafts: r.AllowIncompleteDrafts,
             PreferredFirstMaxSlotOrderOverride: r.PreferredFirstMaxSlotOrderOverride,
             GroupRoomPreferences: r.GroupRoomPreferences,
             SoftOptions: MapSoftOptions(r.SoftOptions)
@@ -194,6 +233,7 @@ public sealed class TeacherDraftsAutogenService
         var rangeEndDateExclusive = rangeEndDate.AddDays(1);
         // Режим "м'якого заповнення" дозволяє послаблювати частину правил.
         var softFill = r.SoftFill;
+        var allowIncompleteDrafts = r.AllowIncompleteDrafts;
         var softOptions = r.SoftOptions;
         var recentRepeatWindowDays = softOptions?.RecentRepeatWindowDays is int repeatWindow && repeatWindow >= 0
             ? repeatWindow
@@ -790,6 +830,7 @@ public sealed class TeacherDraftsAutogenService
         var topicsExhaustedNotified = new HashSet<(int GroupId, int ModuleId)>();
         var missingModulesNotified = new HashSet<int>();
         int created = 0, skipped = 0;
+        int incompleteDraftsCreated = 0, incompleteMissingTeacherCount = 0, incompleteMissingRoomCount = 0, incompleteMissingBothCount = 0;
         // Збираємо попередження та деталі прогалин.
         var warnings = new List<string>();
         if (initWarnings.Count > 0)
@@ -2564,14 +2605,17 @@ public sealed class TeacherDraftsAutogenService
                         : $"Не знайдено викладачів для модуля <{ModuleLabel()}> (група {grp.Name}).";
                     RecordSlotFailureReasonForAllSlots(date, teacherReason);
                     warnings.Add(teacherReason);
-                    if (placeSelfStudy)
+                    if (placeSelfStudy && !allowIncompleteDrafts)
                     {
                         var key = (grp.Id, moduleId);
                         if (selfStudyRemainingByGroupModule.ContainsKey(key))
                             selfStudyRemainingByGroupModule[key] = 0;
                     }
-                    skipped++;
-                    return false;
+                    if (!allowIncompleteDrafts)
+                    {
+                        skipped++;
+                        return false;
+                    }
                 }
                 // Кандидатні аудиторії для модуля.
                 var candidateRooms = CandidateRoomsFor(moduleId);
@@ -2580,6 +2624,8 @@ public sealed class TeacherDraftsAutogenService
                 var maxModuleSegmentsAllowed = allowAdditionalModuleSegmentsInGapFill ? 2 : 1;
                 PlacementCandidate? best = null;
                 double bestEffectivePenalty = double.MaxValue;
+                IncompletePlacementCandidate? bestIncomplete = null;
+                double bestIncompleteEffectivePenalty = double.MaxValue;
                 // Перебираємо слоти дня та шукаємо найкращого кандидата.
                 var slotsToEvaluate = forcedSlot is null
                     ? slots
@@ -2763,10 +2809,74 @@ public sealed class TeacherDraftsAutogenService
                                 ? $"Для модуля <{ModuleLabel()}> обрано кафедру \"{depName}\", але немає доступних викладачів цієї кафедри."
                                 : $"Для модуля <{ModuleLabel()}> (тема {topicCode}) обрано кафедру \"{depName}\", але немає доступних викладачів цієї кафедри.";
                             RecordSlotFailureReason(date, sl, reason);
-                            continue;
+                            if (!allowIncompleteDrafts)
+                            {
+                                continue;
+                            }
                         }
                     }
                     // Перебір кандидатів-викладачів для цього слоту.
+                    var requiresTeacher = (typeById.TryGetValue(ltypeId, out var ltMetaForFallback) ? ltMetaForFallback.RequiresTeacher : (bool?)null) ?? true;
+                    var requiresRoomForFallback = (typeById.TryGetValue(ltypeId, out var ltMetaRoomFallback) ? ltMetaRoomFallback.RequiresRoom : (bool?)null) ?? true;
+                    var isShareableLecturePlacementForFallback = !isSelfStudyPlacement && CanShareAcrossGroups(ltypeId);
+                    var orderedCandidateRoomsForFallback = requiresRoomForFallback
+                        ? OrderCandidateRoomsForPlacement(candidateRooms, isShareableLecturePlacementForFallback)
+                        : Array.Empty<Room>();
+                    var slotGroupBusy = busy.Any(x => x.Date == date
+                                                      && x.GroupId == grp.Id
+                                                      && x.StartTime < e && s < x.EndTime);
+                    int? FindTeacherForIncompleteDraft()
+                    {
+                        if (!requiresTeacher)
+                        {
+                            return null;
+                        }
+                        foreach (var teacherId in filteredTeacherIds)
+                        {
+                            if (!TeacherFitsWorkingHours(teacherId, date, s, e))
+                            {
+                                continue;
+                            }
+                            var teacherBusyForSlot = busy.Any(x => x.Date == date
+                                                                   && x.TeacherId == teacherId
+                                                                   && x.StartTime < e && s < x.EndTime);
+                            if (!teacherBusyForSlot)
+                            {
+                                return teacherId;
+                            }
+                        }
+                        return null;
+                    }
+                    Room? FindRoomForIncompleteDraft()
+                    {
+                        if (!requiresRoomForFallback)
+                        {
+                            return null;
+                        }
+                        foreach (var roomCandidate in orderedCandidateRoomsForFallback)
+                        {
+                            var roomBusyForSlot = busy.Any(x => x.Date == date
+                                                                && x.RoomId == roomCandidate.Id
+                                                                && x.StartTime < e && s < x.EndTime);
+                            if (roomBusyForSlot)
+                            {
+                                continue;
+                            }
+                            if (ViolatesTravelFeasibility(
+                                    existing => existing.GroupId == grp.Id,
+                                    roomCandidate,
+                                    date,
+                                    s,
+                                    e,
+                                    $"групи {grp.Name}",
+                                    out _))
+                            {
+                                continue;
+                            }
+                            return roomCandidate;
+                        }
+                        return null;
+                    }
                     foreach (var tidCandidate in filteredTeacherIds)
                     {
                         if (!TeacherFitsWorkingHours(tidCandidate, date, s, e))
@@ -3120,6 +3230,48 @@ public sealed class TeacherDraftsAutogenService
                         }
                     }
                     // Якщо є кандидати — обираємо найкращого за штрафами.
+                    if (allowIncompleteDrafts && slotCandidates.Count == 0 && !slotGroupBusy)
+                    {
+                        var fallbackTeacherId = FindTeacherForIncompleteDraft();
+                        var fallbackRoom = FindRoomForIncompleteDraft();
+                        var missingTeacher = requiresTeacher && fallbackTeacherId is null;
+                        var missingRoom = requiresRoomForFallback && fallbackRoom is null;
+                        if (missingTeacher || missingRoom)
+                        {
+                            int? assignedTeacherId = missingRoom && !missingTeacher ? fallbackTeacherId : null;
+                            var assignedRoom = missingTeacher && !missingRoom ? fallbackRoom : null;
+                            var fallbackPenalty = (missingTeacher ? 40.0 : 0.0) + (missingRoom ? 40.0 : 0.0);
+                            if (preferEarliestSlot)
+                            {
+                                fallbackPenalty += slotIndex * 0.20;
+                            }
+                            var notes = new List<string>();
+                            if (missingTeacher)
+                            {
+                                notes.Add("Чернетку створено без викладача");
+                            }
+                            if (missingRoom)
+                            {
+                                notes.Add("Чернетку створено без аудиторії");
+                            }
+                            var incompleteCandidate = new IncompletePlacementCandidate(
+                                sl,
+                                assignedTeacherId,
+                                assignedRoom,
+                                ltypeId,
+                                topicSelection,
+                                isSelfStudyPlacement,
+                                fallbackPenalty,
+                                missingTeacher,
+                                missingRoom,
+                                notes);
+                            if (bestIncomplete is null || incompleteCandidate.Penalty < bestIncompleteEffectivePenalty)
+                            {
+                                bestIncomplete = incompleteCandidate;
+                                bestIncompleteEffectivePenalty = incompleteCandidate.Penalty;
+                            }
+                        }
+                    }
                     if (slotCandidates.Count > 0)
                     {
                         var bestAny = slotCandidates
@@ -3181,22 +3333,46 @@ public sealed class TeacherDraftsAutogenService
                         }
                     }
                 }
-                // Якщо не знайдено жодного слоту — виходимо.
                 if (best is null)
                 {
-                    return false;
+                    if (bestIncomplete is null)
+                    {
+                        return false;
+                    }
                 }
                 // Фіксуємо обраний варіант та створюємо чернетку.
-                var selectedSlot = best.Slot;
-                var selectedRoom = best.Room;
-                var selectedTeacher = best.TeacherId;
-                var selectedTopic = best.Topic;
-                var selectedLessonTypeId = best.LessonTypeId;
+                var selectedIncomplete = best is null ? bestIncomplete : null;
+                var selectedSlot = selectedIncomplete is not null ? selectedIncomplete.Slot : best!.Slot;
+                var selectedRoom = selectedIncomplete is not null ? selectedIncomplete.Room : best!.Room;
+                var selectedTeacher = selectedIncomplete is not null ? selectedIncomplete.TeacherId : best!.TeacherId;
+                var selectedTopic = selectedIncomplete is not null ? selectedIncomplete.Topic : best!.Topic;
+                var selectedLessonTypeId = selectedIncomplete is not null ? selectedIncomplete.LessonTypeId : best!.LessonTypeId;
+                var selectedIsSelfStudy = selectedIncomplete is not null ? selectedIncomplete.IsSelfStudy : best!.IsSelfStudy;
+                var selectedNotes = selectedIncomplete is not null ? selectedIncomplete.Notes : best!.Notes;
+                var selectedValidationWarnings = selectedIncomplete is not null
+                    ? BuildIncompleteDraftWarningJson(selectedIncomplete.MissingTeacher, selectedIncomplete.MissingRoom)
+                    : null;
                 var startTime = selectedSlot.Start;
                 var endTime = selectedSlot.End;
-                var placedGroupIds = best.SharedGroupIds.Count > 0
-                    ? best.SharedGroupIds
+                var placedGroupIds = selectedIncomplete is null
+                    ? (best!.SharedGroupIds.Count > 0 ? best.SharedGroupIds : new[] { grp.Id })
                     : new[] { grp.Id };
+                if (selectedIncomplete is not null)
+                {
+                    incompleteDraftsCreated++;
+                    if (selectedIncomplete.MissingTeacher)
+                    {
+                        incompleteMissingTeacherCount++;
+                    }
+                    if (selectedIncomplete.MissingRoom)
+                    {
+                        incompleteMissingRoomCount++;
+                    }
+                    if (selectedIncomplete.MissingTeacher && selectedIncomplete.MissingRoom)
+                    {
+                        incompleteMissingBothCount++;
+                    }
+                }
                 bool currentGroupPlaced = false;
                 foreach (var sharedGroupId in placedGroupIds.Distinct())
                 {
@@ -3218,7 +3394,8 @@ public sealed class TeacherDraftsAutogenService
                         LessonTypeId = selectedLessonTypeId,
                         Status = DraftStatus.Draft,
                         IsLocked = false,
-                        IsSelfStudy = best.IsSelfStudy
+                        IsSelfStudy = selectedIsSelfStudy,
+                        ValidationWarnings = selectedValidationWarnings
                     };
                     _db.TeacherDraftItems.Add(item);
                     if (sharedGroupId == grp.Id)
@@ -3227,7 +3404,7 @@ public sealed class TeacherDraftsAutogenService
                         currentGroupPlaced = true;
                     }
                     // Позначаємо тему як використану (для звичайних занять).
-                    if (selectedTopic is not null && !best.IsSelfStudy)
+                    if (selectedTopic is not null && !selectedIsSelfStudy)
                     {
                         MarkTopicUsed(sharedGroupId, moduleId, selectedTopic);
                     }
@@ -3253,11 +3430,11 @@ public sealed class TeacherDraftsAutogenService
                     }
                     // Зменшуємо залишки самостійної роботи.
                     var sharedRemainingKey = (sharedGroupId, moduleId);
-                    if (best.IsSelfStudy && selfStudyRemainingByGroupModule.TryGetValue(sharedRemainingKey, out var ssLeft) && ssLeft > 0)
+                    if (selectedIsSelfStudy && selfStudyRemainingByGroupModule.TryGetValue(sharedRemainingKey, out var ssLeft) && ssLeft > 0)
                     {
                         selfStudyRemainingByGroupModule[sharedRemainingKey] = Math.Max(0, ssLeft - 1);
                     }
-                    if (best.IsSelfStudy && selectedTopic is not null)
+                    if (selectedIsSelfStudy && selectedTopic is not null)
                     {
                         var topicKey = (sharedGroupId, moduleId, selectedTopic.Id);
                         if (selfStudyTopicRemaining.TryGetValue(topicKey, out var leftByTopic) && leftByTopic > 0)
@@ -3295,9 +3472,9 @@ public sealed class TeacherDraftsAutogenService
                     lastPrimaryModuleId = moduleId;
                 }
                 // Додаємо нотатки з причинами штрафів.
-                if (best.Notes.Count > 0)
+                if (selectedNotes.Count > 0)
                 {
-                    var noteText = string.Join("; ", best.Notes);
+                    var noteText = string.Join("; ", selectedNotes);
                     warnings.Add($"[{date:yyyy-MM-dd} {startTime:HH\\:mm}-{endTime:HH\\:mm}] {grp.Name}: {noteText}");
                 }
                 return true;
@@ -3960,6 +4137,11 @@ public sealed class TeacherDraftsAutogenService
             }
         }
         // Зберігаємо створені чернетки та повертаємо результат.
+        if (incompleteDraftsCreated > 0)
+        {
+            warnings.Add(
+                $"Створено {incompleteDraftsCreated} неповних чернеток: без викладача — {incompleteMissingTeacherCount}, без аудиторії — {incompleteMissingRoomCount}, без обох призначень — {incompleteMissingBothCount}.");
+        }
         await _db.SaveChangesAsync();
         return Ok(new AutoGenResult(created, skipped, warnings, gapDetails));
     }

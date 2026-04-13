@@ -14,6 +14,7 @@
 @inject IAdminApi Admin
 @inject ITeacherDraftsApi Drafts
 @inject IJSRuntime JS
+@inject NavigationManager Nav
 @inject AdminScheduleLogService LogService
 
 <style>
@@ -283,6 +284,19 @@ else
                                 Профіль вимкнено: сторінка бере налаштування "бажано першим" із БД, а дозаповнення працює без примусових override-параметрів.
                             </span>
                         }
+                    </div>
+                </div>
+                <div class="mt-3 pt-3 border-top">
+                    <label class="form-check mb-0">
+                        <input class="form-check-input"
+                               type="checkbox"
+                               @bind="_allowIncompleteDrafts"
+                               @bind:after="PersistAutoGenConfigAsync" />
+                        <span class="form-check-label fw-semibold">Створювати неповні чернетки, якщо не знайдено викладача або аудиторію</span>
+                    </label>
+                    <div class="small text-muted mt-2">
+                        Якщо слот неможливо закрити через відсутність вільної аудиторії або викладача, автоген збереже чернетку без призначення.
+                        Потім її можна відкрити у повному редакторі й дозаповнити вручну.
                     </div>
                 </div>
             </div>
@@ -714,11 +728,26 @@ else
                             <div>@(selected.IsLocked ? "Так" : "Ні")</div>
                         </div>
                     </div>
+                    @if (selected.NeedsManualAssignment)
+                    {
+                        <div class="alert alert-warning mt-3 mb-0">
+                            Для цієї чернетки ще потрібно призначити: @selected.MissingAssignmentSummary.
+                        </div>
+                    }
                     @if (!string.IsNullOrWhiteSpace(_editError))
                     {
                         <div class="alert alert-danger mt-2">@_editError</div>
                     }
-                    <div class="d-flex gap-2 mt-3">
+                    <div class="d-flex flex-wrap gap-2 mt-3">
+                        @if (selected.Source == TableItemSource.Draft)
+                        {
+                            <button type="button"
+                                    class="btn btn-outline-primary"
+                                    @onclick="() => OpenDraftsEditor(selected)"
+                                    disabled="@_editDeleting">
+                                Редагувати у повному редакторі
+                            </button>
+                        }
                         <button type="button"
                                 class="btn btn-danger"
                                 @onclick="DeleteSelectedAsync"
@@ -794,6 +823,7 @@ else
     private string _sortField = SortByDate;
     private bool _sortAsc = true;
     private bool _useRecommendedAutoGenProfile;
+    private bool _allowIncompleteDrafts;
     private ConflictDetails? _currentConflict;
     private Dictionary<string, ConflictDetails> _conflictStorage = new();
     private bool _conflictsLoaded;
@@ -1338,7 +1368,8 @@ else
                     Modules: moduleConfig,
                     SelectedGroupIds: selectedGroupIds,
                     GroupRoomSelections: existingGroupRoomSelections.Count > 0 ? existingGroupRoomSelections : null,
-                    UseRecommendedProfile: _useRecommendedAutoGenProfile
+                    UseRecommendedProfile: _useRecommendedAutoGenProfile,
+                    AllowIncompleteDrafts: _allowIncompleteDrafts
                 );
             }
             configs[CurrentWeekKey] = weekConfig;
@@ -1357,6 +1388,7 @@ else
         if (!configs.TryGetValue(CurrentWeekKey, out var weekConfig))
         {
             _useRecommendedAutoGenProfile = false;
+            _allowIncompleteDrafts = false;
             return;
         }
         if (restoreCourseSelection && weekConfig.SelectedCourseId is int persistedCourseId)
@@ -1371,6 +1403,7 @@ else
         if (_selectedCourseId is not int courseId)
         {
             _useRecommendedAutoGenProfile = false;
+            _allowIncompleteDrafts = false;
             return;
         }
         if (_moduleWeekRows.Count == 0)
@@ -1384,9 +1417,11 @@ else
         if (!weekConfig.Courses.TryGetValue(courseId, out var courseConfig))
         {
             _useRecommendedAutoGenProfile = false;
+            _allowIncompleteDrafts = false;
             return;
         }
         _useRecommendedAutoGenProfile = courseConfig.UseRecommendedProfile;
+        _allowIncompleteDrafts = courseConfig.AllowIncompleteDrafts;
         foreach (var row in _moduleWeekRows)
         {
             row.Selected = false;
@@ -1583,6 +1618,7 @@ else
                 Days: _daysPreset,
                 ModuleHours: moduleHours,
                 SoftFill: softFill,
+                AllowIncompleteDrafts: _allowIncompleteDrafts,
                 RangeStartDate: rangeStartDate,
                 RangeEndDate: rangeEndDate,
                 GroupRoomPreferences: groupRoomPreferences.Count > 0 ? groupRoomPreferences.ToList() : null,
@@ -2143,6 +2179,16 @@ else
         _editItem = null;
         _editError = null;
     }
+    // Відкриває повний редактор чернеток із фокусом на потрібному тижні та групі.
+    private void OpenDraftsEditor(TableItem item)
+    {
+        var query = new List<string>
+        {
+            $"weekStart={GetMonday(item.Date):yyyy-MM-dd}",
+            $"groupId={item.GroupId}"
+        };
+        Nav.NavigateTo($"/teacher-drafts?{string.Join("&", query)}");
+    }
     private async Task DeleteSelectedAsync()
     {
         if (_editItem is null)
@@ -2292,16 +2338,19 @@ else
             draft.TimeStart,
             draft.TimeEnd,
             draft.Group,
+            draft.GroupId,
             draft.Module,
             draft.ModuleId,
-            draft.Teacher,
-            draft.Room,
+            draft.MissingTeacherAssignment ? "Не призначено" : NormalizeDraftPersonOrRoomLabel(draft.Teacher),
+            draft.MissingRoomAssignment ? "Не призначено" : NormalizeDraftPersonOrRoomLabel(draft.Room),
             draft.LessonTypeName,
             draft.LessonTypeId,
-            FormatDraftStatus(draft.Status),
+            ComposeDraftStatusLabel(draft),
             "Чернетка",
             TableItemSource.Draft,
-            draft.IsLocked
+            draft.IsLocked,
+            draft.MissingTeacherAssignment,
+            draft.MissingRoomAssignment
         );
     // Перетворює опублікований запис у рядок таблиці.
     private TableItem CreateTableItemFromPublished(ScheduleItemDto item)
@@ -2311,6 +2360,7 @@ else
             item.TimeStart,
             item.TimeEnd,
             item.Group,
+            item.GroupId,
             item.Module,
             item.ModuleId,
             item.Teacher,
@@ -2322,6 +2372,17 @@ else
             TableItemSource.Published,
             item.IsLocked
         );
+    // Форматує короткий статус чернетки з позначкою про відсутні призначення.
+    private static string ComposeDraftStatusLabel(TeacherDraftItemDto draft)
+    {
+        var baseStatus = FormatDraftStatus(draft.Status);
+        return draft.MissingTeacherAssignment || draft.MissingRoomAssignment
+            ? $"{baseStatus} · потребує призначення"
+            : baseStatus;
+    }
+    // Нормалізує підпис викладача або аудиторії для таблиці.
+    private static string NormalizeDraftPersonOrRoomLabel(string? value)
+        => string.IsNullOrWhiteSpace(value) ? "-" : value;
     // Повертає назву курсу для модуля.
     private string ModuleCourseCaption(int? moduleId)
     {
@@ -2363,7 +2424,8 @@ else
         Dictionary<int, PersistedModuleSelection> Modules,
         List<int>? SelectedGroupIds = null,
         Dictionary<int, PersistedGroupRoomSelection>? GroupRoomSelections = null,
-        bool UseRecommendedProfile = false
+        bool UseRecommendedProfile = false,
+        bool AllowIncompleteDrafts = false
     );
     private sealed record PersistedModuleSelection(
         bool Selected,
@@ -2394,6 +2456,7 @@ else
         string TimeStart,
         string TimeEnd,
         string Group,
+        int GroupId,
         string? Module,
         int? ModuleId,
         string? Teacher,
@@ -2403,6 +2466,17 @@ else
         string StatusText,
         string SourceLabel,
         TableItemSource Source,
-        bool IsLocked
-    );
+        bool IsLocked,
+        bool MissingTeacherAssignment = false,
+        bool MissingRoomAssignment = false
+    )
+    {
+        public bool NeedsManualAssignment => MissingTeacherAssignment || MissingRoomAssignment;
+        public string MissingAssignmentSummary =>
+            MissingTeacherAssignment && MissingRoomAssignment
+                ? "викладача та аудиторію"
+                : MissingTeacherAssignment
+                    ? "викладача"
+                    : "аудиторію";
+    }
 }

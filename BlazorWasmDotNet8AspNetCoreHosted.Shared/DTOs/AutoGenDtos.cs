@@ -42,6 +42,7 @@ public record AutoGenRequest(
     WeekPreset Days = WeekPreset.MonFri,
     Dictionary<int, int>? ModuleHours = null,
     bool SoftFill = false,
+    bool AllowIncompleteDrafts = false,
     DateOnly? RangeStartDate = null,
     DateOnly? RangeEndDate = null,
     List<GroupRoomPreferenceDto>? GroupRoomPreferences = null,

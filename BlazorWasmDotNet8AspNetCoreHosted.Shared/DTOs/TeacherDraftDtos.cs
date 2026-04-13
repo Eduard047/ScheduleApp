@@ -22,6 +22,8 @@ public record TeacherDraftItemDto(
     string Room,
     int? RoomId,
     bool RequiresRoom,
+    bool MissingTeacherAssignment,
+    bool MissingRoomAssignment,
     int LessonTypeId,
     string LessonTypeCode,
     string LessonTypeName,
@@ -85,6 +87,7 @@ public record AutogenMonthRequest(
     int? TeacherId,
     bool AllowOnDaysOff,
     WeekPreset Days,
+    bool AllowIncompleteDrafts = false,
     List<GroupRoomPreferenceDto>? GroupRoomPreferences = null,
     AutoGenSoftOptionsDto? SoftOptions = null,
     int? PreferredFirstMaxSlotOrderOverride = null
@@ -99,6 +102,7 @@ public record AutogenCourseRequest(
     int? TeacherId,
     bool AllowOnDaysOff,
     WeekPreset Days,
+    bool AllowIncompleteDrafts = false,
     List<GroupRoomPreferenceDto>? GroupRoomPreferences = null,
     AutoGenSoftOptionsDto? SoftOptions = null,
     int? PreferredFirstMaxSlotOrderOverride = null

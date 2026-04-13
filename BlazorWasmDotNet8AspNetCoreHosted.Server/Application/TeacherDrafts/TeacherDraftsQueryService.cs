@@ -113,6 +113,8 @@ public sealed class TeacherDraftsQueryService
                 topicCode = reschedTopic.topicCode;
             }
             var requiresRoom = i.LessonType.RequiresRoom;
+            var missingTeacherAssignment = i.LessonType.RequiresTeacher && i.TeacherId is null;
+            var missingRoomAssignment = requiresRoom && i.RoomId is null;
             return new TeacherDraftItemDto(
                 Id: i.Id,
                 Date: i.Date,
@@ -130,6 +132,8 @@ public sealed class TeacherDraftsQueryService
                 Room: requiresRoom && i.Room is not null ? i.Room.Name : "",
                 RoomId: requiresRoom ? i.RoomId : null,
                 RequiresRoom: requiresRoom,
+                MissingTeacherAssignment: missingTeacherAssignment,
+                MissingRoomAssignment: missingRoomAssignment,
                 LessonTypeId: i.LessonTypeId,
                 LessonTypeCode: i.LessonType.Code,
                 LessonTypeName: i.LessonType.Name,

@@ -31,17 +31,23 @@ public sealed class RulesService(AppDbContext db)
         var blocksRoom = ltype?.BlocksRoom ?? true;
         var blocksTeacher = ltype?.BlocksTeacher ?? true;
         Room? room = null;
-        if (requiresRoom)
+        if (requiresRoom && r.RoomId is null)
         {
-            if (r.RoomId is int rid)
-            {
-                room = await db.Rooms.AsNoTracking().Include(x => x.Building)
-                    .FirstOrDefaultAsync(x => x.Id == rid);
-                if (room is null) errors.Add("Аудиторію не знайдено.");
-            }
-            else errors.Add("Для цього заняття потрібно обрати аудиторію.");
+            errors.Add("Для цього заняття потрібно обрати аудиторію.");
+            return (errors, warnings);
+        }
+        if (requiresRoom && r.RoomId is int rid)
+        {
+            room = await db.Rooms.AsNoTracking().Include(x => x.Building)
+                .FirstOrDefaultAsync(x => x.Id == rid);
+            if (room is null) errors.Add("Аудиторію не знайдено.");
         }
         if (errors.Count > 0) return (errors, warnings);
+        if (requiresTeacher && r.TeacherId is null)
+        {
+            errors.Add("Для цього заняття потрібно обрати викладача.");
+            return (errors, warnings);
+        }
         var start = TimeOnly.Parse(r.TimeStart);
         var end = TimeOnly.Parse(r.TimeEnd);
         if (end <= start) errors.Add("Час завершення має бути більшим за час початку.");
@@ -61,7 +67,7 @@ public sealed class RulesService(AppDbContext db)
         bool isWorking = cal?.IsWorkingDay ?? !isWeekend;
         if (!isWorking && !r.OverrideNonWorkingDay)
             warnings.Add("Увага: заняття потрапляє на вихідний день.");
-        if (requiresRoom)
+        if (requiresRoom && room is not null)
         {
             if (room!.Capacity < group!.StudentsCount)
                 errors.Add($"Аудиторія {room.Name} замала для групи {group.Name} ({room.Capacity} < {group.StudentsCount}).");
@@ -203,8 +209,12 @@ public sealed class RulesService(AppDbContext db)
             }
             else
             {
-                AddError("room-required", "Потрібна аудиторія", "Цей тип заняття потребує вибраної аудиторії.");
+                AddWarning("room-required", "Потрібна аудиторія", "У чернетці пара збережена без аудиторії. Перед публікацією потрібно призначити аудиторію.");
             }
+        }
+        if (requiresTeacher && r.TeacherId is null)
+        {
+            AddWarning("teacher-required", "Потрібен викладач", "У чернетці пара збережена без викладача. Перед публікацією потрібно призначити викладача.");
         }
         if (errors.Count > 0)
             return new DraftValidationResult(errors, warnings, new DraftValidationReportDto(DateTimeOffset.UtcNow, issues));
@@ -231,9 +241,9 @@ public sealed class RulesService(AppDbContext db)
             var reason = cal is not null ? cal.Name : (isWeekend ? "вихідний день" : "неробочий день");
             AddWarning("non-working-day", "Заняття у вихідний", $"Дата {r.Date:yyyy-MM-dd} позначена як {reason}. Для публікації потрібно примусове збереження.");
         }
-        if (requiresRoom)
+        if (requiresRoom && room is not null)
         {
-            if (room!.Capacity < group!.StudentsCount)
+            if (room.Capacity < group!.StudentsCount)
                 AddError("room-capacity", "Недостатня місткість", $"Аудиторія {room.Name} вміщує {room.Capacity} осіб, у групі {group.Name} {group.StudentsCount} студентів.");
             var allowedBuildingIds = module!.AllowedBuildings.Select(b => b.BuildingId).ToList();
             if (allowedBuildingIds.Count > 0 && !allowedBuildingIds.Contains(room.BuildingId))

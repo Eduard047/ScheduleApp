@@ -26,6 +26,7 @@ public sealed record DraftAutoGenRequest(
     WeekPreset Days = WeekPreset.MonFri, // Набір днів для генерації.
     Dictionary<int, int>? ModuleHours = null, // Ручні години по модулях.
     bool SoftFill = false, // Дозволити заповнення за м'якими правилами.
+    bool AllowIncompleteDrafts = false, // Дозволити створювати чернетки без викладача/аудиторії, якщо повний варіант не знайдено.
     DateOnly? RangeStartDate = null, // Опційний початок діапазону в межах тижня.
     DateOnly? RangeEndDate = null, // Опційне завершення діапазону в межах тижня.
     int? PreferredFirstMaxSlotOrderOverride = null, // Явний override ліміту для типу "бажано першим у тижні"; 0 вимикає збережений ліміт.
