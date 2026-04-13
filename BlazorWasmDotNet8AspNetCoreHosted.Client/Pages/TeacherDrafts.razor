@@ -29,6 +29,16 @@
 </div>
 
 @code {
+    [Parameter, SupplyParameterFromQuery(Name = "weekStart")]
+    public string? QueryWeekStart { get; set; }
+    [Parameter, SupplyParameterFromQuery(Name = "teacherId")]
+    public int? QueryTeacherId { get; set; }
+    [Parameter, SupplyParameterFromQuery(Name = "groupId")]
+    public int? QueryGroupId { get; set; }
+    [Parameter, SupplyParameterFromQuery(Name = "roomId")]
+    public int? QueryRoomId { get; set; }
+    [Parameter, SupplyParameterFromQuery(Name = "courseId")]
+    public int? QueryCourseId { get; set; }
     private MetaResponseDto? _meta;
     private int? _teacherId;
     private int? _groupId;
@@ -117,8 +127,31 @@
     {
         _meta = await Http.GetFromJsonAsync<MetaResponseDto>("api/meta");
         await LoadConflictsAsync();
+    }
+    protected override async Task OnParametersSetAsync()
+    {
+        if (_meta is null)
+        {
+            return;
+        }
+        ApplyQueryFilters();
         await Reload();
     }
+    // Застосовує фільтри, що прийшли з query string.
+    private void ApplyQueryFilters()
+    {
+        _teacherId = NormalizeQueryId(QueryTeacherId);
+        _groupId = NormalizeQueryId(QueryGroupId);
+        _roomId = NormalizeQueryId(QueryRoomId);
+        _courseId = NormalizeQueryId(QueryCourseId);
+        if (DateOnly.TryParse(QueryWeekStart, out var weekStart))
+        {
+            _weekStart = FirstMonday(weekStart);
+        }
+    }
+    // Нормалізує query-параметр і перетворює 0/від'ємні значення на відсутність фільтра.
+    private static int? NormalizeQueryId(int? value)
+        => value is > 0 ? value : null;
     // Перезавантажує чернетки, попередження та тайм-слоти для поточного тижня.
     private async Task Reload()
     {

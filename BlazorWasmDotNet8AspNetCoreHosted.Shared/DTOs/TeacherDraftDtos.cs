@@ -22,6 +22,8 @@ public record TeacherDraftItemDto(
     string Room,
     int? RoomId,
     bool RequiresRoom,
+    bool MissingTeacherAssignment,
+    bool MissingRoomAssignment,
     int LessonTypeId,
     string LessonTypeCode,
     string LessonTypeName,
@@ -84,7 +86,11 @@ public record AutogenMonthRequest(
     int? GroupId,
     int? TeacherId,
     bool AllowOnDaysOff,
-    WeekPreset Days
+    WeekPreset Days,
+    bool AllowIncompleteDrafts = false,
+    List<GroupRoomPreferenceDto>? GroupRoomPreferences = null,
+    AutoGenSoftOptionsDto? SoftOptions = null,
+    int? PreferredFirstMaxSlotOrderOverride = null
 );
 
 // DTO для автогенерації чернеток по курсу за діапазон.
@@ -95,5 +101,9 @@ public record AutogenCourseRequest(
     int? GroupId,
     int? TeacherId,
     bool AllowOnDaysOff,
-    WeekPreset Days
+    WeekPreset Days,
+    bool AllowIncompleteDrafts = false,
+    List<GroupRoomPreferenceDto>? GroupRoomPreferences = null,
+    AutoGenSoftOptionsDto? SoftOptions = null,
+    int? PreferredFirstMaxSlotOrderOverride = null
 );

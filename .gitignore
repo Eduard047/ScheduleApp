@@ -4,11 +4,12 @@
 
 # Visual Studio workspace
 .vs/
-.vscode/
+.vscode/*
 *.suo
 *.user
 *.userosscache
 *.sln.docstates
+BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.local.sln
 
 # Build tools
 *.log
@@ -37,6 +38,17 @@ _ReSharper*/
 
 # DotCover
 *.dotCover
+
+# Test projects and artifacts
+*Tests/
+*.Tests/
+*.IntegrationTests/
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+coverage/
+autogen-reasons.txt
 
 # VS Code local history
 .history/
