@@ -5,11 +5,13 @@
 @using System.Net
 @using System.Text.Json
 @using Microsoft.AspNetCore.Components
+@using Microsoft.AspNetCore.Components.Forms
 @using Microsoft.JSInterop
 @using BlazorWasmDotNet8AspNetCoreHosted.Client.Services
 @using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
 
 @inject IScheduleApi Api
+@inject IAdminApi Admin
 @inject ITeacherDraftsApi Drafts
 @inject IJSRuntime JS
 @inject AdminScheduleLogService LogService
@@ -97,6 +99,83 @@
         color: #64748b;
         margin-bottom: 2px;
     }
+    .group-room-preferences {
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        border-radius: 14px;
+        background: linear-gradient(180deg, rgba(248, 250, 252, 0.92), rgba(255, 255, 255, 0.98));
+        padding: 1rem;
+    }
+    .group-room-preferences__head {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: .75rem;
+        margin-bottom: .75rem;
+    }
+    .group-room-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        gap: .75rem;
+    }
+    .group-room-card {
+        border: 1px solid rgba(203, 213, 225, 0.9);
+        border-radius: 12px;
+        background: #fff;
+        padding: .8rem .85rem;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+    .group-room-card__head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: .5rem;
+        margin-bottom: .65rem;
+    }
+    .group-room-card__summary {
+        font-size: .8rem;
+        color: #64748b;
+        line-height: 1.3;
+        margin-top: .1rem;
+    }
+    .group-room-card__body {
+        display: grid;
+        gap: .75rem;
+    }
+    .group-room-roomlist {
+        display: flex;
+        flex-wrap: wrap;
+        gap: .45rem;
+        max-height: 8.75rem;
+        overflow: auto;
+        padding-right: .25rem;
+    }
+    .room-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: .35rem;
+        padding: .33rem .7rem;
+        border: 1px solid #cbd5e1;
+        border-radius: 999px;
+        background: #fff;
+        color: #0f172a;
+        font-size: .86rem;
+        line-height: 1.1;
+        cursor: pointer;
+        user-select: none;
+        transition: all .15s ease;
+    }
+    .room-chip input {
+        margin: 0;
+    }
+    .room-chip--selected {
+        border-color: #2563eb;
+        background: #eff6ff;
+        color: #1d4ed8;
+    }
+    .room-chip--disabled {
+        opacity: .6;
+        cursor: not-allowed;
+    }
 </style>
 
 @page "/admin/schedule"
@@ -180,6 +259,33 @@ else
                     </button>
                 </div>
             </div>
+            <div class="mt-3 rounded-3 border bg-white p-3">
+                <div class="d-flex flex-column flex-lg-row align-items-start justify-content-between gap-3">
+                    <label class="form-check form-switch mb-0">
+                        <input class="form-check-input"
+                               type="checkbox"
+                               @bind="_useRecommendedAutoGenProfile"
+                               @bind:after="PersistAutoGenConfigAsync" />
+                        <span class="form-check-label fw-semibold">Використовувати рекомендований профіль автогенерації</span>
+                    </label>
+                    <div class="small text-muted">
+                        @if (_useRecommendedAutoGenProfile)
+                        {
+                            <span>
+                                Активний профіль: <strong>@RecommendedAutoGenProfileName</strong>.
+                                Для автогенерації застосовується ліміт "бажано першим" до @RecommendedPreferredFirstMaxSlotOrderOverride-го слота,
+                                а для дозаповнення додатково використовується вікно близьких повторів @RecommendedSoftFillRepeatWindowDays день.
+                            </span>
+                        }
+                        else
+                        {
+                            <span>
+                                Профіль вимкнено: сторінка бере налаштування "бажано першим" із БД, а дозаповнення працює без примусових override-параметрів.
+                            </span>
+                        }
+                    </div>
+                </div>
+            </div>
             @if (_selectedCourseId is int)
             {
                 <div class="mt-3">
@@ -212,6 +318,107 @@ else
                     </div>
                     <div class="small text-muted mt-2">
                         Автогенерація створює заняття лише для обраних груп.
+                    </div>
+                    <div class="group-room-preferences mt-3">
+                        <div class="group-room-preferences__head">
+                            <div>
+                                <div class="fw-semibold">Аудиторії для вибраних груп</div>
+                                <div class="small text-muted">
+                                    Для кожної активної групи можна задати корпус і, за потреби, конкретні аудиторії.
+                                    Якщо нічого не обирати, автопідбір працюватиме як раніше.
+                                </div>
+                            </div>
+                        </div>
+                        @if (!_roomCatalogLoaded)
+                        {
+                            <div class="small text-muted mb-2">
+                                Довідник корпусів і аудиторій ще не завантажено.
+                            </div>
+                        }
+                        @if (!string.IsNullOrWhiteSpace(_roomCatalogError))
+                        {
+                            <div class="small text-warning mb-2">
+                                Не вдалося завантажити довідник корпусів і аудиторій: @_roomCatalogError
+                            </div>
+                        }
+                        @if (_courseGroupRows.Any(row => row.Selected))
+                        {
+                            <div class="group-room-grid">
+                                @foreach (var row in _courseGroupRows.Where(row => row.Selected))
+                                {
+                                    <div class="group-room-card" @key="row.GroupId">
+                                        <div class="group-room-card__head">
+                                            <div>
+                                                <div class="fw-semibold">@row.Caption</div>
+                                                <div class="group-room-card__summary">@GetGroupRoomPreferenceSummary(row)</div>
+                                            </div>
+                                            <button type="button"
+                                                    class="btn btn-sm btn-link text-decoration-none p-0"
+                                                    disabled="@(!row.HasRoomPreferences)"
+                                                    @onclick="() => ClearGroupRoomPreferenceAsync(row)">
+                                                Скинути
+                                            </button>
+                                        </div>
+                                        <div class="group-room-card__body">
+                                            <div>
+                                                <label class="form-label form-label-sm mb-1">Корпус</label>
+                                                <select class="form-select form-select-sm"
+                                                        value="@(row.PreferredBuildingId?.ToString() ?? string.Empty)"
+                                                        @onchange="e => OnGroupBuildingChangedAsync(row, e)">
+                                                    <option value="">Автоматично</option>
+                                                    @foreach (var building in GetOrderedBuildings())
+                                                    {
+                                                        <option value="@building.Id">@building.Name</option>
+                                                    }
+                                                </select>
+                                            </div>
+                                            <div>
+                                                <div class="d-flex justify-content-between align-items-center gap-2 mb-1">
+                                                    <label class="form-label form-label-sm mb-0">Аудиторії</label>
+                                                    <span class="small text-muted">@GetSelectedRoomCountLabel(row)</span>
+                                                </div>
+                                                @if (row.PreferredBuildingId is int buildingId)
+                                                {
+                                                    <div class="group-room-roomlist">
+                                                        @foreach (var room in GetRoomsForBuilding(buildingId))
+                                                        {
+                                                            if (room.Id is int roomId)
+                                                            {
+                                                                var isSelected = row.PreferredRoomIds.Contains(roomId);
+                                                                <label class="room-chip @(isSelected ? "room-chip--selected" : null)">
+                                                                    <input type="checkbox"
+                                                                           checked="@isSelected"
+                                                                           @onchange="e => OnGroupRoomToggleAsync(row, roomId, e)" />
+                                                                    <span>@room.Name</span>
+                                                                </label>
+                                                            }
+                                                        }
+                                                        @if (!GetRoomsForBuilding(buildingId).Any())
+                                                        {
+                                                            <div class="small text-muted">
+                                                                Для цього корпусу немає доступних аудиторій.
+                                                            </div>
+                                                        }
+                                                    </div>
+                                                }
+                                                else
+                                                {
+                                                    <div class="small text-muted">
+                                                        Спочатку оберіть корпус, щоб побачити аудиторії.
+                                                    </div>
+                                                }
+                                            </div>
+                                        </div>
+                                    </div>
+                                }
+                            </div>
+                        }
+                        else
+                        {
+                            <div class="small text-muted">
+                                Спочатку оберіть хоча б одну групу, щоб налаштувати аудиторії для неї.
+                            </div>
+                        }
                     </div>
                 </div>
                 <div class="mt-3">
@@ -547,6 +754,10 @@ else
     private int? _selectedCourseId;
     private readonly List<ModuleWeekRow> _moduleWeekRows = new();
     private readonly List<CourseGroupRow> _courseGroupRows = new();
+    private List<BuildingEditDto> _buildingOptions = new();
+    private List<RoomEditDto> _roomOptions = new();
+    private bool _roomCatalogLoaded;
+    private string? _roomCatalogError;
     private string? ok;
     private string? error;
     private List<string> okWarnings = new();
@@ -563,6 +774,12 @@ else
     private const string LogActionClearSchedule = "clear-schedule-week";
     private const string LogActionDelete = "delete-item";
     private const string ContiguousModuleBlockReasonMarker = "суцільним блоком без повернення після перемикання на інший модуль";
+    private const string RecommendedAutoGenProfileName = "soft-pref-4-repeat1";
+    private const int RecommendedPreferredFirstMaxSlotOrderOverride = 4;
+    private const int RecommendedSoftFillRepeatWindowDays = 1;
+    private static readonly AutoGenSoftOptionsDto RecommendedSoftFillOptions = new(
+        RecentRepeatWindowDays: RecommendedSoftFillRepeatWindowDays
+    );
     private static readonly JsonSerializerOptions AutoGenStatusJsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -576,6 +793,7 @@ else
     private string _search = string.Empty;
     private string _sortField = SortByDate;
     private bool _sortAsc = true;
+    private bool _useRecommendedAutoGenProfile;
     private ConflictDetails? _currentConflict;
     private Dictionary<string, ConflictDetails> _conflictStorage = new();
     private bool _conflictsLoaded;
@@ -611,6 +829,7 @@ else
         var selectedWeekStart = GetMonday(_selectedDate);
         _generationFromDate = selectedWeekStart;
         _generationToDate = selectedWeekStart;
+        await LoadRoomCatalogAsync();
         await RestorePersistedAutoGenConfigAsync(restoreCourseSelection: true);
         if (_selectedCourseId is null && meta.Courses.Count == 1)
         {
@@ -674,6 +893,27 @@ else
         }
         _courseGroupRows.AddRange(groups);
     }
+    // Завантажує довідник корпусів і аудиторій для ручного вибору аудиторій груп.
+    private async Task LoadRoomCatalogAsync()
+    {
+        try
+        {
+            var roomsTask = Admin.GetRooms();
+            var buildingsTask = Admin.GetBuildings();
+            await Task.WhenAll(roomsTask, buildingsTask);
+            _roomOptions = roomsTask.Result ?? new();
+            _buildingOptions = buildingsTask.Result ?? new();
+            _roomCatalogLoaded = true;
+            _roomCatalogError = null;
+        }
+        catch (Exception ex)
+        {
+            _roomOptions = new();
+            _buildingOptions = new();
+            _roomCatalogLoaded = false;
+            _roomCatalogError = ex.Message;
+        }
+    }
     // Обирає всі групи поточного курсу.
     private async Task SelectAllCourseGroupsAsync()
     {
@@ -699,6 +939,88 @@ else
             .Select(row => row.GroupId)
             .Distinct()
             .ToList();
+    // Повертає корпуси у зрозумілому для UI порядку.
+    private IEnumerable<BuildingEditDto> GetOrderedBuildings()
+        => _buildingOptions.OrderBy(building => building.Name, StringComparer.CurrentCultureIgnoreCase);
+    // Повертає аудиторії конкретного корпусу.
+    private IEnumerable<RoomEditDto> GetRoomsForBuilding(int buildingId)
+        => _roomOptions
+            .Where(room => room.Id.HasValue && room.BuildingId == buildingId)
+            .OrderBy(room => room.Name, StringComparer.CurrentCultureIgnoreCase);
+    // Формує короткий підпис ручного вибору аудиторій для групи.
+    private string GetGroupRoomPreferenceSummary(CourseGroupRow row)
+    {
+        if (row.PreferredBuildingId is not int buildingId)
+        {
+            return "Автоматичний підбір аудиторій";
+        }
+        var buildingName = BuildingName(buildingId);
+        if (row.PreferredRoomIds.Count == 0)
+        {
+            return $"Корпус: {buildingName}";
+        }
+        return $"Корпус: {buildingName} · аудиторій: {row.PreferredRoomIds.Count}";
+    }
+    // Повертає підпис для кількості вибраних аудиторій.
+    private string GetSelectedRoomCountLabel(CourseGroupRow row)
+        => row.PreferredRoomIds.Count == 0
+            ? "без вибору"
+            : $"{row.PreferredRoomIds.Count} вибр.";
+    // Повертає назву корпусу або службовий ідентифікатор.
+    private string BuildingName(int buildingId)
+        => _buildingOptions.FirstOrDefault(building => building.Id == buildingId)?.Name ?? $"#{buildingId}";
+    // Перевіряє, чи для групи задано хоча б один ручний пріоритет.
+    private static bool HasManualGroupRoomPreference(CourseGroupRow row)
+        => row.PreferredBuildingId is int || row.PreferredRoomIds.Count > 0;
+    // Нормалізує вибір аудиторій після зміни корпусу.
+    private void NormalizeGroupRoomPreference(CourseGroupRow row)
+    {
+        if (row.PreferredBuildingId is not int buildingId)
+        {
+            row.PreferredRoomIds.Clear();
+            return;
+        }
+        var validRoomIds = GetRoomsForBuilding(buildingId)
+            .Select(room => room.Id!.Value)
+            .ToHashSet();
+        row.PreferredRoomIds = row.PreferredRoomIds
+            .Where(validRoomIds.Contains)
+            .Distinct()
+            .ToList();
+    }
+    // Обробляє зміну корпусу для групи.
+    private async Task OnGroupBuildingChangedAsync(CourseGroupRow row, ChangeEventArgs e)
+    {
+        var rawValue = e.Value?.ToString();
+        row.PreferredBuildingId = int.TryParse(rawValue, out var buildingId) ? buildingId : null;
+        NormalizeGroupRoomPreference(row);
+        await PersistAutoGenConfigAsync();
+    }
+    // Перемикає аудиторію в ручному наборі групи.
+    private async Task OnGroupRoomToggleAsync(CourseGroupRow row, int roomId, ChangeEventArgs e)
+    {
+        var isChecked = e.Value is bool value && value;
+        if (isChecked)
+        {
+            if (!row.PreferredRoomIds.Contains(roomId))
+            {
+                row.PreferredRoomIds.Add(roomId);
+            }
+        }
+        else
+        {
+            row.PreferredRoomIds.Remove(roomId);
+        }
+        NormalizeGroupRoomPreference(row);
+        await PersistAutoGenConfigAsync();
+    }
+    // Скидає ручний вибір корпусу та аудиторій для конкретної групи.
+    private async Task ClearGroupRoomPreferenceAsync(CourseGroupRow row)
+    {
+        row.PreferredBuildingId = null;
+        row.PreferredRoomIds.Clear();
+        await PersistAutoGenConfigAsync();
+    }
     // Формує опис діапазону тижня для генерації.
     private string GetGenerationRangeDescription()
     {
@@ -995,9 +1317,28 @@ else
                     .Select(row => row.GroupId)
                     .Distinct()
                     .ToList();
+                var existingGroupRoomSelections = weekConfig.Courses.TryGetValue(courseId, out var existingCourseConfig)
+                    ? new Dictionary<int, PersistedGroupRoomSelection>(existingCourseConfig.GroupRoomSelections ?? new())
+                    : new Dictionary<int, PersistedGroupRoomSelection>();
+                foreach (var row in _courseGroupRows.Where(row => row.Selected))
+                {
+                    if (HasManualGroupRoomPreference(row))
+                    {
+                        existingGroupRoomSelections[row.GroupId] = new PersistedGroupRoomSelection(
+                            PreferredBuildingId: row.PreferredBuildingId,
+                            PreferredRoomIds: row.PreferredRoomIds.Distinct().ToList()
+                        );
+                    }
+                    else
+                    {
+                        existingGroupRoomSelections.Remove(row.GroupId);
+                    }
+                }
                 weekConfig.Courses[courseId] = new PersistedCourseAutoGenConfig(
                     Modules: moduleConfig,
-                    SelectedGroupIds: selectedGroupIds
+                    SelectedGroupIds: selectedGroupIds,
+                    GroupRoomSelections: existingGroupRoomSelections.Count > 0 ? existingGroupRoomSelections : null,
+                    UseRecommendedProfile: _useRecommendedAutoGenProfile
                 );
             }
             configs[CurrentWeekKey] = weekConfig;
@@ -1014,7 +1355,10 @@ else
             return;
         var configs = await LoadPersistedAutoGenConfigsAsync();
         if (!configs.TryGetValue(CurrentWeekKey, out var weekConfig))
+        {
+            _useRecommendedAutoGenProfile = false;
             return;
+        }
         if (restoreCourseSelection && weekConfig.SelectedCourseId is int persistedCourseId)
         {
             if (meta.Courses.Any(c => c.Id == persistedCourseId))
@@ -1026,6 +1370,7 @@ else
         }
         if (_selectedCourseId is not int courseId)
         {
+            _useRecommendedAutoGenProfile = false;
             return;
         }
         if (_moduleWeekRows.Count == 0)
@@ -1038,8 +1383,10 @@ else
         }
         if (!weekConfig.Courses.TryGetValue(courseId, out var courseConfig))
         {
+            _useRecommendedAutoGenProfile = false;
             return;
         }
+        _useRecommendedAutoGenProfile = courseConfig.UseRecommendedProfile;
         foreach (var row in _moduleWeekRows)
         {
             row.Selected = false;
@@ -1057,15 +1404,68 @@ else
             {
                 row.Selected = true;
             }
+        }
+        else
+        {
+            var persistedSet = persistedGroupIds
+                .Where(groupId => groupId > 0)
+                .ToHashSet();
+            foreach (var row in _courseGroupRows)
+            {
+                row.Selected = persistedSet.Contains(row.GroupId);
+            }
+        }
+        ApplyPersistedGroupRoomSelections(courseConfig.GroupRoomSelections);
+    }
+    // Відновлює ручні пріоритети корпусів і аудиторій для груп.
+    private void ApplyPersistedGroupRoomSelections(Dictionary<int, PersistedGroupRoomSelection>? selections)
+    {
+        if (selections is null || selections.Count == 0)
+        {
+            foreach (var row in _courseGroupRows)
+            {
+                row.PreferredBuildingId = null;
+                row.PreferredRoomIds.Clear();
+            }
             return;
         }
-        var persistedSet = persistedGroupIds
-            .Where(groupId => groupId > 0)
-            .ToHashSet();
         foreach (var row in _courseGroupRows)
         {
-            row.Selected = persistedSet.Contains(row.GroupId);
+            if (!selections.TryGetValue(row.GroupId, out var persisted))
+            {
+                row.PreferredBuildingId = null;
+                row.PreferredRoomIds.Clear();
+                continue;
+            }
+            ApplyPersistedGroupRoomSelection(row, persisted);
         }
+    }
+    // Застосовує один збережений пріоритет до рядка групи.
+    private void ApplyPersistedGroupRoomSelection(CourseGroupRow row, PersistedGroupRoomSelection persisted)
+    {
+        var normalizedBuildingId = persisted.PreferredBuildingId is int buildingId && _buildingOptions.Any(existing => existing.Id == buildingId)
+            ? buildingId
+            : (int?)null;
+        if (normalizedBuildingId is null && persisted.PreferredRoomIds.Count > 0)
+        {
+            normalizedBuildingId = persisted.PreferredRoomIds
+                .Select(roomId => _roomOptions.FirstOrDefault(room => room.Id.HasValue && room.Id.Value == roomId))
+                .FirstOrDefault(room => room is not null)
+                ?.BuildingId;
+        }
+        row.PreferredBuildingId = normalizedBuildingId;
+        if (normalizedBuildingId is not int buildingForRooms)
+        {
+            row.PreferredRoomIds.Clear();
+            return;
+        }
+        var validRoomIds = GetRoomsForBuilding(buildingForRooms)
+            .Select(room => room.Id!.Value)
+            .ToHashSet();
+        row.PreferredRoomIds = persisted.PreferredRoomIds
+            .Where(validRoomIds.Contains)
+            .Distinct()
+            .ToList();
     }
     // Завантажує збережені налаштування автогенерації.
     private async Task<Dictionary<string, PersistedWeekAutoGenConfig>> LoadPersistedAutoGenConfigsAsync()
@@ -1124,9 +1524,32 @@ else
         }
     }
     // Запускає автогенерацію послідовно для кожного тижня в обраному діапазоні.
+    // Формує запит ручних пріоритетів корпусів і аудиторій для вибраних груп.
+    private List<GroupRoomPreferenceDto> BuildSelectedGroupRoomPreferences(IReadOnlyCollection<int>? groupIds = null)
+    {
+        var groupSet = groupIds?
+            .Where(groupId => groupId > 0)
+            .ToHashSet();
+        return _courseGroupRows
+            .Where(row => row.Selected && HasManualGroupRoomPreference(row))
+            .Where(row => groupSet is null || groupSet.Contains(row.GroupId))
+            .Select(row => new GroupRoomPreferenceDto(
+                GroupId: row.GroupId,
+                BuildingId: row.PreferredBuildingId,
+                RoomIds: row.PreferredRoomIds.Distinct().ToList()
+            ))
+            .ToList();
+    }
+    // Повертає рекомендований профіль м'якого дозаповнення, який показав найкращий frozen-snapshot результат у тестах.
+    private AutoGenSoftOptionsDto? BuildRecommendedSoftOptions(bool softFill)
+        => _useRecommendedAutoGenProfile && softFill ? RecommendedSoftFillOptions : null;
+    // За явного перемикача підміняємо збережений у БД ліміт "бажано першим" параметром рекомендованого профілю.
+    private int? BuildRecommendedPreferredFirstLimitOverride()
+        => _useRecommendedAutoGenProfile ? RecommendedPreferredFirstMaxSlotOrderOverride : null;
     private async Task<(AutoGenResult Result, DateOnly RangeStartDate, DateOnly RangeEndDate, int WeekCount)> RunAutoGenForRangeAsync(
         int courseId,
         IReadOnlyList<int> groupIds,
+        IReadOnlyList<GroupRoomPreferenceDto> groupRoomPreferences,
         Dictionary<int, int> moduleHours,
         bool clearExisting,
         bool softFill)
@@ -1161,7 +1584,10 @@ else
                 ModuleHours: moduleHours,
                 SoftFill: softFill,
                 RangeStartDate: rangeStartDate,
-                RangeEndDate: rangeEndDate
+                RangeEndDate: rangeEndDate,
+                GroupRoomPreferences: groupRoomPreferences.Count > 0 ? groupRoomPreferences.ToList() : null,
+                SoftOptions: BuildRecommendedSoftOptions(softFill),
+                PreferredFirstMaxSlotOrderOverride: BuildRecommendedPreferredFirstLimitOverride()
             ));
             created += res.Created;
             skipped += res.Skipped;
@@ -1203,10 +1629,12 @@ else
                 error = "Оберіть хоча б одну групу для автогенерації.";
                 return;
             }
+            var groupRoomPreferences = BuildSelectedGroupRoomPreferences(selectedGroupIds);
             await PersistAutoGenConfigAsync();
             var (res, rangeStartDate, rangeEndDate, weekCount) = await RunAutoGenForRangeAsync(
                 courseId,
                 selectedGroupIds,
+                groupRoomPreferences,
                 moduleHours,
                 clearExisting: true,
                 softFill: false);
@@ -1265,10 +1693,12 @@ else
                 error = "Оберіть хоча б одну групу для заповнення порожніх слотів.";
                 return;
             }
+            var groupRoomPreferences = BuildSelectedGroupRoomPreferences(selectedGroupIds);
             await PersistAutoGenConfigAsync();
             var (res, rangeStartDate, rangeEndDate, weekCount) = await RunAutoGenForRangeAsync(
                 courseId,
                 selectedGroupIds,
+                groupRoomPreferences,
                 moduleHours,
                 clearExisting: false,
                 softFill: true);
@@ -1921,6 +2351,9 @@ else
         public int GroupId { get; } = groupId;
         public string Caption { get; } = caption;
         public bool Selected { get; set; }
+        public int? PreferredBuildingId { get; set; }
+        public List<int> PreferredRoomIds { get; set; } = new();
+        public bool HasRoomPreferences => PreferredBuildingId is int || PreferredRoomIds.Count > 0;
     }
     private sealed record PersistedWeekAutoGenConfig(
         int? SelectedCourseId,
@@ -1928,11 +2361,17 @@ else
     );
     private sealed record PersistedCourseAutoGenConfig(
         Dictionary<int, PersistedModuleSelection> Modules,
-        List<int>? SelectedGroupIds = null
+        List<int>? SelectedGroupIds = null,
+        Dictionary<int, PersistedGroupRoomSelection>? GroupRoomSelections = null,
+        bool UseRecommendedProfile = false
     );
     private sealed record PersistedModuleSelection(
         bool Selected,
         int Hours
+    );
+    private sealed record PersistedGroupRoomSelection(
+        int? PreferredBuildingId,
+        List<int> PreferredRoomIds
     );
     private sealed class ConflictDetails
     {

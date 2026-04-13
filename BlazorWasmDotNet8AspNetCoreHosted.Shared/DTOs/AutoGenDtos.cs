@@ -12,6 +12,25 @@ public enum WeekPreset
     MonSun
 }
 
+// Налаштування пріоритетного корпусу та аудиторій для конкретної групи.
+public record GroupRoomPreferenceDto(
+    int GroupId,
+    int? BuildingId = null,
+    List<int>? RoomIds = null
+);
+
+// М'які параметри тюнінгу автогенерації.
+public record AutoGenSoftOptionsDto(
+    int? MaxParallelGroupsPerModuleInSlot = null,
+    int? RecentRepeatWindowDays = null,
+    int? PreferredMaxDistinctModulesPerDay = null,
+    int? MaxDistinctModulesPerDay = null,
+    double? PreferredFirstPenaltyMultiplier = null,
+    double? AdjacentRoomChangePenalty = null,
+    double? TeacherLoadPenaltyWeight = null,
+    double? BuildingDistancePenaltyWeight = null
+);
+
 // DTO запиту автогенерації чернеток.
 public record AutoGenRequest(
     DateOnly WeekStart,
@@ -24,7 +43,10 @@ public record AutoGenRequest(
     Dictionary<int, int>? ModuleHours = null,
     bool SoftFill = false,
     DateOnly? RangeStartDate = null,
-    DateOnly? RangeEndDate = null
+    DateOnly? RangeEndDate = null,
+    List<GroupRoomPreferenceDto>? GroupRoomPreferences = null,
+    AutoGenSoftOptionsDto? SoftOptions = null,
+    int? PreferredFirstMaxSlotOrderOverride = null
 );
 
 // DTO деталі пропущеного слота.

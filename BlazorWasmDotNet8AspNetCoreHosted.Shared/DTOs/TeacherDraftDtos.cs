@@ -84,7 +84,10 @@ public record AutogenMonthRequest(
     int? GroupId,
     int? TeacherId,
     bool AllowOnDaysOff,
-    WeekPreset Days
+    WeekPreset Days,
+    List<GroupRoomPreferenceDto>? GroupRoomPreferences = null,
+    AutoGenSoftOptionsDto? SoftOptions = null,
+    int? PreferredFirstMaxSlotOrderOverride = null
 );
 
 // DTO для автогенерації чернеток по курсу за діапазон.
@@ -95,5 +98,8 @@ public record AutogenCourseRequest(
     int? GroupId,
     int? TeacherId,
     bool AllowOnDaysOff,
-    WeekPreset Days
+    WeekPreset Days,
+    List<GroupRoomPreferenceDto>? GroupRoomPreferences = null,
+    AutoGenSoftOptionsDto? SoftOptions = null,
+    int? PreferredFirstMaxSlotOrderOverride = null
 );
