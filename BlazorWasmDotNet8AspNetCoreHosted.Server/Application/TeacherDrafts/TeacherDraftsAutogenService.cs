@@ -710,6 +710,7 @@ public sealed class TeacherDraftsAutogenService
         var topicsByModule = topicsRaw
             .GroupBy(t => t.ModuleId)
             .ToDictionary(g => g.Key, g => g.ToList());
+        var topicById = topicsRaw.ToDictionary(t => t.Id);
         // Теми самостійної роботи для кожного модуля.
         var selfStudyTopicsByModule = topicsByModule
             .ToDictionary(
@@ -917,15 +918,8 @@ public sealed class TeacherDraftsAutogenService
         // Перевірка доступності конкретної теми для групи з урахуванням лімітів використання.
         bool CanAssignSpecificTopic(int groupIdCheck, int moduleIdCheck, ModuleTopic topic)
         {
-            var limit = GetTopicUsageLimit(topic);
-            if (limit <= 0)
-            {
-                return false;
-            }
-            var key = (groupIdCheck, moduleIdCheck);
-            topicAssignments.TryGetValue(key, out var assigned);
-            var usedCount = assigned != null && assigned.TryGetValue(topic.Id, out var count) ? count : 0;
-            return usedCount < limit;
+            var nextTopic = SelectNextTopicInOrder(groupIdCheck, moduleIdCheck);
+            return nextTopic is not null && nextTopic.Id == topic.Id;
         }
         // Позначає тему як використану для конкретної групи.
         void MarkTopicUsed(int groupId, int moduleId, ModuleTopic topic)
@@ -938,6 +932,77 @@ public sealed class TeacherDraftsAutogenService
             }
             assigned.TryGetValue(topic.Id, out var used);
             assigned[topic.Id] = used + 1;
+        }
+        static int CompareSlotPosition(
+            DateOnly leftDate,
+            TimeOnly leftStart,
+            TimeOnly leftEnd,
+            DateOnly rightDate,
+            TimeOnly rightStart,
+            TimeOnly rightEnd)
+        {
+            var dateDiff = leftDate.DayNumber.CompareTo(rightDate.DayNumber);
+            if (dateDiff != 0)
+            {
+                return dateDiff;
+            }
+            var startDiff = leftStart.CompareTo(rightStart);
+            if (startDiff != 0)
+            {
+                return startDiff;
+            }
+            return leftEnd.CompareTo(rightEnd);
+        }
+        bool ViolatesTopicCalendarOrder(
+            int groupIdCheck,
+            int moduleIdCheck,
+            ModuleTopic topic,
+            DateOnly date,
+            TimeOnly start,
+            TimeOnly end)
+        {
+            var candidateCode = string.IsNullOrWhiteSpace(topic.TopicCode) ? null : topic.TopicCode.Trim();
+            if (candidateCode is null)
+            {
+                return false;
+            }
+            foreach (var slot in busy.Where(x =>
+                         x.GroupId == groupIdCheck
+                         && x.ModuleId == moduleIdCheck
+                         && x.ModuleTopicId is int))
+            {
+                if (slot.ModuleTopicId is not int existingTopicId)
+                {
+                    continue;
+                }
+                if (!topicById.TryGetValue(existingTopicId, out var existingTopic))
+                {
+                    continue;
+                }
+                var existingCode = string.IsNullOrWhiteSpace(existingTopic.TopicCode) ? null : existingTopic.TopicCode.Trim();
+                if (existingCode is null)
+                {
+                    continue;
+                }
+                var slotPosition = CompareSlotPosition(
+                    slot.Date,
+                    slot.StartTime,
+                    slot.EndTime,
+                    date,
+                    start,
+                    end);
+                if (slotPosition < 0
+                    && TeacherDraftsHelpers.CompareTopicCodes(existingCode, candidateCode) > 0)
+                {
+                    return true;
+                }
+                if (slotPosition > 0
+                    && TeacherDraftsHelpers.CompareTopicCodes(candidateCode, existingCode) > 0)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
         // Перевіряє, чи вичерпано всі теми модуля для групи.
         bool TopicsDepleted(int groupIdCheck, int moduleIdCheck)
@@ -2227,6 +2292,10 @@ public sealed class TeacherDraftsAutogenService
                     {
                         continue;
                     }
+                    if (topic is not null && ViolatesTopicCalendarOrder(otherGroup.Id, moduleId, topic, date, start, end))
+                    {
+                        continue;
+                    }
                     if (!RoomMatchesGroupPreference(otherGroup.Id, room))
                     {
                         continue;
@@ -2754,6 +2823,16 @@ public sealed class TeacherDraftsAutogenService
                             reason = $"Тип заняття #{ltypeId} недоступний для автогенерації, тому слот {slotLabel} пропущено.";
                         }
                         RecordSlotFailureReason(date, sl, reason);
+                        continue;
+                    }
+                    if (!isSelfStudyPlacement
+                        && topicSelection is not null
+                        && ViolatesTopicCalendarOrder(grp.Id, moduleId, topicSelection, date, s, e))
+                    {
+                        RecordSlotFailureReason(
+                            date,
+                            sl,
+                            $"Для групи {grp.Name} порушується хронологічний порядок тем модуля <{ModuleLabel()}> у слоті {slotLabel}.");
                         continue;
                     }
                     // Дуже сильно штрафуємо тип з прапорцем "Бажано першим у тижні" за вихід за межу слота, але не блокуємо жорстко.
@@ -3354,9 +3433,28 @@ public sealed class TeacherDraftsAutogenService
                     : null;
                 var startTime = selectedSlot.Start;
                 var endTime = selectedSlot.End;
-                var placedGroupIds = selectedIncomplete is null
+                var placedGroupIds = (selectedIncomplete is null
                     ? (best!.SharedGroupIds.Count > 0 ? best.SharedGroupIds : new[] { grp.Id })
-                    : new[] { grp.Id };
+                    : new[] { grp.Id })
+                    .Distinct()
+                    .ToList();
+                if (!selectedIsSelfStudy && selectedTopic is not null)
+                {
+                    foreach (var sharedGroupId in placedGroupIds)
+                    {
+                        if (ViolatesTopicCalendarOrder(sharedGroupId, moduleId, selectedTopic, date, startTime, endTime))
+                        {
+                            var groupLabel = selectedGroupsById.TryGetValue(sharedGroupId, out var sharedGroupInfo)
+                                ? sharedGroupInfo.Name
+                                : $"#{sharedGroupId}";
+                            RecordSlotFailureReason(
+                                date,
+                                selectedSlot,
+                                $"Для групи {groupLabel} порушується хронологічний порядок тем модуля <{ModuleLabel()}> у слоті {startTime:HH\\:mm}-{endTime:HH\\:mm}.");
+                            return false;
+                        }
+                    }
+                }
                 if (selectedIncomplete is not null)
                 {
                     incompleteDraftsCreated++;
@@ -3374,7 +3472,7 @@ public sealed class TeacherDraftsAutogenService
                     }
                 }
                 bool currentGroupPlaced = false;
-                foreach (var sharedGroupId in placedGroupIds.Distinct())
+                foreach (var sharedGroupId in placedGroupIds)
                 {
                     if (!selectedGroupsById.TryGetValue(sharedGroupId, out var sharedGroup))
                     {
