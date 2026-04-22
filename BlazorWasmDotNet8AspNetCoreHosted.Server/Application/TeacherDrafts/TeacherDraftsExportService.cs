@@ -91,6 +91,20 @@ public sealed class TeacherDraftsExportService
         => itemsForSlot
             .OrderBy(item => item.Id)
             .First();
+    private static int CountDisplayLines(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return 1;
+        }
+        return text.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n').Length;
+    }
+    private static double ResolveRowHeightByLineCount(int lineCount)
+    {
+        const double baseLineHeight = 15d;
+        var normalizedLines = Math.Max(1, lineCount);
+        return baseLineHeight * normalizedLines;
+    }
     private static int ResolveGroupMergeSpan(
         DateOnly day,
         TimeOnly start,
@@ -295,6 +309,7 @@ public sealed class TeacherDraftsExportService
                         ? mappedSlotNumber
                         : slotIndex + 1;
                     worksheet.Cell(row, 2).Value = slotNumber;
+                    var maxDisplayLinesInRow = 1;
                     for (var index = 0; index < groups.Count;)
                     {
                         var column = 3 + index;
@@ -310,6 +325,7 @@ public sealed class TeacherDraftsExportService
                         if (cellTextLookup.TryGetValue(key, out var cellText) && !string.IsNullOrWhiteSpace(cellText))
                         {
                             worksheet.Cell(row, column).Value = cellText;
+                            maxDisplayLinesInRow = Math.Max(maxDisplayLinesInRow, CountDisplayLines(cellText));
                         }
                         if (mergeSpan > 1)
                         {
@@ -318,6 +334,7 @@ public sealed class TeacherDraftsExportService
                         }
                         index += mergeSpan;
                     }
+                    worksheet.Row(row).Height = ResolveRowHeightByLineCount(maxDisplayLinesInRow);
                     row++;
                 }
                 var dayRange = worksheet.Range(dayStartRow, 1, row - 1, 1);
