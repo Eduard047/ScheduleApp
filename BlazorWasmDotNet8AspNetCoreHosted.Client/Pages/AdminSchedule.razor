@@ -274,8 +274,10 @@ else
                         {
                             <span>
                                 Активний профіль: <strong>@RecommendedAutoGenProfileName</strong>.
-                                Для автогенерації застосовується ліміт "бажано першим" до @RecommendedPreferredFirstMaxSlotOrderOverride-го слота,
-                                а для дозаповнення додатково використовується вікно близьких повторів @RecommendedSoftFillRepeatWindowDays день.
+                                Для автогенерації застосовується override ліміту "бажано першим" = @RecommendedPreferredFirstMaxSlotOrderOverride.
+                                Для дозаповнення використовується вікно близьких повторів @RecommendedSoftFillRepeatWindowDays день,
+                                ліміт паралельних груп @RecommendedSoftFillMaxParallelGroupsPerModuleInSlot
+                                та межа різних модулів @RecommendedSoftFillPreferredMaxDistinctModulesPerDay/@RecommendedSoftFillMaxDistinctModulesPerDay.
                             </span>
                         }
                         else
@@ -803,11 +805,19 @@ else
     private const string LogActionClearSchedule = "clear-schedule-week";
     private const string LogActionDelete = "delete-item";
     private const string ContiguousModuleBlockReasonMarker = "суцільним блоком без повернення після перемикання на інший модуль";
-    private const string RecommendedAutoGenProfileName = "soft-pref-4-repeat1";
-    private const int RecommendedPreferredFirstMaxSlotOrderOverride = 4;
-    private const int RecommendedSoftFillRepeatWindowDays = 1;
+    private const string RecommendedAutoGenProfileName = "soft-repeat-0-par4-distinct5-pref035";
+    private const int RecommendedPreferredFirstMaxSlotOrderOverride = 0;
+    private const int RecommendedSoftFillRepeatWindowDays = 0;
+    private const int RecommendedSoftFillMaxParallelGroupsPerModuleInSlot = 4;
+    private const int RecommendedSoftFillPreferredMaxDistinctModulesPerDay = 5;
+    private const int RecommendedSoftFillMaxDistinctModulesPerDay = 6;
+    private const double RecommendedSoftFillPreferredFirstPenaltyMultiplier = 0.35;
     private static readonly AutoGenSoftOptionsDto RecommendedSoftFillOptions = new(
-        RecentRepeatWindowDays: RecommendedSoftFillRepeatWindowDays
+        MaxParallelGroupsPerModuleInSlot: RecommendedSoftFillMaxParallelGroupsPerModuleInSlot,
+        RecentRepeatWindowDays: RecommendedSoftFillRepeatWindowDays,
+        PreferredMaxDistinctModulesPerDay: RecommendedSoftFillPreferredMaxDistinctModulesPerDay,
+        MaxDistinctModulesPerDay: RecommendedSoftFillMaxDistinctModulesPerDay,
+        PreferredFirstPenaltyMultiplier: RecommendedSoftFillPreferredFirstPenaltyMultiplier
     );
     private static readonly JsonSerializerOptions AutoGenStatusJsonOptions = new()
     {
