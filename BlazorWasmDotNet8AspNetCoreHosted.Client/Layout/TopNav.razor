@@ -1,395 +1,303 @@
+@* Верхня панель навігації застосунку *@
 @using Microsoft.AspNetCore.Components.Routing
+@implements IDisposable
+@inject NavigationManager NavigationManager
 
 <style>
-    .app-topnav {
-        --topnav-height: 72px;
-        --topnav-border: #dde5f0;
-        --topnav-text: #63728b;
-        --topnav-icon: #7c8ca7;
-        --topnav-accent: #2f66f6;
-        --topnav-hover: #f4f7ff;
-        --topnav-active-bg: #eef4ff;
+    .app-navbar {
         position: sticky;
         top: 0;
-        z-index: 1200;
-        height: var(--topnav-height);
+        z-index: 1100;
+        background: #ffffff;
+        border-bottom: 1px solid #e5e7eb;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
+    }
+
+    .app-navbar__inner {
+        min-height: 64px;
         display: flex;
-        align-items: stretch;
-        border-bottom: 1px solid var(--topnav-border);
-        background: linear-gradient(180deg, #ffffff 0%, #fbfcff 100%);
-        box-shadow: 0 1px 0 rgba(17, 24, 39, .03);
+        align-items: center;
+        gap: 1rem;
+        padding: 0 clamp(1rem, 2.5vw, 2.25rem);
     }
 
-    .app-topnav::before {
-        content: "";
-        position: absolute;
-        top: 0;
-        left: 0;
-        right: 0;
-        height: 3px;
-        background: linear-gradient(90deg, #2f3340 0%, #3a414f 100%);
-        pointer-events: none;
-    }
-
-    .app-topnav__logo {
-        width: 70px;
-        min-width: 70px;
+    .app-navbar__logo {
+        flex: 0 0 auto;
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        border-right: 1px solid var(--topnav-border);
         text-decoration: none;
-        padding: 0 .8rem;
     }
 
-    .app-topnav__logo-shell {
-        width: 42px;
-        height: 42px;
-        border-radius: 12px;
+    .app-navbar__logo-mark {
+        width: 44px;
+        height: 44px;
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        border: 1px solid #d4deed;
-        background: #f6f9ff;
-        color: var(--topnav-accent);
+        border-radius: 14px;
+        background: linear-gradient(180deg, #2f7bff 0%, #1f6ff2 100%);
+        color: #ffffff;
+        box-shadow: 0 10px 22px rgba(31, 111, 242, 0.18);
     }
 
-    .app-topnav__logo-glyph {
-        width: 22px;
-        height: 22px;
-        flex-shrink: 0;
+    .app-navbar__logo-mark svg {
+        width: 24px;
+        height: 24px;
     }
 
-    .app-topnav__links {
-        flex: 1;
+    .app-navbar__nav {
         min-width: 0;
         display: flex;
-        align-items: stretch;
-        overflow-x: auto;
-        overflow-y: hidden;
-        scrollbar-width: none;
+        align-items: center;
+        gap: 0.45rem;
+        flex-wrap: nowrap;
+        overflow: visible;
     }
 
-    .app-topnav__links::-webkit-scrollbar {
-        display: none;
-    }
-
-    .app-topnav__link {
+    .app-navbar__item {
         position: relative;
-        min-height: var(--topnav-height);
+        flex: 0 0 auto;
+        min-height: 48px;
         display: inline-flex;
         align-items: center;
-        gap: .7rem;
-        padding: 0 clamp(1rem, 1.8vw, 1.85rem);
+        gap: 0.75rem;
+        padding: 0 1.2rem;
         border: 0;
-        border-right: 1px solid var(--topnav-border);
+        border-radius: 16px 16px 0 0;
         background: transparent;
-        color: var(--topnav-text);
-        font-family: "Segoe UI", "Segoe UI Variable Text", "Helvetica Neue", Arial, sans-serif;
-        font-weight: 600;
-        font-size: 1.02rem;
+        color: #64748b;
+        font-family: "Segoe UI Variable Text", "Segoe UI", "Inter", system-ui, sans-serif;
+        font-size: 1rem;
+        font-weight: 500;
         line-height: 1;
         text-decoration: none;
         white-space: nowrap;
-        transition: color .16s ease, background-color .16s ease;
+        transition: background-color 0.18s ease, color 0.18s ease, box-shadow 0.18s ease;
     }
 
-    .app-topnav__link::after {
+    .app-navbar__item::after {
         content: "";
         position: absolute;
-        left: .85rem;
-        right: .85rem;
+        left: 1rem;
+        right: 1rem;
         bottom: 0;
         height: 3px;
-        border-radius: 3px 3px 0 0;
+        border-radius: 999px 999px 0 0;
         background: transparent;
-        transition: background-color .16s ease;
+        transition: background-color 0.18s ease;
     }
 
-    .app-topnav__link:hover {
-        background: var(--topnav-hover);
-        color: #4f5f7d;
+    .app-navbar__item:hover {
+        background: #f3f8ff;
+        color: #475569;
+        text-decoration: none;
     }
 
-    .app-topnav__link.active {
-        background: var(--topnav-active-bg);
-        color: var(--topnav-accent);
+    .app-navbar__item:focus-visible {
+        outline: 2px solid #9fc2ff;
+        outline-offset: 2px;
     }
 
-    .app-topnav__link.active::after {
-        background: var(--topnav-accent);
-    }
-
-    .app-topnav__link--button {
-        appearance: none;
-        cursor: pointer;
-        font: inherit;
-    }
-
-    .app-topnav__admin {
-        position: relative;
-        display: flex;
-    }
-
-    .app-topnav__icon {
-        width: 20px !important;
-        height: 20px !important;
-        min-width: 20px;
-        min-height: 20px;
+    .app-navbar__item-icon {
+        width: 22px;
+        height: 22px;
         flex-shrink: 0;
-        color: var(--topnav-icon);
+        color: #7a8ca5;
+        transition: color 0.18s ease;
     }
 
-    .app-topnav__label {
+    .app-navbar__item-text {
         display: inline-flex;
         align-items: center;
     }
 
-    .app-topnav__caret {
-        width: .95rem;
-        height: .95rem;
-        margin-left: .14rem;
+    .app-navbar__item--active {
+        background: #eef5ff;
+        color: #1f6ff2;
+        box-shadow: inset 0 0 0 1px rgba(31, 111, 242, 0.06);
+    }
+
+    .app-navbar__item--active::after {
+        background: #1f6ff2;
+    }
+
+    .app-navbar__item--dropdown[aria-expanded="true"] {
+        background: #eef5ff;
+        color: #1f6ff2;
+        box-shadow: inset 0 0 0 1px rgba(31, 111, 242, 0.06);
+    }
+
+    .app-navbar__item--dropdown[aria-expanded="true"]::after {
+        background: #1f6ff2;
+    }
+
+    .app-navbar__item:hover .app-navbar__item-icon,
+    .app-navbar__item--active .app-navbar__item-icon,
+    .app-navbar__item--dropdown[aria-expanded="true"] .app-navbar__item-icon {
+        color: currentColor;
+    }
+
+    .app-navbar__item--dropdown {
+        appearance: none;
+        cursor: pointer;
+    }
+
+    .app-navbar__admin {
+        position: relative;
+        flex: 0 0 auto;
+        display: flex;
+    }
+
+    .app-navbar__caret {
+        width: 0.95rem;
+        height: 0.95rem;
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        color: #98a7bd;
-        transition: transform .16s ease, color .16s ease;
+        color: #94a3b8;
+        transition: color 0.18s ease, transform 0.18s ease;
     }
 
-    .app-topnav__caret svg {
-        width: 12px !important;
-        height: 12px !important;
-        flex-shrink: 0;
+    .app-navbar__caret svg {
+        width: 100%;
+        height: 100%;
     }
 
-    .app-topnav__link.active .app-topnav__icon,
-    .app-topnav__admin--open .app-topnav__link--button .app-topnav__icon {
-        color: var(--topnav-accent);
+    .app-navbar__item--dropdown[aria-expanded="true"] .app-navbar__caret,
+    .app-navbar__item--active .app-navbar__caret,
+    .app-navbar__item--dropdown:hover .app-navbar__caret {
+        color: currentColor;
     }
 
-    .app-topnav__admin--open .app-topnav__link--button {
-        background: var(--topnav-active-bg);
-        color: var(--topnav-accent);
-    }
-
-    .app-topnav__admin--open .app-topnav__link--button::after {
-        background: var(--topnav-accent);
-    }
-
-    .app-topnav__admin--open .app-topnav__caret {
-        color: var(--topnav-accent);
+    .app-navbar__item--dropdown[aria-expanded="true"] .app-navbar__caret {
         transform: rotate(180deg);
     }
 
-    .app-topnav__menu {
+    .app-navbar__dropdown-menu {
         position: absolute;
-        top: calc(100% + 10px);
-        right: .35rem;
+        top: calc(100% + 0.65rem);
+        right: 0;
         display: flex;
         flex-direction: column;
-        gap: .2rem;
-        border: 1px solid #d9e2f0;
+        gap: 0.2rem;
+        padding: 0.5rem;
+        border: 1px solid #e5e7eb;
         border-radius: 14px;
-        box-shadow: 0 20px 42px rgba(15, 23, 42, .18);
-        padding: .5rem;
-        min-width: 250px;
-        max-height: min(68vh, 520px);
+        box-shadow: 0 18px 38px rgba(15, 23, 42, 0.12);
+        min-width: 240px;
+        max-height: min(70vh, 480px);
         overflow-y: auto;
-        background: #fff;
-        z-index: 1210;
+        background: #ffffff;
+        z-index: 1120;
     }
 
-    .app-topnav__menu-item {
+    .app-navbar__dropdown-item {
         display: block;
-        text-decoration: none;
         border-radius: 10px;
-        font-size: .95rem;
-        font-weight: 560;
-        padding: .55rem .72rem;
-        color: #41516e;
+        color: #475569;
+        font-size: 0.96rem;
+        padding: 0.6rem 0.8rem;
+        text-decoration: none;
         white-space: nowrap;
-        transition: background-color .14s ease, color .14s ease;
+        transition: background-color 0.16s ease, color 0.16s ease;
     }
 
-    .app-topnav__menu-item:hover {
-        background: #f4f8ff;
-        color: #33445f;
+    .app-navbar__dropdown-item:hover,
+    .app-navbar__dropdown-item:focus {
+        background: #f3f8ff;
+        color: #334155;
     }
 
-    .app-topnav__menu-item.active,
-    .app-topnav__menu-item:active {
-        background: #ecf3ff;
-        color: #1f4fe3;
+    .app-navbar__dropdown-item.active,
+    .app-navbar__dropdown-item:active {
+        background: #eef5ff;
+        color: #1f6ff2;
     }
 
-    .app-topnav__backdrop {
+    .app-navbar__spacer {
+        flex: 1 1 auto;
+        min-width: 1rem;
+    }
+
+    .app-navbar__backdrop {
         position: fixed;
-        top: var(--topnav-height);
+        top: 64px;
         left: 0;
         right: 0;
         bottom: 0;
-        z-index: 1190;
+        z-index: 1090;
         border: 0;
-        background: transparent;
         margin: 0;
         padding: 0;
+        background: transparent;
     }
 
-    @@media (max-width: 1120px) {
-        .app-topnav__logo {
-            width: 64px;
-            min-width: 64px;
+    @@media (max-width: 840px) {
+        .app-navbar__inner {
+            gap: 0.85rem;
+            padding: 0 0.9rem;
         }
 
-        .app-topnav__link {
-            padding: 0 1.1rem;
-            font-size: .97rem;
-        }
-    }
-
-    @@media (max-width: 860px) {
-        .app-topnav {
-            --topnav-height: 66px;
+        .app-navbar__logo-mark {
+            width: 40px;
+            height: 40px;
+            border-radius: 12px;
         }
 
-        .app-topnav__logo {
-            width: 56px;
-            min-width: 56px;
-            padding: 0 .55rem;
+        .app-navbar__item {
+            min-height: 44px;
+            gap: 0.65rem;
+            padding: 0 0.95rem;
+            font-size: 0.95rem;
         }
 
-        .app-topnav__logo-shell {
-            width: 36px;
-            height: 36px;
-            border-radius: 10px;
-        }
-
-        .app-topnav__link {
-            padding: 0 .92rem;
-            font-size: .93rem;
-            gap: .55rem;
-        }
-
-        .app-topnav__icon {
-            width: 18px !important;
-            height: 18px !important;
-            min-width: 18px;
-            min-height: 18px;
-        }
-
-        .app-topnav__menu {
-            right: 0;
+        .app-navbar__item-icon {
+            width: 20px;
+            height: 20px;
         }
     }
 
-    @@media (max-width: 620px) {
-        .app-topnav__logo {
-            display: none;
+    @@media (max-width: 640px) {
+        .app-navbar__inner {
+            gap: 0.7rem;
         }
 
-        .app-topnav__link {
-            border-right: 0;
-            padding: 0 .82rem;
-            font-size: .9rem;
+        .app-navbar__item {
+            padding: 0 0.85rem;
         }
 
-        .app-topnav__link::after {
-            left: .5rem;
-            right: .5rem;
-        }
-
-        .app-topnav__menu {
-            min-width: 220px;
+        .app-navbar__spacer {
+            min-width: 0.5rem;
         }
     }
 </style>
 
-<nav class="app-topnav" aria-label="Головна навігація">
-    <a class="app-topnav__logo" href="/schedule" title="Розклад" aria-label="Розклад">
-        <span class="app-topnav__logo-shell" aria-hidden="true">
-            <svg class="app-topnav__logo-glyph"
-                 width="22"
-                 height="22"
-                 viewBox="0 0 24 24"
-                 fill="none"
-                 stroke="currentColor"
-                 stroke-width="1.9"
-                 stroke-linecap="round"
-                 stroke-linejoin="round"
-                 focusable="false">
-                <path d="M4.5 5.5C4.5 4.67 5.17 4 6 4H18C18.83 4 19.5 4.67 19.5 5.5V18.5C19.5 19.33 18.83 20 18 20H6C5.17 20 4.5 19.33 4.5 18.5V5.5Z" />
-                <path d="M8 8H16M8 12H16M8 16H13" />
-            </svg>
-        </span>
-    </a>
+<nav class="app-navbar" aria-label="Головна навігація">
+    <div class="app-navbar__inner">
+        <a class="app-navbar__logo" href="/schedule" aria-label="Розклад" title="Розклад">
+            <span class="app-navbar__logo-mark" aria-hidden="true">
+                <svg viewBox="0 0 24 24"
+                     fill="none"
+                     stroke="currentColor"
+                     stroke-width="1.85"
+                     stroke-linecap="round"
+                     stroke-linejoin="round"
+                     focusable="false">
+                    <path d="M3.75 8.5L12 4.75L20.25 8.5L12 12.25L3.75 8.5Z" />
+                    <path d="M7.25 10V13.9C7.25 15.45 9.38 16.75 12 16.75C14.62 16.75 16.75 15.45 16.75 13.9V10" />
+                    <path d="M18.25 9.4V14.75" />
+                    <circle cx="18.25" cy="17.15" r="0.85" fill="currentColor" stroke="none" />
+                </svg>
+            </span>
+        </a>
 
-    <div class="app-topnav__links">
-        <NavLink class="app-topnav__link" href="/schedule" Match="NavLinkMatch.Prefix">
-            <svg class="app-topnav__icon"
-                 width="20"
-                 height="20"
-                 viewBox="0 0 24 24"
-                 fill="none"
-                 stroke="currentColor"
-                 stroke-width="1.85"
-                 stroke-linecap="round"
-                 stroke-linejoin="round"
-                 focusable="false"
-                 aria-hidden="true">
-                <path d="M5.25 5.75C5.25 4.78 6.03 4 7 4H17C17.97 4 18.75 4.78 18.75 5.75V18.25C18.75 19.22 17.97 20 17 20H7C6.03 20 5.25 19.22 5.25 18.25V5.75Z" />
-                <path d="M9 8.5H15M9 12H15M9 15.5H13.2" />
-            </svg>
-            <span class="app-topnav__label">Розклад</span>
-        </NavLink>
-
-        <NavLink class="app-topnav__link" href="/teacher-drafts" Match="NavLinkMatch.Prefix">
-            <svg class="app-topnav__icon"
-                 width="20"
-                 height="20"
-                 viewBox="0 0 24 24"
-                 fill="none"
-                 stroke="currentColor"
-                 stroke-width="1.85"
-                 stroke-linecap="round"
-                 stroke-linejoin="round"
-                 focusable="false"
-                 aria-hidden="true">
-                <circle cx="8.75" cy="9" r="2.25" />
-                <circle cx="15.75" cy="10" r="1.75" />
-                <path d="M4.5 18C4.5 15.65 6.41 13.75 8.75 13.75C11.09 13.75 13 15.65 13 18" />
-                <path d="M13.5 18C13.5 16.34 14.84 15 16.5 15C18.16 15 19.5 16.34 19.5 18" />
-            </svg>
-            <span class="app-topnav__label">Графік викладачів</span>
-        </NavLink>
-
-        <NavLink class="app-topnav__link" href="/admin/schedule" Match="NavLinkMatch.Prefix">
-            <svg class="app-topnav__icon"
-                 width="20"
-                 height="20"
-                 viewBox="0 0 24 24"
-                 fill="none"
-                 stroke="currentColor"
-                 stroke-width="1.85"
-                 stroke-linecap="round"
-                 stroke-linejoin="round"
-                 focusable="false"
-                 aria-hidden="true">
-                <rect x="4.5" y="5.25" width="12" height="13.5" rx="2.25" />
-                <path d="M8 3.75V6.5M13 3.75V6.5M4.5 9.5H16.5" />
-                <path d="M15.5 16.25L19.1 12.65C19.47 12.28 20.06 12.28 20.43 12.65L20.85 13.07C21.22 13.44 21.22 14.04 20.85 14.41L17.25 18.01L14.9 18.6L15.5 16.25Z" />
-            </svg>
-            <span class="app-topnav__label">Редактор розкладу</span>
-        </NavLink>
-
-        <div class="app-topnav__admin @(_isAdminMenuOpen ? "app-topnav__admin--open" : string.Empty)">
-            <button class="app-topnav__link app-topnav__link--button"
-                    type="button"
-                    @onclick="ToggleAdminMenu"
-                    aria-expanded="@_isAdminMenuOpen"
-                    aria-haspopup="menu">
-                <svg class="app-topnav__icon"
-                     width="20"
-                     height="20"
+        <div class="app-navbar__nav" role="menubar">
+            <NavLink class="app-navbar__item"
+                     ActiveClass="app-navbar__item--active"
+                     href="/schedule"
+                     Match="NavLinkMatch.All">
+                <svg class="app-navbar__item-icon"
                      viewBox="0 0 24 24"
                      fill="none"
                      stroke="currentColor"
@@ -398,55 +306,162 @@
                      stroke-linejoin="round"
                      focusable="false"
                      aria-hidden="true">
-                    <path d="M12 3.5C14.32 5.5 17.12 6.5 19.5 6.75V11.5C19.5 15.95 16.77 19.1 12 20.75C7.23 19.1 4.5 15.95 4.5 11.5V6.75C6.88 6.5 9.68 5.5 12 3.5Z" />
-                    <path d="M9.25 12.2L11.2 14.15L14.95 10.4" />
+                    <path d="M7 3.75V6.25" />
+                    <path d="M17 3.75V6.25" />
+                    <rect x="4.5" y="5.25" width="15" height="14.25" rx="2.25" />
+                    <path d="M4.5 9.5H19.5" />
                 </svg>
-                <span class="app-topnav__label">Адмін</span>
-                <span class="app-topnav__caret" aria-hidden="true">
-                    <svg width="12"
-                         height="12"
-                         viewBox="0 0 12 12"
+                <span class="app-navbar__item-text">Розклад</span>
+            </NavLink>
+
+            <NavLink class="app-navbar__item"
+                     ActiveClass="app-navbar__item--active"
+                     href="/teacher-drafts"
+                     Match="NavLinkMatch.All">
+                <svg class="app-navbar__item-icon"
+                     viewBox="0 0 24 24"
+                     fill="none"
+                     stroke="currentColor"
+                     stroke-width="1.85"
+                     stroke-linecap="round"
+                     stroke-linejoin="round"
+                     focusable="false"
+                     aria-hidden="true">
+                    <circle cx="8.25" cy="9" r="2.75" />
+                    <circle cx="15.9" cy="10.1" r="2.2" />
+                    <path d="M3.75 18C3.75 15.38 5.88 13.25 8.5 13.25C11.12 13.25 13.25 15.38 13.25 18" />
+                    <path d="M13.3 18C13.3 16.12 14.82 14.6 16.7 14.6C18.58 14.6 20.1 16.12 20.1 18" />
+                </svg>
+                <span class="app-navbar__item-text">Графік викладачів</span>
+            </NavLink>
+
+            <NavLink class="app-navbar__item"
+                     ActiveClass="app-navbar__item--active"
+                     href="/admin/schedule"
+                     Match="NavLinkMatch.All">
+                <svg class="app-navbar__item-icon"
+                     viewBox="0 0 24 24"
+                     fill="none"
+                     stroke="currentColor"
+                     stroke-width="1.85"
+                     stroke-linecap="round"
+                     stroke-linejoin="round"
+                     focusable="false"
+                     aria-hidden="true">
+                    <rect x="4.5" y="4.5" width="6" height="6" rx="1.5" />
+                    <rect x="13.5" y="4.5" width="6" height="6" rx="1.5" />
+                    <rect x="4.5" y="13.5" width="6" height="6" rx="1.5" />
+                    <rect x="13.5" y="13.5" width="6" height="6" rx="1.5" />
+                </svg>
+                <span class="app-navbar__item-text">Редактор розкладу</span>
+            </NavLink>
+
+            <div class="app-navbar__admin">
+                <button type="button"
+                        class="@AdminItemClass"
+                        @onclick="ToggleAdminMenu"
+                        aria-expanded="@_isAdminMenuOpen"
+                        aria-haspopup="menu">
+                    <svg class="app-navbar__item-icon"
+                         viewBox="0 0 24 24"
                          fill="none"
                          stroke="currentColor"
                          stroke-width="1.85"
                          stroke-linecap="round"
                          stroke-linejoin="round"
-                         focusable="false">
-                        <path d="M2.25 4.5L6 8.25L9.75 4.5" />
+                         focusable="false"
+                         aria-hidden="true">
+                        <path d="M12 3.75C14.41 5.61 17.19 6.67 19.5 6.95V11.75C19.5 16.06 16.89 19.11 12 20.75C7.11 19.11 4.5 16.06 4.5 11.75V6.95C6.81 6.67 9.59 5.61 12 3.75Z" />
+                        <path d="M9.35 12.1L11.25 14L14.95 10.3" />
                     </svg>
-                </span>
-            </button>
-            @if (_isAdminMenuOpen)
-            {
-                <div class="app-topnav__menu" role="menu">
-                    <NavLink class="app-topnav__menu-item" href="/admin/schedule-logs" @onclick="CloseAdminMenu">Журнал розкладу</NavLink>
-                    <NavLink class="app-topnav__menu-item" href="/admin/time-slots" @onclick="CloseAdminMenu">Слоти часу</NavLink>
-                    <NavLink class="app-topnav__menu-item" href="/admin/courses" @onclick="CloseAdminMenu">Курси</NavLink>
-                    <NavLink class="app-topnav__menu-item" href="/admin/buildings" @onclick="CloseAdminMenu">Корпуси</NavLink>
-                    <NavLink class="app-topnav__menu-item" href="/admin/rooms" @onclick="CloseAdminMenu">Аудиторії</NavLink>
-                    <NavLink class="app-topnav__menu-item" href="/admin/groups" @onclick="CloseAdminMenu">Групи</NavLink>
-                    <NavLink class="app-topnav__menu-item" href="/admin/lesson-types" @onclick="CloseAdminMenu">Типи занять</NavLink>
-                    <NavLink class="app-topnav__menu-item" href="/admin/modules" @onclick="CloseAdminMenu">Модулі</NavLink>
-                    <NavLink class="app-topnav__menu-item" href="/admin/module-sequence" @onclick="CloseAdminMenu">Послідовності</NavLink>
-                    <NavLink class="app-topnav__menu-item" href="/admin/departments" @onclick="CloseAdminMenu">Кафедри</NavLink>
-                    <NavLink class="app-topnav__menu-item" href="/admin/teachers" @onclick="CloseAdminMenu">Викладачі</NavLink>
-                    <NavLink class="app-topnav__menu-item" href="/admin/calendar" @onclick="CloseAdminMenu">Календар</NavLink>
-                </div>
-            }
+                    <span class="app-navbar__item-text">Адмін</span>
+                    <span class="app-navbar__caret" aria-hidden="true">
+                        <svg viewBox="0 0 12 12"
+                             fill="none"
+                             stroke="currentColor"
+                             stroke-width="1.8"
+                             stroke-linecap="round"
+                             stroke-linejoin="round"
+                             focusable="false">
+                            <path d="M2.25 4.5L6 8.25L9.75 4.5" />
+                        </svg>
+                    </span>
+                </button>
+
+                @if (_isAdminMenuOpen)
+                {
+                    <div class="app-navbar__dropdown-menu" role="menu">
+                        <NavLink class="app-navbar__dropdown-item" href="/admin/schedule-logs" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Журнал розкладу</NavLink>
+                        <NavLink class="app-navbar__dropdown-item" href="/admin/time-slots" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Слоти часу</NavLink>
+                        <NavLink class="app-navbar__dropdown-item" href="/admin/courses" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Курси</NavLink>
+                        <NavLink class="app-navbar__dropdown-item" href="/admin/buildings" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Корпуси</NavLink>
+                        <NavLink class="app-navbar__dropdown-item" href="/admin/rooms" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Аудиторії</NavLink>
+                        <NavLink class="app-navbar__dropdown-item" href="/admin/groups" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Групи</NavLink>
+                        <NavLink class="app-navbar__dropdown-item" href="/admin/lesson-types" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Типи занять</NavLink>
+                        <NavLink class="app-navbar__dropdown-item" href="/admin/modules" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Модулі</NavLink>
+                        <NavLink class="app-navbar__dropdown-item" href="/admin/module-sequence" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Послідовності</NavLink>
+                        <NavLink class="app-navbar__dropdown-item" href="/admin/departments" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Кафедри</NavLink>
+                        <NavLink class="app-navbar__dropdown-item" href="/admin/teachers" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Викладачі</NavLink>
+                        <NavLink class="app-navbar__dropdown-item" href="/admin/calendar" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Календар</NavLink>
+                    </div>
+                }
+            </div>
         </div>
+
+        <div class="app-navbar__spacer" aria-hidden="true"></div>
     </div>
 </nav>
 
 @if (_isAdminMenuOpen)
 {
     <button type="button"
-            class="app-topnav__backdrop"
+            class="app-navbar__backdrop"
             aria-label="Закрити меню Адмін"
             @onclick="CloseAdminMenu"></button>
 }
 
 @code {
+    private static readonly string[] AdminRoutes =
+    [
+        "admin/schedule-logs",
+        "admin/time-slots",
+        "admin/courses",
+        "admin/buildings",
+        "admin/rooms",
+        "admin/groups",
+        "admin/lesson-types",
+        "admin/modules",
+        "admin/module-sequence",
+        "admin/departments",
+        "admin/teachers",
+        "admin/calendar",
+        "admin/lunch"
+    ];
+
     private bool _isAdminMenuOpen;
+
+    private string AdminItemClass =>
+        IsAdminActive || _isAdminMenuOpen
+            ? "app-navbar__item app-navbar__item--dropdown app-navbar__item--active"
+            : "app-navbar__item app-navbar__item--dropdown";
+
+    private bool IsAdminActive => AdminRoutes.Any(IsCurrentRoute);
+
+    protected override void OnInitialized()
+    {
+        NavigationManager.LocationChanged += HandleLocationChanged;
+    }
+
+    public void Dispose()
+    {
+        NavigationManager.LocationChanged -= HandleLocationChanged;
+    }
+
+    private void HandleLocationChanged(object? sender, LocationChangedEventArgs args)
+    {
+        _isAdminMenuOpen = false;
+        _ = InvokeAsync(StateHasChanged);
+    }
 
     private void ToggleAdminMenu()
     {
@@ -456,5 +471,30 @@
     private void CloseAdminMenu()
     {
         _isAdminMenuOpen = false;
+    }
+
+    private bool IsCurrentRoute(string route)
+    {
+        var currentPath = GetCurrentPath();
+        return currentPath.Equals(route, StringComparison.OrdinalIgnoreCase)
+            || currentPath.StartsWith($"{route}/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private string GetCurrentPath()
+    {
+        var currentPath = NavigationManager.ToBaseRelativePath(NavigationManager.Uri);
+        var queryIndex = currentPath.IndexOf('?');
+        if (queryIndex >= 0)
+        {
+            currentPath = currentPath[..queryIndex];
+        }
+
+        var fragmentIndex = currentPath.IndexOf('#');
+        if (fragmentIndex >= 0)
+        {
+            currentPath = currentPath[..fragmentIndex];
+        }
+
+        return currentPath.Trim('/');
     }
 }
