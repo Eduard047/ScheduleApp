@@ -7,4 +7,12 @@
 
 .layout-main {
     flex: 1;
+    padding: 1.35rem 2.2rem 1.8rem;
+    background: #f7f9fd;
+}
+
+@media (max-width: 900px) {
+    .layout-main {
+        padding: 1rem .85rem 1.2rem;
+    }
 }
