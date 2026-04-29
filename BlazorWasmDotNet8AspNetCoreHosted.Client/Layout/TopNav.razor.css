@@ -1,0 +1,265 @@
+.app-navbar {
+    position: sticky;
+    top: 0;
+    z-index: 1100;
+    background: #ffffff;
+    border-bottom: 1px solid #e5e7eb;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
+}
+
+.app-navbar__inner {
+    min-height: 64px;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 0 clamp(1rem, 2.5vw, 2.25rem);
+}
+
+.app-navbar__logo {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-decoration: none;
+}
+
+.app-navbar__logo-mark {
+    width: 44px;
+    height: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 14px;
+    background: linear-gradient(180deg, #2f7bff 0%, #1f6ff2 100%);
+    color: #ffffff;
+    box-shadow: 0 10px 22px rgba(31, 111, 242, 0.18);
+}
+
+.app-navbar__logo-mark svg {
+    width: 26px;
+    height: 26px;
+}
+
+.app-navbar__nav {
+    min-width: 0;
+    flex: 0 1 auto;
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+}
+
+.app-navbar__nav::-webkit-scrollbar {
+    display: none;
+}
+
+.app-navbar ::deep .app-navbar__item {
+    position: relative;
+    flex: 0 0 auto;
+    min-height: 48px;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0 1.2rem;
+    border: 0;
+    border-radius: 16px 16px 0 0;
+    background: transparent;
+    color: #64748b;
+    font-family: "Segoe UI Variable Text", "Segoe UI", "Inter", system-ui, sans-serif;
+    font-size: 1rem;
+    font-weight: 500;
+    line-height: 1;
+    text-decoration: none;
+    white-space: nowrap;
+    transition: background-color 0.18s ease, color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.app-navbar ::deep .app-navbar__item::after {
+    content: "";
+    position: absolute;
+    left: 1rem;
+    right: 1rem;
+    bottom: 0;
+    height: 3px;
+    border-radius: 999px 999px 0 0;
+    background: transparent;
+    transition: background-color 0.18s ease;
+}
+
+.app-navbar ::deep .app-navbar__item:hover {
+    background: #f3f8ff;
+    color: #475569;
+    text-decoration: none;
+}
+
+.app-navbar ::deep .app-navbar__item:focus-visible {
+    outline: 2px solid #9fc2ff;
+    outline-offset: 2px;
+}
+
+.app-navbar ::deep .app-navbar__item-icon {
+    width: 22px;
+    height: 22px;
+    flex-shrink: 0;
+    color: #7a8ca5;
+    transition: color 0.18s ease;
+}
+
+.app-navbar ::deep .app-navbar__item-text {
+    display: inline-flex;
+    align-items: center;
+}
+
+.app-navbar ::deep .app-navbar__item--active {
+    background: #eef5ff;
+    color: #1f6ff2;
+    box-shadow: inset 0 0 0 1px rgba(31, 111, 242, 0.06);
+}
+
+.app-navbar ::deep .app-navbar__item--active::after {
+    background: #1f6ff2;
+}
+
+.app-navbar ::deep .app-navbar__item--dropdown[aria-expanded="true"] {
+    background: #eef5ff;
+    color: #1f6ff2;
+    box-shadow: inset 0 0 0 1px rgba(31, 111, 242, 0.06);
+}
+
+.app-navbar ::deep .app-navbar__item--dropdown[aria-expanded="true"]::after {
+    background: #1f6ff2;
+}
+
+.app-navbar ::deep .app-navbar__item:hover .app-navbar__item-icon,
+.app-navbar ::deep .app-navbar__item--active .app-navbar__item-icon,
+.app-navbar ::deep .app-navbar__item--dropdown[aria-expanded="true"] .app-navbar__item-icon {
+    color: currentColor;
+}
+
+.app-navbar ::deep .app-navbar__item--dropdown {
+    appearance: none;
+    cursor: pointer;
+}
+
+.app-navbar ::deep .app-navbar__admin {
+    position: relative;
+    flex: 0 0 auto;
+    display: flex;
+}
+
+.app-navbar ::deep .app-navbar__caret {
+    width: 0.95rem;
+    height: 0.95rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: #94a3b8;
+    transition: color 0.18s ease, transform 0.18s ease;
+}
+
+.app-navbar ::deep .app-navbar__caret svg {
+    width: 100%;
+    height: 100%;
+}
+
+.app-navbar ::deep .app-navbar__item--dropdown[aria-expanded="true"] .app-navbar__caret,
+.app-navbar ::deep .app-navbar__item--active .app-navbar__caret,
+.app-navbar ::deep .app-navbar__item--dropdown:hover .app-navbar__caret {
+    color: currentColor;
+}
+
+.app-navbar__spacer {
+    flex: 1 1 auto;
+    min-width: 1rem;
+}
+
+.app-navbar ::deep .app-navbar__item--dropdown[aria-expanded="true"] .app-navbar__caret {
+    transform: rotate(180deg);
+}
+
+.app-navbar ::deep .app-navbar__dropdown-menu {
+    position: absolute;
+    top: calc(100% + 0.65rem);
+    right: 0;
+    display: none;
+    flex-direction: column;
+    gap: 0.2rem;
+    padding: 0.5rem;
+    border: 1px solid #e5e7eb;
+    border-radius: 14px;
+    box-shadow: 0 18px 38px rgba(15, 23, 42, 0.12);
+    min-width: 240px;
+    max-height: min(70vh, 480px);
+    overflow-y: auto;
+    background: #ffffff;
+    z-index: 1120;
+}
+
+.app-navbar ::deep .app-navbar__dropdown-menu--open {
+    display: flex;
+}
+
+.app-navbar ::deep .app-navbar__dropdown-item {
+    display: block;
+    border-radius: 10px;
+    color: #475569;
+    font-size: 0.96rem;
+    padding: 0.6rem 0.8rem;
+    text-decoration: none;
+    white-space: nowrap;
+    transition: background-color 0.16s ease, color 0.16s ease;
+}
+
+.app-navbar ::deep .app-navbar__dropdown-item:hover,
+.app-navbar ::deep .app-navbar__dropdown-item:focus {
+    background: #f3f8ff;
+    color: #334155;
+}
+
+.app-navbar ::deep .app-navbar__dropdown-item.active,
+.app-navbar ::deep .app-navbar__dropdown-item:active {
+    background: #eef5ff;
+    color: #1f6ff2;
+}
+
+@media (max-width: 840px) {
+    .app-navbar__inner {
+        gap: 0.85rem;
+        padding: 0 0.9rem;
+    }
+
+    .app-navbar__logo-mark {
+        width: 40px;
+        height: 40px;
+        border-radius: 12px;
+    }
+
+    .app-navbar ::deep .app-navbar__item {
+        min-height: 44px;
+        gap: 0.65rem;
+        padding: 0 0.95rem;
+        font-size: 0.95rem;
+    }
+
+    .app-navbar ::deep .app-navbar__item-icon {
+        width: 20px;
+        height: 20px;
+    }
+}
+
+@media (max-width: 640px) {
+    .app-navbar__inner {
+        gap: 0.7rem;
+    }
+
+    .app-navbar ::deep .app-navbar__item {
+        padding: 0 0.85rem;
+    }
+
+    .app-navbar__spacer {
+        min-width: 0.5rem;
+    }
+}

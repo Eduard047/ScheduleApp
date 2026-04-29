@@ -14,20 +14,6 @@
 @inject IJSRuntime JS
 @inject AdminScheduleLogService LogService
 
-<h3 class="page-title">
-    Графік викладачів <span class="draft-pill">Чернетка</span>
-    <span class="weak">(тиждень @_weekStart.ToString("yyyy-MM-dd"))</span>
-</h3>
-
-<div class="week-nav">
-    <button class="btn btn-ghost" @onclick="PrevWeek">&lt; Попередній тиждень</button>
-    <div class="week-label">
-        @_weekStart.ToDateTime(TimeOnly.MinValue).ToString("d MMMM yyyy", new CultureInfo("uk-UA")) -
-        @_weekStart.AddDays(6).ToDateTime(TimeOnly.MinValue).ToString("d MMMM yyyy", new CultureInfo("uk-UA"))
-    </div>
-    <button class="btn btn-ghost" @onclick="NextWeek">Наступний тиждень &gt;</button>
-</div>
-
 @code {
     [Parameter, SupplyParameterFromQuery(Name = "weekStart")]
     public string? QueryWeekStart { get; set; }
@@ -2687,66 +2673,125 @@ static string CssByCode(string code) => code switch
 
 }
 
-<div class="toolbar">
-    <div class="toolbar-filters">
-        <select class="select select--narrow" @bind="_teacherId">
-            <option value="">Обрати викладача</option>
-            @if (_meta is not null)
-            {
-                foreach (var t in _meta.Teachers)
-                {
-                    <option value="@t.Id">@t.Name</option>
-                }
-            }
-        </select>
-        <select class="select" @bind="_groupId">
-            <option value="">Обрати групу</option>
-            @foreach (var g in CourseScopedGroups())
-            {
-                <option value="@g.Id">@g.Name</option>
-            }
-        </select>
-        <select class="select" @bind="_roomId">
-            <option value="">Обрати аудиторію</option>
-            @if (_meta is not null)
-            {
-                foreach (var r in _meta.Rooms)
-                {
-                    <option value="@r.Id">@r.Name</option>
-                }
-            }
-        </select>
-        <select class="select" @bind="_courseId">
-            <option value="">Обрати курс</option>
-            @if (_meta is not null)
-            {
-                foreach (var c in _meta.Courses)
-                {
-                    <option value="@c.Id">@c.Name</option>
-                }
-            }
-        </select>
-        <input type="date"
-               class="select"
-               value="@_weekStart.ToString("yyyy-MM-dd")"
-               @onchange="e => _weekStart = FirstMonday(DateOnly.Parse((string)e.Value!))" />
-    </div>
-    <div class="toolbar-actions">
-        <button class="btn btn-primary" @onclick="Reload">Оновити</button>
-        <button class="btn btn-ghost" @onclick="ResetFilters">Скинути</button>
-        <button class="btn btn-primary" type="button" @onclick="ExportScheduleAsync" disabled="@_isExporting">
+<div class="teacher-drafts-page">
+<div class="teacher-drafts-headline">
+    <h3 class="page-title">
+        Графік викладачів
+        <span class="draft-pill">Чернетка</span>
+        <span class="week-caption">Тиждень @_weekStart.ToString("yyyy-MM-dd")</span>
+    </h3>
+    <div class="teacher-drafts-headline-actions">
+        <button class="btn btn-excel" type="button" @onclick="ExportScheduleAsync" disabled="@_isExporting">
+            <span class="btn-icon btn-icon--svg" aria-hidden="true">
+                <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M10 3.5V11.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+                    <path d="M6.75 8.75L10 12L13.25 8.75" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+                    <path d="M4.5 14.5H15.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+                    <path d="M6.5 17H13.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+            </span>
             @(_isExporting ? "Генерую Excel..." : "Експорт в Excel")
+        </button>
+        <button class="btn btn-primary btn-publish" @onclick="PublishWeek">
+            <span class="btn-icon" aria-hidden="true">➤</span>
+            Опублікувати тиждень
         </button>
     </div>
 </div>
 
-<div class="actions">
-    <div class="group">
-        <div class="caption">Публікація</div>
-        <div class="row">
-            <button class="btn btn-primary" @onclick="PublishWeek">Опублікувати тиждень у розклад</button>
-        </div>
-        <div class="hint">Публікуються всі чернетки за обраний тиждень (по всіх викладачах).</div>
+<div class="week-nav">
+    <button class="btn btn-ghost week-nav-btn" @onclick="PrevWeek">
+        <span aria-hidden="true">←</span>
+        Попередній тиждень
+    </button>
+    <div class="week-label">
+        <span class="week-label-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <rect x="3.5" y="5.5" width="17" height="15" rx="3" stroke="currentColor" stroke-width="1.8" />
+                <path d="M7.5 3.75V7.25" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+                <path d="M16.5 3.75V7.25" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+                <path d="M3.5 9H20.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+                <path d="M8 12.25H8.01" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
+                <path d="M12 12.25H12.01" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
+                <path d="M16 12.25H16.01" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
+                <path d="M8 16.25H8.01" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
+                <path d="M12 16.25H12.01" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
+            </svg>
+        </span>
+        @_weekStart.ToDateTime(TimeOnly.MinValue).ToString("d MMMM yyyy", new CultureInfo("uk-UA")) -
+        @_weekStart.AddDays(6).ToDateTime(TimeOnly.MinValue).ToString("d MMMM yyyy", new CultureInfo("uk-UA"))
+    </div>
+    <button class="btn btn-ghost week-nav-btn" @onclick="NextWeek">
+        Наступний тиждень
+        <span aria-hidden="true">→</span>
+    </button>
+</div>
+
+<div class="toolbar">
+    <div class="toolbar-filters">
+        <label class="filter-field">
+            <span class="filter-label">Обрати викладача</span>
+            <select class="select select--narrow" @bind="_teacherId">
+                <option value="">Всі викладачі</option>
+                @if (_meta is not null)
+                {
+                    foreach (var t in _meta.Teachers)
+                    {
+                        <option value="@t.Id">@t.Name</option>
+                    }
+                }
+            </select>
+        </label>
+        <label class="filter-field">
+            <span class="filter-label">Обрати групу</span>
+            <select class="select" @bind="_groupId">
+                <option value="">Всі групи</option>
+                @foreach (var g in CourseScopedGroups())
+                {
+                    <option value="@g.Id">@g.Name</option>
+                }
+            </select>
+        </label>
+        <label class="filter-field">
+            <span class="filter-label">Обрати аудиторію</span>
+            <select class="select" @bind="_roomId">
+                <option value="">Всі аудиторії</option>
+                @if (_meta is not null)
+                {
+                    foreach (var r in _meta.Rooms)
+                    {
+                        <option value="@r.Id">@r.Name</option>
+                    }
+                }
+            </select>
+        </label>
+        <label class="filter-field">
+            <span class="filter-label">Обрати курс</span>
+            <select class="select" @bind="_courseId">
+                <option value="">Всі курси</option>
+                @if (_meta is not null)
+                {
+                    foreach (var c in _meta.Courses)
+                    {
+                        <option value="@c.Id">@c.Name</option>
+                    }
+                }
+            </select>
+        </label>
+        <label class="filter-field filter-field--date">
+            <span class="filter-label">Дата</span>
+            <input type="date"
+                   class="select"
+                   value="@_weekStart.ToString("yyyy-MM-dd")"
+                   @onchange="e => _weekStart = FirstMonday(DateOnly.Parse((string)e.Value!))" />
+        </label>
+    </div>
+    <div class="toolbar-actions">
+        <button class="btn btn-primary" @onclick="Reload">
+            <span class="btn-icon" aria-hidden="true">↻</span>
+            Оновити
+        </button>
+        <button class="btn btn-ghost" @onclick="ResetFilters">Скинути</button>
     </div>
 </div>
 
@@ -2908,7 +2953,8 @@ else
                                                     <button type="button"
                                                             class="btn btn-ghost btn-sm td-empty-add"
                                                             @onclick="async () => await StartCreate(dayNumber, slot.Start, slot.End, group.Id)">
-                                                        Додати
+                                                        <span aria-hidden="true">＋</span>
+                                                        <span>Додати</span>
                                                     </button>
                                                 </div>
                                             }
@@ -3412,119 +3458,271 @@ else
     </div>
 }
 
+</div>
+
 <style>
-    .page-title {
-        margin: .5rem 0 1rem;
+    .teacher-drafts-page {
+        display: flex;
+        flex-direction: column;
+        gap: .8rem;
+        color: #1e293b;
+        padding-bottom: .2rem;
     }
-    .page-title .weak {
-        color: #64748b;
-        font-weight: 400;
+    .teacher-drafts-headline {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: .75rem;
+        flex-wrap: wrap;
+    }
+    .page-title {
+        margin: .1rem 0 0;
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: .55rem;
+        font-size: clamp(1.55rem, 2.35vw, 1.75rem);
+        font-weight: 650;
+        line-height: 1.08;
+        letter-spacing: -.02em;
+        color: #1e293b;
     }
     .draft-pill {
         display: inline-flex;
         align-items: center;
-        margin-left: .4rem;
-        padding: .18rem .6rem;
+        padding: .28rem .75rem;
         border-radius: 999px;
-        background: #fef3c7;
-        color: #92400e;
+        background: #fff1db;
+        color: #b45309;
         font-weight: 700;
-        font-size: .78rem;
+        font-size: .82rem;
         text-transform: uppercase;
-        letter-spacing: .02em;
+        letter-spacing: .04em;
+    }
+    .week-caption {
+        color: #2563eb;
+        font-size: clamp(1.08rem, 1.9vw, 1.28rem);
+        font-weight: 500;
+        letter-spacing: -.015em;
+    }
+    .teacher-drafts-headline-actions {
+        display: flex;
+        align-items: center;
+        gap: .65rem;
+        flex-wrap: wrap;
+    }
+    .btn {
+        border-radius: 12px;
+        border: 1px solid transparent;
+        cursor: pointer;
+        font-weight: 600;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: .5rem;
+        padding: .58rem 1.1rem;
+        min-height: 44px;
+        font-size: .95rem;
+        transition: background-color .18s ease, border-color .18s ease, color .18s ease, box-shadow .18s ease;
+    }
+    .btn:disabled {
+        cursor: not-allowed;
+        opacity: .65;
+    }
+    .btn-icon {
+        font-size: .92rem;
+        line-height: 1;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex: 0 0 auto;
+    }
+    .btn-icon--svg {
+        line-height: 0;
+    }
+    .btn-icon--svg svg {
+        width: 1.05rem;
+        height: 1.05rem;
+        display: block;
+    }
+    .btn-primary {
+        background: #1d4ed8;
+        border-color: #1d4ed8;
+        color: #fff;
+    }
+    .btn-primary:hover:not(:disabled) {
+        background: #1e40af;
+        border-color: #1e40af;
+    }
+    .btn-ghost {
+        background: #fff;
+        color: #64748b;
+        border-color: #d7deea;
+    }
+    .btn-ghost:hover:not(:disabled) {
+        color: #1e293b;
+        border-color: #c5d0e0;
+        background: #f8fafc;
+    }
+    .btn-excel {
+        background: #fff;
+        color: #1d4ed8;
+        border-color: #9fbefa;
+    }
+    .btn-excel:hover:not(:disabled) {
+        background: #eff6ff;
+        border-color: #7ea8f8;
+    }
+    .btn-publish {
+        min-width: 250px;
+    }
+    .btn-sm {
+        min-height: auto;
+        padding: .38rem .68rem;
+        border-radius: 9px;
+        font-size: .8rem;
+    }
+    .week-nav {
+        display: grid;
+        grid-template-columns: minmax(180px, auto) 1fr minmax(180px, auto);
+        align-items: center;
+        gap: .75rem;
+        background: #fff;
+        border: 1px solid #dbe2ee;
+        border-radius: 14px;
+        padding: .82rem 1rem;
+    }
+    .week-nav-btn {
+        min-width: 190px;
+    }
+    .week-label {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: .5rem;
+        font-size: clamp(1.15rem, 2vw, 1.4rem);
+        font-weight: 650;
+        line-height: 1.12;
+        color: #1e293b;
+        text-align: center;
+    }
+    .week-label-icon {
+        color: #2563eb;
+        width: 1.15rem;
+        height: 1.15rem;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex: 0 0 auto;
+        line-height: 0;
+    }
+    .week-label-icon svg {
+        width: 100%;
+        height: 100%;
+        display: block;
     }
     .toolbar {
         display: grid;
-        grid-template-columns: 1fr auto;
-        gap: .5rem;
-        align-items: center;
-        margin-bottom: 12px;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: .85rem;
+        align-items: end;
+        background: #fff;
+        border: 1px solid #dbe2ee;
+        border-radius: 14px;
+        padding: 1rem 1.05rem;
     }
     .toolbar-filters {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+        gap: .75rem;
+        align-items: end;
+    }
+    .filter-field {
         display: flex;
-        flex-wrap: wrap;
-        gap: .5rem;
-        align-items: center;
+        flex-direction: column;
+        gap: .28rem;
+        min-width: 0;
+    }
+    .filter-label {
+        color: #64748b;
+        font-size: .84rem;
+        font-weight: 500;
+    }
+    .select {
+        min-width: 0;
+        width: 100%;
+        min-height: 44px;
+        padding: .5rem .8rem;
+        border: 1px solid #d7deea;
+        border-radius: 11px;
+        background: #fff;
+        color: #334155;
+        font-size: .95rem;
+    }
+    .select:focus {
+        outline: none;
+        border-color: #60a5fa;
+        box-shadow: 0 0 0 3px rgba(37, 99, 235, .12);
+    }
+    .select--narrow {
+        max-width: none;
+        width: 100%;
+    }
+    .filter-field--date .select {
+        min-width: 160px;
     }
     .toolbar-actions {
         display: flex;
-        align-items: center;
-        gap: .5rem;
-        flex-wrap: nowrap;
-        justify-content: flex-end;
+        align-items: end;
+        gap: .6rem;
     }
-    .select {
-        min-width: 160px;
-        padding: .46rem .6rem;
-        border: 1px solid #dfe3e8;
-        border-radius: 10px;
-        background: #fff;
+    .toolbar-actions .btn {
+        min-width: 122px;
     }
-    .select--narrow {
-        width: 240px;
-        max-width: 240px;
+    @@media (max-width: 1380px) {
+        .page-title {
+            font-size: 1.65rem;
+        }
+        .week-caption {
+            font-size: 1.12rem;
+        }
+        .week-label {
+            font-size: 1.22rem;
+        }
     }
-    .toolbar .select {
-        height: 44px;
-    }
-    .toolbar .btn {
-        height: 44px;
-        display: inline-flex;
-        align-items: center;
-    }
-    @@media (max-width: 1100px) {
+    @@media (max-width: 1180px) {
+        .week-nav {
+            grid-template-columns: 1fr;
+        }
+        .week-nav-btn {
+            width: 100%;
+            min-width: 0;
+        }
         .toolbar {
             grid-template-columns: 1fr;
         }
         .toolbar-actions {
-            justify-content: flex-start;
+            width: 100%;
+            justify-content: flex-end;
         }
     }
-    .actions {
-        display: flex;
-        flex-direction: column;
-        gap: 10px;
-        margin-bottom: 12px;
-    }
-    .actions .group {
-        background: #fff;
-        border: 1px solid #e5e7eb;
-        border-radius: 12px;
-        padding: 10px 12px;
-    }
-    .actions .caption {
-        font-weight: 700;
-        margin-bottom: .35rem;
-    }
-    .actions .row {
-        display: flex;
-        gap: .5rem;
-        align-items: center;
-        flex-wrap: wrap;
-    }
-    .actions .hint {
-        color: #64748b;
-        font-size: .875rem;
-    }
-    .btn {
-        padding: .5rem .9rem;
-        border-radius: 10px;
-        border: 1px solid transparent;
-        cursor: pointer;
-        font-weight: 600;
-    }
-    .btn-primary {
-        background: #111827;
-        color: #fff;
-    }
-    .btn-ghost {
-        background: #fff;
-        color: #111827;
-        border-color: #d1d5db;
-    }
-    .btn-sm {
-        padding: .2rem .5rem;
-        font-size: .85rem;
+    @@media (max-width: 900px) {
+        .teacher-drafts-headline-actions {
+            width: 100%;
+        }
+        .teacher-drafts-headline-actions .btn {
+            flex: 1 1 210px;
+        }
+        .btn-publish {
+            min-width: 0;
+        }
+        .toolbar-actions {
+            justify-content: stretch;
+        }
+        .toolbar-actions .btn {
+            flex: 1 1 120px;
+            min-width: 0;
+        }
     }
     .td-slot-mode {
         display: inline-flex;
@@ -3550,9 +3748,9 @@ else
         color: #6b7280;
     }
     .alert {
-        margin: 8px 0;
-        padding: 10px 12px;
-        border-radius: 10px;
+        margin: 2px 0;
+        padding: .72rem .9rem;
+        border-radius: 12px;
     }
     .alert-ok {
         background: #ecfdf5;
@@ -3607,42 +3805,40 @@ else
         color: #64748b;
     }
     .teacher-drafts-grid-shell {
-        width: calc(100% + 1rem);
-        max-width: none;
-        margin-left: -.5rem;
-        margin-right: -.5rem;
         display: flex;
         flex-direction: column;
+        background: transparent;
     }
     .teacher-drafts-print-header {
         text-align: center;
-        margin: 1.2rem 0 .5rem;
-        padding: 0 .5rem;
+        margin: .35rem 0 .25rem;
     }
     .teacher-drafts-print-title {
         text-transform: uppercase;
-        font-weight: 700;
-        font-size: 1.05rem;
+        font-weight: 600;
+        font-size: 1.35rem;
+        color: #1e293b;
     }
     .teacher-drafts-print-dates {
-        color: #475569;
-        font-size: .85rem;
+        color: #64748b;
+        font-size: .95rem;
         margin-top: .15rem;
     }
     .teacher-drafts-table-wrapper {
-        --td-day-col-width: 160px;
-        --td-slot-col-width: 125px;
+        --td-day-col-width: 140px;
+        --td-slot-col-width: 108px;
         overflow: auto;
-        max-height: clamp(420px, 72vh, 920px);
+        max-height: clamp(440px, 76vh, 940px);
         min-height: 320px;
         overscroll-behavior: auto;
         scrollbar-gutter: stable both-edges;
-        border: 1px solid #e2e8f0;
-        border-radius: 10px;
-        background: #f8fafc;
-        padding: 0 .25rem .25rem;
+        border: 1px solid #dbe2ee;
+        border-radius: 14px;
+        background: #fff;
+        padding: 0;
         position: relative;
         isolation: isolate;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
         margin-bottom: 0;
     }
     .teacher-drafts-table {
@@ -3650,34 +3846,35 @@ else
         min-width: 100%;
         border-collapse: collapse;
         table-layout: fixed;
-        font-size: .9rem;
+        font-size: .96rem;
         background: #fff;
     }
     .teacher-drafts-table th,
     .teacher-drafts-table td {
-        border: 1px solid #d9e2ec;
-        padding: .55rem;
+        border: 1px solid #e2e8f0;
+        padding: .5rem;
         vertical-align: top;
         background: #fff;
     }
     .teacher-drafts-table th {
-        background: #f8fafc;
+        background: #f4f6fa;
         text-align: center;
         font-weight: 700;
-        font-size: .85rem;
+        font-size: .92rem;
+        color: #1e293b;
     }
     .teacher-drafts-table thead {
         position: sticky;
         top: 0;
         z-index: 20;
-        background: #f8fafc;
-        box-shadow: inset 0 -1px 0 #d9e2ec;
+        background: #f4f6fa;
+        box-shadow: inset 0 -1px 0 #e2e8f0;
     }
     .teacher-drafts-table thead::before {
         content: "";
         position: absolute;
         inset: 0;
-        background: #f8fafc;
+        background: #f4f6fa;
         z-index: 0;
         pointer-events: none;
     }
@@ -3687,14 +3884,14 @@ else
     .teacher-drafts-table thead th {
         position: relative;
         z-index: 1;
-        background: #f8fafc;
+        background: #f4f6fa;
         background-clip: padding-box;
     }
     .td-group-col {
         font-weight: 600;
         text-align: center;
-        min-width: 250px;
-        width: 250px;
+        min-width: 220px;
+        width: 220px;
     }
     .td-day-col {
         width: var(--td-day-col-width);
@@ -3717,15 +3914,15 @@ else
     .teacher-drafts-table thead .td-day-col,
     .teacher-drafts-table thead .td-slot-col {
         z-index: 21;
-        background: #f8fafc;
+        background: #f4f6fa;
     }
     .teacher-drafts-table tbody .td-day-col,
     .teacher-drafts-table tbody .td-slot-col {
-        box-shadow: 1px 0 0 #d9e2ec;
+        box-shadow: 1px 0 0 #e2e8f0;
     }
     .td-cell {
-        min-width: 250px;
-        width: 250px;
+        min-width: 220px;
+        width: 220px;
         background: #fff;
         overflow-x: hidden;
         overflow-y: visible;
@@ -3736,16 +3933,17 @@ else
     }
     .td-day-cell,
     .td-slot-cell {
-        background: #f1f5f9;
+        background: #f8fafc;
         text-align: center;
     }
     .td-day-name {
         font-weight: 700;
+        font-size: .9rem;
         user-select: none;
         -webkit-user-select: none;
     }
     .td-day-date {
-        font-size: .78rem;
+        font-size: .72rem;
         color: #64748b;
         user-select: none;
         -webkit-user-select: none;
@@ -3754,11 +3952,12 @@ else
         user-select: none;
         -webkit-user-select: none;
         font-weight: 700;
+        font-size: .88rem;
     }
     .td-slot-time {
         user-select: none;
         -webkit-user-select: none;
-        font-size: .78rem;
+        font-size: .72rem;
         color: #64748b;
     }
     .td-merged-groups {
@@ -3769,11 +3968,11 @@ else
         font-weight: 600;
     }
     .td-cell-body {
-        min-height: 120px;
+        min-height: 72px;
         display: flex;
         flex-direction: column;
-        gap: .35rem;
-        padding: .4rem;
+        gap: .28rem;
+        padding: .38rem;
         border-radius: 10px;
         border: 1px solid transparent;
         background: #fff;
@@ -3785,11 +3984,10 @@ else
     .td-cell-body > * { min-width: 0; }
     .td-cell-body--empty {
         justify-content: center;
-        align-items: center;
+        align-items: stretch;
         color: #94a3b8;
-        border: 1px dashed #cbd5f5;
-        background: #f8fafc;
-        font-style: italic;
+        border: 1px dashed #d9e2ec;
+        background: #fff;
     }
     .td-cell-body--c1  { border-color: #9dcfff; background: #c9e6ff; }
     .td-cell-body--c2  { border-color: #8feabc; background: #b6f4d2; }
@@ -3844,17 +4042,17 @@ else
     }
     .td-cell-drag-handle {
         position: absolute;
-        top: 6px;
-        right: 6px;
-        width: 26px;
-        height: 26px;
+        top: 4px;
+        right: 4px;
+        width: 24px;
+        height: 24px;
         display: flex;
         align-items: center;
         justify-content: center;
         border-radius: 6px;
         border: 1px solid #cbd5f5;
         background: rgba(241, 245, 249, .9);
-        font-size: .85rem;
+        font-size: .78rem;
         font-weight: 700;
         color: #1f2937;
         cursor: grab;
@@ -3866,19 +4064,19 @@ else
     .td-cell-title {
         font-weight: 600;
         text-transform: uppercase;
-        font-size: .9rem;
+        font-size: .8rem;
         line-height: 1.2;
         word-break: break-word;
         overflow-wrap: anywhere;
     }
     .td-cell-course {
         font-weight: 500;
-        font-size: .78rem;
+        font-size: .72rem;
         margin-top: .1rem;
     }
     .td-cell-teacher {
         font-weight: 500;
-        font-size: .85rem;
+        font-size: .78rem;
         word-break: break-word;
         overflow-wrap: anywhere;
         display: flex;
@@ -3886,27 +4084,27 @@ else
         gap: 2px;
     }
     .td-cell-meta {
-        font-size: .78rem;
+        font-size: .72rem;
         color: #475569;
         display: flex;
         flex-wrap: wrap;
-        gap: .35rem;
+        gap: .25rem;
     }
     .td-cell-meta span {
         word-break: break-word;
         overflow-wrap: anywhere;
     }
     .td-cell-flag {
-        margin-top: .4rem;
+        margin-top: .28rem;
         display: inline-block;
-        padding: .2rem .6rem;
-        font-size: .7rem;
+        padding: .16rem .46rem;
+        font-size: .64rem;
         font-weight: 600;
         color: #0369a1;
         background: rgba(14, 165, 233, .16);
         border-radius: 999px;
     }
-    .td-cell-warning { font-size: .75rem; color: #b45309; }
+    .td-cell-warning { font-size: .7rem; color: #b45309; }
     .td-cell-footer {
         margin-top: auto;
         display: flex;
@@ -3914,22 +4112,31 @@ else
         align-items: center;
         gap: .4rem;
     }
-    .td-cell-actions { display: flex; justify-content: flex-end; gap: 8px; }
-    .td-empty { font-weight: 500; user-select: none; -webkit-user-select: none; }
+    .td-cell-actions { display: flex; justify-content: flex-end; gap: 6px; }
+    .td-empty {
+        font-weight: 500;
+        font-style: italic;
+        user-select: none;
+        -webkit-user-select: none;
+    }
     .td-empty-box {
         display: flex;
-        flex-direction: column;
         align-items: center;
-        gap: 6px;
+        justify-content: space-between;
+        gap: .9rem;
         color: #94a3b8;
+        width: 100%;
     }
     .td-empty-add {
-        padding: .3rem .7rem;
-        border-color: #d1d5db;
-        color: #1f2937;
+        min-height: 40px;
+        min-width: 112px;
+        padding: .4rem .9rem;
+        border-color: #d9e2ec;
+        color: #2563eb;
         background: #fff;
+        font-weight: 600;
     }
-    .td-empty-add:hover { background: #f8fafc; }
+    .td-empty-add:hover { background: #f8fafc; border-color: #bfdbfe; color: #1d4ed8; }
     .badge {
         display: inline-block;
         padding: 2px 8px;
@@ -3942,19 +4149,10 @@ else
     }
     .badge-draft { background: #f1f5f9; color: #475569; }
     .badge-published { background: #ecfdf5; border-color: #bbf7d0; color: #047857; }
-    .week-nav {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 14px;
-        margin-top: 18px;
-        padding: 14px;
-        background: #fff;
-        border: 1px solid #e5e7eb;
-        border-radius: 16px;
-    }
-    .week-label { color: #475569; font-weight: 600; }
     .editor-overlay {
+        --editor-overlay-pad-top: 72px;
+        --editor-overlay-pad-side: 24px;
+        --editor-overlay-pad-bottom: 24px;
         position: fixed;
         inset: 0;
         background: rgba(15, 23, 42, .45);
@@ -3962,8 +4160,11 @@ else
         display: flex;
         align-items: flex-start;
         justify-content: center;
-        padding: 72px 24px 24px;
+        padding: var(--editor-overlay-pad-top) var(--editor-overlay-pad-side) var(--editor-overlay-pad-bottom);
+        box-sizing: border-box;
+        overflow-x: hidden;
         overflow-y: auto;
+        scrollbar-gutter: stable both-edges;
         z-index: 2400;
     }
     .editor {
@@ -3977,9 +4178,11 @@ else
         margin-top: 0;
         width: min(1100px, 100%);
         box-shadow: 0 20px 50px rgba(15, 23, 42, .25);
-        max-height: calc(100vh - 80px);
+        max-height: calc(100vh - var(--editor-overlay-pad-top) - var(--editor-overlay-pad-bottom));
+        max-height: calc(100dvh - var(--editor-overlay-pad-top) - var(--editor-overlay-pad-bottom));
         overflow-y: auto;
         position: relative;
+        margin-inline: auto;
     }
     .editor-modal-head {
         display: flex;
@@ -4217,24 +4420,43 @@ else
     .td-slot-issue-title { font-weight: 600; margin-bottom: 2px; }
     .td-slot-issue-text  { font-size: .78rem; line-height: 1.3; }
     .unrestricted-toggle {
-        margin: 16px 0;
-        padding: 12px;
-        border: 1px solid #fcd34d;
-        background: #fffbeb;
+        margin: 0;
+        padding: 10px 14px;
+        border: 1px solid #f3d39c;
+        background: #fffaf0;
         border-radius: 12px;
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
+        display: grid;
+        grid-template-columns: auto 1fr;
+        column-gap: 10px;
+        row-gap: 3px;
+        align-items: start;
+    }
+    .unrestricted-toggle::before {
+        content: "⚠";
+        color: #d97706;
+        font-size: 1.2rem;
+        line-height: 1;
+        margin-top: 2px;
     }
     .unrestricted-check {
+        grid-column: 2;
         display: inline-flex;
         align-items: center;
-        gap: 8px;
+        gap: 6px;
         font-weight: 600;
+        font-size: .95rem;
         color: #92400e;
     }
-    .unrestricted-check input { width: 20px; height: 20px; }
-    .unrestricted-hint { font-size: .82rem; color: #b45309; }
+    .unrestricted-check input {
+        width: 16px;
+        height: 16px;
+        accent-color: #f59e0b;
+    }
+    .unrestricted-hint {
+        grid-column: 2;
+        font-size: .8rem;
+        color: #b45309;
+    }
     .td-slot-alert {
         padding: 12px;
         gap: 10px;
