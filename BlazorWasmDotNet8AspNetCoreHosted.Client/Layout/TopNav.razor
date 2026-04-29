@@ -48,11 +48,18 @@
 
     .app-navbar__nav {
         min-width: 0;
+        flex: 0 1 auto;
         display: flex;
         align-items: center;
         gap: 0.45rem;
         flex-wrap: nowrap;
-        overflow: visible;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-width: none;
+    }
+
+    .app-navbar__nav::-webkit-scrollbar {
+        display: none;
     }
 
     .app-navbar__item {
@@ -178,7 +185,7 @@
         position: absolute;
         top: calc(100% + 0.65rem);
         right: 0;
-        display: flex;
+        display: none;
         flex-direction: column;
         gap: 0.2rem;
         padding: 0.5rem;
@@ -190,6 +197,10 @@
         overflow-y: auto;
         background: #ffffff;
         z-index: 1120;
+    }
+
+    .app-navbar__dropdown-menu--open {
+        display: flex;
     }
 
     .app-navbar__dropdown-item {
@@ -355,56 +366,53 @@
                 </svg>
                 <span class="app-navbar__item-text">Редактор розкладу</span>
             </NavLink>
+        </div>
 
-            <div class="app-navbar__admin">
-                <button type="button"
-                        class="@AdminItemClass"
-                        @onclick="ToggleAdminMenu"
-                        aria-expanded="@_isAdminMenuOpen"
-                        aria-haspopup="menu">
-                    <svg class="app-navbar__item-icon"
-                         viewBox="0 0 24 24"
+        <div class="app-navbar__admin">
+            <button type="button"
+                    class="@AdminItemClass"
+                    @onclick="ToggleAdminMenu"
+                    aria-expanded="@AdminMenuExpanded"
+                    aria-haspopup="menu">
+                <svg class="app-navbar__item-icon"
+                     viewBox="0 0 24 24"
+                     fill="none"
+                     stroke="currentColor"
+                     stroke-width="1.85"
+                     stroke-linecap="round"
+                     stroke-linejoin="round"
+                     focusable="false"
+                     aria-hidden="true">
+                    <path d="M12 3.75C14.41 5.61 17.19 6.67 19.5 6.95V11.75C19.5 16.06 16.89 19.11 12 20.75C7.11 19.11 4.5 16.06 4.5 11.75V6.95C6.81 6.67 9.59 5.61 12 3.75Z" />
+                    <path d="M9.35 12.1L11.25 14L14.95 10.3" />
+                </svg>
+                <span class="app-navbar__item-text">Адмін</span>
+                <span class="app-navbar__caret" aria-hidden="true">
+                    <svg viewBox="0 0 12 12"
                          fill="none"
                          stroke="currentColor"
-                         stroke-width="1.85"
+                         stroke-width="1.8"
                          stroke-linecap="round"
                          stroke-linejoin="round"
-                         focusable="false"
-                         aria-hidden="true">
-                        <path d="M12 3.75C14.41 5.61 17.19 6.67 19.5 6.95V11.75C19.5 16.06 16.89 19.11 12 20.75C7.11 19.11 4.5 16.06 4.5 11.75V6.95C6.81 6.67 9.59 5.61 12 3.75Z" />
-                        <path d="M9.35 12.1L11.25 14L14.95 10.3" />
+                         focusable="false">
+                        <path d="M2.25 4.5L6 8.25L9.75 4.5" />
                     </svg>
-                    <span class="app-navbar__item-text">Адмін</span>
-                    <span class="app-navbar__caret" aria-hidden="true">
-                        <svg viewBox="0 0 12 12"
-                             fill="none"
-                             stroke="currentColor"
-                             stroke-width="1.8"
-                             stroke-linecap="round"
-                             stroke-linejoin="round"
-                             focusable="false">
-                            <path d="M2.25 4.5L6 8.25L9.75 4.5" />
-                        </svg>
-                    </span>
-                </button>
+                </span>
+            </button>
 
-                @if (_isAdminMenuOpen)
-                {
-                    <div class="app-navbar__dropdown-menu" role="menu">
-                        <NavLink class="app-navbar__dropdown-item" href="/admin/schedule-logs" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Журнал розкладу</NavLink>
-                        <NavLink class="app-navbar__dropdown-item" href="/admin/time-slots" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Слоти часу</NavLink>
-                        <NavLink class="app-navbar__dropdown-item" href="/admin/courses" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Курси</NavLink>
-                        <NavLink class="app-navbar__dropdown-item" href="/admin/buildings" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Корпуси</NavLink>
-                        <NavLink class="app-navbar__dropdown-item" href="/admin/rooms" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Аудиторії</NavLink>
-                        <NavLink class="app-navbar__dropdown-item" href="/admin/groups" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Групи</NavLink>
-                        <NavLink class="app-navbar__dropdown-item" href="/admin/lesson-types" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Типи занять</NavLink>
-                        <NavLink class="app-navbar__dropdown-item" href="/admin/modules" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Модулі</NavLink>
-                        <NavLink class="app-navbar__dropdown-item" href="/admin/module-sequence" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Послідовності</NavLink>
-                        <NavLink class="app-navbar__dropdown-item" href="/admin/departments" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Кафедри</NavLink>
-                        <NavLink class="app-navbar__dropdown-item" href="/admin/teachers" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Викладачі</NavLink>
-                        <NavLink class="app-navbar__dropdown-item" href="/admin/calendar" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Календар</NavLink>
-                    </div>
-                }
+            <div class="@AdminMenuClass" role="menu" aria-hidden="@AdminMenuHidden">
+                <NavLink class="app-navbar__dropdown-item" href="/admin/schedule-logs" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Журнал розкладу</NavLink>
+                <NavLink class="app-navbar__dropdown-item" href="/admin/time-slots" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Слоти часу</NavLink>
+                <NavLink class="app-navbar__dropdown-item" href="/admin/courses" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Курси</NavLink>
+                <NavLink class="app-navbar__dropdown-item" href="/admin/buildings" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Корпуси</NavLink>
+                <NavLink class="app-navbar__dropdown-item" href="/admin/rooms" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Аудиторії</NavLink>
+                <NavLink class="app-navbar__dropdown-item" href="/admin/groups" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Групи</NavLink>
+                <NavLink class="app-navbar__dropdown-item" href="/admin/lesson-types" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Типи занять</NavLink>
+                <NavLink class="app-navbar__dropdown-item" href="/admin/modules" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Модулі</NavLink>
+                <NavLink class="app-navbar__dropdown-item" href="/admin/module-sequence" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Послідовності</NavLink>
+                <NavLink class="app-navbar__dropdown-item" href="/admin/departments" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Кафедри</NavLink>
+                <NavLink class="app-navbar__dropdown-item" href="/admin/teachers" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Викладачі</NavLink>
+                <NavLink class="app-navbar__dropdown-item" href="/admin/calendar" Match="NavLinkMatch.All" @onclick="CloseAdminMenu">Календар</NavLink>
             </div>
         </div>
 
@@ -444,6 +452,15 @@
         IsAdminActive || _isAdminMenuOpen
             ? "app-navbar__item app-navbar__item--dropdown app-navbar__item--active"
             : "app-navbar__item app-navbar__item--dropdown";
+
+    private string AdminMenuClass =>
+        _isAdminMenuOpen
+            ? "app-navbar__dropdown-menu app-navbar__dropdown-menu--open"
+            : "app-navbar__dropdown-menu";
+
+    private string AdminMenuExpanded => _isAdminMenuOpen ? "true" : "false";
+
+    private string AdminMenuHidden => _isAdminMenuOpen ? "false" : "true";
 
     private bool IsAdminActive => AdminRoutes.Any(IsCurrentRoute);
 

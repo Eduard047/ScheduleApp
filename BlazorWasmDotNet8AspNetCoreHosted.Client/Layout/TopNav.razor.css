@@ -42,9 +42,11 @@
 
 .app-navbar__nav {
     min-width: 0;
+    flex: 0 1 auto;
     display: flex;
     align-items: center;
     gap: 0.45rem;
+    flex-wrap: nowrap;
     overflow-x: auto;
     overflow-y: hidden;
     scrollbar-width: none;
@@ -142,6 +144,12 @@
     cursor: pointer;
 }
 
+.app-navbar ::deep .app-navbar__admin {
+    position: relative;
+    flex: 0 0 auto;
+    display: flex;
+}
+
 .app-navbar ::deep .app-navbar__caret {
     width: 0.95rem;
     height: 0.95rem;
@@ -173,19 +181,35 @@
 }
 
 .app-navbar ::deep .app-navbar__dropdown-menu {
-    margin-top: 0.7rem;
+    position: absolute;
+    top: calc(100% + 0.65rem);
+    right: 0;
+    display: none;
+    flex-direction: column;
+    gap: 0.2rem;
     padding: 0.5rem;
     border: 1px solid #e5e7eb;
     border-radius: 14px;
     box-shadow: 0 18px 38px rgba(15, 23, 42, 0.12);
     min-width: 240px;
+    max-height: min(70vh, 480px);
+    overflow-y: auto;
+    background: #ffffff;
+    z-index: 1120;
+}
+
+.app-navbar ::deep .app-navbar__dropdown-menu--open {
+    display: flex;
 }
 
 .app-navbar ::deep .app-navbar__dropdown-item {
+    display: block;
     border-radius: 10px;
     color: #475569;
     font-size: 0.96rem;
     padding: 0.6rem 0.8rem;
+    text-decoration: none;
+    white-space: nowrap;
     transition: background-color 0.16s ease, color 0.16s ease;
 }
 
