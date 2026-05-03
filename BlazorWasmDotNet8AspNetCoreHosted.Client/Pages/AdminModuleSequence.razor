@@ -330,8 +330,8 @@ else
     private List<ModuleEditDto> CourseModules()
         => modules
             .Where(m => m.Id.HasValue && ModuleBelongsToCourse(m, _selectedCourseId))
-            .OrderBy(m => string.IsNullOrWhiteSpace(m.Code) ? m.Title : m.Code)
-            .ThenBy(m => m.Title)
+            .OrderBy(m => string.IsNullOrWhiteSpace(m.Code) ? m.Title : m.Code, NaturalStringComparer.CurrentCultureIgnoreCase)
+            .ThenBy(m => m.Title, StringComparer.CurrentCultureIgnoreCase)
             .ToList();
     // Повертає список курсів, пов'язаних із модулем.
     private static List<int> ModuleCourseIds(ModuleEditDto module)

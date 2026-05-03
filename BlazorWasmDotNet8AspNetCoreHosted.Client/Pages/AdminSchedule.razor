@@ -908,8 +908,8 @@ else
         }
         var modules = meta.Modules
             .Where(m => m.CourseId == courseId || m.CourseIds.Contains(courseId))
-            .OrderBy(m => m.Code)
-            .ThenBy(m => m.Name)
+            .OrderBy(m => m.Code, NaturalStringComparer.CurrentCultureIgnoreCase)
+            .ThenBy(m => m.Name, StringComparer.CurrentCultureIgnoreCase)
             .Select(m => new ModuleWeekRow(m.Id, $"{m.Code} — {m.Name}"))
             .ToList();
         _moduleWeekRows.AddRange(modules);

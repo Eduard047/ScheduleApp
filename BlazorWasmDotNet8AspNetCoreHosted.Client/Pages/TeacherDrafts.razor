@@ -3134,7 +3134,7 @@ else
                     <label>Модуль</label>
                     <select class="select" @onchange="OnBulkModuleChanged">
                         <option value="" selected="@(_bulkModuleId is null)">Без змін</option>
-                        @foreach (var module in _meta.Modules.OrderBy(m => m.Code, StringComparer.CurrentCultureIgnoreCase).ThenBy(m => m.Name, StringComparer.CurrentCultureIgnoreCase))
+                        @foreach (var module in _meta.Modules.OrderBy(m => m.Code, NaturalStringComparer.CurrentCultureIgnoreCase).ThenBy(m => m.Name, StringComparer.CurrentCultureIgnoreCase))
                         {
                             <option value="@module.Id" selected="@(_bulkModuleId == module.Id)">@ModuleOptionCaption(module)</option>
                         }

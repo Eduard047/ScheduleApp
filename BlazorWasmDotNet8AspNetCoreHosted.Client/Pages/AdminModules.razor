@@ -1243,8 +1243,8 @@ private string plansModuleCode = "";
         {
             (nameof(ModuleEditDto.Id), true) => seq.OrderBy(x => x.Id ?? 0),
             (nameof(ModuleEditDto.Id), false) => seq.OrderByDescending(x => x.Id ?? 0),
-            (nameof(ModuleEditDto.Code), true) => seq.OrderBy(x => x.Code),
-            (nameof(ModuleEditDto.Code), false) => seq.OrderByDescending(x => x.Code),
+            (nameof(ModuleEditDto.Code), true) => seq.OrderBy(x => x.Code, NaturalStringComparer.CurrentCultureIgnoreCase),
+            (nameof(ModuleEditDto.Code), false) => seq.OrderByDescending(x => x.Code, NaturalStringComparer.CurrentCultureIgnoreCase),
             (nameof(ModuleEditDto.Title), true) => seq.OrderBy(x => x.Title),
             (nameof(ModuleEditDto.Title), false) => seq.OrderByDescending(x => x.Title),
             (nameof(ModuleEditDto.Credits), true) => seq.OrderBy(x => x.Credits),
