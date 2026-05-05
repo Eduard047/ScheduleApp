@@ -843,7 +843,7 @@ public sealed class TeacherDraftsAutogenService
         var topicsExhaustedNotified = new HashSet<(int GroupId, int ModuleId)>();
         var missingModulesNotified = new HashSet<int>();
         int created = 0, skipped = 0;
-        const int maxEmergencySingletonSharedLectures = 3;
+        const int maxEmergencySingletonSharedLectures = 0;
         var emergencySingletonSharedLecturesCreated = 0;
         int incompleteDraftsCreated = 0, incompleteMissingTeacherCount = 0, incompleteMissingRoomCount = 0, incompleteMissingBothCount = 0;
         // Збираємо попередження та деталі прогалин.
@@ -1337,6 +1337,8 @@ public sealed class TeacherDraftsAutogenService
             hasModuleHourOverrides && moduleHoursByModuleId.TryGetValue(mid, out var hours)
                 ? Math.Max(0, hours - CurrentRangeFactFor(gid, mid))
                 : RemainingFor(gid, mid);
+        int PlacementRemainingFor(int gid, int mid) =>
+            RemainingFor(gid, mid);
         // Доступ до залишків самостійної роботи.
         int SelfStudyRemaining(int gid, int mid) =>
             selfStudyRemainingByGroupModule.TryGetValue((gid, mid), out var left) ? left : 0;
@@ -1505,7 +1507,7 @@ public sealed class TeacherDraftsAutogenService
             {
                 var pendingGroups = sameCourseGroups
                     .Where(group => group.Id != groupIdCheck
-                                    && RemainingFor(group.Id, moduleIdCheck) > 0
+                                    && PlacementRemainingFor(group.Id, moduleIdCheck) > 0
                                     && IsTopicStillPendingForGroup(group.Id, moduleIdCheck, previousShareableTopic))
                     .OrderBy(group => group.StudentsCount)
                     .ThenBy(group => group.Id)
@@ -1518,6 +1520,73 @@ public sealed class TeacherDraftsAutogenService
             }
 
             return false;
+        }
+
+        bool HasUnreadySelectedGroupForShareableTopic(int courseIdCheck, int moduleIdCheck, ModuleTopic topic)
+        {
+            if (!CanShareAcrossGroups(topic.LessonTypeId)
+                || !selectedGroupsByCourse.TryGetValue(courseIdCheck, out var sameCourseGroups)
+                || sameCourseGroups.Count <= 1)
+            {
+                return false;
+            }
+
+            foreach (var group in sameCourseGroups)
+            {
+                if (PlacementRemainingFor(group.Id, moduleIdCheck) <= 0)
+                {
+                    continue;
+                }
+
+                if (!IsTopicStillPendingForGroup(group.Id, moduleIdCheck, topic))
+                {
+                    continue;
+                }
+
+                if (!CanAssignSpecificTopic(group.Id, moduleIdCheck, topic))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        bool ShouldHoldShareableTopicForMissingPendingGroups(
+            int courseIdCheck,
+            int moduleIdCheck,
+            ModuleTopic topic,
+            IReadOnlyCollection<int> currentGroupIds)
+        {
+            if (!CanShareAcrossGroups(topic.LessonTypeId)
+                || !selectedGroupsByCourse.TryGetValue(courseIdCheck, out var sameCourseGroups)
+                || sameCourseGroups.Count <= 1)
+            {
+                return false;
+            }
+
+            var currentGroupSet = currentGroupIds.ToHashSet();
+            var pendingGroups = sameCourseGroups
+                .Where(group => PlacementRemainingFor(group.Id, moduleIdCheck) > 0)
+                .Where(group => IsTopicStillPendingForGroup(group.Id, moduleIdCheck, topic))
+                .ToList();
+            if (pendingGroups.Count <= currentGroupSet.Count)
+            {
+                return false;
+            }
+
+            var pendingStudents = pendingGroups.Sum(group => group.StudentsCount);
+            allowedRoomsByModule.TryGetValue(moduleIdCheck, out var allowedRooms);
+            allowedBuildingsByModule.TryGetValue(moduleIdCheck, out var allowedBuildings);
+            var largestCompatibleRoomCapacity = roomsAll
+                .Where(candidateRoom =>
+                    (allowedBuildings == null || allowedBuildings.Count == 0 || allowedBuildings.Contains(candidateRoom.BuildingId))
+                    && (allowedRooms == null || allowedRooms.Count == 0 || allowedRooms.Contains(candidateRoom.Id))
+                    && pendingGroups.All(group => RoomMatchesGroupPreferenceFor(group.Id, candidateRoom)))
+                .Select(candidateRoom => candidateRoom.Capacity)
+                .DefaultIfEmpty(0)
+                .Max();
+            return pendingStudents <= largestCompatibleRoomCapacity;
         }
 
         List<int> BuildPotentialSharedLectureGroupPack(
@@ -1541,7 +1610,7 @@ public sealed class TeacherDraftsAutogenService
                 {
                     continue;
                 }
-                if (RemainingFor(group.Id, moduleId) <= 0)
+                if (PlacementRemainingFor(group.Id, moduleId) <= 0)
                 {
                     continue;
                 }
@@ -1596,7 +1665,7 @@ public sealed class TeacherDraftsAutogenService
                 {
                     continue;
                 }
-                if (RemainingFor(group.Id, moduleId) <= 0)
+                if (PlacementRemainingFor(group.Id, moduleId) <= 0)
                 {
                     continue;
                 }
@@ -1650,6 +1719,11 @@ public sealed class TeacherDraftsAutogenService
 
             var lessonType = typeById[topic.LessonTypeId];
             if (!lessonType.RequiresRoom)
+            {
+                return false;
+            }
+
+            if (HasUnreadySelectedGroupForShareableTopic(courseIdValue, moduleId, topic))
             {
                 return false;
             }
@@ -1739,6 +1813,10 @@ public sealed class TeacherDraftsAutogenService
                             }
                             var potentialPack = BuildPotentialSharedLectureGroupPack(courseGroups, moduleId, topic, room, date, slot);
                             if (pack.Count < potentialPack.Count)
+                            {
+                                continue;
+                            }
+                            if (ShouldHoldShareableTopicForMissingPendingGroups(courseIdValue, moduleId, topic, pack))
                             {
                                 continue;
                             }
@@ -2846,7 +2924,7 @@ public sealed class TeacherDraftsAutogenService
                     {
                         continue;
                     }
-                    if (RemainingFor(otherGroup.Id, moduleId) <= 0)
+                    if (PlacementRemainingFor(otherGroup.Id, moduleId) <= 0)
                     {
                         continue;
                     }
@@ -2905,7 +2983,7 @@ public sealed class TeacherDraftsAutogenService
                     {
                         continue;
                     }
-                    if (RemainingFor(otherGroup.Id, moduleId) <= 0)
+                    if (PlacementRemainingFor(otherGroup.Id, moduleId) <= 0)
                     {
                         continue;
                     }
@@ -2948,7 +3026,7 @@ public sealed class TeacherDraftsAutogenService
                     {
                         continue;
                     }
-                    if (RemainingFor(otherGroup.Id, moduleId) <= 0)
+                    if (PlacementRemainingFor(otherGroup.Id, moduleId) <= 0)
                     {
                         continue;
                     }
@@ -2993,7 +3071,7 @@ public sealed class TeacherDraftsAutogenService
                     {
                         continue;
                     }
-                    if (RemainingFor(otherGroup.Id, moduleId) <= 0)
+                    if (PlacementRemainingFor(otherGroup.Id, moduleId) <= 0)
                     {
                         continue;
                     }
@@ -3342,7 +3420,7 @@ public sealed class TeacherDraftsAutogenService
                 // Лейбл модуля для текстів попереджень.
                 string ModuleLabel() => string.IsNullOrWhiteSpace(moduleTitle) ? $"#{moduleId}" : moduleTitle!;
                 // Для основних модулів — перевіряємо залишок годин.
-                if (!isFiller && RemainingFor(grp.Id, moduleId) <= 0)
+                if (!isFiller && PlacementRemainingFor(grp.Id, moduleId) <= 0)
                 {
                     return false;
                 }
@@ -3528,6 +3606,17 @@ public sealed class TeacherDraftsAutogenService
                         continue;
                     }
                     // Лекційні потоки лімітуємо кількістю вибраних груп курсу, а не фіксованою стелею.
+                    if (!isSelfStudyPlacement
+                        && topicSelection is not null
+                        && CanShareAcrossGroups(ltypeId)
+                        && HasUnreadySelectedGroupForShareableTopic(grp.CourseId, moduleId, topicSelection))
+                    {
+                        RecordSlotFailureReason(
+                            date,
+                            sl,
+                            $"Спільну лекційну тему {topicSelection.TopicCode} модуля <{ModuleLabel()}> відкладено, доки всі вибрані групи курсу дійдуть до неї за порядком тем.");
+                        continue;
+                    }
                     var preselectedSlotGroupLimit = SlotGroupLimitForPlacement(grp.CourseId, ltypeId, isSelfStudyPlacement);
                     if (CountGroupsWithModuleInSlot(moduleId, date, s, e) >= preselectedSlotGroupLimit)
                     {
@@ -3888,6 +3977,12 @@ public sealed class TeacherDraftsAutogenService
                                 var newSharedGroupIds = allSharedGroupIds
                                     .Except(existingSharedLectureGroupIds)
                                     .ToList();
+                                if (isShareableLecturePlacement
+                                    && topicSelection is not null
+                                    && ShouldHoldShareableTopicForMissingPendingGroups(grp.CourseId, moduleId, topicSelection, allSharedGroupIds))
+                                {
+                                    continue;
+                                }
                                 if (isShareableLecturePlacement
                                     && allSharedGroupIds.Count <= 1
                                     && (!softFill
@@ -4351,7 +4446,7 @@ public sealed class TeacherDraftsAutogenService
                     && !selectedIsSelfStudy
                     && selectedTopic is not null
                     && placedGroupIds.Any(sharedGroupId =>
-                        RemainingFor(sharedGroupId, moduleId) > 0
+                        PlacementRemainingFor(sharedGroupId, moduleId) > 0
                         && SelectNextTopicInOrder(sharedGroupId, moduleId) is { } nextTopic
                         && CanShareAcrossGroups(nextTopic.LessonTypeId));
                 if (nextShareableTopicUnlocked)
