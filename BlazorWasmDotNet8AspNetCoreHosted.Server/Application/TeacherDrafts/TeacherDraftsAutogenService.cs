@@ -32,7 +32,8 @@ public sealed class TeacherDraftsAutogenService
         int? BuildingId, // Будівля аудиторії (для штрафів за переходи).
         int ModuleId, // Модуль, до якого належить слот.
         int LessonTypeId, // Тип заняття (для обмежень).
-        int? ModuleTopicId // Тема модуля для точного зіставлення спільних потоків.
+        int? ModuleTopicId, // Тема модуля для точного зіставлення спільних потоків.
+        bool JoinableDraft // Чи можна приєднати до цього слоту нові групи як до чернеткового потоку.
     );
     private sealed record PlacementCandidate(
         TimeSlot Slot, // Слот розкладу для можливого розміщення.
@@ -249,10 +250,10 @@ public sealed class TeacherDraftsAutogenService
         var softOptions = r.SoftOptions;
         var recentRepeatWindowDays = softOptions?.RecentRepeatWindowDays is int repeatWindow && repeatWindow >= 0
             ? repeatWindow
-            : 2;
+            : softFill ? 0 : 2;
         var maxParallelGroupsPerModuleInSlot = softOptions?.MaxParallelGroupsPerModuleInSlot is int parallelGroups && parallelGroups > 0
             ? parallelGroups
-            : 2;
+            : softFill ? 4 : 2;
         var preferredFirstPenaltyMultiplier = softOptions?.PreferredFirstPenaltyMultiplier is double preferredFirstMultiplier && preferredFirstMultiplier >= 0
             ? preferredFirstMultiplier
             : 1.0;
@@ -506,7 +507,8 @@ public sealed class TeacherDraftsAutogenService
                 x.Room != null ? (int?)x.Room.BuildingId : null,
                 x.ModuleId,
                 x.LessonTypeId,
-                x.ModuleTopicId))
+                x.ModuleTopicId,
+                true))
             .ToListAsync();
         var busySchedule = await _db.ScheduleItems
             .Include(x => x.Room)
@@ -521,7 +523,8 @@ public sealed class TeacherDraftsAutogenService
                 x.Room != null ? (int?)x.Room.BuildingId : null,
                 x.ModuleId,
                 x.LessonTypeId,
-                x.ModuleTopicId))
+                x.ModuleTopicId,
+                false))
             .ToListAsync();
         var busy = busyDrafts
             .Concat(busySchedule)
@@ -900,6 +903,7 @@ public sealed class TeacherDraftsAutogenService
                             && x.ModuleId == moduleId
                             && x.LessonTypeId == lessonTypeId
                             && x.ModuleTopicId == moduleTopicId
+                            && x.JoinableDraft
                             && x.TeacherId == teacherId
                             && x.RoomId == roomId
                             && selectedGroupsById.TryGetValue(x.GroupId, out var existingGroup)
@@ -1420,6 +1424,15 @@ public sealed class TeacherDraftsAutogenService
                 : Array.Empty<TimeSlot>();
         }
 
+        int GetSharedSlotOrder(IReadOnlyList<TimeSlot> slotsForDate, TimeSlot slot)
+        {
+            var index = slotsForDate
+                .Select((candidate, candidateIndex) => new { candidate, candidateIndex })
+                .FirstOrDefault(x => x.candidate.Start == slot.Start && x.candidate.End == slot.End)
+                ?.candidateIndex;
+            return index is int value ? value + 1 : int.MaxValue;
+        }
+
         bool IsTopicStillPendingForGroup(int groupIdCheck, int moduleIdCheck, ModuleTopic topic)
         {
             if (!topicsByModule.TryGetValue(moduleIdCheck, out var moduleTopics)
@@ -1745,6 +1758,13 @@ public sealed class TeacherDraftsAutogenService
             {
                 return false;
             }
+            var coursePreferredFirstSlotLimit = preferredFirstSlotLimitsAll.FirstOrDefault(x => x.CourseId == courseIdValue)
+                                               ?? preferredFirstSlotLimitsAll.FirstOrDefault(x => x.CourseId == null);
+            int? coursePreferredFirstMaxSlotOrder = r.PreferredFirstMaxSlotOrderOverride is int preferredFirstOverride
+                ? preferredFirstOverride > 0 ? preferredFirstOverride : null
+                : coursePreferredFirstSlotLimit is not null && coursePreferredFirstSlotLimit.MaxSlotOrder > 0
+                    ? coursePreferredFirstSlotLimit.MaxSlotOrder
+                    : preferredFirstTypeId != 0 ? 6 : null;
 
             allowedRoomsByModule.TryGetValue(moduleId, out var allowedRooms);
             allowedBuildingsByModule.TryGetValue(moduleId, out var allowedBuildings);
@@ -1759,7 +1779,32 @@ public sealed class TeacherDraftsAutogenService
                 return false;
             }
 
-            (DateOnly Date, TimeSlot Slot, int? TeacherId, Room Room, List<int> GroupIds)? best = null;
+            int PreferredFirstLectureLoadForCourseDate(DateOnly date)
+            {
+                if (preferredFirstTypeId == 0 || topic.LessonTypeId != preferredFirstTypeId)
+                {
+                    return 0;
+                }
+                return busy
+                    .Where(slot => slot.Date == date
+                                   && slot.LessonTypeId == preferredFirstTypeId
+                                   && selectedGroupsById.TryGetValue(slot.GroupId, out var slotGroup)
+                                   && slotGroup.CourseId == courseIdValue)
+                    .GroupBy(slot => new { slot.ModuleId, slot.ModuleTopicId, slot.StartTime, slot.EndTime })
+                    .Count();
+            }
+            bool JoinsExistingTopicOccurrence(DateOnly date, TimeSlot slot)
+            {
+                return busy.Any(existing => existing.Date == date
+                                            && existing.StartTime == slot.Start
+                                            && existing.EndTime == slot.End
+                                            && existing.ModuleId == moduleId
+                                            && existing.ModuleTopicId == topic.Id
+                                            && selectedGroupsById.TryGetValue(existing.GroupId, out var existingGroup)
+                                            && existingGroup.CourseId == courseIdValue);
+            }
+
+            (DateOnly Date, TimeSlot Slot, int? TeacherId, Room Room, List<int> GroupIds, int PreferredFirstLoad, bool JoinsExistingOccurrence)? best = null;
             for (var dayOffset = 0; dayOffset < 7; dayOffset++)
             {
                 var date = weekStart.AddDays(dayOffset);
@@ -1774,6 +1819,13 @@ public sealed class TeacherDraftsAutogenService
                 }
                 foreach (var slot in slotsForDate)
                 {
+                    if (preferredFirstTypeId != 0
+                        && topic.LessonTypeId == preferredFirstTypeId
+                        && coursePreferredFirstMaxSlotOrder is int maxPreferredSlot
+                        && GetSharedSlotOrder(slotsForDate, slot) > maxPreferredSlot)
+                    {
+                        continue;
+                    }
                     foreach (var teacherId in teacherIds)
                     {
                         if (teacherId is int tid)
@@ -1820,17 +1872,28 @@ public sealed class TeacherDraftsAutogenService
                             {
                                 continue;
                             }
+                            var preferredFirstLoad = PreferredFirstLectureLoadForCourseDate(date);
+                            var joinsExistingOccurrence = JoinsExistingTopicOccurrence(date, slot);
                             var slotComparison = best is null
                                 ? 0
                                 : CompareSlotPosition(date, slot.Start, slot.End, best.Value.Date, best.Value.Slot.Start, best.Value.Slot.End);
                             if (best is null
                                 || pack.Count > best.Value.GroupIds.Count
-                                || (pack.Count == best.Value.GroupIds.Count && slotComparison < 0)
+                                || (pack.Count == best.Value.GroupIds.Count && joinsExistingOccurrence && !best.Value.JoinsExistingOccurrence)
                                 || (pack.Count == best.Value.GroupIds.Count
+                                    && joinsExistingOccurrence == best.Value.JoinsExistingOccurrence
+                                    && preferredFirstLoad < best.Value.PreferredFirstLoad)
+                                || (pack.Count == best.Value.GroupIds.Count
+                                    && joinsExistingOccurrence == best.Value.JoinsExistingOccurrence
+                                    && preferredFirstLoad == best.Value.PreferredFirstLoad
+                                    && slotComparison < 0)
+                                || (pack.Count == best.Value.GroupIds.Count
+                                    && joinsExistingOccurrence == best.Value.JoinsExistingOccurrence
+                                    && preferredFirstLoad == best.Value.PreferredFirstLoad
                                     && slotComparison == 0
                                     && room.Capacity > best.Value.Room.Capacity))
                             {
-                                best = (date, slot, teacherId, room, pack);
+                                best = (date, slot, teacherId, room, pack, preferredFirstLoad, joinsExistingOccurrence);
                             }
                         }
                     }
@@ -1877,7 +1940,8 @@ public sealed class TeacherDraftsAutogenService
                     best.Value.Room.BuildingId,
                     moduleId,
                     topic.LessonTypeId,
-                    topic.Id));
+                    topic.Id,
+                    true));
                 created++;
                 Inc(groupId, best.Value.Date);
                 if (preferredFirstTypeId != 0 && topic.LessonTypeId == preferredFirstTypeId)
@@ -1942,7 +2006,7 @@ public sealed class TeacherDraftsAutogenService
                 ? preferredFirstOverride > 0 ? preferredFirstOverride : null
                 : preferredFirstSlotLimit is not null && preferredFirstSlotLimit.MaxSlotOrder > 0
                     ? preferredFirstSlotLimit.MaxSlotOrder
-                    : null;
+                    : preferredFirstTypeId != 0 ? 6 : null;
             var allSlots = await _db.TimeSlots.AsNoTracking()
                 .Where(s => s.IsActive && (s.CourseId == grp.CourseId || s.CourseId == null))
                 .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
@@ -2273,6 +2337,7 @@ public sealed class TeacherDraftsAutogenService
                         .Where(cd => cd.GroupId == grp.Id
                                      && cd.Date == date
                                      && !cd.IsLocked
+                                     && !CanShareAcrossGroups(cd.LessonTypeId)
                                      && cd.StartTime > gap.Start
                                      && !attempted.Contains(cd))
                         .OrderBy(cd => cd.StartTime)
@@ -2449,7 +2514,8 @@ public sealed class TeacherDraftsAutogenService
                         buildingId,
                         candidate.ModuleId,
                         candidate.LessonTypeId,
-                        candidate.ModuleTopicId));
+                        candidate.ModuleTopicId,
+                        true));
                     candidate.StartTime = s;
                     candidate.EndTime = e;
                     candidate.DayOfWeek = date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
@@ -3366,6 +3432,129 @@ public sealed class TeacherDraftsAutogenService
                 }
                 return candidates[sequenceRandom.Next(candidates.Count)];
             }
+            var generationDates = Enumerable.Range(0, 7)
+                .Select(offset => weekStart.AddDays(offset))
+                .Where(date => date >= rangeStartDate && date < rangeEndDateExclusive && IsWorking(date, grp))
+                .ToList();
+            int CountPendingPreferredFirstPlacements()
+            {
+                if (preferredFirstTypeId == 0 || !TypeAllowed(preferredFirstTypeId))
+                {
+                    return 0;
+                }
+                var total = 0;
+                foreach (var moduleId in orderedModules.Concat(fillerModulesOrdered).Distinct())
+                {
+                    var remaining = PlacementRemainingFor(grp.Id, moduleId);
+                    if (remaining <= 0)
+                    {
+                        continue;
+                    }
+                    var topicLeft = 0;
+                    if (topicsByModule.TryGetValue(moduleId, out var topicList))
+                    {
+                        topicAssignments.TryGetValue((grp.Id, moduleId), out var assignedTopics);
+                        foreach (var topic in topicList.Where(t => t.LessonTypeId == preferredFirstTypeId))
+                        {
+                            var limit = GetTopicUsageLimit(topic);
+                            var used = assignedTopics is not null && assignedTopics.TryGetValue(topic.Id, out var usedCount)
+                                ? usedCount
+                                : 0;
+                            topicLeft += Math.Max(0, limit - used);
+                        }
+                    }
+                    if (topicLeft > 0)
+                    {
+                        total += Math.Min(remaining, topicLeft);
+                    }
+                    else if (!hasPreferred.Contains((grp.Id, moduleId)))
+                    {
+                        total++;
+                    }
+                }
+                return total;
+            }
+            bool ShouldPrioritizePreferredFirstOnDate(DateOnly date)
+            {
+                if (preferredFirstTypeId == 0 || generationDates.Count <= 1)
+                {
+                    return true;
+                }
+                var dateIndex = generationDates.FindIndex(x => x == date);
+                if (dateIndex < 0)
+                {
+                    return true;
+                }
+                var placedBeforeDate = busy.Count(b => b.GroupId == grp.Id
+                                                       && b.Date >= rangeStartDate
+                                                       && b.Date < date
+                                                       && b.LessonTypeId == preferredFirstTypeId);
+                var estimatedTotal = placedBeforeDate + CountPendingPreferredFirstPlacements();
+                if (estimatedTotal <= 1)
+                {
+                    return true;
+                }
+                var allowedBeforeDate = (int)Math.Floor(estimatedTotal * dateIndex / (double)generationDates.Count);
+                return placedBeforeDate <= allowedBeforeDate;
+            }
+            bool PreferredFirstWouldExceedDateBudget(DateOnly date)
+            {
+                if (preferredFirstTypeId == 0 || generationDates.Count <= 1)
+                {
+                    return false;
+                }
+                var dateIndex = generationDates.FindIndex(x => x == date);
+                if (dateIndex < 0)
+                {
+                    return false;
+                }
+                var placedThroughDate = busy.Count(b => b.GroupId == grp.Id
+                                                        && b.Date >= rangeStartDate
+                                                        && b.Date <= date
+                                                        && b.LessonTypeId == preferredFirstTypeId);
+                var estimatedTotal = placedThroughDate + CountPendingPreferredFirstPlacements();
+                if (estimatedTotal <= 1)
+                {
+                    return false;
+                }
+                var allowedThroughDate = (int)Math.Ceiling(estimatedTotal * (dateIndex + 1) / (double)generationDates.Count);
+                return placedThroughDate + 1 > allowedThroughDate;
+            }
+            bool HasNonPreferredAlternativeForDate(int currentModuleId, DateOnly date)
+            {
+                if (preferredFirstTypeId == 0)
+                {
+                    return false;
+                }
+                var savedLtIndex = ltIndex;
+                try
+                {
+                    foreach (var alternativeModuleId in orderedModules.Concat(fillerModulesOrdered).Distinct())
+                    {
+                        if (alternativeModuleId == currentModuleId)
+                        {
+                            continue;
+                        }
+                        if (RemainingFor(grp.Id, alternativeModuleId) <= 0)
+                        {
+                            continue;
+                        }
+                        if (TopicsDepleted(grp.Id, alternativeModuleId))
+                        {
+                            continue;
+                        }
+                        if (PeekLessonTypeForDate(grp.Id, grp.CourseId, alternativeModuleId, date) != preferredFirstTypeId)
+                        {
+                            return true;
+                        }
+                    }
+                }
+                finally
+                {
+                    ltIndex = savedLtIndex;
+                }
+                return false;
+            }
             // Основна спроба розмістити модуль у межах конкретного дня.
             async Task<bool> TryPlaceModuleAsync(int moduleId, DateOnly date, bool isPrimary, bool allowRepeatPreviousDay = false, bool allowExtraSameDay = false, bool relaxed = false, bool preferEarliestSlot = true, TimeSlot? forcedSlot = null, int? forcedGapVariantBudget = null, bool bypassCatchUpHold = false)
             {
@@ -3382,7 +3571,9 @@ public sealed class TeacherDraftsAutogenService
                 // Чи використовуємо пріоритетний тип занять.
                 bool preferredFirstEnabled = preferredFirstTypeId != 0 && TypeAllowed(preferredFirstTypeId);
                 bool preferredFirstPendingToday = false;
-                if (preferredFirstEnabled && (penaltyPreferredFirstTypeLateSlot > 0 || penaltyNonPreferredEarlySlotWhilePreferredPending > 0))
+                if (preferredFirstEnabled
+                    && ShouldPrioritizePreferredFirstOnDate(date)
+                    && (penaltyPreferredFirstTypeLateSlot > 0 || penaltyNonPreferredEarlySlotWhilePreferredPending > 0))
                 {
                     // Визначаємо, чи є сьогодні ще теми з пріоритетним типом.
                     foreach (var mid in orderedModules)
@@ -3476,9 +3667,11 @@ public sealed class TeacherDraftsAutogenService
                 }
                 // Кандидатні аудиторії для модуля.
                 var candidateRooms = CandidateRoomsFor(moduleId);
-                // Тимчасово вимикаємо послаблення для другого сегмента модуля під час gap-fill.
                 var allowAdditionalModuleSegmentsInGapFill = softFill && forcedSlot is not null;
-                var maxModuleSegmentsAllowed = allowAdditionalModuleSegmentsInGapFill ? 2 : 1;
+                var maxModuleSegmentsAllowed = allowAdditionalModuleSegmentsInGapFill
+                    ? bypassCatchUpHold ? slots.Count : 2
+                    : 1;
+                var allowEmergencyTopicOrderRelaxation = softFill && forcedSlot is not null && bypassCatchUpHold;
                 PlacementCandidate? best = null;
                 double bestEffectivePenalty = double.MaxValue;
                 IncompletePlacementCandidate? bestIncomplete = null;
@@ -3605,6 +3798,31 @@ public sealed class TeacherDraftsAutogenService
                         RecordSlotFailureReason(date, sl, reason);
                         continue;
                     }
+                    var preferredFirstWeekBalancePenalty = 0.0;
+                    var preferredFirstWeekBalanceNote = string.Empty;
+                    if (preferredFirstEnabled
+                        && ltypeId == preferredFirstTypeId
+                        && preferredFirstMaxSlotOrder is int maxPreferredSlotOrder
+                        && GetSlotOrder(sl.Start, sl.End) > maxPreferredSlotOrder)
+                    {
+                        var slotOrder = GetSlotOrder(sl.Start, sl.End);
+                        RecordSlotFailureReason(
+                            date,
+                            sl,
+                            $"Тип з прапорцем \"Бажано першим у тижні\" не можна ставити після ліміту (слот №{slotOrder}, ліміт №{maxPreferredSlotOrder}).");
+                        continue;
+                    }
+                    if (preferredFirstEnabled
+                        && ltypeId == preferredFirstTypeId
+                        && !CanShareAcrossGroups(ltypeId)
+                        && PreferredFirstWouldExceedDateBudget(date)
+                        && HasNonPreferredAlternativeForDate(moduleId, date)
+                        && forcedSlot is null
+                        && !relaxed)
+                    {
+                        preferredFirstWeekBalancePenalty = 34.0 * preferredFirstPenaltyMultiplier;
+                        preferredFirstWeekBalanceNote = "Тип з прапорцем \"Бажано першим у тижні\" поставлено раніше тижневого балансу, щоб не лишати порожній слот";
+                    }
                     // Лекційні потоки лімітуємо кількістю вибраних груп курсу, а не фіксованою стелею.
                     if (!isSelfStudyPlacement
                         && topicSelection is not null
@@ -3624,6 +3842,7 @@ public sealed class TeacherDraftsAutogenService
                     }
                     if (!isSelfStudyPlacement
                         && topicSelection is not null
+                        && !allowEmergencyTopicOrderRelaxation
                         && ViolatesTopicCalendarOrder(grp.Id, moduleId, topicSelection, date, s, e))
                     {
                         RecordSlotFailureReason(
@@ -3639,20 +3858,6 @@ public sealed class TeacherDraftsAutogenService
                         && HasPendingSharedLectureCatchUpBeforeTopic(grp.Id, grp.CourseId, moduleId, topicSelection, out pendingSharedTopic))
                     {
                         catchUpHoldBypassed = softFill;
-                    }
-                    // Дуже сильно штрафуємо тип з прапорцем "Бажано першим у тижні" за вихід за межу слота, але не блокуємо жорстко.
-                    string? preferredFirstAfterLimitNote = null;
-                    double preferredFirstAfterLimitPenalty = 0;
-                    if (preferredFirstEnabled
-                        && penaltyPreferredFirstBeyondLimitSlot > 0
-                        && preferredFirstMaxSlotOrder is int maxPreferredSlot
-                        && ltypeId == preferredFirstTypeId
-                        && GetSlotOrder(sl.Start, sl.End) > maxPreferredSlot)
-                    {
-                        var slotOrder = GetSlotOrder(sl.Start, sl.End);
-                        var overLimitBy = Math.Max(1, slotOrder - maxPreferredSlot);
-                        preferredFirstAfterLimitPenalty = overLimitBy * penaltyPreferredFirstBeyondLimitSlot;
-                        preferredFirstAfterLimitNote = $"Тип з прапорцем \"Бажано першим у тижні\" поставлено після ліміту (слот №{slotOrder}, ліміт №{maxPreferredSlot})";
                     }
                     // Дуже сильно штрафуємо інші типи в ранніх слотах до першого заняття з прапорцем "Бажано першим у тижні", але не блокуємо жорстко.
                     string? nonPreferredBeforeFirstPreferredNote = null;
@@ -3785,15 +3990,15 @@ public sealed class TeacherDraftsAutogenService
                             penaltyScore += 120.0;
                             penalties.Add("Тему після спільної лекції дозволено лише для аварійного дозаповнення");
                         }
-                        if (!string.IsNullOrWhiteSpace(preferredFirstAfterLimitNote))
-                        {
-                            penaltyScore += preferredFirstAfterLimitPenalty;
-                            penalties.Add(preferredFirstAfterLimitNote);
-                        }
                         if (!string.IsNullOrWhiteSpace(nonPreferredBeforeFirstPreferredNote))
                         {
                             penaltyScore += nonPreferredBeforeFirstPreferredPenalty;
                             penalties.Add(nonPreferredBeforeFirstPreferredNote);
+                        }
+                        if (preferredFirstWeekBalancePenalty > 0)
+                        {
+                            penaltyScore += preferredFirstWeekBalancePenalty;
+                            penalties.Add(preferredFirstWeekBalanceNote);
                         }
                         if (preferredFirstEnabled)
                         {
@@ -4295,16 +4500,28 @@ public sealed class TeacherDraftsAutogenService
                     : new[] { grp.Id })
                     .Distinct()
                     .ToList();
+                var writablePlacedGroupIds = placedGroupIds
+                    .Where(selectedGroupsById.ContainsKey)
+                    .ToList();
                 var selectedIsEmergencySingletonSharedLecture = !selectedIsSelfStudy
                                                                  && CanShareAcrossGroups(selectedLessonTypeId)
-                                                                 && placedGroupIds.Count <= 1
+                                                                 && writablePlacedGroupIds.Count <= 1
                                                                  && softFill
                                                                  && bypassCatchUpHold;
+                if (!selectedIsSelfStudy
+                    && selectedTopic is not null
+                    && CanShareAcrossGroups(selectedLessonTypeId)
+                    && writablePlacedGroupIds.Count <= 1)
+                {
+                    RecordSlotFailureReason(date, selectedSlot, $"Спільну лекційну тему модуля <{ModuleLabel()}> не створено одиночним потоком.");
+                    return false;
+                }
                 if (!selectedIsSelfStudy && selectedTopic is not null)
                 {
-                    foreach (var sharedGroupId in placedGroupIds)
+                    foreach (var sharedGroupId in writablePlacedGroupIds)
                     {
-                        if (ViolatesTopicCalendarOrder(sharedGroupId, moduleId, selectedTopic, date, startTime, endTime))
+                        if (!allowEmergencyTopicOrderRelaxation
+                            && ViolatesTopicCalendarOrder(sharedGroupId, moduleId, selectedTopic, date, startTime, endTime))
                         {
                             var groupLabel = selectedGroupsById.TryGetValue(sharedGroupId, out var sharedGroupInfo)
                                 ? sharedGroupInfo.Name
@@ -4334,7 +4551,7 @@ public sealed class TeacherDraftsAutogenService
                     }
                 }
                 bool currentGroupPlaced = false;
-                foreach (var sharedGroupId in placedGroupIds)
+                foreach (var sharedGroupId in writablePlacedGroupIds)
                 {
                     if (!selectedGroupsById.TryGetValue(sharedGroupId, out var sharedGroup))
                     {
@@ -4380,7 +4597,8 @@ public sealed class TeacherDraftsAutogenService
                         selectedRoom?.BuildingId,
                         moduleId,
                         selectedLessonTypeId,
-                        selectedTopic?.Id));
+                        selectedTopic?.Id,
+                        true));
                     // Збільшуємо лічильники створених записів і зайнятих слотів.
                     created++;
                     Inc(sharedGroupId, date);
@@ -4442,6 +4660,10 @@ public sealed class TeacherDraftsAutogenService
                     var noteText = string.Join("; ", selectedNotes);
                     warnings.Add($"[{date:yyyy-MM-dd} {startTime:HH\\:mm}-{endTime:HH\\:mm}] {grp.Name}: {noteText}");
                 }
+                if (allowEmergencyTopicOrderRelaxation && selectedTopic is not null)
+                {
+                    warnings.Add($"[{date:yyyy-MM-dd} {startTime:HH\\:mm}-{endTime:HH\\:mm}] {grp.Name}: аварійне дозаповнення послабило хронологічний порядок тем модуля <{ModuleLabel()}>.");
+                }
                 var nextShareableTopicUnlocked = !softFill
                     && !selectedIsSelfStudy
                     && selectedTopic is not null
@@ -4465,7 +4687,7 @@ public sealed class TeacherDraftsAutogenService
                 if (maxPerDay == 0) continue;
                 var modulesAttemptedToday = new HashSet<int>();
                 var orderedModulesForDay = BuildOrderedModulesForDay(date);
-                if (preferredFirstTypeId != 0)
+                if (preferredFirstTypeId != 0 && ShouldPrioritizePreferredFirstOnDate(date))
                 {
                     var preferredModulesForDay = orderedModulesForDay
                         .Where(mid => RemainingFor(grp.Id, mid) > 0)
@@ -4481,10 +4703,10 @@ public sealed class TeacherDraftsAutogenService
                 }
                 int preferredMaxDistinctModulesPerDay = softOptions?.PreferredMaxDistinctModulesPerDay is int preferredDistinctLimit && preferredDistinctLimit > 0
                     ? Math.Min(preferredDistinctLimit, maxPerDay)
-                    : (maxPerDay >= 8 ? 3 : 2);
+                    : softFill ? Math.Min(5, maxPerDay) : (maxPerDay >= 8 ? 3 : 2);
                 int maxDistinctModulesPerDay = softOptions?.MaxDistinctModulesPerDay is int distinctLimit && distinctLimit > 0
                     ? Math.Min(distinctLimit, maxPerDay)
-                    : Math.Min(5, maxPerDay);
+                    : softFill ? Math.Min(6, maxPerDay) : Math.Min(5, maxPerDay);
                 preferredMaxDistinctModulesPerDay = Math.Min(preferredMaxDistinctModulesPerDay, maxDistinctModulesPerDay);
                 bool CanIntroduceModuleToday(int moduleId, bool bypassPreferredLimit = false)
                 {
