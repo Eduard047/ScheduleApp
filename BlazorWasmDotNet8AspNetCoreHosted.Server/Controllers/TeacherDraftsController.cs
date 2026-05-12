@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Text.Json;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
@@ -28,6 +29,9 @@ public sealed class TeacherDraftsController : ControllerBase
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         WriteIndented = false
     };
+    private static bool TryParseClock(string value, out TimeOnly time)
+        => TimeOnly.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out time);
+
     public TeacherDraftsController(
         AppDbContext db,
         RulesService rules,
@@ -73,7 +77,7 @@ public sealed class TeacherDraftsController : ControllerBase
     {
         var item = await _db.TeacherDraftItems.FirstOrDefaultAsync(x => x.Id == id);
         if (item is null) return NotFound(new { message = $"TeacherDraftItem {id} not found" });
-        if (item.IsLocked && !unrestricted) return Conflict(new { message = "Чернетка заблокована. Увімкніть режим без обмежень, щоб видалити." });
+        if (item.IsLocked) return Conflict(new { message = "Чернетка заблокована. Видалення заблокованих чернеток через API заборонено." });
         _db.TeacherDraftItems.Remove(item);
         await _db.SaveChangesAsync();
         return NoContent();
@@ -83,6 +87,14 @@ public sealed class TeacherDraftsController : ControllerBase
     public async Task<ActionResult<int>> Upsert([FromBody] DraftUpsertRequest r)
     {
         var request = r;
+        if (!TryParseClock(request.TimeStart, out var start) || !TryParseClock(request.TimeEnd, out var end))
+        {
+            return BadRequest(new { message = "Некоректний формат часу. Використовуйте формат HH:mm." });
+        }
+        if (end <= start)
+        {
+            return BadRequest(new { message = "Час завершення має бути більшим за час початку." });
+        }
         if (request.LessonTypeId <= 0)
         {
             var noneTypeId = await _db.LessonTypes
@@ -96,7 +108,7 @@ public sealed class TeacherDraftsController : ControllerBase
             request = request with { LessonTypeId = noneTypeId.Value };
         }
         var validation = await _rules.ValidateDraftAsync(request);
-        if (validation.Errors.Count > 0 && !request.IgnoreValidationErrors)
+        if (validation.Errors.Count > 0)
             return Conflict(new
             {
                 message = "Validation failed",
@@ -112,12 +124,11 @@ public sealed class TeacherDraftsController : ControllerBase
             .Select(x => (bool?)x.RequiresRoom)
             .FirstOrDefaultAsync();
         var normalizedRoomId = lessonTypeRequiresRoom is false ? null : request.RoomId;
-        var start = TimeOnly.Parse(request.TimeStart);
-        var end = TimeOnly.Parse(request.TimeEnd);
         if (request.Id is int id && id > 0)
         {
             var item = await _db.TeacherDraftItems.FirstOrDefaultAsync(x => x.Id == id);
             if (item is null) return NotFound(new { message = $"TeacherDraftItem {id} not found" });
+            if (item.IsLocked) return Conflict(new { message = "Чернетка заблокована. Зміна заблокованих чернеток через API заборонена." });
             ApplyDraftRequest(item, request, start, end, normalizedRoomId, reportJson);
             await _db.SaveChangesAsync();
             return Ok(item.Id);
@@ -156,6 +167,10 @@ public sealed class TeacherDraftsController : ControllerBase
     // Очищає незаблоковані чернетки за вказаний тиждень із можливими додатковими фільтрами.
     public async Task<ActionResult<ClearWeekResult>> ClearWeek([FromBody] ClearWeekRequest r)
     {
+        if (r.CourseId is null && r.GroupId is null)
+        {
+            return BadRequest(new { message = "Для очищення тижня потрібно вказати курс або групу." });
+        }
         var start = r.WeekStart;
         var end = start.AddDays(7);
         var q = _db.TeacherDraftItems.Where(x => x.Date >= start && x.Date < end && !x.IsLocked);

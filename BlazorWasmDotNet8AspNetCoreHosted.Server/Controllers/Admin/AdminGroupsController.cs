@@ -22,11 +22,24 @@ public class AdminGroupsController(AppDbContext db) : ControllerBase
     // Створює або оновлює групу.
     public async Task<ActionResult<int>> Upsert(GroupEditDto dto)
     {
-        var course = await db.Courses.FindAsync(dto.CourseId) ?? throw new ArgumentException("Курс не знайдено");
+        var name = dto.Name.Trim();
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return BadRequest(new { message = "Назва групи обов'язкова." });
+        }
+        if (dto.StudentsCount < 0)
+        {
+            return BadRequest(new { message = "Кількість студентів не може бути від'ємною." });
+        }
+        if (!await db.Courses.AnyAsync(c => c.Id == dto.CourseId))
+        {
+            return NotFound(new { message = "Курс не знайдено." });
+        }
         if (dto.Id is int id && id > 0)
         {
-            var g = await db.Groups.FindAsync(id) ?? throw new ArgumentException("Групу не знайдено");
-            g.Name = dto.Name;
+            var g = await db.Groups.FindAsync(id);
+            if (g is null) return NotFound(new { message = "Групу не знайдено." });
+            g.Name = name;
             g.StudentsCount = dto.StudentsCount;
             g.CourseId = dto.CourseId;
             await db.SaveChangesAsync();
@@ -34,7 +47,7 @@ public class AdminGroupsController(AppDbContext db) : ControllerBase
         }
         else
         {
-            var g = new GroupEntity { Name = dto.Name, StudentsCount = dto.StudentsCount, CourseId = dto.CourseId };
+            var g = new GroupEntity { Name = name, StudentsCount = dto.StudentsCount, CourseId = dto.CourseId };
             db.Groups.Add(g);
             await db.SaveChangesAsync();
             return Ok(g.Id);
@@ -47,9 +60,11 @@ public class AdminGroupsController(AppDbContext db) : ControllerBase
     {
         var group = await db.Groups.AsNoTracking().FirstOrDefaultAsync(g => g.Id == id);
         if (group is null) return NotFound();
-        var used = await db.ScheduleItems.AnyAsync(x => x.GroupId == id);
+        var hasScheduleItems = await db.ScheduleItems.AnyAsync(x => x.GroupId == id);
+        var hasDraftItems = await db.TeacherDraftItems.AnyAsync(x => x.GroupId == id);
+        var used = hasScheduleItems || hasDraftItems;
         if (used && !force)
-            return Conflict(new { message = "Група використовується у розкладі" });
+            return Conflict(new { message = "Група використовується у розкладі або чернетках" });
         if (force)
         {
             var q = db.ScheduleItems.Where(x => x.GroupId == id);
@@ -112,6 +127,7 @@ public class AdminGroupsController(AppDbContext db) : ControllerBase
                     p.ScheduledHours = countsByModule.FirstOrDefault(c => c.ModuleId == p.ModuleId)?.C ?? 0;
                 await db.SaveChangesAsync();
             }
+            await db.TeacherDraftItems.Where(x => x.GroupId == id).ExecuteDeleteAsync();
         }
         var rows = await db.Groups.Where(x => x.Id == id).ExecuteDeleteAsync();
         if (rows == 0) return NotFound();
