@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Data;
+using System.Globalization;
 using System.Linq;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Infrastructure;
@@ -36,6 +37,9 @@ public class ScheduleController : ControllerBase
         int ModuleId,
         int LessonTypeId
     );
+    private static bool TryParseClock(string value, out TimeOnly time)
+        => TimeOnly.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out time);
+
     [HttpGet]
     // Повертає розклад за тиждень із фільтрами.
     public async Task<IReadOnlyList<ScheduleItemDto>> Get(
@@ -77,12 +81,15 @@ public class ScheduleController : ControllerBase
         {
             normalizedRoomId = keepRoomId;
         }
-        var start = TimeOnly.Parse(r.TimeStart);
-        var end = TimeOnly.Parse(r.TimeEnd);
+        if (!TryParseClock(r.TimeStart, out var start) || !TryParseClock(r.TimeEnd, out var end))
+        {
+            return BadRequest(new { message = "Некоректний формат часу. Використовуйте формат HH:mm." });
+        }
         if (r.Id is int id && id > 0)
         {
             var item = await _db.ScheduleItems.FirstOrDefaultAsync(x => x.Id == id);
             if (item is null) return NotFound(new { message = $"ScheduleItem {id} not found" });
+            if (item.IsLocked) return Conflict(new { message = "Запис розкладу заблоковано. Зміна заблокованих записів через API заборонена." });
             var previousLessonTypeId = item.LessonTypeId;
             var previousRoomId = item.RoomId;
             var previousLessonType = await _db.LessonTypes.AsNoTracking().FirstOrDefaultAsync(t => t.Id == previousLessonTypeId);
@@ -302,10 +309,11 @@ public class ScheduleController : ControllerBase
         var info = await _db.ScheduleItems
             .AsNoTracking()
             .Where(x => x.Id == id)
-            .Select(x => new { x.GroupId, x.ModuleId, x.TeacherId, CourseId = x.Group.CourseId })
+            .Select(x => new { x.GroupId, x.ModuleId, x.TeacherId, x.IsLocked, CourseId = x.Group.CourseId })
             .FirstOrDefaultAsync();
         if (info is null)
             return NotFound(new { message = $"ScheduleItem {id} not found" });
+        if (info.IsLocked) return Conflict(new { message = "Запис розкладу заблоковано. Видалення заблокованих записів через API заборонено." });
         await _db.ScheduleItems.Where(x => x.Id == id).ExecuteDeleteAsync();
         await _aggregates.RecalcAsync(
             plans: new[] { (info.CourseId, info.ModuleId) },
@@ -317,6 +325,10 @@ public class ScheduleController : ControllerBase
     // Очищає розклад за тиждень із перерахунком агрегатів.
     public async Task<ActionResult<ClearWeekResult>> ClearWeek([FromBody] ClearWeekRequest r)
     {
+        if (r.CourseId is null && r.GroupId is null)
+        {
+            return BadRequest(new { message = "Для очищення тижня потрібно вказати курс або групу." });
+        }
         var start = r.WeekStart;
         var end = start.AddDays(7);
         var q = _db.ScheduleItems.Where(x => x.Date >= start && x.Date < end && !x.IsLocked);

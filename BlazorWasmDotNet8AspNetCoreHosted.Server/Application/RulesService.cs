@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
@@ -11,6 +12,9 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 // Сервіс валідації правил розкладу
 public sealed class RulesService(AppDbContext db)
 {
+    private static bool TryParseClock(string value, out TimeOnly time)
+        => TimeOnly.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out time);
+
     // Перевіряє правила для створення/оновлення опублікованої пари.
     public async Task<(List<string> errors, List<string> warnings)> ValidateUpsertAsync(UpsertScheduleItemRequest r)
     {
@@ -48,8 +52,11 @@ public sealed class RulesService(AppDbContext db)
             errors.Add("Для цього заняття потрібно обрати викладача.");
             return (errors, warnings);
         }
-        var start = TimeOnly.Parse(r.TimeStart);
-        var end = TimeOnly.Parse(r.TimeEnd);
+        if (!TryParseClock(r.TimeStart, out var start) || !TryParseClock(r.TimeEnd, out var end))
+        {
+            errors.Add("Некоректний формат часу. Використовуйте формат HH:mm.");
+            return (errors, warnings);
+        }
         if (end <= start) errors.Add("Час завершення має бути більшим за час початку.");
         var dayOfWeek = r.Date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
         if (group is not null)
@@ -218,8 +225,14 @@ public sealed class RulesService(AppDbContext db)
         }
         if (errors.Count > 0)
             return new DraftValidationResult(errors, warnings, new DraftValidationReportDto(DateTimeOffset.UtcNow, issues));
-        var start = TimeOnly.Parse(r.TimeStart);
-        var end = TimeOnly.Parse(r.TimeEnd);
+        if (!TryParseClock(r.TimeStart, out var start) || !TryParseClock(r.TimeEnd, out var end))
+        {
+            AddError(
+                "time-format-invalid",
+                "Некоректний формат часу",
+                "Час початку та завершення потрібно передавати у форматі HH:mm.");
+            return new DraftValidationResult(errors, warnings, new DraftValidationReportDto(DateTimeOffset.UtcNow, issues));
+        }
         if (end <= start)
             AddError("time-window-invalid", "Некоректний час", $"Час завершення {r.TimeEnd} не може бути меншим або рівним часу початку {r.TimeStart}.");
         var dayOfWeek = r.Date.ToDateTime(TimeOnly.MinValue).DayOfWeek;

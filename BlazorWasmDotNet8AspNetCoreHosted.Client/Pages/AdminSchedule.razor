@@ -979,6 +979,12 @@ else
             .Select(row => row.GroupId)
             .Distinct()
             .ToList();
+    private HashSet<int> GetGroupIdsForCourse(int courseId)
+        => meta?.Groups
+            .Where(group => group.CourseId == courseId)
+            .Select(group => group.Id)
+            .ToHashSet()
+           ?? new HashSet<int>();
     // Повертає корпуси у зрозумілому для UI порядку.
     private IEnumerable<BuildingEditDto> GetOrderedBuildings()
         => _buildingOptions.OrderBy(building => building.Name, StringComparer.CurrentCultureIgnoreCase);
@@ -1783,17 +1789,24 @@ else
         await ResetStatusAsync();
         try
         {
+            if (_selectedCourseId is not int courseId)
+            {
+                error = "Оберіть курс перед очищенням тижня.";
+                return;
+            }
             var monday = GetMonday(_selectedDate);
             var sunday = monday.AddDays(6);
             var confirm = await JS.InvokeAsync<bool>("confirm",
                 $"Очистити чернетки тижня {monday:dd.MM.yyyy} – {sunday:dd.MM.yyyy}? (всі групи)");
             if (!confirm) return;
             var deleted = await Drafts.ClearWeek(new ClearWeekRequest(
-                WeekStart: monday
+                WeekStart: monday,
+                CourseId: courseId
             ));
+            var courseGroupIds = GetGroupIdsForCourse(courseId);
             RemoveItemsFromState(
                 TableItemSource.Draft,
-                item => !item.IsLocked);
+                item => !item.IsLocked && courseGroupIds.Contains(item.GroupId));
             var summary = $"Видалено {deleted} чернеток за поточний тиждень.";
             await SetOkMessageAsync(summary);
             await LogWeekClearAsync(LogActionClearDrafts, "Очищення чернеток", summary, monday);
@@ -1813,17 +1826,24 @@ else
         await ResetStatusAsync();
         try
         {
+            if (_selectedCourseId is not int courseId)
+            {
+                error = "Оберіть курс перед очищенням тижня.";
+                return;
+            }
             var monday = GetMonday(_selectedDate);
             var sunday = monday.AddDays(6);
             var confirm = await JS.InvokeAsync<bool>("confirm",
                 $"Очистити опублікований розклад за {monday:dd.MM.yyyy} – {sunday:dd.MM.yyyy}? (всі групи)");
             if (!confirm) return;
             var deleted = await Api.ClearWeek(new ClearWeekRequest(
-                WeekStart: monday
+                WeekStart: monday,
+                CourseId: courseId
             ));
+            var courseGroupIds = GetGroupIdsForCourse(courseId);
             RemoveItemsFromState(
                 TableItemSource.Published,
-                item => !item.IsLocked);
+                item => !item.IsLocked && courseGroupIds.Contains(item.GroupId));
             var summary = $"Видалено {deleted} записів з опублікованого розкладу.";
             await SetOkMessageAsync(summary);
             await LogWeekClearAsync(LogActionClearSchedule, "Очищення розкладу", summary, monday);
