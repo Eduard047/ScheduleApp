@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
@@ -15,6 +16,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 // Сервіс автоматичної генерації чернеток розкладу.
 public sealed class TeacherDraftsAutogenService
 {
+    private static readonly SemaphoreSlim GenerationLock = new(1, 1);
+
     // Контекст БД для читання довідників та запису чернеток.
     private readonly AppDbContext _db;
     public TeacherDraftsAutogenService(AppDbContext db)
@@ -75,6 +78,70 @@ public sealed class TeacherDraftsAutogenService
                 AdjacentRoomChangePenalty: dto.AdjacentRoomChangePenalty,
                 TeacherLoadPenaltyWeight: dto.TeacherLoadPenaltyWeight,
                 BuildingDistancePenaltyWeight: dto.BuildingDistancePenaltyWeight);
+    private static string CompactGapReasonExample(AutoGenGapDetail gap)
+    {
+        var reason = string.IsNullOrWhiteSpace(gap.Reason) ? "Причину не визначено." : gap.Reason.Trim();
+        if (reason.Length > 220)
+        {
+            reason = reason[..220] + "...";
+        }
+        return $"{gap.Date:yyyy-MM-dd} {gap.SlotLabel}, {gap.GroupName}: {reason}";
+    }
+    private static (string Code, string Title) ClassifyGapReason(string? reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+        {
+            return ("unknown", "Причину не визначено");
+        }
+        var text = reason.ToLowerInvariant();
+        if (text.Contains("немає доступних викладач", StringComparison.Ordinal)
+            || text.Contains("викладач", StringComparison.Ordinal) && (text.Contains("кафедр", StringComparison.Ordinal) || text.Contains("зайнят", StringComparison.Ordinal)))
+        {
+            return ("teacher", "Немає доступного викладача");
+        }
+        if (text.Contains("усі аудитор", StringComparison.Ordinal)
+            || text.Contains("аудитор", StringComparison.Ordinal) && (text.Contains("зайнят", StringComparison.Ordinal) || text.Contains("не належ", StringComparison.Ordinal)))
+        {
+            return ("room", "Немає доступної аудиторії");
+        }
+        if (text.Contains("переход", StringComparison.Ordinal)
+            || text.Contains("корпус", StringComparison.Ordinal) && text.Contains("хв", StringComparison.Ordinal))
+        {
+            return ("travel", "Недостатньо часу на перехід");
+        }
+        if (text.Contains("хронолог", StringComparison.Ordinal)
+            || text.Contains("порядок тем", StringComparison.Ordinal)
+            || text.Contains("відкладено", StringComparison.Ordinal) && text.Contains("порядком тем", StringComparison.Ordinal))
+        {
+            return ("topic-order", "Порядок тем не дозволив слот");
+        }
+        if (text.Contains("суцільним блоком", StringComparison.Ordinal))
+        {
+            return ("module-block", "Модуль має йти суцільним блоком");
+        }
+        if (text.Contains("більше двох", StringComparison.Ordinal)
+            || text.Contains("ліміт", StringComparison.Ordinal)
+            || text.Contains("обмеж", StringComparison.Ordinal))
+        {
+            return ("limit", "Спрацювали денні або слотні ліміти");
+        }
+        if (text.Contains("спільн", StringComparison.Ordinal))
+        {
+            return ("shared-flow", "Спільний потік не готовий");
+        }
+        return ("other", "Інші причини");
+    }
+    private static List<AutoGenGapSummaryItem> BuildAutoGenGapSummary(IEnumerable<AutoGenGapDetail> gaps)
+        => gaps
+            .GroupBy(gap => ClassifyGapReason(gap.Reason))
+            .OrderByDescending(group => group.Count())
+            .ThenBy(group => group.Key.Title, StringComparer.Ordinal)
+            .Select(group => new AutoGenGapSummaryItem(
+                group.Key.Code,
+                group.Key.Title,
+                group.Count(),
+                group.Take(5).Select(CompactGapReasonExample).ToList()))
+            .ToList();
     private static int StableSeed(params int[] values)
     {
         unchecked
@@ -132,7 +199,9 @@ public sealed class TeacherDraftsAutogenService
             AllowIncompleteDrafts: r.AllowIncompleteDrafts,
             PreferredFirstMaxSlotOrderOverride: r.PreferredFirstMaxSlotOrderOverride,
             GroupRoomPreferences: r.GroupRoomPreferences,
-            SoftOptions: MapSoftOptions(r.SoftOptions)
+            SoftOptions: MapSoftOptions(r.SoftOptions),
+            RangeStartDate: monthStart,
+            RangeEndDate: nextMonth.AddDays(-1)
         );
         // Запускаємо автогенерацію для кожного тижня місяця.
         return await RunAutoGenForWeeks(template, EnumerateWeekStarts(monthStart, week => week < nextMonth));
@@ -152,7 +221,9 @@ public sealed class TeacherDraftsAutogenService
             AllowIncompleteDrafts: r.AllowIncompleteDrafts,
             PreferredFirstMaxSlotOrderOverride: r.PreferredFirstMaxSlotOrderOverride,
             GroupRoomPreferences: r.GroupRoomPreferences,
-            SoftOptions: MapSoftOptions(r.SoftOptions)
+            SoftOptions: MapSoftOptions(r.SoftOptions),
+            RangeStartDate: r.From,
+            RangeEndDate: r.To
         );
         // Проганяємо всі тижні в межах діапазону.
         return await RunAutoGenForWeeks(template, EnumerateWeekStarts(r.From, week => week <= r.To));
@@ -171,11 +242,30 @@ public sealed class TeacherDraftsAutogenService
         int created = 0, skipped = 0;
         var warnings = new List<string>();
         var gapDetails = new List<AutoGenGapDetail>();
+        var failed = false;
         foreach (var weekStart in weekStarts)
         {
             // Генеруємо тиждень окремо, щоб не зупиняти весь процес при часткових збоях.
             var res = await DraftAutoGen(template with { WeekStart = weekStart });
-            if (res.Result is not OkObjectResult { Value: AutoGenResult ok }) continue;
+            if (res.Result is not OkObjectResult { Value: AutoGenResult ok })
+            {
+                failed = true;
+                warnings.Add($"[{weekStart:yyyy-MM-dd}] Тиждень не згенеровано.");
+                if (res.Result is ObjectResult { Value: AutoGenResult failedResult })
+                {
+                    skipped += failedResult.Skipped;
+                    warnings.AddRange(failedResult.Warnings);
+                    if (failedResult.GapDetails is not null)
+                    {
+                        gapDetails.AddRange(failedResult.GapDetails);
+                    }
+                }
+                else if (res.Result is ObjectResult { Value: { } value })
+                {
+                    warnings.Add(JsonSerializer.Serialize(value));
+                }
+                continue;
+            }
             created += ok.Created;
             skipped += ok.Skipped;
             warnings.AddRange(ok.Warnings);
@@ -185,7 +275,8 @@ public sealed class TeacherDraftsAutogenService
             }
         }
         // Підсумовуємо статистику по всіх тижнях.
-        return Ok(new AutoGenResult(created, skipped, warnings, gapDetails));
+        var result = new AutoGenResult(created, skipped, warnings, gapDetails, BuildAutoGenGapSummary(gapDetails));
+        return failed ? BadRequest(result) : Ok(result);
     }
     // Створює чернетки на основі правил і доступних даних для заданого тижня.
     public async Task<ActionResult<AutoGenResult>> DraftAutoGen(DraftAutoGenRequest r)
@@ -294,6 +385,7 @@ public sealed class TeacherDraftsAutogenService
         }
         // Нормалізуємо фільтри: 0 або null означає "без фільтра".
         int? courseId = (r.CourseId > 0) ? r.CourseId : null;
+        int? requestedTeacherId = (r.TeacherId > 0) ? r.TeacherId : null;
         var requestedGroupIds = new HashSet<int>();
         if (r.GroupId is int singleGroupId && singleGroupId > 0)
         {
@@ -387,13 +479,21 @@ public sealed class TeacherDraftsAutogenService
                 });
             }
         }
+        await GenerationLock.WaitAsync();
+        await using var tx = await _db.Database.BeginTransactionAsync();
+        try
+        {
         // За потреби очищаємо існуючі незаблоковані чернетки тижня.
         if (r.ClearExisting && !softFill)
         {
             var gids = groups.Select(g => g.Id).ToList();
-            await _db.TeacherDraftItems
-                .Where(x => x.Date >= rangeStartDate && x.Date < rangeEndDateExclusive && gids.Contains(x.GroupId) && !x.IsLocked)
-                .ExecuteDeleteAsync();
+            var clearQuery = _db.TeacherDraftItems
+                .Where(x => x.Date >= rangeStartDate && x.Date < rangeEndDateExclusive && gids.Contains(x.GroupId) && !x.IsLocked);
+            if (requestedTeacherId is int clearTeacherId)
+            {
+                clearQuery = clearQuery.Where(x => x.TeacherId == clearTeacherId);
+            }
+            await clearQuery.ExecuteDeleteAsync();
         }
         // Конфігурації ліміту слота для типу з прапорцем "Бажано першим у тижні" та список аудиторій для підбору.
         var preferredFirstSlotLimitsAll = await _db.PreferredFirstSlotLimitConfigs.AsNoTracking().ToListAsync();
@@ -606,6 +706,15 @@ public sealed class TeacherDraftsAutogenService
         // Базові зв'язки модуль -> викладачі / керівники самостійної роботи.
         var teachersForModule = await _db.TeacherModules.AsNoTracking().ToListAsync();
         var supervisorsForModule = await _db.ModuleSupervisors.AsNoTracking().ToListAsync();
+        if (requestedTeacherId is int teacherFilterId)
+        {
+            teachersForModule = teachersForModule
+                .Where(x => x.TeacherId == teacherFilterId)
+                .ToList();
+            supervisorsForModule = supervisorsForModule
+                .Where(x => x.TeacherId == teacherFilterId)
+                .ToList();
+        }
         // Метадані викладачів (для підписів і перевірок кафедр).
         var teachersMeta = await _db.Teachers
             .AsNoTracking()
@@ -846,6 +955,7 @@ public sealed class TeacherDraftsAutogenService
         var topicsExhaustedNotified = new HashSet<(int GroupId, int ModuleId)>();
         var missingModulesNotified = new HashSet<int>();
         int created = 0, skipped = 0;
+        var allCreatedDrafts = new List<TeacherDraftItem>();
         const int maxEmergencySingletonSharedLectures = 0;
         var emergencySingletonSharedLecturesCreated = 0;
         int incompleteDraftsCreated = 0, incompleteMissingTeacherCount = 0, incompleteMissingRoomCount = 0, incompleteMissingBothCount = 0;
@@ -1928,6 +2038,7 @@ public sealed class TeacherDraftsAutogenService
                     IsSelfStudy = false
                 };
                 _db.TeacherDraftItems.Add(item);
+                allCreatedDrafts.Add(item);
                 AddCurrentRangeFact(groupId, moduleId);
                 MarkTopicUsed(groupId, moduleId, topic);
                 busy.Add(new BusySlot(
@@ -4575,6 +4686,7 @@ public sealed class TeacherDraftsAutogenService
                         ValidationWarnings = selectedValidationWarnings
                     };
                     _db.TeacherDraftItems.Add(item);
+                    allCreatedDrafts.Add(item);
                     AddCurrentRangeFact(sharedGroupId, moduleId);
                     if (sharedGroupId == grp.Id)
                     {
@@ -5356,14 +5468,290 @@ public sealed class TeacherDraftsAutogenService
                 }
             }
         }
+        async Task<List<string>> ValidateGeneratedDraftsAsync()
+        {
+            var errors = new List<string>();
+            if (allCreatedDrafts.Count == 0)
+            {
+                return errors;
+            }
+
+            static bool Overlaps(TimeOnly leftStart, TimeOnly leftEnd, TimeOnly rightStart, TimeOnly rightEnd)
+                => leftStart < rightEnd && rightStart < leftEnd;
+
+            static bool SlotRangeAllowed(TimeOnly start, TimeOnly end, List<(TimeOnly Start, TimeOnly End)> daySlots)
+            {
+                if (daySlots.Count == 0) return true;
+                for (var i = 0; i < daySlots.Count; i++)
+                {
+                    if (daySlots[i].Start != start) continue;
+                    for (var j = i; j < daySlots.Count; j++)
+                    {
+                        if (j > i && daySlots[j - 1].End != daySlots[j].Start) break;
+                        if (daySlots[j].End == end) return true;
+                    }
+                }
+                return false;
+            }
+            bool BlocksTeacher(int lessonTypeId)
+                => typeById.TryGetValue(lessonTypeId, out var lessonType) && lessonType.BlocksTeacher;
+            bool BlocksRoom(int lessonTypeId)
+                => typeById.TryGetValue(lessonTypeId, out var lessonType) && lessonType.BlocksRoom;
+            bool SameShareableOccurrence(
+                int leftGroupId,
+                int leftModuleId,
+                int leftLessonTypeId,
+                int? leftModuleTopicId,
+                int? leftTeacherId,
+                int? leftRoomId,
+                DateOnly leftDate,
+                TimeOnly leftStart,
+                TimeOnly leftEnd,
+                int rightGroupId,
+                int rightModuleId,
+                int rightLessonTypeId,
+                int? rightModuleTopicId,
+                int? rightTeacherId,
+                int? rightRoomId,
+                DateOnly rightDate,
+                TimeOnly rightStart,
+                TimeOnly rightEnd)
+            {
+                if (leftGroupId == rightGroupId || !CanShareAcrossGroups(leftLessonTypeId))
+                {
+                    return false;
+                }
+                return leftDate == rightDate
+                       && leftStart == rightStart
+                       && leftEnd == rightEnd
+                       && leftModuleId == rightModuleId
+                       && leftLessonTypeId == rightLessonTypeId
+                       && leftModuleTopicId == rightModuleTopicId
+                       && leftTeacherId == rightTeacherId
+                       && leftRoomId == rightRoomId;
+            }
+
+            var slotCache = new Dictionary<(int CourseId, DayOfWeek Day), List<(TimeOnly Start, TimeOnly End)>>();
+            async Task<List<(TimeOnly Start, TimeOnly End)>> GetSlotsAsync(int courseIdValue, DayOfWeek day)
+            {
+                var key = (courseIdValue, day);
+                if (!slotCache.TryGetValue(key, out var daySlots))
+                {
+                    var resolved = await TimeSlotsResolver.ResolveForDayAsync(_db, courseIdValue, day);
+                    daySlots = resolved.Slots
+                        .Select(s => (s.Start, s.End))
+                        .ToList();
+                    slotCache[key] = daySlots;
+                }
+                return daySlots;
+            }
+
+            foreach (var draft in allCreatedDrafts)
+            {
+                var groupLabel = selectedGroupsById.TryGetValue(draft.GroupId, out var group)
+                    ? group.Name
+                    : $"#{draft.GroupId}";
+                if (draft.Date < rangeStartDate || draft.Date > rangeEndDate)
+                {
+                    errors.Add($"Фінальна перевірка: чернетка групи {groupLabel} виходить за діапазон генерації ({draft.Date:yyyy-MM-dd}).");
+                }
+                if (draft.EndTime <= draft.StartTime)
+                {
+                    errors.Add($"Фінальна перевірка: некоректний час {draft.StartTime:HH\\:mm}-{draft.EndTime:HH\\:mm} для групи {groupLabel}.");
+                }
+                if (typeById.TryGetValue(draft.LessonTypeId, out var lessonType))
+                {
+                    if (!allowIncompleteDrafts && lessonType.RequiresTeacher && draft.TeacherId is null)
+                    {
+                        errors.Add($"Фінальна перевірка: для групи {groupLabel} у слоті {draft.Date:yyyy-MM-dd} {draft.StartTime:HH\\:mm}-{draft.EndTime:HH\\:mm} відсутній викладач.");
+                    }
+                    if (!allowIncompleteDrafts && lessonType.RequiresRoom && draft.RoomId is null)
+                    {
+                        errors.Add($"Фінальна перевірка: для групи {groupLabel} у слоті {draft.Date:yyyy-MM-dd} {draft.StartTime:HH\\:mm}-{draft.EndTime:HH\\:mm} відсутня аудиторія.");
+                    }
+                }
+                else
+                {
+                    errors.Add($"Фінальна перевірка: невідомий тип заняття #{draft.LessonTypeId} для групи {groupLabel}.");
+                }
+                if (selectedGroupsById.TryGetValue(draft.GroupId, out var selectedGroup))
+                {
+                    var daySlots = await GetSlotsAsync(selectedGroup.CourseId, draft.DayOfWeek);
+                    if (!SlotRangeAllowed(draft.StartTime, draft.EndTime, daySlots))
+                    {
+                        errors.Add($"Фінальна перевірка: слот {draft.Date:yyyy-MM-dd} {draft.StartTime:HH\\:mm}-{draft.EndTime:HH\\:mm} для групи {groupLabel} не входить у налаштовані слоти.");
+                    }
+                }
+            }
+
+            for (var i = 0; i < allCreatedDrafts.Count; i++)
+            {
+                var left = allCreatedDrafts[i];
+                for (var j = i + 1; j < allCreatedDrafts.Count; j++)
+                {
+                    var right = allCreatedDrafts[j];
+                    if (left.Date != right.Date || !Overlaps(left.StartTime, left.EndTime, right.StartTime, right.EndTime))
+                    {
+                        continue;
+                    }
+                    var label = $"{left.Date:yyyy-MM-dd} {left.StartTime:HH\\:mm}-{left.EndTime:HH\\:mm}";
+                    if (left.GroupId == right.GroupId)
+                    {
+                        errors.Add($"Фінальна перевірка: група #{left.GroupId} має перетин чернеток у слоті {label}.");
+                    }
+                    var sameShareableOccurrence = SameShareableOccurrence(
+                        left.GroupId,
+                        left.ModuleId,
+                        left.LessonTypeId,
+                        left.ModuleTopicId,
+                        left.TeacherId,
+                        left.RoomId,
+                        left.Date,
+                        left.StartTime,
+                        left.EndTime,
+                        right.GroupId,
+                        right.ModuleId,
+                        right.LessonTypeId,
+                        right.ModuleTopicId,
+                        right.TeacherId,
+                        right.RoomId,
+                        right.Date,
+                        right.StartTime,
+                        right.EndTime);
+                    if (left.TeacherId is int leftTeacher
+                        && right.TeacherId == leftTeacher
+                        && BlocksTeacher(left.LessonTypeId)
+                        && BlocksTeacher(right.LessonTypeId)
+                        && !sameShareableOccurrence)
+                    {
+                        errors.Add($"Фінальна перевірка: викладач #{leftTeacher} має перетин чернеток у слоті {label}.");
+                    }
+                    if (left.RoomId is int leftRoom
+                        && right.RoomId == leftRoom
+                        && BlocksRoom(left.LessonTypeId)
+                        && BlocksRoom(right.LessonTypeId)
+                        && !sameShareableOccurrence)
+                    {
+                        errors.Add($"Фінальна перевірка: аудиторія #{leftRoom} має перетин чернеток у слоті {label}.");
+                    }
+                }
+            }
+
+            var groupIdsForValidation = allCreatedDrafts.Select(d => d.GroupId).Distinct().ToList();
+            var teacherIdsForValidation = allCreatedDrafts.Where(d => d.TeacherId != null).Select(d => d.TeacherId!.Value).Distinct().ToList();
+            var roomIdsForValidation = allCreatedDrafts.Where(d => d.RoomId != null).Select(d => d.RoomId!.Value).Distinct().ToList();
+
+            var existingDrafts = await _db.TeacherDraftItems.AsNoTracking()
+                .Where(d => d.Date >= rangeStartDate
+                            && d.Date < rangeEndDateExclusive
+                            && (groupIdsForValidation.Contains(d.GroupId)
+                                || (d.TeacherId != null && teacherIdsForValidation.Contains(d.TeacherId.Value))
+                                || (d.RoomId != null && roomIdsForValidation.Contains(d.RoomId.Value))))
+                .Select(d => new { d.Date, d.StartTime, d.EndTime, d.GroupId, d.ModuleId, d.ModuleTopicId, d.TeacherId, d.RoomId, d.LessonTypeId })
+                .ToListAsync();
+            var existingSchedule = await _db.ScheduleItems.AsNoTracking()
+                .Where(d => d.Date >= rangeStartDate
+                            && d.Date < rangeEndDateExclusive
+                            && (groupIdsForValidation.Contains(d.GroupId)
+                                || (d.TeacherId != null && teacherIdsForValidation.Contains(d.TeacherId.Value))
+                                || (d.RoomId != null && roomIdsForValidation.Contains(d.RoomId.Value))))
+                .Select(d => new { d.Date, d.StartTime, d.EndTime, d.GroupId, d.ModuleId, d.ModuleTopicId, d.TeacherId, d.RoomId, d.LessonTypeId })
+                .ToListAsync();
+
+            foreach (var draft in allCreatedDrafts)
+            {
+                foreach (var existing in existingDrafts.Concat(existingSchedule))
+                {
+                    if (draft.Date != existing.Date || !Overlaps(draft.StartTime, draft.EndTime, existing.StartTime, existing.EndTime))
+                    {
+                        continue;
+                    }
+                    var label = $"{draft.Date:yyyy-MM-dd} {draft.StartTime:HH\\:mm}-{draft.EndTime:HH\\:mm}";
+                    if (draft.GroupId == existing.GroupId)
+                    {
+                        errors.Add($"Фінальна перевірка: група #{draft.GroupId} перетинається з наявним заняттям у слоті {label}.");
+                    }
+                    var sameShareableOccurrence = SameShareableOccurrence(
+                        draft.GroupId,
+                        draft.ModuleId,
+                        draft.LessonTypeId,
+                        draft.ModuleTopicId,
+                        draft.TeacherId,
+                        draft.RoomId,
+                        draft.Date,
+                        draft.StartTime,
+                        draft.EndTime,
+                        existing.GroupId,
+                        existing.ModuleId,
+                        existing.LessonTypeId,
+                        existing.ModuleTopicId,
+                        existing.TeacherId,
+                        existing.RoomId,
+                        existing.Date,
+                        existing.StartTime,
+                        existing.EndTime);
+                    if (!typeById.ContainsKey(existing.LessonTypeId))
+                    {
+                        errors.Add($"Фінальна перевірка: наявне заняття у слоті {label} має невідомий тип #{existing.LessonTypeId}.");
+                    }
+                    if (draft.TeacherId is int draftTeacher
+                        && existing.TeacherId == draftTeacher
+                        && BlocksTeacher(draft.LessonTypeId)
+                        && BlocksTeacher(existing.LessonTypeId)
+                        && !sameShareableOccurrence)
+                    {
+                        errors.Add($"Фінальна перевірка: викладач #{draftTeacher} перетинається з наявним заняттям у слоті {label}.");
+                    }
+                    if (draft.RoomId is int draftRoom
+                        && existing.RoomId == draftRoom
+                        && BlocksRoom(draft.LessonTypeId)
+                        && BlocksRoom(existing.LessonTypeId)
+                        && !sameShareableOccurrence)
+                    {
+                        errors.Add($"Фінальна перевірка: аудиторія #{draftRoom} перетинається з наявним заняттям у слоті {label}.");
+                    }
+                }
+            }
+
+            return errors
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+        }
+        if (gapDetails.Count > 0)
+        {
+            var reasonSummary = gapDetails
+                .Select(g => string.IsNullOrWhiteSpace(g.Reason) ? "Причину не визначено" : g.Reason!)
+                .GroupBy(reason => reason)
+                .OrderByDescending(g => g.Count())
+                .ThenBy(g => g.Key, StringComparer.Ordinal)
+                .Take(8)
+                .Select(g => $"{g.Count()} x {g.Key}");
+            warnings.Add($"Зведення причин незаповнених слотів: {string.Join(" | ", reasonSummary)}.");
+        }
         // Зберігаємо створені чернетки та повертаємо результат.
         if (incompleteDraftsCreated > 0)
         {
             warnings.Add(
                 $"Створено {incompleteDraftsCreated} неповних чернеток: без викладача — {incompleteMissingTeacherCount}, без аудиторії — {incompleteMissingRoomCount}, без обох призначень — {incompleteMissingBothCount}.");
         }
+        var finalValidationErrors = await ValidateGeneratedDraftsAsync();
+        if (finalValidationErrors.Count > 0)
+        {
+            warnings.AddRange(finalValidationErrors.Take(50));
+            if (finalValidationErrors.Count > 50)
+            {
+                warnings.Add($"Фінальна перевірка знайшла ще {finalValidationErrors.Count - 50} проблем.");
+            }
+            return BadRequest(new AutoGenResult(created, skipped, warnings, gapDetails, BuildAutoGenGapSummary(gapDetails)));
+        }
         await _db.SaveChangesAsync();
-        return Ok(new AutoGenResult(created, skipped, warnings, gapDetails));
+        await tx.CommitAsync();
+        return Ok(new AutoGenResult(created, skipped, warnings, gapDetails, BuildAutoGenGapSummary(gapDetails)));
+        }
+        finally
+        {
+            GenerationLock.Release();
+        }
     }
 
 }

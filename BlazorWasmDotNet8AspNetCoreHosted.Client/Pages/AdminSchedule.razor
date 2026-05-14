@@ -65,6 +65,26 @@
         border-radius: .35rem;
         padding: .45rem .65rem;
     }
+    .gap-summary {
+        border-left: 4px solid #0f766e;
+        background: #ecfdf5;
+        color: #064e3b;
+        border-radius: .35rem;
+        padding: .45rem .65rem;
+    }
+    .gap-summary-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: .4rem;
+        margin-top: .35rem;
+    }
+    .gap-summary-pill {
+        border: 1px solid rgba(15, 118, 110, .25);
+        border-radius: 999px;
+        background: #fff;
+        padding: .15rem .45rem;
+        font-size: .78rem;
+    }
     .lesson-editor-overlay {
         position: fixed;
         inset: 0;
@@ -504,10 +524,23 @@ else
                     <div>@ok</div>
                     @{
                         var warningsTotal = okWarnings.Count;
+                        var gapSummary = _latestGapSummary;
                         var contiguousModuleBlockWarnings = CountContiguousModuleBlockWarnings();
                     }
                     @if (warningsTotal > 0)
                     {
+                        @if (gapSummary.Count > 0)
+                        {
+                            <div class="gap-summary small">
+                                <div class="fw-semibold">Причини незаповнених слотів</div>
+                                <div class="gap-summary-list">
+                                    @foreach (var item in gapSummary)
+                                    {
+                                        <span class="gap-summary-pill">@item.Title: @item.Count</span>
+                                    }
+                                </div>
+                            </div>
+                        }
                         @if (contiguousModuleBlockWarnings > 0)
                         {
                             <div class="contiguous-module-block-warning small">
@@ -794,6 +827,7 @@ else
     private List<string> okWarnings = new();
     private bool okWarningsExpanded;
     private List<AutoGenGapDetail> _latestGapDetails = new();
+    private List<AutoGenGapSummaryItem> _latestGapSummary = new();
     private const string AutoGenStatusStorageKey = "adminSchedule.autoGenStatus.v1";
     private const string AutoGenStatusLocalStorageKey = "adminSchedule.autoGenStatus.local.v1";
     private const string AutoGenConfigStorageKey = "adminSchedule.autoGenConfig.v1";
@@ -1119,16 +1153,23 @@ else
         okWarnings = new();
         okWarningsExpanded = false;
         _latestGapDetails = new();
+        _latestGapSummary = new();
         if (clearPersisted)
         {
             await RemovePersistedAutoGenStatusAsync();
         }
     }
     // Встановлює повідомлення успіху та опційні попередження.
-    private async Task SetOkMessageAsync(string message, IEnumerable<string>? warnings = null, IEnumerable<AutoGenGapDetail>? gapDetails = null, bool persist = true)
+    private async Task SetOkMessageAsync(
+        string message,
+        IEnumerable<string>? warnings = null,
+        IEnumerable<AutoGenGapDetail>? gapDetails = null,
+        IEnumerable<AutoGenGapSummaryItem>? gapSummary = null,
+        bool persist = true)
     {
         ok = message;
         _latestGapDetails = gapDetails?.ToList() ?? new List<AutoGenGapDetail>();
+        _latestGapSummary = gapSummary?.ToList() ?? BuildGapReasonSummary(_latestGapDetails);
         okWarnings = BuildSlotGapWarnings(warnings, _latestGapDetails);
         okWarningsExpanded = false;
         if (persist)
@@ -1190,6 +1231,76 @@ else
             }
         }
         return result;
+    }
+    private static List<AutoGenGapSummaryItem> BuildGapReasonSummary(IEnumerable<AutoGenGapDetail>? gapDetails)
+    {
+        if (gapDetails is null)
+        {
+            return new();
+        }
+        return gapDetails
+            .GroupBy(gap => ClassifyGapReason(gap.Reason))
+            .OrderByDescending(group => group.Count())
+            .ThenBy(group => group.Key.Title, StringComparer.Ordinal)
+            .Select(group => new AutoGenGapSummaryItem(
+                group.Key.Code,
+                group.Key.Title,
+                group.Count(),
+                group.Take(5).Select(BuildGapSummaryExample).ToList()))
+            .ToList();
+    }
+    private static string BuildGapSummaryExample(AutoGenGapDetail gap)
+    {
+        var reason = string.IsNullOrWhiteSpace(gap.Reason) ? "Причину не визначено." : gap.Reason.Trim();
+        if (reason.Length > 220)
+        {
+            reason = reason[..220] + "...";
+        }
+        return $"{gap.Date:yyyy-MM-dd} {gap.SlotLabel}, {gap.GroupName}: {reason}";
+    }
+    private static (string Code, string Title) ClassifyGapReason(string? reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+        {
+            return ("unknown", "Причину не визначено");
+        }
+        var text = reason.ToLowerInvariant();
+        if (text.Contains("немає доступних викладач", StringComparison.Ordinal)
+            || text.Contains("викладач", StringComparison.Ordinal) && (text.Contains("кафедр", StringComparison.Ordinal) || text.Contains("зайнят", StringComparison.Ordinal)))
+        {
+            return ("teacher", "Немає доступного викладача");
+        }
+        if (text.Contains("усі аудитор", StringComparison.Ordinal)
+            || text.Contains("аудитор", StringComparison.Ordinal) && (text.Contains("зайнят", StringComparison.Ordinal) || text.Contains("не належ", StringComparison.Ordinal)))
+        {
+            return ("room", "Немає доступної аудиторії");
+        }
+        if (text.Contains("переход", StringComparison.Ordinal)
+            || text.Contains("корпус", StringComparison.Ordinal) && text.Contains("хв", StringComparison.Ordinal))
+        {
+            return ("travel", "Недостатньо часу на перехід");
+        }
+        if (text.Contains("хронолог", StringComparison.Ordinal)
+            || text.Contains("порядок тем", StringComparison.Ordinal)
+            || text.Contains("відкладено", StringComparison.Ordinal) && text.Contains("порядком тем", StringComparison.Ordinal))
+        {
+            return ("topic-order", "Порядок тем не дозволив слот");
+        }
+        if (text.Contains("суцільним блоком", StringComparison.Ordinal))
+        {
+            return ("module-block", "Модуль має йти суцільним блоком");
+        }
+        if (text.Contains("більше двох", StringComparison.Ordinal)
+            || text.Contains("ліміт", StringComparison.Ordinal)
+            || text.Contains("обмеж", StringComparison.Ordinal))
+        {
+            return ("limit", "Спрацювали денні або слотні ліміти");
+        }
+        if (text.Contains("спільн", StringComparison.Ordinal))
+        {
+            return ("shared-flow", "Спільний потік не готовий");
+        }
+        return ("other", "Інші причини");
     }
     private static string BuildSlotGapWarning(AutoGenGapDetail gap)
     {
@@ -1315,7 +1426,8 @@ else
         return new PersistedAutoGenStatus(
             Message: ok,
             Warnings: new List<string>(okWarnings),
-            GapDetails: new List<AutoGenGapDetail>(_latestGapDetails)
+            GapDetails: new List<AutoGenGapDetail>(_latestGapDetails),
+            GapSummary: new List<AutoGenGapSummaryItem>(_latestGapSummary)
         );
     }
     // Відновлює останній статус автогенерації з storage.
@@ -1324,7 +1436,7 @@ else
         var statuses = await LoadPersistedAutoGenStatusesAsync();
         if (!statuses.TryGetValue(CurrentWeekKey, out var payload))
             return;
-        await SetOkMessageAsync(payload.Message, payload.Warnings, payload.GapDetails, persist: false);
+        await SetOkMessageAsync(payload.Message, payload.Warnings, payload.GapDetails, payload.GapSummary, persist: false);
     }
     // Зберігає налаштування автогенерації для тижня.
     private async Task PersistAutoGenConfigAsync()
@@ -1652,7 +1764,7 @@ else
                 gapDetails.AddRange(res.GapDetails);
             }
         }
-        var result = new AutoGenResult(created, skipped, warnings, gapDetails);
+        var result = new AutoGenResult(created, skipped, warnings, gapDetails, BuildGapReasonSummary(gapDetails));
         return (result, fromDate, toDate, weekStarts.Count);
     }
     // Запускає автогенерацію чернеток для обраного діапазону.
@@ -1698,7 +1810,7 @@ else
             var summary = isSingleFullWeek
                 ? $"Автогенерація тижня у чернетки (курс: {courseName}, груп: {selectedGroupIds.Count}): створено {res.Created}, пропущено {res.Skipped}."
                 : $"Автогенерація діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): створено {res.Created}, пропущено {res.Skipped}.";
-            await SetOkMessageAsync(summary, res.Warnings, res.GapDetails);
+            await SetOkMessageAsync(summary, res.Warnings, res.GapDetails, res.GapSummary);
             await LoadWeek();
             await LogAutoGenAsync(
                 summary,
@@ -1762,7 +1874,7 @@ else
             var summary = isSingleFullWeek
                 ? $"Заповнення порожніх слотів тижня (курс: {courseName}, груп: {selectedGroupIds.Count}): створено {res.Created}, пропущено {res.Skipped}."
                 : $"Заповнення порожніх слотів у діапазоні {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): створено {res.Created}, пропущено {res.Skipped}.";
-            await SetOkMessageAsync(summary, res.Warnings, res.GapDetails);
+            await SetOkMessageAsync(summary, res.Warnings, res.GapDetails, res.GapSummary);
             await LoadWeek();
             await LogAutoGenAsync(
                 summary,
@@ -2049,9 +2161,12 @@ else
         bool softFill)
     {
         var lessons = BuildDraftLessonSnapshot(out var trimmed);
-        var logWarnings = res.GapDetails is { Count: > 0 }
-            ? new List<string>()
-            : BuildSlotGapWarnings(res.Warnings, null);
+        var logWarnings = res.Warnings
+            .Where(warning => !string.IsNullOrWhiteSpace(warning))
+            .Select(warning => warning.Trim())
+            .Where(warning => !IsSlotGapWarning(warning))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
         var entry = new AdminScheduleLogEntry(
             Id: Guid.NewGuid().ToString("N"),
             Timestamp: DateTimeOffset.Now,
@@ -2474,7 +2589,11 @@ else
         public bool Expanded { get; set; } = true;
         public string ToggleLabel => Expanded ? "Приховати" : "Розгорнути";
     }
-    private sealed record PersistedAutoGenStatus(string Message, List<string> Warnings, List<AutoGenGapDetail> GapDetails);
+    private sealed record PersistedAutoGenStatus(
+        string Message,
+        List<string> Warnings,
+        List<AutoGenGapDetail> GapDetails,
+        List<AutoGenGapSummaryItem>? GapSummary = null);
     private enum TableItemSource
     {
         Draft,

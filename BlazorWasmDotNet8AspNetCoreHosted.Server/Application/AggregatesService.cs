@@ -15,6 +15,11 @@ public sealed class AggregatesService
     {
         _db = db;
     }
+    private static int ScheduledHours(TimeOnly start, TimeOnly end)
+    {
+        var hours = (end.ToTimeSpan() - start.ToTimeSpan()).TotalHours;
+        return Math.Max(1, (int)Math.Ceiling(hours));
+    }
     // Перераховує години для модульних планів і навантаження викладачів.
     public async Task RecalcAsync(
         IEnumerable<(int CourseId, int ModuleId)>? plans = null,
@@ -42,14 +47,16 @@ public sealed class AggregatesService
             var allPlans = await _db.ModulePlans.ToListAsync();
             var cIds = allPlans.Select(p => p.CourseId).Distinct().ToList();
             var mIds = allPlans.Select(p => p.ModuleId).Distinct().ToList();
-            var counts = await _db.ScheduleItems
+            var items = await _db.ScheduleItems
                 .Include(si => si.Group)
                 .Where(si => !excludePlanIds.Contains(si.LessonTypeId)
                              && cIds.Contains(si.Group.CourseId)
                              && mIds.Contains(si.ModuleId))
-                .GroupBy(si => new { CourseId = si.Group.CourseId, si.ModuleId })
-                .Select(g => new { g.Key.CourseId, g.Key.ModuleId, C = g.Count() })
                 .ToListAsync();
+            var counts = items
+                .GroupBy(si => new { CourseId = si.Group.CourseId, si.ModuleId })
+                .Select(g => new { g.Key.CourseId, g.Key.ModuleId, C = g.Sum(si => ScheduledHours(si.StartTime, si.EndTime)) })
+                .ToList();
             foreach (var p in allPlans)
                 p.ScheduledHours = counts.FirstOrDefault(c => c.CourseId == p.CourseId && c.ModuleId == p.ModuleId)?.C ?? 0;
         }
@@ -60,14 +67,16 @@ public sealed class AggregatesService
             {
                 var cIds = keys.Select(k => k.CourseId).Distinct().ToList();
                 var mIds = keys.Select(k => k.ModuleId).Distinct().ToList();
-                var counts = await _db.ScheduleItems
+                var items = await _db.ScheduleItems
                     .Include(si => si.Group)
                     .Where(si => !excludePlanIds.Contains(si.LessonTypeId)
                                  && cIds.Contains(si.Group.CourseId)
                                  && mIds.Contains(si.ModuleId))
-                    .GroupBy(si => new { CourseId = si.Group.CourseId, si.ModuleId })
-                    .Select(g => new { g.Key.CourseId, g.Key.ModuleId, C = g.Count() })
                     .ToListAsync();
+                var counts = items
+                    .GroupBy(si => new { CourseId = si.Group.CourseId, si.ModuleId })
+                    .Select(g => new { g.Key.CourseId, g.Key.ModuleId, C = g.Sum(si => ScheduledHours(si.StartTime, si.EndTime)) })
+                    .ToList();
                 var plansToUpdate = await _db.ModulePlans
                     .Where(mp => cIds.Contains(mp.CourseId) && mIds.Contains(mp.ModuleId))
                     .ToListAsync();
@@ -80,15 +89,17 @@ public sealed class AggregatesService
             var activeLoads = await _db.TeacherCourseLoads.Where(l => l.IsActive).ToListAsync();
             var tIds = activeLoads.Select(l => l.TeacherId).Distinct().ToList();
             var cIds = activeLoads.Select(l => l.CourseId).Distinct().ToList();
-            var counts = await _db.ScheduleItems
+            var items = await _db.ScheduleItems
                 .Include(si => si.Group)
                 .Where(si => si.TeacherId != null
                              && !excludeLoadIds.Contains(si.LessonTypeId)
                              && tIds.Contains(si.TeacherId!.Value)
                              && cIds.Contains(si.Group.CourseId))
-                .GroupBy(si => new { TeacherId = si.TeacherId!.Value, si.Group.CourseId })
-                .Select(g => new { g.Key.TeacherId, g.Key.CourseId, C = g.Count() })
                 .ToListAsync();
+            var counts = items
+                .GroupBy(si => new { TeacherId = si.TeacherId!.Value, si.Group.CourseId })
+                .Select(g => new { g.Key.TeacherId, g.Key.CourseId, C = g.Sum(si => ScheduledHours(si.StartTime, si.EndTime)) })
+                .ToList();
             foreach (var l in activeLoads)
                 l.ScheduledHours = counts.FirstOrDefault(c => c.TeacherId == l.TeacherId && c.CourseId == l.CourseId)?.C ?? 0;
             var inactive = await _db.TeacherCourseLoads.Where(l => !l.IsActive).ToListAsync();
@@ -101,15 +112,17 @@ public sealed class AggregatesService
             {
                 var tIds = keys.Select(k => k.TeacherId).Distinct().ToList();
                 var cIds = keys.Select(k => k.CourseId).Distinct().ToList();
-                var counts = await _db.ScheduleItems
+                var items = await _db.ScheduleItems
                     .Include(si => si.Group)
                     .Where(si => si.TeacherId != null
                                  && !excludeLoadIds.Contains(si.LessonTypeId)
                                  && tIds.Contains(si.TeacherId!.Value)
                                  && cIds.Contains(si.Group.CourseId))
-                    .GroupBy(si => new { TeacherId = si.TeacherId!.Value, si.Group.CourseId })
-                    .Select(g => new { g.Key.TeacherId, g.Key.CourseId, C = g.Count() })
                     .ToListAsync();
+                var counts = items
+                    .GroupBy(si => new { TeacherId = si.TeacherId!.Value, si.Group.CourseId })
+                    .Select(g => new { g.Key.TeacherId, g.Key.CourseId, C = g.Sum(si => ScheduledHours(si.StartTime, si.EndTime)) })
+                    .ToList();
                 var loadsToUpdate = await _db.TeacherCourseLoads
                     .Where(l => l.IsActive && tIds.Contains(l.TeacherId) && cIds.Contains(l.CourseId))
                     .ToListAsync();

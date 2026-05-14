@@ -120,6 +120,27 @@
         font-size: .85em;
         margin-top: .1rem;
     }
+    .log-gap-summary {
+        border-left: 4px solid #0f766e;
+        background: #ecfdf5;
+        color: #064e3b;
+        border-radius: .35rem;
+        padding: .4rem .55rem;
+        margin-bottom: .5rem;
+    }
+    .log-gap-summary-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: .35rem;
+        margin-top: .3rem;
+    }
+    .log-gap-summary-pill {
+        border: 1px solid rgba(15, 118, 110, .25);
+        border-radius: 999px;
+        background: #fff;
+        padding: .1rem .4rem;
+        font-size: .75rem;
+    }
 </style>
 
 @page "/admin/schedule-logs"
@@ -286,6 +307,19 @@ else
                                                 }
                                                 else
                                                 {
+                                                    var gapSummary = BuildGapReasonSummary(entry.GapDetails);
+                                                    @if (gapSummary.Count > 0)
+                                                    {
+                                                        <div class="log-gap-summary small">
+                                                            <div class="fw-semibold">Причини незаповнених слотів</div>
+                                                            <div class="log-gap-summary-list">
+                                                                @foreach (var item in gapSummary)
+                                                                {
+                                                                    <span class="log-gap-summary-pill">@item.Title: @item.Count</span>
+                                                                }
+                                                            </div>
+                                                        </div>
+                                                    }
                                                     <ul class="log-issue-list">
                                                         @foreach (var warn in entry.Warnings)
                                                         {
@@ -558,6 +592,79 @@ else
     private static bool Contains(string? value, string needle)
         => !string.IsNullOrWhiteSpace(value)
            && value.Contains(needle, StringComparison.OrdinalIgnoreCase);
+
+    private static List<AutoGenGapSummaryItem> BuildGapReasonSummary(IEnumerable<AutoGenGapDetail>? gapDetails)
+    {
+        if (gapDetails is null)
+        {
+            return new();
+        }
+        return gapDetails
+            .GroupBy(gap => ClassifyGapReason(gap.Reason))
+            .OrderByDescending(group => group.Count())
+            .ThenBy(group => group.Key.Title, StringComparer.Ordinal)
+            .Select(group => new AutoGenGapSummaryItem(
+                group.Key.Code,
+                group.Key.Title,
+                group.Count(),
+                group.Take(5).Select(BuildGapSummaryExample).ToList()))
+            .ToList();
+    }
+
+    private static string BuildGapSummaryExample(AutoGenGapDetail gap)
+    {
+        var reason = string.IsNullOrWhiteSpace(gap.Reason) ? "Причину не визначено." : gap.Reason.Trim();
+        if (reason.Length > 220)
+        {
+            reason = reason[..220] + "...";
+        }
+        return $"{gap.Date:yyyy-MM-dd} {gap.SlotLabel}, {gap.GroupName}: {reason}";
+    }
+
+    private static (string Code, string Title) ClassifyGapReason(string? reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+        {
+            return ("unknown", "Причину не визначено");
+        }
+        var text = reason.ToLowerInvariant();
+        if (text.Contains("немає доступних викладач", StringComparison.Ordinal)
+            || text.Contains("викладач", StringComparison.Ordinal) && (text.Contains("кафедр", StringComparison.Ordinal) || text.Contains("зайнят", StringComparison.Ordinal)))
+        {
+            return ("teacher", "Немає доступного викладача");
+        }
+        if (text.Contains("усі аудитор", StringComparison.Ordinal)
+            || text.Contains("аудитор", StringComparison.Ordinal) && (text.Contains("зайнят", StringComparison.Ordinal) || text.Contains("не належ", StringComparison.Ordinal)))
+        {
+            return ("room", "Немає доступної аудиторії");
+        }
+        if (text.Contains("переход", StringComparison.Ordinal)
+            || text.Contains("корпус", StringComparison.Ordinal) && text.Contains("хв", StringComparison.Ordinal))
+        {
+            return ("travel", "Недостатньо часу на перехід");
+        }
+        if (text.Contains("хронолог", StringComparison.Ordinal)
+            || text.Contains("порядок тем", StringComparison.Ordinal)
+            || text.Contains("відкладено", StringComparison.Ordinal) && text.Contains("порядком тем", StringComparison.Ordinal))
+        {
+            return ("topic-order", "Порядок тем не дозволив слот");
+        }
+        if (text.Contains("суцільним блоком", StringComparison.Ordinal))
+        {
+            return ("module-block", "Модуль має йти суцільним блоком");
+        }
+        if (text.Contains("більше двох", StringComparison.Ordinal)
+            || text.Contains("ліміт", StringComparison.Ordinal)
+            || text.Contains("обмеж", StringComparison.Ordinal))
+        {
+            return ("limit", "Спрацювали денні або слотні ліміти");
+        }
+        if (text.Contains("спільн", StringComparison.Ordinal))
+        {
+            return ("shared-flow", "Спільний потік не готовий");
+        }
+        return ("other", "Інші причини");
+    }
 
     private static string FormatWeek(AdminScheduleLogEntry entry)
     {
