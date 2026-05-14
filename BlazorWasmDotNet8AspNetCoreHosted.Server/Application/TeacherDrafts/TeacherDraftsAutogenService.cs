@@ -1913,8 +1913,52 @@ public sealed class TeacherDraftsAutogenService
                                             && selectedGroupsById.TryGetValue(existing.GroupId, out var existingGroup)
                                             && existingGroup.CourseId == courseIdValue);
             }
+            // Оцінює, наскільки слот продовжує вже розпочату тему без розриву іншими заняттями.
+            int TopicContinuationDistance(DateOnly date, TimeSlot slot, IReadOnlyList<TimeSlot> slotsForDate)
+            {
+                var existingTopicSlots = busy
+                    .Where(existing => existing.ModuleId == moduleId
+                                       && existing.ModuleTopicId == topic.Id
+                                       && selectedGroupsById.TryGetValue(existing.GroupId, out var existingGroup)
+                                       && existingGroup.CourseId == courseIdValue)
+                    .GroupBy(existing => new { existing.Date, existing.StartTime, existing.EndTime })
+                    .Select(group => group.Key)
+                    .ToList();
+                if (existingTopicSlots.Count == 0)
+                {
+                    return 0;
+                }
 
-            (DateOnly Date, TimeSlot Slot, int? TeacherId, Room Room, List<int> GroupIds, int PreferredFirstLoad, bool JoinsExistingOccurrence)? best = null;
+                var candidateIndex = slotsForDate
+                    .Select((candidate, index) => new { candidate, index })
+                    .FirstOrDefault(x => x.candidate.Start == slot.Start && x.candidate.End == slot.End)
+                    ?.index;
+                if (candidateIndex is int currentIndex)
+                {
+                    var sameDayDistances = existingTopicSlots
+                        .Where(existing => existing.Date == date)
+                        .Select(existing =>
+                            slotsForDate
+                                .Select((candidate, index) => new { candidate, index })
+                                .FirstOrDefault(x => x.candidate.Start == existing.StartTime && x.candidate.End == existing.EndTime)
+                                ?.index)
+                        .Where(index => index.HasValue)
+                        .Select(index => Math.Abs(currentIndex - index!.Value) - 1)
+                        .ToList();
+                    if (sameDayDistances.Count > 0)
+                    {
+                        return Math.Max(0, sameDayDistances.Min());
+                    }
+                }
+
+                var nearestDayDistance = existingTopicSlots
+                    .Select(existing => Math.Abs(existing.Date.DayNumber - date.DayNumber))
+                    .DefaultIfEmpty(7)
+                    .Min();
+                return 100 + nearestDayDistance;
+            }
+
+            (DateOnly Date, TimeSlot Slot, int? TeacherId, Room Room, List<int> GroupIds, int TopicContinuationDistance, int PreferredFirstLoad, bool JoinsExistingOccurrence)? best = null;
             for (var dayOffset = 0; dayOffset < 7; dayOffset++)
             {
                 var date = weekStart.AddDays(dayOffset);
@@ -1984,6 +2028,7 @@ public sealed class TeacherDraftsAutogenService
                             }
                             var preferredFirstLoad = PreferredFirstLectureLoadForCourseDate(date);
                             var joinsExistingOccurrence = JoinsExistingTopicOccurrence(date, slot);
+                            var topicContinuationDistance = TopicContinuationDistance(date, slot, slotsForDate);
                             var slotComparison = best is null
                                 ? 0
                                 : CompareSlotPosition(date, slot.Start, slot.End, best.Value.Date, best.Value.Slot.Start, best.Value.Slot.End);
@@ -1992,18 +2037,24 @@ public sealed class TeacherDraftsAutogenService
                                 || (pack.Count == best.Value.GroupIds.Count && joinsExistingOccurrence && !best.Value.JoinsExistingOccurrence)
                                 || (pack.Count == best.Value.GroupIds.Count
                                     && joinsExistingOccurrence == best.Value.JoinsExistingOccurrence
+                                    && topicContinuationDistance < best.Value.TopicContinuationDistance)
+                                || (pack.Count == best.Value.GroupIds.Count
+                                    && joinsExistingOccurrence == best.Value.JoinsExistingOccurrence
+                                    && topicContinuationDistance == best.Value.TopicContinuationDistance
                                     && preferredFirstLoad < best.Value.PreferredFirstLoad)
                                 || (pack.Count == best.Value.GroupIds.Count
                                     && joinsExistingOccurrence == best.Value.JoinsExistingOccurrence
+                                    && topicContinuationDistance == best.Value.TopicContinuationDistance
                                     && preferredFirstLoad == best.Value.PreferredFirstLoad
                                     && slotComparison < 0)
                                 || (pack.Count == best.Value.GroupIds.Count
                                     && joinsExistingOccurrence == best.Value.JoinsExistingOccurrence
+                                    && topicContinuationDistance == best.Value.TopicContinuationDistance
                                     && preferredFirstLoad == best.Value.PreferredFirstLoad
                                     && slotComparison == 0
                                     && room.Capacity > best.Value.Room.Capacity))
                             {
-                                best = (date, slot, teacherId, room, pack, preferredFirstLoad, joinsExistingOccurrence);
+                                best = (date, slot, teacherId, room, pack, topicContinuationDistance, preferredFirstLoad, joinsExistingOccurrence);
                             }
                         }
                     }
@@ -2248,6 +2299,46 @@ public sealed class TeacherDraftsAutogenService
                 if (prevRoomId is int pr && nextRoomId is int nr && pr == nr)
                     return pr;
                 return prevRoomId ?? nextRoomId;
+            }
+            // Рахує відстань до вже поставлених годин цієї самої теми для групи.
+            int TopicContinuationDistanceForGroup(DateOnly date, TimeSlot slot, int moduleId, int? topicId)
+            {
+                if (topicId is not int selectedTopicId)
+                {
+                    return 0;
+                }
+                var existingTopicSlots = busy
+                    .Where(existing => existing.GroupId == grp.Id
+                                       && existing.ModuleId == moduleId
+                                       && existing.ModuleTopicId == selectedTopicId
+                                       && !excludedTypeIds.Contains(existing.LessonTypeId))
+                    .Select(existing => new { existing.Date, existing.StartTime, existing.EndTime })
+                    .Distinct()
+                    .ToList();
+                if (existingTopicSlots.Count == 0)
+                {
+                    return 0;
+                }
+                if (slotIndexByTime.TryGetValue((slot.Start, slot.End), out var currentIndex))
+                {
+                    var sameDayDistances = existingTopicSlots
+                        .Where(existing => existing.Date == date)
+                        .Select(existing => slotIndexByTime.TryGetValue((existing.StartTime, existing.EndTime), out var existingIndex)
+                            ? (int?)Math.Max(0, Math.Abs(currentIndex - existingIndex) - 1)
+                            : null)
+                        .Where(distance => distance.HasValue)
+                        .Select(distance => distance!.Value)
+                        .ToList();
+                    if (sameDayDistances.Count > 0)
+                    {
+                        return sameDayDistances.Min();
+                    }
+                }
+                var nearestDayDistance = existingTopicSlots
+                    .Select(existing => Math.Abs(existing.Date.DayNumber - date.DayNumber))
+                    .DefaultIfEmpty(7)
+                    .Min();
+                return 100 + nearestDayDistance;
             }
             // Рахує кількість окремих сегментів модуля в межах дня.
             int CountModuleSegments(IReadOnlyList<int> orderedIndexes)
@@ -2741,6 +2832,7 @@ public sealed class TeacherDraftsAutogenService
             const double penaltyExtraSameDay = 6.0; // Третя і наступні пари модуля за день.
             const double penaltySameSlotPattern = 1.5; // Повтор однакового StartTime для модуля в інші дні.
             const double maxExtraPenaltyPreferSameTeacherForConsecutiveModule = 6.0; // Перевага одного викладача на суміжні слоти модуля.
+            const double penaltyTopicContinuationGap = 85.0; // Розрив повтору тієї самої теми іншим заняттям.
             var penaltyPreferredFirstTypeLateSlot = 2.4 * preferredFirstPenaltyMultiplier; // Пізній слот для типу "бажано першим".
             var penaltyNonPreferredEarlySlotWhilePreferredPending = 18.0 * preferredFirstPenaltyMultiplier; // Ранній непріоритетний тип, поки пріоритетний ще не поставлено.
             var penaltyPreferredFirstBeyondLimitSlot = 28.0 * preferredFirstPenaltyMultiplier; // Вихід пріоритетного типу за ліміт номера слоту.
@@ -4195,6 +4287,12 @@ public sealed class TeacherDraftsAutogenService
                         {
                             penaltyScore += penaltySameSlotPattern;
                             penalties.Add("Повтор того ж часу в інші дні");
+                        }
+                        var topicContinuationDistance = TopicContinuationDistanceForGroup(date, sl, moduleId, topicSelection?.Id);
+                        if (topicContinuationDistance > 0)
+                        {
+                            penaltyScore += topicContinuationDistance * penaltyTopicContinuationGap;
+                            penalties.Add("Повтор тієї самої теми поставлено не суміжним блоком");
                         }
                         // Підбір аудиторій (якщо потрібні).
                         if (requiresRoom)
