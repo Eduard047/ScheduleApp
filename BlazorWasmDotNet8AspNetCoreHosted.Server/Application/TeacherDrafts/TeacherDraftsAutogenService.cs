@@ -1957,8 +1957,76 @@ public sealed class TeacherDraftsAutogenService
                     .Min();
                 return 100 + nearestDayDistance;
             }
+            int SharedLectureGapTrapPenalty(DateOnly date, TimeSlot slot, IReadOnlyList<TimeSlot> slotsForDate, Room room, IReadOnlyList<int> groupIds)
+            {
+                if (room.BuildingId == 0 || groupIds.Count == 0)
+                {
+                    return 0;
+                }
+                var slotIndex = slotsForDate
+                    .Select((candidate, index) => new { candidate, index })
+                    .FirstOrDefault(x => x.candidate.Start == slot.Start && x.candidate.End == slot.End)
+                    ?.index;
+                if (slotIndex is not int currentIndex)
+                {
+                    return 0;
+                }
 
-            (DateOnly Date, TimeSlot Slot, int? TeacherId, Room Room, List<int> GroupIds, int TopicContinuationDistance, int PreferredFirstLoad, bool JoinsExistingOccurrence)? best = null;
+                int CountTrappedGroups(TimeSlot adjacentSlot, bool adjacentBefore)
+                {
+                    var gapMinutes = adjacentBefore
+                        ? (slot.Start.ToTimeSpan() - adjacentSlot.End.ToTimeSpan()).TotalMinutes
+                        : (adjacentSlot.Start.ToTimeSpan() - slot.End.ToTimeSpan()).TotalMinutes;
+                    var trapped = 0;
+                    foreach (var groupId in groupIds)
+                    {
+                        if (busy.Any(x => x.GroupId == groupId
+                                          && x.Date == date
+                                          && x.StartTime < adjacentSlot.End
+                                          && adjacentSlot.Start < x.EndTime))
+                        {
+                            continue;
+                        }
+                        if (!remainingByGroupModule.Any(kv => kv.Key.GroupId == groupId && kv.Value > 0))
+                        {
+                            continue;
+                        }
+                        var reachableBuildingCount = roomsAll
+                            .Where(candidateRoom => candidateRoom.BuildingId != 0
+                                                    && RoomMatchesGroupPreferenceFor(groupId, candidateRoom)
+                                                    && !busy.Any(x => x.Date == date
+                                                                      && x.RoomId == candidateRoom.Id
+                                                                      && x.StartTime < adjacentSlot.End
+                                                                      && adjacentSlot.Start < x.EndTime))
+                            .Select(candidateRoom => candidateRoom.BuildingId)
+                            .Distinct()
+                            .Count(buildingId =>
+                            {
+                                var needMinutes = adjacentBefore
+                                    ? TravelMinutes(buildingId, room.BuildingId)
+                                    : TravelMinutes(room.BuildingId, buildingId);
+                                return gapMinutes >= needMinutes;
+                            });
+                        if (reachableBuildingCount <= 1)
+                        {
+                            trapped++;
+                        }
+                    }
+                    return trapped;
+                }
+
+                var penalty = 0;
+                if (currentIndex > 0)
+                {
+                    penalty += CountTrappedGroups(slotsForDate[currentIndex - 1], adjacentBefore: true);
+                }
+                if (currentIndex + 1 < slotsForDate.Count)
+                {
+                    penalty += CountTrappedGroups(slotsForDate[currentIndex + 1], adjacentBefore: false);
+                }
+                return penalty;
+            }
+            (DateOnly Date, TimeSlot Slot, int? TeacherId, Room Room, List<int> GroupIds, int TopicContinuationDistance, int PreferredFirstLoad, int GapTrapPenalty, bool JoinsExistingOccurrence)? best = null;
             for (var dayOffset = 0; dayOffset < 7; dayOffset++)
             {
                 var date = weekStart.AddDays(dayOffset);
@@ -2029,6 +2097,7 @@ public sealed class TeacherDraftsAutogenService
                             var preferredFirstLoad = PreferredFirstLectureLoadForCourseDate(date);
                             var joinsExistingOccurrence = JoinsExistingTopicOccurrence(date, slot);
                             var topicContinuationDistance = TopicContinuationDistance(date, slot, slotsForDate);
+                            var gapTrapPenalty = SharedLectureGapTrapPenalty(date, slot, slotsForDate, room, pack);
                             var slotComparison = best is null
                                 ? 0
                                 : CompareSlotPosition(date, slot.Start, slot.End, best.Value.Date, best.Value.Slot.Start, best.Value.Slot.End);
@@ -2037,24 +2106,31 @@ public sealed class TeacherDraftsAutogenService
                                 || (pack.Count == best.Value.GroupIds.Count && joinsExistingOccurrence && !best.Value.JoinsExistingOccurrence)
                                 || (pack.Count == best.Value.GroupIds.Count
                                     && joinsExistingOccurrence == best.Value.JoinsExistingOccurrence
+                                    && gapTrapPenalty < best.Value.GapTrapPenalty)
+                                || (pack.Count == best.Value.GroupIds.Count
+                                    && joinsExistingOccurrence == best.Value.JoinsExistingOccurrence
+                                    && gapTrapPenalty == best.Value.GapTrapPenalty
                                     && topicContinuationDistance < best.Value.TopicContinuationDistance)
                                 || (pack.Count == best.Value.GroupIds.Count
                                     && joinsExistingOccurrence == best.Value.JoinsExistingOccurrence
+                                    && gapTrapPenalty == best.Value.GapTrapPenalty
                                     && topicContinuationDistance == best.Value.TopicContinuationDistance
                                     && preferredFirstLoad < best.Value.PreferredFirstLoad)
                                 || (pack.Count == best.Value.GroupIds.Count
                                     && joinsExistingOccurrence == best.Value.JoinsExistingOccurrence
+                                    && gapTrapPenalty == best.Value.GapTrapPenalty
                                     && topicContinuationDistance == best.Value.TopicContinuationDistance
                                     && preferredFirstLoad == best.Value.PreferredFirstLoad
                                     && slotComparison < 0)
                                 || (pack.Count == best.Value.GroupIds.Count
                                     && joinsExistingOccurrence == best.Value.JoinsExistingOccurrence
+                                    && gapTrapPenalty == best.Value.GapTrapPenalty
                                     && topicContinuationDistance == best.Value.TopicContinuationDistance
                                     && preferredFirstLoad == best.Value.PreferredFirstLoad
                                     && slotComparison == 0
                                     && room.Capacity > best.Value.Room.Capacity))
                             {
-                                best = (date, slot, teacherId, room, pack, topicContinuationDistance, preferredFirstLoad, joinsExistingOccurrence);
+                                best = (date, slot, teacherId, room, pack, topicContinuationDistance, preferredFirstLoad, gapTrapPenalty, joinsExistingOccurrence);
                             }
                         }
                     }
@@ -3042,6 +3118,15 @@ public sealed class TeacherDraftsAutogenService
                         .ToList()
                     : candidateRooms;
             }
+            // Зміна аудиторії в суміжному блоці є небажаною, але не має створювати неповну чернетку, якщо є вільна аудиторія.
+            double AdjacentRoomSwitchPenalty()
+            {
+                if (adjacentRoomChangePenalty is double overridePenalty && overridePenalty >= 0)
+                {
+                    return overridePenalty;
+                }
+                return softFill ? 4.0 : 12.0;
+            }
             // Оцінює, скільки додаткових груп ще може вмістити спільна лекція в обраній аудиторії.
             int AdditionalSharedLectureGroupCapacity(Room room, int sharedStudents, int totalSharedGroupCount)
             {
@@ -3514,9 +3599,13 @@ public sealed class TeacherDraftsAutogenService
                 return reachableBuildings.Count;
             }
             // Штрафує корпус, який занадто сильно обмежує наступні або попередні порожні слоти.
-            double NeighborGapBuildingPreservationPenalty(Room room, DateOnly day, TimeSlot currentSlot, int? forcedGapVariantBudget)
+            double NeighborGapBuildingPreservationPenalty(Room room, DateOnly day, TimeSlot currentSlot, int? forcedGapVariantBudget, bool isShareableLecturePlacement)
             {
                 var preservationWeight = GapResourcePreservationWeight(forcedGapVariantBudget);
+                if (preservationWeight <= 0 && isShareableLecturePlacement)
+                {
+                    preservationWeight = 18.0;
+                }
                 if (preservationWeight <= 0 || room.BuildingId == 0)
                 {
                     return 0;
@@ -4312,14 +4401,7 @@ public sealed class TeacherDraftsAutogenService
                                 var roomSwitchPenalty = 0.0;
                                 if (preferredAdjacentRoomId is int preferredRoomId && rm.Id != preferredRoomId)
                                 {
-                                    if (adjacentRoomChangePenalty is double overridePenalty && overridePenalty >= 0)
-                                    {
-                                        roomSwitchPenalty = overridePenalty;
-                                    }
-                                    else
-                                    {
-                                        continue;
-                                    }
+                                    roomSwitchPenalty = AdjacentRoomSwitchPenalty();
                                 }
                                 var topicId = topicSelection?.Id;
                                 var existingSharedLectureGroupIds = allowJoinExistingSharedLecture
@@ -4489,7 +4571,8 @@ public sealed class TeacherDraftsAutogenService
                                     rm,
                                     date,
                                     sl,
-                                    forcedGapVariantBudget);
+                                    forcedGapVariantBudget,
+                                    isShareableLecturePlacement);
                                 var sharedLectureBonus = isShareableLecturePlacement
                                     ? Math.Max(0, allSharedGroupIds.Count - 1) * 18.0
                                     : 0;
