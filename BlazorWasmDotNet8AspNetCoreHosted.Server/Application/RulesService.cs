@@ -396,6 +396,7 @@ public sealed class RulesService(AppDbContext db)
             if (slots[i].Start != start) continue;
             for (var j = i; j < slots.Count; j++)
             {
+                if (j > i && slots[j - 1].End != slots[j].Start) break;
                 if (slots[j].End == end) return true;
             }
         }

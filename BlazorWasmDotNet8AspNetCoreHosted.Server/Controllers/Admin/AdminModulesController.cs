@@ -164,6 +164,10 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
         if (force)
         {
             var q = db.ScheduleItems.Where(x => x.ModuleId == id);
+            var affectedPlans = await q
+                .Select(x => new { CourseId = x.Group.CourseId, x.ModuleId })
+                .Distinct()
+                .ToListAsync();
             var affectedLoads = await q.Where(x => x.TeacherId != null)
                 .Select(x => new { x.TeacherId, CourseId = x.Group.CourseId })
                 .Distinct()
@@ -172,30 +176,9 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
             await db.ModulePlans.Where(p => p.ModuleId == id).ExecuteDeleteAsync();
             await db.ModuleRooms.Where(x => x.ModuleId == id).ExecuteDeleteAsync();
             await db.ModuleBuildings.Where(x => x.ModuleId == id).ExecuteDeleteAsync();
-            if (affectedLoads.Count > 0)
-            {
-                var tIds = affectedLoads.Select(a => a.TeacherId!.Value).Distinct().ToList();
-                var cIds = affectedLoads.Select(a => a.CourseId).Distinct().ToList();
-                var excludeLoadIds = await db.LessonTypes
-                    .Where(lt => !lt.CountInLoad)
-                    .Select(lt => lt.Id)
-                    .ToListAsync();
-                var counts = await db.ScheduleItems
-                    .Include(si => si.Group)
-                    .Where(si => si.TeacherId != null
-                                 && !excludeLoadIds.Contains(si.LessonTypeId)
-                                 && tIds.Contains(si.TeacherId!.Value)
-                                 && cIds.Contains(si.Group.CourseId))
-                    .GroupBy(si => new { TeacherId = si.TeacherId!.Value, si.Group.CourseId })
-                    .Select(g => new { g.Key.TeacherId, g.Key.CourseId, C = g.Count() })
-                    .ToListAsync();
-                var loadsToUpdate = await db.TeacherCourseLoads
-                    .Where(l => tIds.Contains(l.TeacherId) && cIds.Contains(l.CourseId))
-                    .ToListAsync();
-                foreach (var l in loadsToUpdate)
-                    l.ScheduledHours = counts.FirstOrDefault(c => c.TeacherId == l.TeacherId && c.CourseId == l.CourseId)?.C ?? 0;
-                await db.SaveChangesAsync();
-            }
+            await new AggregatesService(db).RecalcAsync(
+                affectedPlans.Select(a => (a.CourseId, a.ModuleId)),
+                affectedLoads.Select(a => (a.TeacherId!.Value, a.CourseId)));
         }
         else
         {

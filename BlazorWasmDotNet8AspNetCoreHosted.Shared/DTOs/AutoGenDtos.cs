@@ -62,9 +62,17 @@ public record AutoGenGapDetail(
 );
 
 // Результат автогенерації чернеток.
+public record AutoGenGapSummaryItem(
+    string Code,
+    string Title,
+    int Count,
+    List<string> Examples
+);
+
 public record AutoGenResult(
     int Created,
     int Skipped,
     List<string> Warnings,
-    List<AutoGenGapDetail>? GapDetails = null
+    List<AutoGenGapDetail>? GapDetails = null,
+    List<AutoGenGapSummaryItem>? GapSummary = null
 );
