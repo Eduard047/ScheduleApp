@@ -1534,15 +1534,6 @@ public sealed class TeacherDraftsAutogenService
                 : Array.Empty<TimeSlot>();
         }
 
-        int GetSharedSlotOrder(IReadOnlyList<TimeSlot> slotsForDate, TimeSlot slot)
-        {
-            var index = slotsForDate
-                .Select((candidate, candidateIndex) => new { candidate, candidateIndex })
-                .FirstOrDefault(x => x.candidate.Start == slot.Start && x.candidate.End == slot.End)
-                ?.candidateIndex;
-            return index is int value ? value + 1 : int.MaxValue;
-        }
-
         bool IsTopicStillPendingForGroup(int groupIdCheck, int moduleIdCheck, ModuleTopic topic)
         {
             if (!topicsByModule.TryGetValue(moduleIdCheck, out var moduleTopics)
@@ -1868,14 +1859,6 @@ public sealed class TeacherDraftsAutogenService
             {
                 return false;
             }
-            var coursePreferredFirstSlotLimit = preferredFirstSlotLimitsAll.FirstOrDefault(x => x.CourseId == courseIdValue)
-                                               ?? preferredFirstSlotLimitsAll.FirstOrDefault(x => x.CourseId == null);
-            int? coursePreferredFirstMaxSlotOrder = r.PreferredFirstMaxSlotOrderOverride is int preferredFirstOverride
-                ? preferredFirstOverride > 0 ? preferredFirstOverride : null
-                : coursePreferredFirstSlotLimit is not null && coursePreferredFirstSlotLimit.MaxSlotOrder > 0
-                    ? coursePreferredFirstSlotLimit.MaxSlotOrder
-                    : preferredFirstTypeId != 0 ? 6 : null;
-
             allowedRoomsByModule.TryGetValue(moduleId, out var allowedRooms);
             allowedBuildingsByModule.TryGetValue(moduleId, out var allowedBuildings);
             var roomCandidates = roomsAll
@@ -1887,6 +1870,23 @@ public sealed class TeacherDraftsAutogenService
             if (roomCandidates.Count == 0)
             {
                 return false;
+            }
+
+            var coursePreferredFirstSlotLimit = preferredFirstSlotLimitsAll.FirstOrDefault(x => x.CourseId == courseIdValue)
+                                               ?? preferredFirstSlotLimitsAll.FirstOrDefault(x => x.CourseId == null);
+            int? coursePreferredFirstMaxSlotOrder = r.PreferredFirstMaxSlotOrderOverride is int preferredFirstOverride
+                ? preferredFirstOverride > 0 ? preferredFirstOverride : null
+                : coursePreferredFirstSlotLimit is not null && coursePreferredFirstSlotLimit.MaxSlotOrder > 0
+                    ? coursePreferredFirstSlotLimit.MaxSlotOrder
+                    : preferredFirstTypeId != 0 ? 6 : null;
+
+            int GetSharedSlotOrder(IReadOnlyList<TimeSlot> slotsForDate, TimeSlot slot)
+            {
+                var index = slotsForDate
+                    .Select((candidate, candidateIndex) => new { candidate, candidateIndex })
+                    .FirstOrDefault(x => x.candidate.Start == slot.Start && x.candidate.End == slot.End)
+                    ?.candidateIndex;
+                return index is int value ? value + 1 : int.MaxValue;
             }
 
             int PreferredFirstLectureLoadForCourseDate(DateOnly date)
@@ -2026,7 +2026,7 @@ public sealed class TeacherDraftsAutogenService
                 }
                 return penalty;
             }
-            (DateOnly Date, TimeSlot Slot, int? TeacherId, Room Room, List<int> GroupIds, int TopicContinuationDistance, int PreferredFirstLoad, int GapTrapPenalty, bool JoinsExistingOccurrence)? best = null;
+            (DateOnly Date, TimeSlot Slot, int? TeacherId, Room Room, List<int> GroupIds, int TopicContinuationDistance, int PreferredFirstLoad, int GapTrapPenalty, bool JoinsExistingOccurrence, bool BeyondPreferredLimit)? best = null;
             for (var dayOffset = 0; dayOffset < 7; dayOffset++)
             {
                 var date = weekStart.AddDays(dayOffset);
@@ -2041,13 +2041,19 @@ public sealed class TeacherDraftsAutogenService
                 }
                 foreach (var slot in slotsForDate)
                 {
+                    var sharedSlotOrder = GetSharedSlotOrder(slotsForDate, slot);
+                    // Пізній резерв для "бажано першим" обмежений одним слотом після ліміту, щоб не забивати перші дні лекціями.
                     if (preferredFirstTypeId != 0
                         && topic.LessonTypeId == preferredFirstTypeId
-                        && coursePreferredFirstMaxSlotOrder is int maxPreferredSlot
-                        && GetSharedSlotOrder(slotsForDate, slot) > maxPreferredSlot)
+                        && coursePreferredFirstMaxSlotOrder is int maxPreferredOverflowSlot
+                        && sharedSlotOrder > maxPreferredOverflowSlot + 1)
                     {
                         continue;
                     }
+                    var beyondPreferredLimit = preferredFirstTypeId != 0
+                                               && topic.LessonTypeId == preferredFirstTypeId
+                                               && coursePreferredFirstMaxSlotOrder is int maxPreferredSlot
+                                               && sharedSlotOrder > maxPreferredSlot;
                     foreach (var teacherId in teacherIds)
                     {
                         if (teacherId is int tid)
@@ -2101,36 +2107,53 @@ public sealed class TeacherDraftsAutogenService
                             var slotComparison = best is null
                                 ? 0
                                 : CompareSlotPosition(date, slot.Start, slot.End, best.Value.Date, best.Value.Slot.Start, best.Value.Slot.End);
-                            if (best is null
-                                || pack.Count > best.Value.GroupIds.Count
-                                || (pack.Count == best.Value.GroupIds.Count && joinsExistingOccurrence && !best.Value.JoinsExistingOccurrence)
-                                || (pack.Count == best.Value.GroupIds.Count
-                                    && joinsExistingOccurrence == best.Value.JoinsExistingOccurrence
-                                    && gapTrapPenalty < best.Value.GapTrapPenalty)
-                                || (pack.Count == best.Value.GroupIds.Count
-                                    && joinsExistingOccurrence == best.Value.JoinsExistingOccurrence
-                                    && gapTrapPenalty == best.Value.GapTrapPenalty
-                                    && topicContinuationDistance < best.Value.TopicContinuationDistance)
-                                || (pack.Count == best.Value.GroupIds.Count
-                                    && joinsExistingOccurrence == best.Value.JoinsExistingOccurrence
-                                    && gapTrapPenalty == best.Value.GapTrapPenalty
-                                    && topicContinuationDistance == best.Value.TopicContinuationDistance
-                                    && preferredFirstLoad < best.Value.PreferredFirstLoad)
-                                || (pack.Count == best.Value.GroupIds.Count
-                                    && joinsExistingOccurrence == best.Value.JoinsExistingOccurrence
-                                    && gapTrapPenalty == best.Value.GapTrapPenalty
-                                    && topicContinuationDistance == best.Value.TopicContinuationDistance
-                                    && preferredFirstLoad == best.Value.PreferredFirstLoad
-                                    && slotComparison < 0)
-                                || (pack.Count == best.Value.GroupIds.Count
-                                    && joinsExistingOccurrence == best.Value.JoinsExistingOccurrence
-                                    && gapTrapPenalty == best.Value.GapTrapPenalty
-                                    && topicContinuationDistance == best.Value.TopicContinuationDistance
-                                    && preferredFirstLoad == best.Value.PreferredFirstLoad
-                                    && slotComparison == 0
-                                    && room.Capacity > best.Value.Room.Capacity))
+                            var preferEarliestPreferredFirst = preferredFirstTypeId != 0 && topic.LessonTypeId == preferredFirstTypeId;
+                            var betterCandidate = best is null || pack.Count > best.Value.GroupIds.Count;
+                            if (!betterCandidate
+                                && best is not null
+                                && pack.Count == best.Value.GroupIds.Count)
                             {
-                                best = (date, slot, teacherId, room, pack, topicContinuationDistance, preferredFirstLoad, gapTrapPenalty, joinsExistingOccurrence);
+                                if (joinsExistingOccurrence != best.Value.JoinsExistingOccurrence)
+                                {
+                                    betterCandidate = joinsExistingOccurrence;
+                                }
+                                else if (preferEarliestPreferredFirst)
+                                {
+                                    betterCandidate = slotComparison < 0
+                                                      || (slotComparison == 0
+                                                          && beyondPreferredLimit != best.Value.BeyondPreferredLimit
+                                                          && !beyondPreferredLimit)
+                                                      || (slotComparison == 0 && gapTrapPenalty < best.Value.GapTrapPenalty)
+                                                      || (slotComparison == 0
+                                                          && gapTrapPenalty == best.Value.GapTrapPenalty
+                                                          && topicContinuationDistance < best.Value.TopicContinuationDistance)
+                                                      || (slotComparison == 0
+                                                          && gapTrapPenalty == best.Value.GapTrapPenalty
+                                                          && topicContinuationDistance == best.Value.TopicContinuationDistance
+                                                          && room.Capacity > best.Value.Room.Capacity);
+                                }
+                                else
+                                {
+                                    betterCandidate = gapTrapPenalty < best.Value.GapTrapPenalty
+                                                      || (gapTrapPenalty == best.Value.GapTrapPenalty
+                                                          && topicContinuationDistance < best.Value.TopicContinuationDistance)
+                                                      || (gapTrapPenalty == best.Value.GapTrapPenalty
+                                                          && topicContinuationDistance == best.Value.TopicContinuationDistance
+                                                          && preferredFirstLoad < best.Value.PreferredFirstLoad)
+                                                      || (gapTrapPenalty == best.Value.GapTrapPenalty
+                                                          && topicContinuationDistance == best.Value.TopicContinuationDistance
+                                                          && preferredFirstLoad == best.Value.PreferredFirstLoad
+                                                          && slotComparison < 0)
+                                                      || (gapTrapPenalty == best.Value.GapTrapPenalty
+                                                          && topicContinuationDistance == best.Value.TopicContinuationDistance
+                                                          && preferredFirstLoad == best.Value.PreferredFirstLoad
+                                                          && slotComparison == 0
+                                                          && room.Capacity > best.Value.Room.Capacity);
+                                }
+                            }
+                            if (betterCandidate)
+                            {
+                                best = (date, slot, teacherId, room, pack, topicContinuationDistance, preferredFirstLoad, gapTrapPenalty, joinsExistingOccurrence, beyondPreferredLimit);
                             }
                         }
                     }
@@ -2198,11 +2221,6 @@ public sealed class TeacherDraftsAutogenService
 
         int PreplaceAvailableSharedLectureTopics(int? onlyModuleId = null)
         {
-            if (softFill)
-            {
-                return 0;
-            }
-
             var placed = 0;
             foreach (var courseEntry in selectedGroupsByCourse.OrderBy(entry => entry.Key))
             {
@@ -4810,9 +4828,16 @@ public sealed class TeacherDraftsAutogenService
                 }
                 if (!selectedIsSelfStudy && selectedTopic is not null)
                 {
+                    var selectedViolatesTopicOrder = writablePlacedGroupIds
+                        .Any(sharedGroupId => ViolatesTopicCalendarOrder(sharedGroupId, moduleId, selectedTopic, date, startTime, endTime));
+                    if (selectedViolatesTopicOrder && allowEmergencyTopicOrderRelaxation && selectedIncomplete is null)
+                    {
+                        selectedNotes.Add("Аварійне дозаповнення створило заняття без теми, щоб не порушувати хронологічний порядок тем.");
+                        selectedTopic = null;
+                    }
                     foreach (var sharedGroupId in writablePlacedGroupIds)
                     {
-                        if (!allowEmergencyTopicOrderRelaxation
+                        if (selectedTopic is not null
                             && ViolatesTopicCalendarOrder(sharedGroupId, moduleId, selectedTopic, date, startTime, endTime))
                         {
                             var groupLabel = selectedGroupsById.TryGetValue(sharedGroupId, out var sharedGroupInfo)
@@ -5410,7 +5435,8 @@ public sealed class TeacherDraftsAutogenService
                             gap => EstimateGapVariantBudget(gap, bypassDistinctLimit, maxModuleSegmentsAllowedForGapFill, moduleBudgetCache));
                         gaps = gaps
                             .OrderBy(gap => gapVariantBudgetBySlot[(gap.Start, gap.End)])
-                            .ThenByDescending(gap => slotIndexByTime.TryGetValue((gap.Start, gap.End), out var gapIndex) ? gapIndex : 0)
+                            // Прогалини дозаповнюємо за ходом дня, щоб раніший слот не отримав пізнішу тему після пізнього слоту.
+                            .ThenBy(gap => slotIndexByTime.TryGetValue((gap.Start, gap.End), out var gapIndex) ? gapIndex : 0)
                             .ToList();
                         foreach (var gap in gaps)
                         {
