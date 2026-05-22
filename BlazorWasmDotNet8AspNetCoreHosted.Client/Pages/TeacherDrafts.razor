@@ -37,18 +37,20 @@
     private readonly List<ExtraTeacherSelection> _extraTeachers = new();
     private readonly Dictionary<int, List<ModuleTopicViewDto>> _topicsCache = new();
     private readonly Dictionary<int, int?> _lessonTypeRoomCache = new();
+    private readonly List<IdCodeNameDto> _allowedLessonTypes = new();
+    private readonly Dictionary<int, ModuleMetaDto> _moduleById = new();
+    private readonly Dictionary<int, LookupDto> _groupById = new();
+    private readonly Dictionary<int, string> _lessonTypeCodeById = new();
+    private readonly Dictionary<int, string> _moduleCourseCaptionById = new();
+    private int? _noneLessonTypeId;
     private List<ModuleTopicViewDto> TopicsForModule(int moduleId) => _topicsCache.TryGetValue(moduleId, out var list) ? list : new List<ModuleTopicViewDto>();
-    private List<IdCodeNameDto> AllowedLessonTypes =>
-        _meta?.LessonTypes
-            .Where(lt => !string.Equals(lt.Code, "NONE", StringComparison.OrdinalIgnoreCase))
-            .ToList() ?? new();
-    private int? NoneLessonTypeId =>
-        _meta?.LessonTypes.FirstOrDefault(lt => string.Equals(lt.Code, "NONE", StringComparison.OrdinalIgnoreCase))?.Id;
+    private List<IdCodeNameDto> AllowedLessonTypes => _allowedLessonTypes;
+    private int? NoneLessonTypeId => _noneLessonTypeId;
     // Перевіряє, чи тип заняття є підсумковим контролем.
     private bool IsFinalAssessment(int? lessonTypeId)
     {
         if (lessonTypeId is not int ltId || _meta is null) return false;
-        var code = _meta.LessonTypes.FirstOrDefault(lt => lt.Id == ltId)?.Code;
+        var code = _lessonTypeCodeById.GetValueOrDefault(ltId);
         return string.Equals(code, "EXAM", StringComparison.OrdinalIgnoreCase)
                || string.Equals(code, "CREDIT", StringComparison.OrdinalIgnoreCase);
     }
@@ -92,6 +94,11 @@
     private const string MixedTopicLessonTypeError = "Можна обрати кілька тем лише з однаковим типом заняття.";
     private record SlotRow(string Start, string End) { public string Label => $"{Start}-{End}"; }
     private List<SlotRow> _rows = new();
+    private List<TeacherDraftItemDto> _filteredItems = new();
+    private List<LookupDto> _displayGroups = new();
+    private List<DateOnly> _displayWeekDays = new();
+    private List<SlotRow> _displaySlots = new();
+    private Dictionary<(int DayNumber, string Start, string End, int GroupId), TeacherDraftItemDto> _displayLookup = new();
     private static readonly string[] UkrainianDayNames = { "Неділя", "Понеділок", "Вівторок", "Середа", "Четвер", "П'ятниця", "Субота" };
     private DragPayload? _dragPayload;
     private SlotKey? _dragHover;
@@ -100,18 +107,11 @@
     private const string LogActionCreate = "create-item";
     private const string LogActionDelete = "delete-item";
     private string CurrentConflictKey => $"{_weekStart:yyyy-MM-dd}|t:{_teacherId?.ToString() ?? "all"}|g:{_groupId?.ToString() ?? "all"}|r:{_roomId?.ToString() ?? "all"}|c:{_courseId?.ToString() ?? "all"}";
-    // Фільтрує чернетки за поточними параметрами відбору.
-    private IEnumerable<TeacherDraftItemDto> Filtered =>
-        _items.Where(i =>
-            (_teacherId is null || i.TeacherId == _teacherId) &&
-            (_groupId is null || i.GroupId == _groupId) &&
-            (_roomId is null || i.RoomId == _roomId) &&
-            ModuleMatchesCourse(i.ModuleId, _courseId)
-        );
     // Початкове завантаження метаданих, конфліктів та чернеток.
     protected override async Task OnInitializedAsync()
     {
         _meta = await Http.GetFromJsonAsync<MetaResponseDto>("api/meta");
+        RebuildMetaLookups();
         await LoadConflictsAsync();
     }
     protected override async Task OnParametersSetAsync()
@@ -134,6 +134,61 @@
         {
             _weekStart = FirstMonday(weekStart);
         }
+    }
+    // Будує швидкі довідники для метаданих, щоб не шукати їх у списках під час кожного рендеру.
+    private void RebuildMetaLookups()
+    {
+        _allowedLessonTypes.Clear();
+        _moduleById.Clear();
+        _groupById.Clear();
+        _lessonTypeCodeById.Clear();
+        _moduleCourseCaptionById.Clear();
+        _noneLessonTypeId = null;
+
+        if (_meta is null)
+        {
+            return;
+        }
+
+        _allowedLessonTypes.AddRange(_meta.LessonTypes
+            .Where(lt => !string.Equals(lt.Code, "NONE", StringComparison.OrdinalIgnoreCase)));
+        _noneLessonTypeId = _meta.LessonTypes
+            .FirstOrDefault(lt => string.Equals(lt.Code, "NONE", StringComparison.OrdinalIgnoreCase))?.Id;
+
+        foreach (var lessonType in _meta.LessonTypes)
+        {
+            _lessonTypeCodeById[lessonType.Id] = lessonType.Code;
+        }
+        foreach (var module in _meta.Modules)
+        {
+            _moduleById[module.Id] = module;
+            if (!string.IsNullOrWhiteSpace(module.CourseName))
+            {
+                _moduleCourseCaptionById[module.Id] = module.CourseName!;
+            }
+        }
+        foreach (var group in _meta.Groups)
+        {
+            _groupById[group.Id] = group;
+        }
+    }
+    // Перебудовує дані таблиці один раз після завантаження або зміни фільтрів.
+    private void RebuildDraftDisplayCache()
+    {
+        _filteredItems = _items.Where(i =>
+            (_teacherId is null || i.TeacherId == _teacherId) &&
+            (_groupId is null || i.GroupId == _groupId) &&
+            (_roomId is null || i.RoomId == _roomId) &&
+            ModuleMatchesCourse(i.ModuleId, _courseId)
+        ).ToList();
+        _displayGroups = ResolveGroups(_filteredItems);
+        _displayWeekDays = GetWeekDates();
+        _displaySlots = MergeSlotRows(_rows, _filteredItems);
+        _displayLookup = BuildLookup(_filteredItems);
+    }
+    private void OnFilterChanged()
+    {
+        RebuildDraftDisplayCache();
     }
     // Нормалізує query-параметр і перетворює 0/від'ємні значення на відсутність фільтра.
     private static int? NormalizeQueryId(int? value)
@@ -166,6 +221,7 @@
             .Select(g => g.First())
             .OrderBy(x => x.Start)
             .ToList();
+        RebuildDraftDisplayCache();
     }
     private async Task ReloadDraftItemsOnlyAsync()
     {
@@ -205,6 +261,7 @@
             _editTopicIds.Clear();
         }
         SyncCurrentConflict();
+        RebuildDraftDisplayCache();
     }
     private void RemoveDraftItemsFromState(IEnumerable<int> ids)
     {
@@ -234,6 +291,7 @@
             _editTopicIds.Clear();
         }
         SyncCurrentConflict();
+        RebuildDraftDisplayCache();
     }
     // Експортує поточний тиждень у формат Excel.
     private async Task ExportScheduleAsync()
@@ -999,7 +1057,7 @@
         if (_meta is null) return new List<LookupDto>();
         if (_groupId is int gid)
         {
-            var match = _meta.Groups.FirstOrDefault(g => g.Id == gid);
+            var match = _groupById.GetValueOrDefault(gid);
             return match is null ? new List<LookupDto>() : new List<LookupDto> { match };
         }
         if (_courseId is int cid)
@@ -1023,7 +1081,7 @@
             .OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase)
             .ToList();
     }
-    private ModuleMetaDto? FindModule(int moduleId) => _meta?.Modules.FirstOrDefault(m => m.Id == moduleId);
+    private ModuleMetaDto? FindModule(int moduleId) => _moduleById.GetValueOrDefault(moduleId);
     private int? ModuleCourseId(int moduleId) => FindModule(moduleId)?.CourseId;
     private bool ModuleMatchesCourse(int moduleId, int? courseId)
     {
@@ -1035,8 +1093,7 @@
     }
     private string ModuleCourseCaption(int moduleId)
     {
-        var course = FindModule(moduleId)?.CourseName;
-        return string.IsNullOrWhiteSpace(course) ? string.Empty : course!;
+        return _moduleCourseCaptionById.GetValueOrDefault(moduleId) ?? string.Empty;
     }
     private static string ModuleOptionCaption(ModuleMetaDto module)
     {
@@ -2607,12 +2664,12 @@
     {
         if (_courseId is int cid) return cid;
         if (_meta is null || _groupId is null) return null;
-        return _meta.Groups.FirstOrDefault(g => g.Id == _groupId)?.CourseId;
+        return _groupById.GetValueOrDefault(_groupId.Value)?.CourseId;
     }
     private int? ResolveCourseIdForEdit()
     {
         if (_edit is null || _meta is null) return ResolveCourseIdForSlots();
-        var courseId = _meta.Groups.FirstOrDefault(g => g.Id == _edit.GroupId)?.CourseId;
+        var courseId = _groupById.GetValueOrDefault(_edit.GroupId)?.CourseId;
         return courseId ?? ResolveCourseIdForSlots();
     }
 
@@ -2628,7 +2685,7 @@ static string CssByCode(string code) => code switch
     private void ResetFilters()
     {
         _teacherId = _groupId = _roomId = _courseId = null;
-        StateHasChanged();
+        RebuildDraftDisplayCache();
     }
     private DraftValidationReportDto? ParseWarningReport(string? raw)
     {
@@ -2731,7 +2788,7 @@ static string CssByCode(string code) => code switch
     <div class="toolbar-filters">
         <label class="filter-field">
             <span class="filter-label">Обрати викладача</span>
-            <select class="select select--narrow" @bind="_teacherId">
+            <select class="select select--narrow" @bind="_teacherId" @bind:after="OnFilterChanged">
                 <option value="">Всі викладачі</option>
                 @if (_meta is not null)
                 {
@@ -2744,7 +2801,7 @@ static string CssByCode(string code) => code switch
         </label>
         <label class="filter-field">
             <span class="filter-label">Обрати групу</span>
-            <select class="select" @bind="_groupId">
+            <select class="select" @bind="_groupId" @bind:after="OnFilterChanged">
                 <option value="">Всі групи</option>
                 @foreach (var g in CourseScopedGroups())
                 {
@@ -2754,7 +2811,7 @@ static string CssByCode(string code) => code switch
         </label>
         <label class="filter-field">
             <span class="filter-label">Обрати аудиторію</span>
-            <select class="select" @bind="_roomId">
+            <select class="select" @bind="_roomId" @bind:after="OnFilterChanged">
                 <option value="">Всі аудиторії</option>
                 @if (_meta is not null)
                 {
@@ -2767,7 +2824,7 @@ static string CssByCode(string code) => code switch
         </label>
         <label class="filter-field">
             <span class="filter-label">Обрати курс</span>
-            <select class="select" @bind="_courseId">
+            <select class="select" @bind="_courseId" @bind:after="OnFilterChanged">
                 <option value="">Всі курси</option>
                 @if (_meta is not null)
                 {
@@ -2856,11 +2913,10 @@ static string CssByCode(string code) => code switch
 }
 else
 {
-    var filtered = Filtered.ToList();
-    var groups = ResolveGroups(filtered);
-    var weekDays = GetWeekDates();
-    var slots = MergeSlotRows(_rows, filtered);
-    var lookup = BuildLookup(filtered);
+    var groups = _displayGroups;
+    var weekDays = _displayWeekDays;
+    var slots = _displaySlots;
+    var lookup = _displayLookup;
     var monday = _weekStart;
     var isoWeek = ISOWeek.GetWeekOfYear(monday.ToDateTime(TimeOnly.MinValue));
     if (groups.Count == 0)

@@ -9,7 +9,7 @@
 
 @code {
 
-    private const string AppVersion = "1.3.9"; // Оновлюйте перед релізом
+    private const string AppVersion = "1.3.10"; // Оновлюйте перед релізом
     private MetaResponseDto? _meta;
     private int? _groupId;
     private int? _teacherId;
@@ -22,26 +22,35 @@
     private bool _editSaving;
     private string? _editError;
     private static readonly int[] DaysMonFirst = new[] { 1, 2, 3, 4, 5, 6, 0 };
+    private static readonly CultureInfo UkrainianCulture = new("uk-UA");
+    private static readonly Dictionary<int, string> DayNamesUk = DaysMonFirst.ToDictionary(
+        d => d,
+        d =>
+        {
+            var name = UkrainianCulture.DateTimeFormat.GetDayName((DayOfWeek)d);
+            return UkrainianCulture.TextInfo.ToTitleCase(name);
+        });
     private record SlotRow(string Start, string End)
     {
         public string Label => $"{Start}-{End}";
     }
+    private sealed record ScheduleCell(
+        ScheduleItemDto Item,
+        List<string> MergedGroups,
+        bool IsMergedLecture,
+        bool IsBreak,
+        string ModuleCourse,
+        string ColorCss);
     private List<SlotRow> _rows = new();
-    // Фільтрує елементи розкладу за вибраними параметрами.
-    private IEnumerable<ScheduleItemDto> Filtered =>
-        _items.Where(i =>
-            (_groupId is null || i.GroupId == _groupId) &&
-            (_teacherId is null || i.TeacherId == _teacherId) &&
-            (_roomId is null || i.RoomId == _roomId)
-        );
+    private Dictionary<(int DayNumber, string Start, string End), ScheduleCell> _scheduleCells = new();
+    private Dictionary<int, string> _moduleCourseById = new();
     // Формує читабельний діапазон дат для поточного тижня.
     private string WeekRangeLabel
     {
         get
         {
-            var ci = new CultureInfo("uk-UA");
-            var from = _weekStart.ToDateTime(TimeOnly.MinValue).ToString("d MMMM yyyy", ci);
-            var to = _weekStart.AddDays(6).ToDateTime(TimeOnly.MinValue).ToString("d MMMM yyyy", ci);
+            var from = _weekStart.ToDateTime(TimeOnly.MinValue).ToString("d MMMM yyyy", UkrainianCulture);
+            var to = _weekStart.AddDays(6).ToDateTime(TimeOnly.MinValue).ToString("d MMMM yyyy", UkrainianCulture);
             return $"{from} — {to}";
         }
     }
@@ -49,6 +58,9 @@
     protected override async Task OnInitializedAsync()
     {
         _meta = await Http.GetFromJsonAsync<MetaResponseDto>("api/meta");
+        _moduleCourseById = _meta?.Modules
+            .Where(m => !string.IsNullOrWhiteSpace(m.CourseName))
+            .ToDictionary(m => m.Id, m => m.CourseName!) ?? new();
         await Reload();
     }
     // Перезавантажує розклад і тайм-слоти.
@@ -75,6 +87,7 @@
         {
             CancelEdit();
         }
+        RebuildScheduleCells();
     }
     private async Task LoadScheduleItemsAsync()
     {
@@ -93,13 +106,8 @@
         if (_meta is null || _groupId is null) return null;
         return _meta.Groups.FirstOrDefault(g => g.Id == _groupId)?.CourseId;
     }
-    // Повертає назву дня українською з великої літери.
-    static string DayNameUk(int d)
-    {
-        var ci = new CultureInfo("uk-UA");
-        var name = ci.DateTimeFormat.GetDayName((DayOfWeek)d); 
-        return ci.TextInfo.ToTitleCase(name);
-    }
+    // Повертає назву дня українською з готового кешу.
+    private static string DayNameUk(int d) => DayNamesUk[d];
     // Мапить коди станів на CSS-класи.
     static string CssByCode(string code) => code switch
     {
@@ -150,11 +158,6 @@
                && left.RoomId == right.RoomId
                && HasSameTeacherForMerge(left, right);
     }
-    // Вибирає основний запис слота для відображення картки.
-    private static ScheduleItemDto? SelectDisplayItem(List<ScheduleItemDto> slotItems)
-        => slotItems
-            .OrderBy(item => item.Id)
-            .FirstOrDefault();
     // Формує перелік груп для об'єднаної лекції в межах одного слота.
     private static List<string> ResolveMergedLectureGroups(List<ScheduleItemDto> slotItems, ScheduleItemDto? anchor)
     {
@@ -175,20 +178,49 @@
     private static bool IsMergedLectureSlot(List<string> mergedGroups)
         => mergedGroups.Count > 1;
     private static string LessonModeLabel(bool requiresRoom) => requiresRoom ? "Аудиторна година" : "Без аудиторії";
-    private string ModuleCourseCaption(int moduleId)
+    // Оновлює швидкий індекс комірок після завантаження або зміни фільтрів.
+    private void RebuildScheduleCells()
     {
-        if (_meta is null) return string.Empty;
-        var module = _meta.Modules.FirstOrDefault(m => m.Id == moduleId);
-        return module is null || string.IsNullOrWhiteSpace(module.CourseName)
-            ? string.Empty
-            : module.CourseName;
+        _scheduleCells = _items
+            .Where(i =>
+                (_groupId is null || i.GroupId == _groupId) &&
+                (_teacherId is null || i.TeacherId == _teacherId) &&
+                (_roomId is null || i.RoomId == _roomId))
+            .GroupBy(i => (i.DayNumber, i.TimeStart, i.TimeEnd))
+            .Select(group =>
+            {
+                var slotItems = group.OrderBy(item => item.Id).ToList();
+                var item = slotItems.First();
+                var mergedGroups = ResolveMergedLectureGroups(slotItems, item);
+                var isBreak = string.Equals(item.LessonTypeCode, "BREAK", StringComparison.OrdinalIgnoreCase);
+                var moduleCourse = !isBreak && _moduleCourseById.TryGetValue(item.ModuleId, out var course)
+                    ? course
+                    : string.Empty;
+
+                return new
+                {
+                    Key = group.Key,
+                    Cell = new ScheduleCell(
+                        item,
+                        mergedGroups,
+                        IsMergedLectureSlot(mergedGroups),
+                        isBreak,
+                        moduleCourse,
+                        item.LessonTypeCss ?? CssByCode(item.LessonTypeCode))
+                };
+            })
+            .ToDictionary(x => x.Key, x => x.Cell);
+    }
+    private void OnFilterChanged()
+    {
+        RebuildScheduleCells();
     }
     private Task PrevWeek() { _weekStart = _weekStart.AddDays(-7); return Reload(); }
     private Task NextWeek() { _weekStart = _weekStart.AddDays(+7); return Reload(); }
     private void ResetFilters()
     {
         _groupId = _teacherId = _roomId = null;
-        StateHasChanged();
+        RebuildScheduleCells();
     }
     // Вмикає режим редагування типу заняття.
     private void BeginEdit(ScheduleItemDto item)
@@ -240,6 +272,7 @@
             );
             await ScheduleApi.Upsert(payload);
             await LoadScheduleItemsAsync();
+            RebuildScheduleCells();
             CancelEdit();
         }
         catch (ApiErrorException ex)
@@ -266,7 +299,7 @@
 
 <div class="toolbar">
 
-    <select class="select" @bind="_groupId">
+    <select class="select" @bind="_groupId" @bind:after="OnFilterChanged">
         <option value="">Обрати групу</option>
         @if (_meta is not null)
         {
@@ -276,7 +309,7 @@
             }
         }
     </select>
-    <select class="select select--narrow" @bind="_teacherId">
+    <select class="select select--narrow" @bind="_teacherId" @bind:after="OnFilterChanged">
         <option value="">Обрати викладача</option>
         @if (_meta is not null)
         {
@@ -286,7 +319,7 @@
             }
         }
     </select>
-    <select class="select" @bind="_roomId">
+    <select class="select" @bind="_roomId" @bind:after="OnFilterChanged">
         <option value="">Обрати аудиторію</option>
         @if (_meta is not null)
         {
@@ -331,20 +364,12 @@ else
                             </th>
                             @foreach (var d in DaysMonFirst)
                             {
-                                var slotItems = Filtered
-                                    .Where(x =>
-                                        x.DayNumber == d &&
-                                        x.TimeStart == row.Start &&
-                                        x.TimeEnd == row.End)
-                                    .ToList();
-                                var item = SelectDisplayItem(slotItems);
-                                var mergedGroups = ResolveMergedLectureGroups(slotItems, item);
-                                var isMergedLecture = IsMergedLectureSlot(mergedGroups);
+                                var hasCell = _scheduleCells.TryGetValue((d, row.Start, row.End), out var cell);
                                 <td class="cell">
-                                    @if (item is not null)
+                                    @if (hasCell && cell is not null)
                                     {
-                                        var colorCss = item.LessonTypeCss ?? CssByCode(item.LessonTypeCode);
-                                        <div class="card @colorCss @(isMergedLecture ? "card--merged-lecture" : string.Empty)">
+                                        var item = cell.Item;
+                                        <div class="card @cell.ColorCss @(cell.IsMergedLecture ? "card--merged-lecture" : string.Empty)">
                                             <div class="card-top">
                                                 <span class="badge">@item.LessonTypeName</span>
                                                 @if (item.IsLocked)
@@ -361,28 +386,24 @@ else
                                                     <span class="td-edit-icon" aria-hidden="true">✎</span>
                                                 </button>
                                             }
-                                            @{
-                                                var isBreak = string.Equals(item.LessonTypeCode, "BREAK", StringComparison.OrdinalIgnoreCase);
-                                                var moduleCourse = isBreak ? string.Empty : ModuleCourseCaption(item.ModuleId);
-                                            }
                                             <div class="title">
                                                 <div>@item.Module</div>
-                                                @if (!string.IsNullOrWhiteSpace(moduleCourse))
+                                                @if (!string.IsNullOrWhiteSpace(cell.ModuleCourse))
                                                 {
-                                                    <div class="title-course text-muted small">@moduleCourse</div>
+                                                    <div class="title-course text-muted small">@cell.ModuleCourse</div>
                                                 }
                                             </div>
-                                            @if (!isBreak && !string.IsNullOrWhiteSpace(item.Group))
+                                            @if (!cell.IsBreak && !string.IsNullOrWhiteSpace(item.Group))
                                             {
                                                 <div class="sub">@item.Group</div>
                                             }
-                                            @if (!isBreak && isMergedLecture)
+                                            @if (!cell.IsBreak && cell.IsMergedLecture)
                                             {
                                                 <div class="merged-lecture-label">
-                                                    Об'єднана лекція (@mergedGroups.Count груп): @string.Join(", ", mergedGroups)
+                                                    Об'єднана лекція (@cell.MergedGroups.Count груп): @string.Join(", ", cell.MergedGroups)
                                                 </div>
                                             }
-                                            @if (!isBreak)
+                                            @if (!cell.IsBreak)
                                             {
                                                 <div class="meta">
                                                     <span class="slot-mode">@LessonModeLabel(item.RequiresRoom)</span>
