@@ -957,6 +957,8 @@ public sealed class TeacherDraftsAutogenService
         int created = 0, skipped = 0;
         var allCreatedDrafts = new List<TeacherDraftItem>();
         const int maxEmergencySingletonSharedLectures = 0;
+        const int latestLectureSlotBeforeLongBreak = 6;
+        const int earliestEmergencyLectureSlotOrder = 9;
         var emergencySingletonSharedLecturesCreated = 0;
         int incompleteDraftsCreated = 0, incompleteMissingTeacherCount = 0, incompleteMissingRoomCount = 0, incompleteMissingBothCount = 0;
         // Збираємо попередження та деталі прогалин.
@@ -986,6 +988,25 @@ public sealed class TeacherDraftsAutogenService
         bool CanShareAcrossGroups(int lessonTypeId)
             => IsLectureType(lessonTypeId)
                || (preferredFirstTypeId != 0 && lessonTypeId == preferredFirstTypeId);
+        // Після 6-ї години лекції не ставимо у перехідні слоти 7-8: там замало часу на зміну корпусу.
+        int RegularLectureMaxSlotOrder(int? configuredMaxSlotOrder = null)
+            => configuredMaxSlotOrder is int configured && configured > 0
+                ? Math.Min(configured, latestLectureSlotBeforeLongBreak)
+                : latestLectureSlotBeforeLongBreak;
+        bool IsBlockedLateLectureSlot(int lessonTypeId, int slotOrder, int? configuredMaxSlotOrder = null)
+        {
+            if (!CanShareAcrossGroups(lessonTypeId) || slotOrder <= 0)
+            {
+                return false;
+            }
+
+            return slotOrder > RegularLectureMaxSlotOrder(configuredMaxSlotOrder)
+                   && slotOrder < earliestEmergencyLectureSlotOrder;
+        }
+        bool IsEmergencyLateLectureSlot(int lessonTypeId, int slotOrder, int? configuredMaxSlotOrder = null)
+            => CanShareAcrossGroups(lessonTypeId)
+               && slotOrder > RegularLectureMaxSlotOrder(configuredMaxSlotOrder)
+               && slotOrder >= earliestEmergencyLectureSlotOrder;
         int SlotGroupLimitForPlacement(int courseId, int lessonTypeId, bool isSelfStudyPlacement)
             => !isSelfStudyPlacement && CanShareAcrossGroups(lessonTypeId)
                 ? MaxSharedLectureGroupsForCourse(courseId)
@@ -2026,7 +2047,7 @@ public sealed class TeacherDraftsAutogenService
                 }
                 return penalty;
             }
-            (DateOnly Date, TimeSlot Slot, int? TeacherId, Room Room, List<int> GroupIds, int TopicContinuationDistance, int PreferredFirstLoad, int GapTrapPenalty, bool JoinsExistingOccurrence, bool BeyondPreferredLimit)? best = null;
+            (DateOnly Date, TimeSlot Slot, int? TeacherId, Room Room, List<int> GroupIds, int TopicContinuationDistance, int PreferredFirstLoad, int GapTrapPenalty, bool JoinsExistingOccurrence, bool BeyondPreferredLimit, bool EmergencyLateLecture)? best = null;
             for (var dayOffset = 0; dayOffset < 7; dayOffset++)
             {
                 var date = weekStart.AddDays(dayOffset);
@@ -2042,11 +2063,7 @@ public sealed class TeacherDraftsAutogenService
                 foreach (var slot in slotsForDate)
                 {
                     var sharedSlotOrder = GetSharedSlotOrder(slotsForDate, slot);
-                    // Пізній резерв для "бажано першим" обмежений одним слотом після ліміту, щоб не забивати перші дні лекціями.
-                    if (preferredFirstTypeId != 0
-                        && topic.LessonTypeId == preferredFirstTypeId
-                        && coursePreferredFirstMaxSlotOrder is int maxPreferredOverflowSlot
-                        && sharedSlotOrder > maxPreferredOverflowSlot + 1)
+                    if (IsBlockedLateLectureSlot(topic.LessonTypeId, sharedSlotOrder, coursePreferredFirstMaxSlotOrder))
                     {
                         continue;
                     }
@@ -2054,6 +2071,7 @@ public sealed class TeacherDraftsAutogenService
                                                && topic.LessonTypeId == preferredFirstTypeId
                                                && coursePreferredFirstMaxSlotOrder is int maxPreferredSlot
                                                && sharedSlotOrder > maxPreferredSlot;
+                    var emergencyLateLecture = IsEmergencyLateLectureSlot(topic.LessonTypeId, sharedSlotOrder, coursePreferredFirstMaxSlotOrder);
                     foreach (var teacherId in teacherIds)
                     {
                         if (teacherId is int tid)
@@ -2108,7 +2126,18 @@ public sealed class TeacherDraftsAutogenService
                                 ? 0
                                 : CompareSlotPosition(date, slot.Start, slot.End, best.Value.Date, best.Value.Slot.Start, best.Value.Slot.End);
                             var preferEarliestPreferredFirst = preferredFirstTypeId != 0 && topic.LessonTypeId == preferredFirstTypeId;
-                            var betterCandidate = best is null || pack.Count > best.Value.GroupIds.Count;
+                            var betterCandidate = best is null;
+                            if (!betterCandidate && best is not null)
+                            {
+                                if (emergencyLateLecture != best.Value.EmergencyLateLecture)
+                                {
+                                    betterCandidate = !emergencyLateLecture;
+                                }
+                                else if (pack.Count > best.Value.GroupIds.Count)
+                                {
+                                    betterCandidate = true;
+                                }
+                            }
                             if (!betterCandidate
                                 && best is not null
                                 && pack.Count == best.Value.GroupIds.Count)
@@ -2153,7 +2182,7 @@ public sealed class TeacherDraftsAutogenService
                             }
                             if (betterCandidate)
                             {
-                                best = (date, slot, teacherId, room, pack, topicContinuationDistance, preferredFirstLoad, gapTrapPenalty, joinsExistingOccurrence, beyondPreferredLimit);
+                                best = (date, slot, teacherId, room, pack, topicContinuationDistance, preferredFirstLoad, gapTrapPenalty, joinsExistingOccurrence, beyondPreferredLimit, emergencyLateLecture);
                             }
                         }
                     }
@@ -4110,16 +4139,13 @@ public sealed class TeacherDraftsAutogenService
                     }
                     var preferredFirstWeekBalancePenalty = 0.0;
                     var preferredFirstWeekBalanceNote = string.Empty;
-                    if (preferredFirstEnabled
-                        && ltypeId == preferredFirstTypeId
-                        && preferredFirstMaxSlotOrder is int maxPreferredSlotOrder
-                        && GetSlotOrder(sl.Start, sl.End) > maxPreferredSlotOrder)
+                    var currentSlotOrder = GetSlotOrder(sl.Start, sl.End);
+                    if (IsBlockedLateLectureSlot(ltypeId, currentSlotOrder, preferredFirstMaxSlotOrder))
                     {
-                        var slotOrder = GetSlotOrder(sl.Start, sl.End);
                         RecordSlotFailureReason(
                             date,
                             sl,
-                            $"Тип з прапорцем \"Бажано першим у тижні\" не можна ставити після ліміту (слот №{slotOrder}, ліміт №{maxPreferredSlotOrder}).");
+                            $"Лекційний тип не можна ставити у слот №{currentSlotOrder}: після 6-ї години замалий перехід між корпусами, а аварійний резерв починається з 9-ї.");
                         continue;
                     }
                     if (preferredFirstEnabled
@@ -4726,7 +4752,8 @@ public sealed class TeacherDraftsAutogenService
                     if (slotCandidates.Count > 0)
                     {
                         var bestAny = slotCandidates
-                            .OrderByDescending(SharedLectureCandidatePriority)
+                            .OrderBy(c => IsEmergencyLateLectureSlot(c.LessonTypeId, GetSlotOrder(c.Slot.Start, c.Slot.End), preferredFirstMaxSlotOrder))
+                            .ThenByDescending(SharedLectureCandidatePriority)
                             .ThenByDescending(c => c.TotalSharedGroupCount)
                             .ThenBy(c => c.Penalty)
                             .ThenBy(c => groupRandom.Next())
@@ -4736,7 +4763,8 @@ public sealed class TeacherDraftsAutogenService
                         {
                             var bestPreferred = slotCandidates
                                 .Where(c => c.TeacherId == pt)
-                                .OrderByDescending(SharedLectureCandidatePriority)
+                                .OrderBy(c => IsEmergencyLateLectureSlot(c.LessonTypeId, GetSlotOrder(c.Slot.Start, c.Slot.End), preferredFirstMaxSlotOrder))
+                                .ThenByDescending(SharedLectureCandidatePriority)
                                 .ThenByDescending(c => c.TotalSharedGroupCount)
                                 .ThenBy(c => c.Penalty)
                                 .ThenBy(c => groupRandom.Next())
@@ -4750,18 +4778,22 @@ public sealed class TeacherDraftsAutogenService
                         var effectivePenalty = localBest.Penalty;
                         var localSharedLecturePriority = SharedLectureCandidatePriority(localBest);
                         var localSharedGroupCount = localBest.TotalSharedGroupCount;
+                        var localEmergencyLateLecture = IsEmergencyLateLectureSlot(localBest.LessonTypeId, GetSlotOrder(localBest.Slot.Start, localBest.Slot.End), preferredFirstMaxSlotOrder);
                         if (preferEarliestSlot)
                         {
                             effectivePenalty += slotIndex * 0.20;
                         }
                         var bestSharedLecturePriority = best is null ? -1 : SharedLectureCandidatePriority(best);
                         var bestSharedGroupCount = best?.TotalSharedGroupCount ?? 0;
+                        var bestEmergencyLateLecture = best is not null && IsEmergencyLateLectureSlot(best.LessonTypeId, GetSlotOrder(best.Slot.Start, best.Slot.End), preferredFirstMaxSlotOrder);
                         if (best is null
-                            || localSharedLecturePriority > bestSharedLecturePriority
-                            || (localSharedLecturePriority == bestSharedLecturePriority && localSharedGroupCount > bestSharedGroupCount)
-                            || (localSharedLecturePriority == bestSharedLecturePriority
-                                && localSharedGroupCount == bestSharedGroupCount
-                                && effectivePenalty < bestEffectivePenalty))
+                            || (!localEmergencyLateLecture && bestEmergencyLateLecture)
+                            || (localEmergencyLateLecture == bestEmergencyLateLecture
+                                && (localSharedLecturePriority > bestSharedLecturePriority
+                                    || (localSharedLecturePriority == bestSharedLecturePriority && localSharedGroupCount > bestSharedGroupCount)
+                                    || (localSharedLecturePriority == bestSharedLecturePriority
+                                        && localSharedGroupCount == bestSharedGroupCount
+                                        && effectivePenalty < bestEffectivePenalty))))
                         {
                             best = localBest;
                             bestEffectivePenalty = effectivePenalty;
