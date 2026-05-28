@@ -52,19 +52,78 @@ public class ScheduleController : ControllerBase
         var weekEnd = weekStart.AddDays(7);
         var q = _db.ScheduleItems
             .AsNoTracking()
-            .Include(x => x.Group).ThenInclude(g => g.Course)
-            .Include(x => x.Module)
-            .Include(x => x.Teacher)
-            .Include(x => x.Room).ThenInclude(r => r!.Building)
-            .Include(x => x.LessonType)
             .Where(x => x.Date >= weekStart && x.Date < weekEnd)
             .AsQueryable();
         if (courseId is int cid) q = q.Where(x => x.Group.CourseId == cid);
         if (groupId is int gidFilter) q = q.Where(x => x.GroupId == gidFilter);
         if (teacherId is int tid) q = q.Where(x => x.TeacherId == tid);
         if (roomId is int rid) q = q.Where(x => x.RoomId == rid);
-        var items = await q.OrderBy(x => x.Date).ThenBy(x => x.StartTime).ToListAsync();
-        return items.Select(i => i.ToDto()).ToList();
+        var items = await q
+            .OrderBy(x => x.Date)
+            .ThenBy(x => x.StartTime)
+            .Select(x => new
+            {
+                x.Id,
+                x.Date,
+                x.StartTime,
+                x.EndTime,
+                x.DayOfWeek,
+                GroupName = x.Group.Name,
+                x.GroupId,
+                ModuleTitle = x.Module.Title,
+                x.ModuleId,
+                TeacherName = x.Teacher != null ? x.Teacher.FullName : "",
+                x.TeacherId,
+                RoomName = x.Room != null ? x.Room.Name : "",
+                x.RoomId,
+                BuildingName = x.Room != null && x.Room.Building != null ? x.Room.Building.Name : "",
+                BuildingId = x.Room != null ? (int?)x.Room.BuildingId : null,
+                x.LessonTypeId,
+                LessonTypeCode = x.LessonType.Code.ToString(),
+                LessonTypeName = x.LessonType.Name,
+                x.LessonType.RequiresRoom,
+                LessonTypeCss = x.LessonType.CssKey,
+                x.IsLocked
+            })
+            .ToListAsync();
+        var uk = new CultureInfo("uk-UA");
+        return items.Select(item =>
+        {
+            var lessonTypeCode = (item.LessonTypeCode ?? string.Empty).ToUpperInvariant();
+            var isBreak = string.Equals(lessonTypeCode, "BREAK", StringComparison.OrdinalIgnoreCase);
+            var isCanceled = string.Equals(lessonTypeCode, "CANCELED", StringComparison.OrdinalIgnoreCase);
+            var isRescheduled = string.Equals(lessonTypeCode, "RESCHEDULED", StringComparison.OrdinalIgnoreCase);
+            var requiresRoom = item.RequiresRoom;
+            if ((isCanceled || isRescheduled) && item.RoomId is not null)
+            {
+                requiresRoom = true;
+            }
+
+            return new ScheduleItemDto(
+                Id: item.Id,
+                Date: item.Date,
+                TimeStart: item.StartTime.ToString("HH\\:mm"),
+                TimeEnd: item.EndTime.ToString("HH\\:mm"),
+                DayName: item.Date.ToDateTime(TimeOnly.MinValue).ToString("dddd", uk),
+                DayNumber: (int)item.DayOfWeek,
+                Group: item.GroupName,
+                GroupId: item.GroupId,
+                Module: isBreak ? "Перерва" : item.ModuleTitle,
+                ModuleId: item.ModuleId,
+                Teacher: isBreak ? "" : item.TeacherName,
+                TeacherId: item.TeacherId,
+                Room: !isBreak && requiresRoom ? item.RoomName : "",
+                RoomId: requiresRoom ? item.RoomId : null,
+                Building: !isBreak && requiresRoom ? item.BuildingName : "",
+                BuildingId: requiresRoom ? item.BuildingId : null,
+                RequiresRoom: requiresRoom,
+                LessonTypeId: item.LessonTypeId,
+                LessonTypeCode: lessonTypeCode,
+                LessonTypeName: item.LessonTypeName,
+                IsLocked: item.IsLocked,
+                LessonTypeCss: item.LessonTypeCss ?? (isBreak ? "brk" : null)
+            );
+        }).ToList();
     }
     [HttpPost("upsert")]
     // Створює або оновлює пару в розкладі з перевіркою правил.
