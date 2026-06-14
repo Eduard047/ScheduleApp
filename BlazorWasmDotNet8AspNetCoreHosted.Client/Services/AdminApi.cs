@@ -1,195 +1,163 @@
-using System.Linq;
+﻿using System.Linq;
 using System.Net.Http.Json;
 using Microsoft.AspNetCore.Components.Forms;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
 {
-    // API-клієнт для адміністративних операцій
+    // API-РєР»С–С”РЅС‚ РґР»СЏ Р°РґРјС–РЅС–СЃС‚СЂР°С‚РёРІРЅРёС… РѕРїРµСЂР°С†С–Р№
     public sealed class AdminApi(HttpClient http) : IAdminApi
     {
         private readonly HttpClient _http = http;
-        // Додає confirm=true до URL для операцій із підтвердженням.
-        private static string WithConfirm(string url)
-            => url.Contains('?') ? $"{url}&confirm=true" : $"{url}?confirm=true";
-        // Перевіряє відповідь і кидає виняток з повідомленням сервера.
+        // РџРµСЂРµРІС–СЂСЏС” РІС–РґРїРѕРІС–РґСЊ С– РєРёРґР°С” РІРёРЅСЏС‚РѕРє Р· РїРѕРІС–РґРѕРјР»РµРЅРЅСЏРј СЃРµСЂРІРµСЂР°.
         private static async Task Ensure(HttpResponseMessage resp)
         {
-            if (resp.IsSuccessStatusCode) return;
-            var body = await resp.Content.ReadAsStringAsync();
-            var msg = string.IsNullOrWhiteSpace(body) ? resp.ReasonPhrase : body;
-            throw new HttpRequestException(msg ?? "Request failed", null, resp.StatusCode);
+            await resp.EnsureSuccessWithDetailsAsync();
         }
-        // Отримує метадані для довідників клієнта.
+        // РќР°РґСЃРёР»Р°С” DTO РЅР° upsert-endpoint С– РїРѕРІРµСЂС‚Р°С” СЃС‚РІРѕСЂРµРЅРёР№ Р°Р±Рѕ РѕРЅРѕРІР»РµРЅРёР№ id.
+        private async Task<int> PostForId<T>(string url, T dto)
+        {
+            var resp = await _http.PostAsJsonAsync(url, dto);
+            await Ensure(resp);
+            return (await resp.Content.ReadFromJsonAsync<int>())!;
+        }
+        // РћС‚СЂРёРјСѓС” РјРµС‚Р°РґР°РЅС– РґР»СЏ РґРѕРІС–РґРЅРёРєС–РІ РєР»С–С”РЅС‚Р°.
         public async Task<MetaResponseDto> GetMeta()
             => await _http.GetFromJsonAsync<MetaResponseDto>("api/meta")
-               ?? new MetaResponseDto(new(), new(), new(), new(), new(), new(), new());
-        // Календар винятків (свята, перенесення).
+               ?? ApiClientHelpers.EmptyMeta();
+        // РљР°Р»РµРЅРґР°СЂ РІРёРЅСЏС‚РєС–РІ (СЃРІСЏС‚Р°, РїРµСЂРµРЅРµСЃРµРЅРЅСЏ).
         public async Task<List<CalendarExceptionEditDto>> GetCalendar()
             => await _http.GetFromJsonAsync<List<CalendarExceptionEditDto>>("api/admin/config/calendar") ?? new();
-        // Створює або оновлює календарний виняток.
+        // РЎС‚РІРѕСЂСЋС” Р°Р±Рѕ РѕРЅРѕРІР»СЋС” РєР°Р»РµРЅРґР°СЂРЅРёР№ РІРёРЅСЏС‚РѕРє.
         public async Task<int> UpsertCalendar(CalendarExceptionEditDto dto)
-        {
-            var resp = await _http.PostAsJsonAsync("api/admin/config/calendar/upsert", dto);
-            await Ensure(resp);
-            return (await resp.Content.ReadFromJsonAsync<int>())!;
-        }
-        // Видаляє календарний виняток.
+            => await PostForId("api/admin/config/calendar/upsert", dto);
+        // Р’РёРґР°Р»СЏС” РєР°Р»РµРЅРґР°СЂРЅРёР№ РІРёРЅСЏС‚РѕРє.
         public async Task DeleteCalendar(int id)
-            => await Ensure(await _http.DeleteAsync(WithConfirm($"api/admin/config/calendar/{id}")));
-        // Налаштування обідніх перерв.
+            => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/config/calendar/{id}")));
+        // РќР°Р»Р°С€С‚СѓРІР°РЅРЅСЏ РѕР±С–РґРЅС–С… РїРµСЂРµСЂРІ.
         public async Task<List<LunchConfigEditDto>> GetLunch()
             => await _http.GetFromJsonAsync<List<LunchConfigEditDto>>("api/admin/config/lunch") ?? new();
-        // Створює або оновлює обідню перерву.
+        // РЎС‚РІРѕСЂСЋС” Р°Р±Рѕ РѕРЅРѕРІР»СЋС” РѕР±С–РґРЅСЋ РїРµСЂРµСЂРІСѓ.
         public async Task<int> UpsertLunch(LunchConfigEditDto dto)
-        {
-            var resp = await _http.PostAsJsonAsync("api/admin/config/lunch/upsert", dto);
-            await Ensure(resp);
-            return (await resp.Content.ReadFromJsonAsync<int>())!;
-        }
-        // Видаляє обідню перерву.
+            => await PostForId("api/admin/config/lunch/upsert", dto);
+        // Р’РёРґР°Р»СЏС” РѕР±С–РґРЅСЋ РїРµСЂРµСЂРІСѓ.
         public async Task DeleteLunch(int id)
-            => await Ensure(await _http.DeleteAsync(WithConfirm($"api/admin/config/lunch/{id}")));
-        // Довідник викладачів.
+            => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/config/lunch/{id}")));
+        // Р”РѕРІС–РґРЅРёРє РІРёРєР»Р°РґР°С‡С–РІ.
         public async Task<List<TeacherViewDto>> GetTeachers()
             => await _http.GetFromJsonAsync<List<TeacherViewDto>>("api/admin/teachers") ?? new();
-        // Отримує викладача для редагування.
+        // РћС‚СЂРёРјСѓС” РІРёРєР»Р°РґР°С‡Р° РґР»СЏ СЂРµРґР°РіСѓРІР°РЅРЅСЏ.
         public async Task<TeacherEditDto?> GetTeacher(int id)
             => await _http.GetFromJsonAsync<TeacherEditDto>($"api/admin/teachers/{id}");
-        // Створює або оновлює викладача.
+        // РЎС‚РІРѕСЂСЋС” Р°Р±Рѕ РѕРЅРѕРІР»СЋС” РІРёРєР»Р°РґР°С‡Р°.
         public async Task<int> UpsertTeacher(TeacherEditDto dto)
-        {
-            var resp = await _http.PostAsJsonAsync("api/admin/teachers/upsert", dto);
-            await Ensure(resp);
-            return (await resp.Content.ReadFromJsonAsync<int>())!;
-        }
-        // Видаляє викладача.
+            => await PostForId("api/admin/teachers/upsert", dto);
+        // Р’РёРґР°Р»СЏС” РІРёРєР»Р°РґР°С‡Р°.
         public async Task DeleteTeacher(int id)
-            => await Ensure(await _http.DeleteAsync(WithConfirm($"api/admin/teachers/{id}")));
-        // Довідник навчальних груп.
+            => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/teachers/{id}")));
+        // Р”РѕРІС–РґРЅРёРє РЅР°РІС‡Р°Р»СЊРЅРёС… РіСЂСѓРї.
         public async Task<List<GroupEditDto>> GetGroups()
             => await _http.GetFromJsonAsync<List<GroupEditDto>>("api/admin/groups") ?? new();
-        // Створює або оновлює групу.
+        // РЎС‚РІРѕСЂСЋС” Р°Р±Рѕ РѕРЅРѕРІР»СЋС” РіСЂСѓРїСѓ.
         public async Task<int> UpsertGroup(GroupEditDto dto)
-        {
-            var resp = await _http.PostAsJsonAsync("api/admin/groups/upsert", dto);
-            await Ensure(resp);
-            return (await resp.Content.ReadFromJsonAsync<int>())!;
-        }
-        // Видаляє групу з опційним force.
+            => await PostForId("api/admin/groups/upsert", dto);
+        // Р’РёРґР°Р»СЏС” РіСЂСѓРїСѓ Р· РѕРїС†С–Р№РЅРёРј force.
         public async Task DeleteGroup(int id, bool force = false)
         {
             var url = force
-                ? WithConfirm($"api/admin/groups/{id}?force=true")
-                : WithConfirm($"api/admin/groups/{id}");
+                ? ApiClientHelpers.WithConfirm($"api/admin/groups/{id}?force=true")
+                : ApiClientHelpers.WithConfirm($"api/admin/groups/{id}");
             await Ensure(await _http.DeleteAsync(url));
         }
-        // Довідник модулів.
+        // Р”РѕРІС–РґРЅРёРє РјРѕРґСѓР»С–РІ.
         public async Task<List<ModuleEditDto>> GetModules()
             => await _http.GetFromJsonAsync<List<ModuleEditDto>>("api/admin/modules") ?? new();
-        // Створює або оновлює модуль.
+        // РЎС‚РІРѕСЂСЋС” Р°Р±Рѕ РѕРЅРѕРІР»СЋС” РјРѕРґСѓР»СЊ.
         public async Task<int> UpsertModule(ModuleEditDto dto)
-        {
-            var resp = await _http.PostAsJsonAsync("api/admin/modules/upsert", dto);
-            await Ensure(resp);
-            return (await resp.Content.ReadFromJsonAsync<int>())!;
-        }
-        // Видаляє модуль.
+            => await PostForId("api/admin/modules/upsert", dto);
+        // Р’РёРґР°Р»СЏС” РјРѕРґСѓР»СЊ.
         public async Task DeleteModule(int id)
-            => await Ensure(await _http.DeleteAsync(WithConfirm($"api/admin/modules/{id}")));
-        // Перетворює модуль на окремий екземпляр для конкретного курсу.
+            => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/modules/{id}")));
+        // РџРµСЂРµС‚РІРѕСЂСЋС” РјРѕРґСѓР»СЊ РЅР° РѕРєСЂРµРјРёР№ РµРєР·РµРјРїР»СЏСЂ РґР»СЏ РєРѕРЅРєСЂРµС‚РЅРѕРіРѕ РєСѓСЂСЃСѓ.
         public async Task<int> EnsureCourseScopedModule(int moduleId, int courseId)
         {
             var resp = await _http.PostAsync($"api/admin/modules/{moduleId}/ensure-course-scope?courseId={courseId}", null);
             await Ensure(resp);
             return (await resp.Content.ReadFromJsonAsync<int>())!;
         }
-        // Теми модуля для вибору в навчальних планах.
+        // РўРµРјРё РјРѕРґСѓР»СЏ РґР»СЏ РІРёР±РѕСЂСѓ РІ РЅР°РІС‡Р°Р»СЊРЅРёС… РїР»Р°РЅР°С….
         public async Task<List<ModuleTopicViewDto>> GetModuleTopics(int moduleId)
             => await _http.GetFromJsonAsync<List<ModuleTopicViewDto>>($"api/admin/modules/{moduleId}/topics") ?? new();
-        // Створює або оновлює тему модуля.
+        // РЎС‚РІРѕСЂСЋС” Р°Р±Рѕ РѕРЅРѕРІР»СЋС” С‚РµРјСѓ РјРѕРґСѓР»СЏ.
         public async Task<int> UpsertModuleTopic(int moduleId, ModuleTopicDto dto)
-        {
-            var resp = await _http.PostAsJsonAsync($"api/admin/modules/{moduleId}/topics/upsert", dto);
-            await Ensure(resp);
-            return (await resp.Content.ReadFromJsonAsync<int>())!;
-        }
-        // Видаляє тему модуля.
+            => await PostForId($"api/admin/modules/{moduleId}/topics/upsert", dto);
+        // Р’РёРґР°Р»СЏС” С‚РµРјСѓ РјРѕРґСѓР»СЏ.
         public async Task DeleteModuleTopic(int moduleId, int topicId)
-            => await Ensure(await _http.DeleteAsync(WithConfirm($"api/admin/modules/{moduleId}/topics/{topicId}")));
-        // Довідник аудиторій.
+            => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/modules/{moduleId}/topics/{topicId}")));
+        // Р”РѕРІС–РґРЅРёРє Р°СѓРґРёС‚РѕСЂС–Р№.
         public async Task<List<RoomEditDto>> GetRooms()
             => await _http.GetFromJsonAsync<List<RoomEditDto>>("api/admin/rooms") ?? new();
-        // Створює або оновлює аудиторію.
+        // РЎС‚РІРѕСЂСЋС” Р°Р±Рѕ РѕРЅРѕРІР»СЋС” Р°СѓРґРёС‚РѕСЂС–СЋ.
         public async Task<int> UpsertRoom(RoomEditDto dto)
-        {
-            var resp = await _http.PostAsJsonAsync("api/admin/rooms/upsert", dto);
-            await Ensure(resp);
-            return (await resp.Content.ReadFromJsonAsync<int>())!;
-        }
-        // Видаляє аудиторію.
+            => await PostForId("api/admin/rooms/upsert", dto);
+        // Р’РёРґР°Р»СЏС” Р°СѓРґРёС‚РѕСЂС–СЋ.
         public async Task DeleteRoom(int id)
-            => await Ensure(await _http.DeleteAsync(WithConfirm($"api/admin/rooms/{id}")));
-        // Комбінована модель для отримання будівель і переходів.
+            => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/rooms/{id}")));
+        // РљРѕРјР±С–РЅРѕРІР°РЅР° РјРѕРґРµР»СЊ РґР»СЏ РѕС‚СЂРёРјР°РЅРЅСЏ Р±СѓРґС–РІРµР»СЊ С– РїРµСЂРµС…РѕРґС–РІ.
         private sealed record BuildingsVm(List<BuildingEditDto> buildings, List<BuildingTravelEditDto> travels);
-        // Довідник будівель.
+        // Р§РёС‚Р°С” РєРѕСЂРїСѓСЃРё С‚Р° РїРµСЂРµС…РѕРґРё РѕРґРЅРёРј Р·Р°РїРёС‚РѕРј Р±РµР· РєРµС€СѓРІР°РЅРЅСЏ.
+        private async Task<BuildingsVm> GetBuildingsVm()
+            => await _http.GetFromJsonAsync<BuildingsVm>("api/admin/buildings") ?? new(new(), new());
+        // Р”РѕРІС–РґРЅРёРє Р±СѓРґС–РІРµР»СЊ.
         public async Task<List<BuildingEditDto>> GetBuildings()
-            => (await _http.GetFromJsonAsync<BuildingsVm>("api/admin/buildings") ?? new(new(), new())).buildings;
-        // Налаштування переходів між будівлями.
+            => (await GetBuildingsVm()).buildings;
+        // РќР°Р»Р°С€С‚СѓРІР°РЅРЅСЏ РїРµСЂРµС…РѕРґС–РІ РјС–Р¶ Р±СѓРґС–РІР»СЏРјРё.
         public async Task<List<BuildingTravelEditDto>> GetBuildingTravels()
-            => (await _http.GetFromJsonAsync<BuildingsVm>("api/admin/buildings") ?? new(new(), new())).travels;
-        // Створює або оновлює будівлю.
+            => (await GetBuildingsVm()).travels;
+        // РЎС‚РІРѕСЂСЋС” Р°Р±Рѕ РѕРЅРѕРІР»СЋС” Р±СѓРґС–РІР»СЋ.
         public async Task<int> UpsertBuilding(BuildingEditDto dto)
-        {
-            var resp = await _http.PostAsJsonAsync("api/admin/buildings/upsert", dto);
-            await Ensure(resp);
-            return (await resp.Content.ReadFromJsonAsync<int>())!;
-        }
-        // Видаляє будівлю.
+            => await PostForId("api/admin/buildings/upsert", dto);
+        // Р’РёРґР°Р»СЏС” Р±СѓРґС–РІР»СЋ.
         public async Task DeleteBuilding(int id)
-            => await Ensure(await _http.DeleteAsync(WithConfirm($"api/admin/buildings/{id}")));
-        // Створює або оновлює маршрут між будівлями.
+            => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/buildings/{id}")));
+        // РЎС‚РІРѕСЂСЋС” Р°Р±Рѕ РѕРЅРѕРІР»СЋС” РјР°СЂС€СЂСѓС‚ РјС–Р¶ Р±СѓРґС–РІР»СЏРјРё.
         public async Task UpsertBuildingTravel(BuildingTravelEditDto dto)
         {
             var resp = await _http.PostAsJsonAsync("api/admin/buildings/travel/upsert", dto);
             await Ensure(resp);
         }
-        // Видаляє маршрут між будівлями.
+        // Р’РёРґР°Р»СЏС” РјР°СЂС€СЂСѓС‚ РјС–Р¶ Р±СѓРґС–РІР»СЏРјРё.
         public async Task DeleteBuildingTravel(int fromId, int toId)
             => await Ensure(await _http.PostAsJsonAsync(
-                WithConfirm("api/admin/buildings/travel/delete"),
+                ApiClientHelpers.WithConfirm("api/admin/buildings/travel/delete"),
                 new BuildingTravelEditDto(fromId, toId, 0)));
-        // Довідник курсів.
+        // Р”РѕРІС–РґРЅРёРє РєСѓСЂСЃС–РІ.
         public async Task<List<CourseEditDto>> GetCourses()
             => await _http.GetFromJsonAsync<List<CourseEditDto>>("api/admin/courses") ?? new();
-        // Створює або оновлює курс.
+        // РЎС‚РІРѕСЂСЋС” Р°Р±Рѕ РѕРЅРѕРІР»СЋС” РєСѓСЂСЃ.
         public async Task<int> UpsertCourse(CourseEditDto dto)
-        {
-            var resp = await _http.PostAsJsonAsync("api/admin/courses/upsert", dto);
-            await Ensure(resp);
-            return (await resp.Content.ReadFromJsonAsync<int>())!;
-        }
-        // Видаляє курс з опційним force.
+            => await PostForId("api/admin/courses/upsert", dto);
+        // Р’РёРґР°Р»СЏС” РєСѓСЂСЃ Р· РѕРїС†С–Р№РЅРёРј force.
         public async Task DeleteCourse(int id, bool force = false)
         {
             var url = force
-                ? WithConfirm($"api/admin/courses/{id}?force=true")
-                : WithConfirm($"api/admin/courses/{id}");
+                ? ApiClientHelpers.WithConfirm($"api/admin/courses/{id}?force=true")
+                : ApiClientHelpers.WithConfirm($"api/admin/courses/{id}");
             await Ensure(await _http.DeleteAsync(url));
         }
-        // Довідник типів занять.
+        // Р”РѕРІС–РґРЅРёРє С‚РёРїС–РІ Р·Р°РЅСЏС‚СЊ.
         public async Task<List<LessonTypeEditDto>> GetLessonTypes()
             => await _http.GetFromJsonAsync<List<LessonTypeEditDto>>("api/admin/types/lesson") ?? new();
-        // Створює або оновлює тип заняття.
+        // РЎС‚РІРѕСЂСЋС” Р°Р±Рѕ РѕРЅРѕРІР»СЋС” С‚РёРї Р·Р°РЅСЏС‚С‚СЏ.
         public async Task UpsertLessonType(LessonTypeEditDto dto)
             => await Ensure(await _http.PostAsJsonAsync("api/admin/types/lesson/upsert", dto));
-        // Видаляє тип заняття.
+        // Р’РёРґР°Р»СЏС” С‚РёРї Р·Р°РЅСЏС‚С‚СЏ.
         public async Task DeleteLessonType(int id)
-            => await Ensure(await _http.DeleteAsync(WithConfirm($"api/admin/types/lesson/{id}")));
-        // Палітра кольорів для типів занять.
+            => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/types/lesson/{id}")));
+        // РџР°Р»С–С‚СЂР° РєРѕР»СЊРѕСЂС–РІ РґР»СЏ С‚РёРїС–РІ Р·Р°РЅСЏС‚СЊ.
         public async Task<List<LessonColorDto>> GetLessonColorPalette()
             => await _http.GetFromJsonAsync<List<LessonColorDto>>("api/admin/types/lesson/palette") ?? new();
-        // Планування модулів із можливим фільтром за курсом.
+        // РџР»Р°РЅСѓРІР°РЅРЅСЏ РјРѕРґСѓР»С–РІ С–Р· РјРѕР¶Р»РёРІРёРј С„С–Р»СЊС‚СЂРѕРј Р·Р° РєСѓСЂСЃРѕРј.
         public async Task<List<CourseModulePlanDto>> GetModulePlans(int moduleId, int? courseId = null)
         {
             var url = courseId is int cid && cid > 0
@@ -197,7 +165,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
                 : $"api/admin/plans/module/{moduleId}";
             return await _http.GetFromJsonAsync<List<CourseModulePlanDto>>(url) ?? new();
         }
-        // Зберігає плани модулів для курсу.
+        // Р—Р±РµСЂС–РіР°С” РїР»Р°РЅРё РјРѕРґСѓР»С–РІ РґР»СЏ РєСѓСЂСЃСѓ.
         public async Task UpsertModulePlans(int moduleId, int? courseId, List<SaveCourseModulePlanDto> rows)
         {
             var url = courseId is int cid && cid > 0
@@ -205,28 +173,28 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
                 : $"api/admin/plans/module/{moduleId}/upsert";
             await Ensure(await _http.PostAsJsonAsync(url, rows));
         }
-        // Повертає план модуля для курсу з дефолтами.
+        // РџРѕРІРµСЂС‚Р°С” РїР»Р°РЅ РјРѕРґСѓР»СЏ РґР»СЏ РєСѓСЂСЃСѓ Р· РґРµС„РѕР»С‚Р°РјРё.
         public async Task<CourseModulePlanDto> GetCourseModulePlan(int moduleId, int courseId)
         {
             var list = await GetModulePlans(moduleId, courseId);
             return list.FirstOrDefault() ?? new CourseModulePlanDto(
                 CourseId: courseId, ModuleId: moduleId, TargetHours: 0, ScheduledHours: 0, IsActive: false);
         }
-        // Зберігає план модуля для курсу.
+        // Р—Р±РµСЂС–РіР°С” РїР»Р°РЅ РјРѕРґСѓР»СЏ РґР»СЏ РєСѓСЂСЃСѓ.
         public async Task UpsertCourseModulePlan(int moduleId, int courseId, SaveCourseModulePlanDto dto)
             => await UpsertModulePlans(moduleId, courseId, new List<SaveCourseModulePlanDto> { dto });
-        // Послідовність модулів у межах курсу.
+        // РџРѕСЃР»С–РґРѕРІРЅС–СЃС‚СЊ РјРѕРґСѓР»С–РІ Сѓ РјРµР¶Р°С… РєСѓСЂСЃСѓ.
         public async Task<ModuleSequenceConfigDto?> GetModuleSequence(int courseId)
             => await _http.GetFromJsonAsync<ModuleSequenceConfigDto>($"api/admin/module-sequence/{courseId}");
-        // Зберігає послідовність модулів.
+        // Р—Р±РµСЂС–РіР°С” РїРѕСЃР»С–РґРѕРІРЅС–СЃС‚СЊ РјРѕРґСѓР»С–РІ.
         public async Task SaveModuleSequence(ModuleSequenceSaveRequestDto dto)
             => await Ensure(await _http.PostAsJsonAsync("api/admin/module-sequence/save", dto));
-        // Імпорт модулів із DOCX з опційним застосуванням змін.
+        // Р†РјРїРѕСЂС‚ РјРѕРґСѓР»С–РІ С–Р· DOCX Р· РѕРїС†С–Р№РЅРёРј Р·Р°СЃС‚РѕСЃСѓРІР°РЅРЅСЏРј Р·РјС–РЅ.
         public async Task<DocxImportResultDto> ImportModulesFromDocx(IBrowserFile file, bool apply, CancellationToken ct = default)
         {
             var url = $"api/admin/modules/import-docx?apply={(apply ? "true" : "false")}";
             var content = new MultipartFormDataContent();
-            // Ліміт стріму щоб уникнути завантаження надвеликих файлів у пам’ять.
+            // Р›С–РјС–С‚ СЃС‚СЂС–РјСѓ С‰РѕР± СѓРЅРёРєРЅСѓС‚Рё Р·Р°РІР°РЅС‚Р°Р¶РµРЅРЅСЏ РЅР°РґРІРµР»РёРєРёС… С„Р°Р№Р»С–РІ Сѓ РїР°РјвЂ™СЏС‚СЊ.
             var stream = file.OpenReadStream(50 * 1024 * 1024, ct);
             var streamContent = new StreamContent(stream);
             streamContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(file.ContentType ?? "application/octet-stream");
@@ -239,9 +207,9 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
                 throw new HttpRequestException(msg ?? "Import failed", null, resp.StatusCode);
             }
             return await resp.Content.ReadFromJsonAsync<DocxImportResultDto>(cancellationToken: ct)
-                   ?? new DocxImportResultDto(string.Empty, null, false, new(), new(), "Порожня відповідь сервера");
+                   ?? new DocxImportResultDto(string.Empty, null, false, new(), new(), "РџРѕСЂРѕР¶РЅСЏ РІС–РґРїРѕРІС–РґСЊ СЃРµСЂРІРµСЂР°");
         }
-        // Повністю очищає модулі та їхні плани.
+        // РџРѕРІРЅС–СЃС‚СЋ РѕС‡РёС‰Р°С” РјРѕРґСѓР»С– С‚Р° С—С…РЅС– РїР»Р°РЅРё.
         public async Task ClearModulesAndPlans()
         {
             var resp = await _http.PostAsync("api/admin/modules/clear-all", null);

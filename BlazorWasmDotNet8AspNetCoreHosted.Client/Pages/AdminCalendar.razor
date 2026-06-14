@@ -30,40 +30,19 @@
 <div class="card p-3">
     <div class="d-flex justify-content-between align-items-center mb-2 gap-2">
         <div class="text-muted small">Показано: @SortedAndFiltered.Count() з @items.Count</div>
-        <div class="input-group" style="max-width:320px;">
-            <span class="input-group-text">Пошук</span>
-            <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / дата / назва / курс / група / так/ні" />
-        </div>
+        <AdminSearchBox @bind-Value="filter" Style="max-width:320px;" Placeholder="Id / дата / назва / курс / група / так/ні" />
     </div>
     <div class="table-responsive">
         <table class="table table-sm align-middle">
             <thead>
                 <tr>
-                    <th style="width:80px;" role="button" class="sortable-th"
-                        @onclick="() => ToggleSort(nameof(CalendarExceptionEditDto.Id))">
-                        Id @HeaderIcon(nameof(CalendarExceptionEditDto.Id))
-                    </th>
-                    <th role="button" class="sortable-th"
-                        @onclick="() => ToggleSort(nameof(CalendarExceptionEditDto.Date))">
-                        Дата @HeaderIcon(nameof(CalendarExceptionEditDto.Date))
-                    </th>
-                    <th role="button" class="sortable-th"
-                        @onclick="() => ToggleSort(CourseNameField)">
-                        Курс @HeaderIcon(CourseNameField)
-                    </th>
-                    <th role="button" class="sortable-th"
-                        @onclick="() => ToggleSort(GroupNameField)">
-                        Група @HeaderIcon(GroupNameField)
-                    </th>
-                    <th role="button" class="sortable-th"
-                        @onclick="() => ToggleSort(nameof(CalendarExceptionEditDto.Name))">
-                        Назва @HeaderIcon(nameof(CalendarExceptionEditDto.Name))
-                    </th>
-                    <th role="button" class="sortable-th"
-                        @onclick="() => ToggleSort(nameof(CalendarExceptionEditDto.IsWorkingDay))">
-                        Робочий @HeaderIcon(nameof(CalendarExceptionEditDto.IsWorkingDay))
-                    </th>
-                    <th style="width:140px;"></th>
+                    <SortableHeader Field="@nameof(CalendarExceptionEditDto.Id)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort" Style="width:80px;">Id</SortableHeader>
+                    <SortableHeader Field="@nameof(CalendarExceptionEditDto.Date)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Дата</SortableHeader>
+                    <SortableHeader Field="@CourseNameField" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Курс</SortableHeader>
+                    <SortableHeader Field="@GroupNameField" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Група</SortableHeader>
+                    <SortableHeader Field="@nameof(CalendarExceptionEditDto.Name)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Назва</SortableHeader>
+                    <SortableHeader Field="@nameof(CalendarExceptionEditDto.IsWorkingDay)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Робочий</SortableHeader>
+                    <th style="width:220px;"></th>
                 </tr>
             </thead>
             <tbody>
@@ -76,7 +55,7 @@
                         <td>@GroupLabel(x)</td>
                         <td>@x.Name</td>
                         <td>@(x.IsWorkingDay ? "Так" : "Ні")</td>
-                        <td class="text-end">
+                        <td class="text-end text-nowrap">
                             <button class="btn btn-sm btn-outline-primary me-2" @onclick="() => EditRow(x)">Редагувати</button>
                             <button class="btn btn-sm btn-outline-danger" @onclick="() => Delete(x.Id!.Value)">Видалити</button>
                         </td>
@@ -157,163 +136,6 @@
         </div>
     </div>
 }
-
-<style>
-    .editor-overlay {
-        position: fixed;
-        inset: 0;
-        background: rgba(15, 23, 42, 0.5);
-        backdrop-filter: blur(2px);
-        display: flex;
-        justify-content: center;
-        align-items: flex-start;
-        padding: 72px 18px 24px;
-        overflow-y: auto;
-        z-index: 2500;
-    }
-    .editor {
-        margin-top: 14px;
-        background: #fff;
-        border: 1px solid #e5e7eb;
-        border-radius: 12px;
-        padding: 14px;
-        width: min(900px, 100%);
-        box-shadow: 0 20px 50px rgba(15, 23, 42, 0.25);
-    }
-    .editor-modal-head {
-        display: flex;
-        align-items: flex-start;
-        justify-content: space-between;
-        gap: 12px;
-        margin-bottom: 12px;
-    }
-    .editor-title { font-weight: 800; font-size: 1.1rem; }
-    .editor-subtitle { color: #475569; font-size: .92rem; margin-top: 4px; }
-    .editor-close { min-width: 44px; height: 44px; font-size: 1.3rem; padding: 0 .6rem; }
-    .calendar-editor-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-        gap: 12px;
-    }
-    .calendar-editor-field {
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
-        min-width: 0;
-    }
-    .calendar-editor-switch {
-        flex-direction: row;
-        align-items: center;
-        justify-content: flex-start;
-        gap: 14px;
-        padding: 12px;
-        border: 1px solid #e5e7eb;
-        border-radius: 10px;
-        background: #f8fafc;
-        flex-wrap: wrap;
-        width: 100%;
-        box-sizing: border-box;
-        grid-column: auto;
-        align-self: end;
-        min-width: 260px;
-    }
-    .switch-caption { display: flex; flex-direction: column; gap: 4px; }
-    .switch-title { font-weight: 700; }
-    .switch-hint { color: #64748b; font-size: .88rem; }
-    .toggle {
-        display: inline-flex;
-        align-items: center;
-        cursor: pointer;
-        position: relative;
-        width: 100%;
-        max-width: 340px;
-        justify-content: flex-start;
-        gap: 10px;
-    }
-    .toggle-input {
-        position: absolute;
-        opacity: 0;
-        pointer-events: none;
-        width: 1px;
-        height: 1px;
-    }
-    .toggle-track {
-        --switch-width: 220px;
-        --switch-padding: 6px;
-        --thumb-gap: 8px;
-        position: relative;
-        display: grid;
-        grid-template-columns: repeat(2, 1fr);
-        align-items: center;
-        width: var(--switch-width);
-        max-width: 100%;
-        padding: var(--switch-padding);
-        min-height: 54px;
-        border-radius: 999px;
-        border: 1px solid #e2e8f0;
-        background: #f8fafc;
-        box-shadow: inset 0 1px 0 rgba(255, 255, 255, .7), 0 14px 30px rgba(15, 23, 42, .08);
-        box-sizing: border-box;
-        transition: border-color .2s ease, background .2s ease, box-shadow .2s ease;
-    }
-    .toggle-thumb {
-        position: absolute;
-        inset: var(--switch-padding) auto var(--switch-padding) var(--switch-padding);
-        width: calc(50% - var(--thumb-gap));
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        border-radius: 999px;
-        background: linear-gradient(135deg, #fb7185, #ef4444);
-        color: #fff;
-        font-weight: 800;
-        letter-spacing: .01em;
-        box-shadow: 0 8px 24px rgba(239, 68, 68, .25);
-        transform: translateX(0);
-        transition: transform .22s ease, background .22s ease, box-shadow .22s ease;
-        z-index: 2;
-    }
-    .toggle-thumb::after {
-        content: "Вихідний";
-        font-size: .95rem;
-    }
-    .toggle-text {
-        font-size: .95rem;
-        font-weight: 700;
-        text-align: center;
-        user-select: none;
-        position: relative;
-        z-index: 1;
-        color: #94a3b8;
-        padding: 0 6px;
-    }
-    .toggle-text--on { text-align: left; }
-    .toggle-text--off { text-align: right; }
-    .toggle:focus-within .toggle-track {
-        box-shadow: 0 0 0 3px rgba(59, 130, 246, .22), inset 0 1px 0 rgba(255, 255, 255, .7), 0 14px 30px rgba(15, 23, 42, .08);
-        border-color: #bfdbfe;
-    }
-    .toggle-input:checked + .toggle-track {
-        border-color: #bbf7d0;
-        background: #ecfdf3;
-    }
-    .toggle-input:checked + .toggle-track .toggle-thumb {
-        transform: translateX(calc(100% + var(--thumb-gap)));
-        background: linear-gradient(135deg, #22c55e, #16a34a);
-        box-shadow: 0 8px 24px rgba(22, 163, 74, .25);
-    }
-    .toggle-input:checked + .toggle-track .toggle-thumb::after { content: "Робочий"; }
-    .toggle-input:not(:checked) + .toggle-track .toggle-text--off { color: #dc2626; }
-    .toggle-input:checked + .toggle-track .toggle-text--on { color: #15803d; }
-    .toggle-input:checked + .toggle-track .toggle-text--off { color: #cbd5e1; }
-    .editor-actions {
-        margin-top: 14px;
-        display: flex;
-        gap: 10px;
-        justify-content: flex-end;
-        flex-wrap: wrap;
-    }
-</style>
 
 @code {
 
@@ -587,7 +409,4 @@
         if (sortField == field) sortAsc = !sortAsc;
         else { sortField = field; sortAsc = true; }
     }
-    // Додає піктограму до заголовку таблиці залежно від сортування.
-    private MarkupString HeaderIcon(string field)
-        => new(sortField == field ? $"<span class=\"ms-1\">{(sortAsc ? "▲" : "▼")}</span>" : "");
 }

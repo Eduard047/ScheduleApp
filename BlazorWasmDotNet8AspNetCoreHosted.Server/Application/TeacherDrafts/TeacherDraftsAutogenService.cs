@@ -953,6 +953,7 @@ public sealed class TeacherDraftsAutogenService
         }
         // Тримаємо прапорці, щоб не дублювати попередження.
         var topicsExhaustedNotified = new HashSet<(int GroupId, int ModuleId)>();
+        var overflowTopicNotified = new HashSet<(int GroupId, int ModuleId, int TopicId)>();
         var missingModulesNotified = new HashSet<int>();
         int created = 0, skipped = 0;
         var allCreatedDrafts = new List<TeacherDraftItem>();
@@ -1176,6 +1177,40 @@ public sealed class TeacherDraftsAutogenService
             });
         }
         // Чи був той самий тип заняття вчора для цього модуля.
+        ModuleTopic? SelectOverflowTopicInOrder(int groupIdCheck, int moduleIdCheck)
+        {
+            if (!softFill || !topicsByModule.TryGetValue(moduleIdCheck, out var list) || list.Count == 0)
+                return null;
+            var usableTopics = list
+                .Where(topic => GetTopicUsageLimit(topic) > 0 && TypeAllowed(topic.LessonTypeId))
+                .ToList();
+            if (usableTopics.Count == 0)
+                return null;
+            topicAssignments.TryGetValue((groupIdCheck, moduleIdCheck), out var assigned);
+            if (assigned is not null)
+            {
+                var latestUsed = usableTopics
+                    .Where(topic => assigned.TryGetValue(topic.Id, out var usedCount) && usedCount > 0)
+                    .LastOrDefault();
+                if (latestUsed is not null)
+                {
+                    return latestUsed;
+                }
+            }
+            return usableTopics.Last();
+        }
+        bool IsOverflowTopicUse(int groupIdCheck, int moduleIdCheck, ModuleTopic topic)
+        {
+            var limit = GetTopicUsageLimit(topic);
+            if (limit <= 0)
+                return false;
+            return topicAssignments.TryGetValue((groupIdCheck, moduleIdCheck), out var assigned)
+                   && assigned.TryGetValue(topic.Id, out var usedCount)
+                   && usedCount >= limit;
+        }
+        bool ModuleHasUsableTopics(int moduleIdCheck)
+            => topicsByModule.TryGetValue(moduleIdCheck, out var moduleTopicsForCheck)
+               && moduleTopicsForCheck.Any(topic => GetTopicUsageLimit(topic) > 0);
         bool HadSameLessonTypePreviousDay(int gid, int mid, int lessonTypeId, DateOnly date)
         {
             var prev = date.AddDays(-1);
@@ -1192,6 +1227,13 @@ public sealed class TeacherDraftsAutogenService
             if (topicCandidate is not null && TypeAllowed(topicCandidate.LessonTypeId))
             {
                 return (topicCandidate.LessonTypeId, topicCandidate);
+            }
+            if (ModuleHasUsableTopics(moduleIdPick))
+            {
+                var overflowTopic = SelectOverflowTopicInOrder(groupIdPick, moduleIdPick);
+                return overflowTopic is not null
+                    ? (overflowTopic.LessonTypeId, overflowTopic)
+                    : (0, null);
             }
             if (!hasPreferred.Contains((groupIdPick, moduleIdPick))
                 && preferredFirstTypeId != 0
@@ -1804,7 +1846,7 @@ public sealed class TeacherDraftsAutogenService
                 {
                     continue;
                 }
-                if (TopicsDepleted(group.Id, moduleId))
+                if (!softFill && TopicsDepleted(group.Id, moduleId))
                 {
                     continue;
                 }
@@ -3333,7 +3375,7 @@ public sealed class TeacherDraftsAutogenService
                     {
                         continue;
                     }
-                    if (TopicsDepleted(otherGroup.Id, moduleId))
+                    if (!softFill && TopicsDepleted(otherGroup.Id, moduleId))
                     {
                         continue;
                     }
@@ -3388,7 +3430,7 @@ public sealed class TeacherDraftsAutogenService
                     {
                         continue;
                     }
-                    if (TopicsDepleted(otherGroup.Id, moduleId))
+                    if (!softFill && TopicsDepleted(otherGroup.Id, moduleId))
                     {
                         continue;
                     }
@@ -3878,7 +3920,7 @@ public sealed class TeacherDraftsAutogenService
                         {
                             continue;
                         }
-                        if (TopicsDepleted(grp.Id, alternativeModuleId))
+                        if (!softFill && TopicsDepleted(grp.Id, alternativeModuleId))
                         {
                             continue;
                         }
@@ -3960,7 +4002,7 @@ public sealed class TeacherDraftsAutogenService
                     return false;
                 }
                 // Якщо теми вичерпано — прибираємо модуль з плану.
-                if (TopicsDepleted(grp.Id, moduleId))
+                if (!softFill && TopicsDepleted(grp.Id, moduleId))
                 {
                     if (remainingByGroupModule.ContainsKey(remainingKey))
                     {
@@ -4858,14 +4900,25 @@ public sealed class TeacherDraftsAutogenService
                     RecordSlotFailureReason(date, selectedSlot, $"Спільну лекційну тему модуля <{ModuleLabel()}> не створено одиночним потоком.");
                     return false;
                 }
+                if (!selectedIsSelfStudy && selectedTopic is null && ModuleHasUsableTopics(moduleId))
+                {
+                    RecordSlotFailureReason(
+                        date,
+                        selectedSlot,
+                        $"Для модуля <{ModuleLabel()}> не знайдено тему, тому заняття без коду теми не створено.");
+                    return false;
+                }
                 if (!selectedIsSelfStudy && selectedTopic is not null)
                 {
                     var selectedViolatesTopicOrder = writablePlacedGroupIds
                         .Any(sharedGroupId => ViolatesTopicCalendarOrder(sharedGroupId, moduleId, selectedTopic, date, startTime, endTime));
                     if (selectedViolatesTopicOrder && allowEmergencyTopicOrderRelaxation && selectedIncomplete is null)
                     {
-                        selectedNotes.Add("Аварійне дозаповнення створило заняття без теми, щоб не порушувати хронологічний порядок тем.");
-                        selectedTopic = null;
+                        RecordSlotFailureReason(
+                            date,
+                            selectedSlot,
+                            $"Аварійне дозаповнення не створило заняття модуля <{ModuleLabel()}> без коду теми, бо тема порушує хронологічний порядок.");
+                        return false;
                     }
                     foreach (var sharedGroupId in writablePlacedGroupIds)
                     {
@@ -4934,6 +4987,11 @@ public sealed class TeacherDraftsAutogenService
                     // Позначаємо тему як використану (для звичайних занять).
                     if (selectedTopic is not null && !selectedIsSelfStudy)
                     {
+                        if (IsOverflowTopicUse(sharedGroupId, moduleId, selectedTopic)
+                            && overflowTopicNotified.Add((sharedGroupId, moduleId, selectedTopic.Id)))
+                        {
+                            warnings.Add($"Для модуля <{ModuleLabel()}> у групі {sharedGroup.Name} повторно використано тему {selectedTopic.TopicCode}, щоб заповнити слот без порушення жорстких правил.");
+                        }
                         MarkTopicUsed(sharedGroupId, moduleId, selectedTopic);
                     }
                     // Додаємо слот у список зайнятих.

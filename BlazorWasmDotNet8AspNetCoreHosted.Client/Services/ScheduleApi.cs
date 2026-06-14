@@ -1,5 +1,4 @@
 using System.Net.Http.Json;
-using System.Web;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services;
@@ -8,26 +7,24 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services;
 public sealed class ScheduleApi(HttpClient http) : IScheduleApi
 {
     // Додає параметр підтвердження до URL.
-    private static string WithConfirm(string url)
-        => url.Contains('?') ? $"{url}&confirm=true" : $"{url}?confirm=true";
     // Отримує метадані для клієнта розкладу.
     public async Task<MetaResponseDto> GetMeta(DateOnly? weekStart = null)
     {
         var url = weekStart is DateOnly d
-            ? $"api/meta?weekStart={d:yyyy-MM-dd}"
+            ? ApiClientHelpers.WithQuery("api/meta", ("weekStart", d.ToString("yyyy-MM-dd")))
             : "api/meta";
-        return await http.GetFromJsonAsync<MetaResponseDto>(url) ?? new MetaResponseDto(new(), new(), new(), new(), new(), new(), new());
+        return await http.GetFromJsonAsync<MetaResponseDto>(url) ?? ApiClientHelpers.EmptyMeta();
     }
     // Завантажує розклад тижня з фільтрами.
     public async Task<List<ScheduleItemDto>> GetWeek(DateOnly weekStart, int? courseId = null, int? groupId = null, int? teacherId = null, int? roomId = null)
     {
-        var qb = HttpUtility.ParseQueryString(string.Empty);
-        qb["weekStart"] = weekStart.ToString("yyyy-MM-dd");
-        if (courseId is int cid) qb["courseId"] = cid.ToString();
-        if (groupId is int gid) qb["groupId"] = gid.ToString();
-        if (teacherId is int tid) qb["teacherId"] = tid.ToString();
-        if (roomId is int rid) qb["roomId"] = rid.ToString();
-        var url = $"api/schedule?{qb}";
+        var url = ApiClientHelpers.WithQuery(
+            "api/schedule",
+            ("weekStart", weekStart.ToString("yyyy-MM-dd")),
+            ("courseId", courseId?.ToString()),
+            ("groupId", groupId?.ToString()),
+            ("teacherId", teacherId?.ToString()),
+            ("roomId", roomId?.ToString()));
         return await http.GetFromJsonAsync<List<ScheduleItemDto>>(url) ?? new();
     }
     // Створює або оновлює пару в розкладі.
@@ -40,7 +37,7 @@ public sealed class ScheduleApi(HttpClient http) : IScheduleApi
     // Видаляє пару з розкладу.
     public async Task Delete(int id)
     {
-        var res = await http.DeleteAsync(WithConfirm($"api/schedule/{id}"));
+        var res = await http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/schedule/{id}"));
         await res.EnsureSuccessWithDetailsAsync();
     }
     // Очищає розклад за тиждень і повертає кількість видалених.

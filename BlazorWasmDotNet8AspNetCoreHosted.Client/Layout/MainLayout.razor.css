@@ -1,4 +1,4 @@
-/* Стилі для макета з верхнім меню (TopNav) */
+/* Стилі для макета з верхнім меню. */
 .layout-root {
     min-height: 100vh;
     display: flex;
@@ -9,6 +9,61 @@
     flex: 1;
     padding: 1.35rem 2.2rem 1.8rem;
     background: #f7f9fd;
+}
+
+.layout-main--work-area {
+    padding-top: 1rem;
+}
+
+.layout-main--work-area ::deep h3 {
+    margin-bottom: .85rem !important;
+    color: #0f172a;
+    font-size: 1.35rem;
+    font-weight: 700;
+}
+
+.layout-main--work-area ::deep .card {
+    border-color: #e5e7eb;
+    border-radius: 10px;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
+}
+
+.layout-main--work-area ::deep .card-header,
+.layout-main--work-area ::deep .card-footer {
+    background: #f8fafc;
+    border-color: #e5e7eb;
+}
+
+.layout-main--work-area ::deep .table {
+    --bs-table-striped-bg: #f8fafc;
+    margin-bottom: .6rem;
+}
+
+.layout-main--work-area ::deep .table th {
+    color: #475569;
+    font-size: .8rem;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.layout-main--work-area ::deep .btn {
+    border-radius: 8px;
+}
+
+.layout-main--work-area ::deep .btn-sm {
+    padding: .28rem .55rem;
+}
+
+.layout-main--work-area ::deep .form-label {
+    margin-bottom: .3rem;
+    color: #475569;
+    font-size: .86rem;
+    font-weight: 600;
+}
+
+.layout-main--work-area ::deep .input-group-text {
+    color: #64748b;
+    background: #f8fafc;
 }
 
 @media (max-width: 900px) {

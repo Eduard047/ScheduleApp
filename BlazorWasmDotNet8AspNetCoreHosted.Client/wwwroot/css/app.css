@@ -107,3 +107,112 @@ code {
     user-select: none;
     white-space: nowrap;
 }
+
+.editor-overlay {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 72px 18px 24px;
+    overflow-y: auto;
+    background: rgba(15, 23, 42, .5);
+    backdrop-filter: blur(2px);
+    z-index: 2500;
+}
+
+.editor {
+    width: min(720px, 100%);
+    margin-top: 14px;
+    padding: 14px;
+    border: 1px solid #e5e7eb;
+    border-radius: 12px;
+    background: #fff;
+    box-shadow: 0 20px 50px rgba(15, 23, 42, .25);
+}
+
+.editor-modal-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.editor-title {
+    font-size: 1.1rem;
+    font-weight: 800;
+}
+
+.editor-subtitle {
+    margin-top: 4px;
+    color: #475569;
+    font-size: .92rem;
+}
+
+.editor-close {
+    min-width: 44px;
+    height: 44px;
+    padding: 0 .6rem;
+    font-size: 1.3rem;
+}
+
+.editor-actions {
+    display: flex;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 14px;
+}
+
+.group-editor,
+.room-editor {
+    width: min(760px, 100%);
+}
+
+.calendar-editor {
+    width: min(900px, 100%);
+}
+
+.teacher-editor {
+    width: min(1200px, 100%);
+}
+
+.building-editor,
+.travel-editor {
+    width: min(680px, 100%);
+}
+
+.table th:last-child,
+.table td:last-child {
+    min-width: 13.5rem;
+}
+
+.table td:has(> .btn) {
+    white-space: nowrap;
+}
+
+.table td > .btn {
+    display: inline-flex;
+    min-width: 6.25rem;
+    align-items: center;
+    justify-content: center;
+    vertical-align: middle;
+    white-space: nowrap;
+}
+
+.table td > .btn + .btn {
+    margin-left: .35rem;
+}
+
+@media (max-width: 720px) {
+    .table th:last-child,
+    .table td:last-child {
+        min-width: 12.75rem;
+    }
+
+    .table td > .btn {
+        min-width: 5.9rem;
+        padding-inline: .5rem;
+    }
+}

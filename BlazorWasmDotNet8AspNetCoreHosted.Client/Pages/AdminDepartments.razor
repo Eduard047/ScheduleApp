@@ -22,26 +22,17 @@
 <div class="card p-3">
     <div class="d-flex justify-content-between align-items-center mb-2 gap-2 flex-wrap">
         <button class="btn btn-primary" @onclick="OpenCreate">Додати кафедру</button>
-        <div class="input-group ms-auto" style="max-width:360px;">
-            <span class="input-group-text">Пошук</span>
-            <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / назва" />
-        </div>
+        <AdminSearchBox @bind-Value="filter" Class="ms-auto" Style="max-width:360px;" Placeholder="Id / назва" />
         <div class="small text-muted">Показано: @SortedAndFiltered.Count() з @items.Count</div>
     </div>
     <div class="table-responsive">
         <table class="table table-sm align-middle">
             <thead>
                 <tr>
-                    <th style="width:80px;" class="sortable-th" role="button" @onclick="() => ToggleSort(nameof(DepartmentEditDto.Id))">
-                        Id @HeaderIcon(nameof(DepartmentEditDto.Id))
-                    </th>
-                    <th class="sortable-th" role="button" @onclick="() => ToggleSort(nameof(DepartmentEditDto.Name))">
-                        Назва @HeaderIcon(nameof(DepartmentEditDto.Name))
-                    </th>
-                    <th style="width:120px;" class="sortable-th" role="button" @onclick="() => ToggleSort(nameof(DepartmentEditDto.IsActive))">
-                        Активна @HeaderIcon(nameof(DepartmentEditDto.IsActive))
-                    </th>
-                    <th style="width:180px;"></th>
+                    <SortableHeader Field="@nameof(DepartmentEditDto.Id)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort" Style="width:80px;">Id</SortableHeader>
+                    <SortableHeader Field="@nameof(DepartmentEditDto.Name)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Назва</SortableHeader>
+                    <SortableHeader Field="@nameof(DepartmentEditDto.IsActive)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort" Style="width:120px;">Активна</SortableHeader>
+                    <th style="width:220px;"></th>
                 </tr>
             </thead>
             <tbody>
@@ -61,7 +52,7 @@
                             <td>
                                 <input type="checkbox" class="form-check-input" checked="@d.IsActive" disabled />
                             </td>
-                            <td class="text-end">
+                            <td class="text-end text-nowrap">
                                 <button class="btn btn-sm btn-outline-primary me-2" @onclick="() => OpenEdit(d)">Редагувати</button>
                                 <button class="btn btn-sm btn-outline-danger" @onclick="() => Delete(d.Id!.Value)">Видалити</button>
                             </td>
@@ -75,75 +66,28 @@
 
 @if (editorOpen)
 {
-    <div class="editor-overlay" @onclick="CloseEditor">
-        <div class="editor editor-modal department-editor" role="dialog" aria-modal="true" @onclick:stopPropagation="true">
-            <div class="editor-modal-head">
-                <div>
-                    <div class="editor-title">@((form.Id is null ? "Створення кафедри" : $"Редагування кафедри #{form.Id}"))</div>
-                    <div class="editor-subtitle">Вкажіть назву кафедри та її статус.</div>
-                </div>
-                <button type="button" class="btn btn-outline-secondary editor-close" title="Закрити" @onclick="CloseEditor">×</button>
+    <AdminEditorModal Title="@DepartmentEditorTitle"
+                      Subtitle="Вкажіть назву кафедри та її статус."
+                      CssClass="department-editor"
+                      OnClose="@CloseEditor">
+        <div class="row g-3 align-items-end">
+            <div class="col-12 col-md-8">
+                <label class="form-label">Назва</label>
+                <input class="form-control" @bind="form.Name" />
             </div>
-            <div class="row g-3 align-items-end">
-                <div class="col-12 col-md-8">
-                    <label class="form-label">Назва</label>
-                    <input class="form-control" @bind="form.Name" />
+            <div class="col-12 col-md-4">
+                <div class="form-check mt-4">
+                    <input class="form-check-input" type="checkbox" id="depActiveEditor" @bind="form.IsActive" />
+                    <label class="form-check-label" for="depActiveEditor">Активна</label>
                 </div>
-                <div class="col-12 col-md-4">
-                    <div class="form-check mt-4">
-                        <input class="form-check-input" type="checkbox" id="depActiveEditor" @bind="form.IsActive" />
-                        <label class="form-check-label" for="depActiveEditor">Активна</label>
-                    </div>
-                </div>
-            </div>
-            <div class="editor-actions">
-                <button class="btn btn-primary" @onclick="Save">Зберегти</button>
-                <button class="btn btn-outline-secondary" @onclick="CloseEditor">Скасувати</button>
             </div>
         </div>
-    </div>
+        <div class="editor-actions">
+            <button class="btn btn-primary" @onclick="Save">Зберегти</button>
+            <button class="btn btn-outline-secondary" @onclick="CloseEditor">Скасувати</button>
+        </div>
+    </AdminEditorModal>
 }
-
-<style>
-    .editor-overlay {
-        position: fixed;
-        inset: 0;
-        background: rgba(15, 23, 42, 0.5);
-        backdrop-filter: blur(2px);
-        display: flex;
-        justify-content: center;
-        align-items: flex-start;
-        padding: 72px 18px 24px;
-        overflow-y: auto;
-        z-index: 2500;
-    }
-    .editor {
-        margin-top: 14px;
-        background: #fff;
-        border: 1px solid #e5e7eb;
-        border-radius: 12px;
-        padding: 14px;
-        width: min(720px, 100%);
-        box-shadow: 0 20px 50px rgba(15, 23, 42, 0.25);
-    }
-    .editor-modal-head {
-        display: flex;
-        align-items: flex-start;
-        justify-content: space-between;
-        gap: 12px;
-        margin-bottom: 12px;
-    }
-    .editor-title { font-weight: 800; font-size: 1.1rem; }
-    .editor-subtitle { color: #475569; font-size: .92rem; margin-top: 4px; }
-    .editor-close { min-width: 44px; height: 44px; font-size: 1.3rem; padding: 0 .6rem; }
-    .editor-actions {
-        margin-top: 14px;
-        display: flex;
-        gap: 10px;
-        justify-content: flex-end;
-        flex-wrap: wrap;
-    }
-</style>
 
 @code {
     private string? error, ok;
@@ -153,6 +97,9 @@
     private string? filter;
     private string sortField = nameof(DepartmentEditDto.Name);
     private bool sortAsc = true;
+    private string DepartmentEditorTitle => form.Id is null
+        ? "Створення кафедри"
+        : $"Редагування кафедри #{form.Id}";
     private static DepartmentEditDto NewForm() => new() { Id = null, Name = "", IsActive = true };
     private void OpenCreate()
     {
@@ -244,12 +191,6 @@
     {
         if (sortField == field) sortAsc = !sortAsc;
         else { sortField = field; sortAsc = true; }
-    }
-    // Повертає піктограму для заголовка сортування.
-    private string HeaderIcon(string field)
-    {
-        if (sortField != field) return "";
-        return sortAsc ? "▲" : "▼";
     }
     // Фільтрує кафедри за пошуковим рядком.
     private IEnumerable<DepartmentEditDto> ApplyFilter(IEnumerable<DepartmentEditDto> seq)

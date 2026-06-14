@@ -1,0 +1,18 @@
+.table-responsive {
+    max-height: 520px;
+}
+
+.module-label {
+    display: flex;
+    flex-direction: column;
+}
+
+.module-label-title {
+    font-weight: 600;
+    line-height: 1.2;
+}
+
+.module-label-course {
+    font-size: .78rem;
+    margin-top: .1rem;
+}

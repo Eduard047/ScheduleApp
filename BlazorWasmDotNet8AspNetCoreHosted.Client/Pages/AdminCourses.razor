@@ -20,24 +20,15 @@
     <div class="col-md-6">
         <div class="d-flex justify-content-between align-items-center mb-2 gap-2">
             <button class="btn btn-primary" @onclick="New">+ Додати курс</button>
-            <div class="input-group" style="max-width:280px;">
-                <span class="input-group-text">Пошук</span>
-                <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / назва / тижні" />
-            </div>
+            <AdminSearchBox @bind-Value="filter" Style="max-width:280px;" Placeholder="Id / назва / тижні" />
         </div>
         <table class="table table-sm table-striped align-middle">
             <thead>
                 <tr>
-                    <th role="button" class="sortable-th" @onclick="() => ToggleSort(nameof(CourseEditDto.Id))">
-                        Id @HeaderIcon(nameof(CourseEditDto.Id))
-                    </th>
-                    <th role="button" class="sortable-th" @onclick="() => ToggleSort(nameof(CourseEditDto.Name))">
-                        Назва @HeaderIcon(nameof(CourseEditDto.Name))
-                    </th>
-                    <th role="button" class="sortable-th" @onclick="() => ToggleSort(nameof(CourseEditDto.DurationWeeks))">
-                        Тривалість (тижнів) @HeaderIcon(nameof(CourseEditDto.DurationWeeks))
-                    </th>
-                    <th style="width:180px;"></th>
+                    <SortableHeader Field="@nameof(CourseEditDto.Id)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Id</SortableHeader>
+                    <SortableHeader Field="@nameof(CourseEditDto.Name)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Назва</SortableHeader>
+                    <SortableHeader Field="@nameof(CourseEditDto.DurationWeeks)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Тривалість (тижнів)</SortableHeader>
+                    <th style="width:220px;"></th>
                 </tr>
             </thead>
             <tbody>
@@ -47,7 +38,7 @@
                         <td>@c.Id</td>
                         <td>@c.Name</td>
                         <td>@c.DurationWeeks</td>
-                        <td>
+                        <td class="text-end text-nowrap">
                             <button class="btn btn-sm btn-outline-secondary me-2" @onclick="() => Edit(c)">Редагувати</button>
                             <button class="btn btn-sm btn-outline-danger" @onclick="() => Delete(c.Id!.Value)">Видалити</button>
                         </td>
@@ -123,9 +114,6 @@
         if (sortField == field) sortAsc = !sortAsc;
         else { sortField = field; sortAsc = true; }
     }
-    // Повертає піктограму для заголовка сортування.
-    private MarkupString HeaderIcon(string field)
-        => new MarkupString(sortField == field ? $"<span class=\"ms-1\">{(sortAsc ? "▲" : "▼")}</span>" : "");
     // Початкове завантаження курсів.
     protected override async Task OnInitializedAsync() => await Load();
     // Завантажує список курсів та ініціалізує форму.

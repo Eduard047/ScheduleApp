@@ -1,0 +1,59 @@
+@* Попередній перегляд імпорту модулів з DOCX. *@
+<div class="mt-3">
+    <div class="d-flex flex-wrap gap-3 align-items-center">
+        <span class="fw-semibold">Курс: @Result.CourseName</span>
+        <span class="badge @(Result.CourseFound ? "bg-success" : "bg-danger")">
+            @(Result.CourseFound ? "Знайдено у БД" : "Не знайдено у БД")
+        </span>
+        <span class="text-muted small">Модулів: @Result.Modules.Count | Занять: @ImportedTopicsCount</span>
+    </div>
+
+    @if (Result.Warnings.Any())
+    {
+        <div class="alert alert-warning mt-2">
+            <div class="fw-semibold mb-1">Попередження:</div>
+            <ul class="mb-0">
+                @foreach (var warning in Result.Warnings.Take(10))
+                {
+                    <li>@warning</li>
+                }
+                @if (Result.Warnings.Count > 10)
+                {
+                    <li>... ще @((Result.Warnings.Count - 10)) попереджень</li>
+                }
+            </ul>
+        </div>
+    }
+
+    <div class="table-responsive mt-3">
+        <table class="table table-sm">
+            <thead class="table-light">
+                <tr>
+                    <th>Код</th>
+                    <th>Назва</th>
+                    <th>Кредити</th>
+                    <th>Занять</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var module in Result.Modules)
+                {
+                    <tr>
+                        <td>@module.Code</td>
+                        <td>@module.Title</td>
+                        <td>@module.Credits</td>
+                        <td>@(module.Topics?.Count ?? 0)</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+</div>
+
+@code {
+    [Parameter, EditorRequired]
+    public DocxImportResultDto Result { get; set; } = default!;
+
+    [Parameter]
+    public int ImportedTopicsCount { get; set; }
+}
