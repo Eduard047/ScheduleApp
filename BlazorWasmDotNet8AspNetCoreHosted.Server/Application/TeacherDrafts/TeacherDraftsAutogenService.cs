@@ -4057,6 +4057,21 @@ public sealed class TeacherDraftsAutogenService
                 double bestEffectivePenalty = double.MaxValue;
                 IncompletePlacementCandidate? bestIncomplete = null;
                 double bestIncompleteEffectivePenalty = double.MaxValue;
+                int PickEmergencyUnthemedLessonType(int currentLessonTypeId)
+                {
+                    var fallback = activeStudyTypes
+                        .Select(t => t.Id)
+                        .Where(TypeAllowed)
+                        .Where(id => !CanShareAcrossGroups(id))
+                        .FirstOrDefault();
+                    if (fallback != 0)
+                    {
+                        return fallback;
+                    }
+                    return TypeAllowed(currentLessonTypeId) && !CanShareAcrossGroups(currentLessonTypeId)
+                        ? currentLessonTypeId
+                        : 0;
+                }
                 // Перебираємо слоти дня та шукаємо найкращого кандидата.
                 var slotsToEvaluate = forcedSlot is null
                     ? slots
@@ -4152,6 +4167,35 @@ public sealed class TeacherDraftsAutogenService
                         var pickResult = PickLessonType(grp.Id, grp.CourseId, moduleId, date);
                         ltypeId = pickResult.LessonTypeId;
                         topicSelection = pickResult.Topic;
+                    }
+                    bool emergencyUnthemedTopic = false;
+                    void TryUseEmergencyUnthemedTopic(string note)
+                    {
+                        if (!allowEmergencyTopicOrderRelaxation
+                            || isSelfStudyPlacement
+                            || topicSelection is null)
+                        {
+                            return;
+                        }
+                        var fallbackLessonTypeId = PickEmergencyUnthemedLessonType(ltypeId);
+                        if (fallbackLessonTypeId == 0)
+                        {
+                            return;
+                        }
+                        ltypeId = fallbackLessonTypeId;
+                        topicSelection = null;
+                        emergencyUnthemedTopic = true;
+                        slotIssues.Add(note);
+                    }
+                    var emergencySlotOrder = GetSlotOrder(sl.Start, sl.End);
+                    if (IsBlockedLateLectureSlot(ltypeId, emergencySlotOrder, preferredFirstMaxSlotOrder))
+                    {
+                        TryUseEmergencyUnthemedTopic("Аварійне дозаповнення замінило тему на заняття без коду теми, щоб не блокувати слот лекційним типом.");
+                    }
+                    if (topicSelection is not null
+                        && ViolatesTopicCalendarOrder(grp.Id, moduleId, topicSelection, date, s, e))
+                    {
+                        TryUseEmergencyUnthemedTopic("Аварійне дозаповнення замінило тему на заняття без коду теми, щоб не ламати хронологію тем.");
                     }
                     if (!TypeAllowed(ltypeId))
                     {
@@ -4367,6 +4411,11 @@ public sealed class TeacherDraftsAutogenService
                         {
                             penaltyScore += 120.0;
                             penalties.Add("Тему після спільної лекції дозволено лише для аварійного дозаповнення");
+                        }
+                        if (emergencyUnthemedTopic)
+                        {
+                            penaltyScore += 65.0;
+                            penalties.Add("Аварійне дозаповнення створило заняття без коду теми");
                         }
                         if (!string.IsNullOrWhiteSpace(nonPreferredBeforeFirstPreferredNote))
                         {
@@ -4902,11 +4951,15 @@ public sealed class TeacherDraftsAutogenService
                 }
                 if (!selectedIsSelfStudy && selectedTopic is null && ModuleHasUsableTopics(moduleId))
                 {
-                    RecordSlotFailureReason(
-                        date,
-                        selectedSlot,
-                        $"Для модуля <{ModuleLabel()}> не знайдено тему, тому заняття без коду теми не створено.");
-                    return false;
+                    if (!allowEmergencyTopicOrderRelaxation)
+                    {
+                        RecordSlotFailureReason(
+                            date,
+                            selectedSlot,
+                            $"Для модуля <{ModuleLabel()}> не знайдено тему, тому заняття без коду теми не створено.");
+                        return false;
+                    }
+                    warnings.Add($"[{date:yyyy-MM-dd} {startTime:HH\\:mm}-{endTime:HH\\:mm}] {grp.Name}: аварійне дозаповнення створило заняття модуля <{ModuleLabel()}> без коду теми.");
                 }
                 if (!selectedIsSelfStudy && selectedTopic is not null)
                 {
