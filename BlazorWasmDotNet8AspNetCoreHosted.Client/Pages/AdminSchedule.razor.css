@@ -177,3 +177,104 @@
         opacity: .6;
         cursor: not-allowed;
     }
+.autogen-progress {
+        border: 1px solid rgba(37, 99, 235, .22);
+        border-radius: 8px;
+        background: #f8fbff;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
+        padding: .85rem .95rem;
+    }
+    .autogen-progress__head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: .75rem;
+        margin-bottom: .65rem;
+    }
+    .autogen-progress__title {
+        display: inline-flex;
+        align-items: center;
+        gap: .45rem;
+        color: #1e3a8a;
+        font-weight: 700;
+    }
+    .autogen-progress__subtitle {
+        margin-top: .2rem;
+        color: #475569;
+        font-size: .9rem;
+    }
+    .autogen-progress__actions {
+        display: inline-flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: .5rem;
+        flex-wrap: wrap;
+    }
+    .autogen-progress__badge {
+        min-width: 3.4rem;
+        border: 1px solid rgba(37, 99, 235, .24);
+        border-radius: 999px;
+        background: #fff;
+        color: #1d4ed8;
+        font-weight: 700;
+        line-height: 1;
+        padding: .35rem .55rem;
+        text-align: center;
+        white-space: nowrap;
+    }
+    .autogen-progress__bar {
+        height: .75rem;
+        border-radius: 999px;
+        background-color: #dbeafe;
+        overflow: hidden;
+    }
+    .autogen-progress__meta {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: .35rem .75rem;
+        margin-top: .65rem;
+        color: #334155;
+        font-size: .82rem;
+    }
+    .autogen-progress__range,
+    .autogen-progress__last {
+        margin-top: .45rem;
+        color: #64748b;
+        font-size: .82rem;
+    }
+    .autogen-progress__last {
+        color: #166534;
+    }
+    .autogen-report {
+        border-left: 4px solid #2563eb;
+        background: #eff6ff;
+        color: #1e3a8a;
+        border-radius: .35rem;
+        padding: .55rem .7rem;
+    }
+    .autogen-report-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
+        gap: .35rem .75rem;
+        margin-top: .4rem;
+    }
+    .autogen-report-section {
+        margin-top: .55rem;
+    }
+    .autogen-report-section ul {
+        padding-left: 1.1rem;
+    }
+    .autogen-report-pills {
+        display: flex;
+        flex-wrap: wrap;
+        gap: .4rem;
+        margin-top: .35rem;
+    }
+    .autogen-report-pill {
+        border: 1px solid rgba(37, 99, 235, .22);
+        border-radius: 999px;
+        background: #fff;
+        color: #1e40af;
+        padding: .15rem .45rem;
+        font-size: .78rem;
+    }

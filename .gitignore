@@ -43,6 +43,9 @@ _ReSharper*/
 *Tests/
 *.Tests/
 *.IntegrationTests/
+!BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/
+BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/*
+!BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/AutogenScaleRangeTests.cs
 TestResults/
 *.trx
 *.coverage

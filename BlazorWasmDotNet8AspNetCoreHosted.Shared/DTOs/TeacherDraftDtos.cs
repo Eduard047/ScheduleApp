@@ -90,7 +90,8 @@ public record AutogenMonthRequest(
     bool AllowIncompleteDrafts = false,
     List<GroupRoomPreferenceDto>? GroupRoomPreferences = null,
     AutoGenSoftOptionsDto? SoftOptions = null,
-    int? PreferredFirstMaxSlotOrderOverride = null
+    int? PreferredFirstMaxSlotOrderOverride = null,
+    bool PreflightOnly = false
 );
 
 // DTO для автогенерації чернеток по курсу за діапазон.
@@ -105,5 +106,6 @@ public record AutogenCourseRequest(
     bool AllowIncompleteDrafts = false,
     List<GroupRoomPreferenceDto>? GroupRoomPreferences = null,
     AutoGenSoftOptionsDto? SoftOptions = null,
-    int? PreferredFirstMaxSlotOrderOverride = null
+    int? PreferredFirstMaxSlotOrderOverride = null,
+    bool PreflightOnly = false
 );

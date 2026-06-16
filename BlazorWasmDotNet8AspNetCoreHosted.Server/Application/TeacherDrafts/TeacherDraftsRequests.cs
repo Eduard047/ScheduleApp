@@ -31,7 +31,8 @@ public sealed record DraftAutoGenRequest(
     DateOnly? RangeEndDate = null, // Опційне завершення діапазону в межах тижня.
     int? PreferredFirstMaxSlotOrderOverride = null, // Явний override ліміту для типу "бажано першим у тижні"; 0 вимикає збережений ліміт.
     List<GroupRoomPreferenceDto>? GroupRoomPreferences = null, // Пріоритетні корпуси та аудиторії для конкретних груп.
-    DraftAutoGenSoftOptions? SoftOptions = null // Додаткові м'які параметри для дослідного пошуку профілів.
+    DraftAutoGenSoftOptions? SoftOptions = null, // Додаткові м'які параметри для дослідного пошуку профілів.
+    bool PreflightOnly = false // Лише перевірити ресурси без збереження чернеток.
 );
 
 public sealed record ApproveWeekRequest(

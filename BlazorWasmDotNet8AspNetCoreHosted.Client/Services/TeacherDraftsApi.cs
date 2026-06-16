@@ -34,6 +34,31 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
         await res.EnsureSuccessWithDetailsAsync();
         return (await res.Content.ReadFromJsonAsync<AutoGenResult>())!;
     }
+    public async Task<AutoGenJobStartResult> StartAutogenJob(AutoGenJobRequest req)
+    {
+        var res = await http.PostAsJsonAsync("api/teacher-drafts/autogen/jobs", req);
+        await res.EnsureSuccessWithDetailsAsync();
+        return (await res.Content.ReadFromJsonAsync<AutoGenJobStartResult>())!;
+    }
+    public async Task<AutoGenJobStatus> GetAutogenJob(string jobId)
+    {
+        var res = await http.GetAsync($"api/teacher-drafts/autogen/jobs/{Uri.EscapeDataString(jobId)}");
+        await res.EnsureSuccessWithDetailsAsync();
+        return (await res.Content.ReadFromJsonAsync<AutoGenJobStatus>())!;
+    }
+    public async Task<AutoGenJobStatus> CancelAutogenJob(string jobId)
+    {
+        var res = await http.PostAsync($"api/teacher-drafts/autogen/jobs/{Uri.EscapeDataString(jobId)}/cancel", content: null);
+        await res.EnsureSuccessWithDetailsAsync();
+        return (await res.Content.ReadFromJsonAsync<AutoGenJobStatus>())!;
+    }
+    // Виконує попередню перевірку ресурсів без запису чернеток.
+    public async Task<AutoGenResult> AutogenPreflightWeek(AutoGenRequest req)
+    {
+        var res = await http.PostAsJsonAsync("api/teacher-drafts/autogen/week", req with { PreflightOnly = true });
+        await res.EnsureSuccessWithDetailsAsync();
+        return (await res.Content.ReadFromJsonAsync<AutoGenResult>())!;
+    }
     // Очищає чернетки тижня.
     public async Task<int> ClearWeek(ClearWeekRequest req)
     {
