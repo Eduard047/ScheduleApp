@@ -1076,8 +1076,14 @@ public sealed class TeacherDraftsAutogenService
         var topicsAll = await _db.ModuleTopics
             .Where(t => moduleIdsForPlans.Contains(t.ModuleId))
             .ToListAsync();
-        // Сортуємо теми за кодом, щоб автоген відповідав порядку у плані модуля.
-        topicsAll.Sort((a, b) => TeacherDraftsHelpers.CompareTopicCodes(a.TopicCode, b.TopicCode));
+        // Сортуємо теми за явним порядком із БД, а код використовуємо лише як стабільний fallback.
+        topicsAll.Sort((a, b) =>
+        {
+            var orderDiff = a.Order.CompareTo(b.Order);
+            return orderDiff != 0
+                ? orderDiff
+                : TeacherDraftsHelpers.CompareTopicCodes(a.TopicCode, b.TopicCode);
+        });
         // Модулі, де всі теми міжзборові (їх пропускаємо у розкладі).
         var interAssemblyOnlyModules = topicsAll
             .GroupBy(t => t.ModuleId)
@@ -1390,7 +1396,7 @@ public sealed class TeacherDraftsAutogenService
             TimeOnly end)
         {
             var candidateCode = string.IsNullOrWhiteSpace(topic.TopicCode) ? null : topic.TopicCode.Trim();
-            if (candidateCode is null)
+            if (candidateCode is null && topic.Order <= 0)
             {
                 return false;
             }
@@ -1407,9 +1413,14 @@ public sealed class TeacherDraftsAutogenService
                     continue;
                 }
                 var existingCode = string.IsNullOrWhiteSpace(existingTopic.TopicCode) ? null : existingTopic.TopicCode.Trim();
-                if (existingCode is null)
+                if (existingCode is null && existingTopic.Order <= 0)
                 {
                     continue;
+                }
+                var orderComparison = topic.Order.CompareTo(existingTopic.Order);
+                if (orderComparison == 0 && candidateCode is not null && existingCode is not null)
+                {
+                    orderComparison = TeacherDraftsHelpers.CompareTopicCodes(candidateCode, existingCode);
                 }
                 var slotPosition = CompareSlotPosition(
                     slot.Date,
@@ -1418,13 +1429,11 @@ public sealed class TeacherDraftsAutogenService
                     date,
                     start,
                     end);
-                if (slotPosition < 0
-                    && TeacherDraftsHelpers.CompareTopicCodes(existingCode, candidateCode) > 0)
+                if (slotPosition < 0 && orderComparison < 0)
                 {
                     return true;
                 }
-                if (slotPosition > 0
-                    && TeacherDraftsHelpers.CompareTopicCodes(candidateCode, existingCode) > 0)
+                if (slotPosition > 0 && orderComparison > 0)
                 {
                     return true;
                 }
@@ -4794,7 +4803,8 @@ public sealed class TeacherDraftsAutogenService
                     {
                         if (!allowEmergencyTopicOrderRelaxation
                             || isSelfStudyPlacement
-                            || topicSelection is null)
+                            || topicSelection is null
+                            || ModuleHasUsableTopics(moduleId))
                         {
                             return;
                         }
@@ -4885,7 +4895,6 @@ public sealed class TeacherDraftsAutogenService
                     }
                     if (!isSelfStudyPlacement
                         && topicSelection is not null
-                        && !allowEmergencyTopicOrderRelaxation
                         && ViolatesTopicCalendarOrder(grp.Id, moduleId, topicSelection, date, s, e))
                     {
                         RecordSlotFailureReason(
@@ -5589,15 +5598,11 @@ public sealed class TeacherDraftsAutogenService
                 }
                 if (!selectedIsSelfStudy && selectedTopic is null && ModuleHasUsableTopics(moduleId))
                 {
-                    if (!allowEmergencyTopicOrderRelaxation)
-                    {
-                        RecordSlotFailureReason(
-                            date,
-                            selectedSlot,
-                            $"Для модуля <{ModuleLabel()}> не знайдено тему, тому заняття без коду теми не створено.");
-                        return false;
-                    }
-                    warnings.Add($"[{date:yyyy-MM-dd} {startTime:HH\\:mm}-{endTime:HH\\:mm}] {grp.Name}: аварійне дозаповнення створило заняття модуля <{ModuleLabel()}> без коду теми.");
+                    RecordSlotFailureReason(
+                        date,
+                        selectedSlot,
+                        $"Для модуля <{ModuleLabel()}> є планові теми, тому заняття без коду теми не створюється.");
+                    return false;
                 }
                 if (!selectedIsSelfStudy && selectedTopic is not null)
                 {
@@ -5759,10 +5764,6 @@ public sealed class TeacherDraftsAutogenService
                 {
                     var noteText = string.Join("; ", selectedNotes);
                     warnings.Add($"[{date:yyyy-MM-dd} {startTime:HH\\:mm}-{endTime:HH\\:mm}] {grp.Name}: {noteText}");
-                }
-                if (allowEmergencyTopicOrderRelaxation && selectedTopic is not null)
-                {
-                    warnings.Add($"[{date:yyyy-MM-dd} {startTime:HH\\:mm}-{endTime:HH\\:mm}] {grp.Name}: аварійне дозаповнення послабило хронологічний порядок тем модуля <{ModuleLabel()}>.");
                 }
                 var nextShareableTopicUnlocked = !softFill
                     && !selectedIsSelfStudy
@@ -7110,6 +7111,29 @@ public sealed class TeacherDraftsAutogenService
                 else
                 {
                     errors.Add($"Фінальна перевірка: невідомий тип заняття #{draft.LessonTypeId} для групи {groupLabel}.");
+                }
+                if (draft.ModuleTopicId is int draftTopicId)
+                {
+                    if (!topicById.TryGetValue(draftTopicId, out var draftTopic))
+                    {
+                        errors.Add($"Фінальна перевірка: тема #{draftTopicId} для групи {groupLabel} не знайдена у плані модуля.");
+                    }
+                    else
+                    {
+                        if (draftTopic.ModuleId != draft.ModuleId)
+                        {
+                            errors.Add($"Фінальна перевірка: тема #{draftTopicId} не належить модулю #{draft.ModuleId} для групи {groupLabel}.");
+                        }
+
+                        if (!draft.IsSelfStudy && draftTopic.LessonTypeId != draft.LessonTypeId)
+                        {
+                            errors.Add($"Фінальна перевірка: тип заняття #{draft.LessonTypeId} не відповідає типу теми #{draftTopicId} для групи {groupLabel}.");
+                        }
+                    }
+                }
+                else if (!draft.IsSelfStudy && ModuleHasUsableTopics(draft.ModuleId))
+                {
+                    errors.Add($"Фінальна перевірка: модуль #{draft.ModuleId} має планові теми, але заняття для групи {groupLabel} створено без теми.");
                 }
                 if (selectedGroupsById.TryGetValue(draft.GroupId, out var selectedGroup))
                 {

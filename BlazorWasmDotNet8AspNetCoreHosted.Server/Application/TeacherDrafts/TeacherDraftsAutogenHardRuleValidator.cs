@@ -32,6 +32,7 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             .ToListAsync(cancellationToken);
         var draftRows = await LoadDraftRowsAsync(request, groupIds, cancellationToken);
         var scheduleRows = await LoadScheduleRowsAsync(request, groupIds, draftRows, cancellationToken);
+        var modulesWithAuditoriumTopics = await LoadModulesWithAuditoriumTopicsAsync(draftRows, cancellationToken);
         var placements = scheduleRows.Concat(draftRows).ToList();
         var violations = new List<string>();
 
@@ -71,6 +72,8 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             "аудиторії",
             CollapseSharedFlowPlacements(placements.Where(row => row.RoomId is not null && row.BlocksRoom))
                 .GroupBy(row => (Id: row.RoomId!.Value, Name: row.RoomName ?? $"#{row.RoomId.Value}"))));
+        violations.AddRange(FindTopicOrderViolations(draftRows));
+        violations.AddRange(FindModuleTopicPlanViolations(draftRows, modulesWithAuditoriumTopics));
         var roomCapacityStats = AnalyzeRoomCapacity(placements);
         violations.AddRange(roomCapacityStats.Violations);
 
@@ -113,6 +116,9 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
                 item.LessonType.Name,
                 item.LessonType.PreferredFirstInWeek,
                 item.ModuleTopicId,
+                item.ModuleTopic != null ? item.ModuleTopic.Order : null,
+                item.ModuleTopic != null ? item.ModuleTopic.LessonTypeId : null,
+                item.ModuleTopic != null ? item.ModuleTopic.ModuleId : null,
                 item.TeacherId,
                 item.Teacher != null ? item.Teacher.FullName : null,
                 item.RoomId,
@@ -149,6 +155,11 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             .Select(item => item.RoomId!.Value)
             .Distinct()
             .ToList();
+        var topicIds = pendingDrafts
+            .Where(item => item.ModuleTopicId is not null)
+            .Select(item => item.ModuleTopicId!.Value)
+            .Distinct()
+            .ToList();
 
         var groups = await _db.Groups
             .AsNoTracking()
@@ -166,6 +177,13 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             .AsNoTracking()
             .Where(item => roomIds.Contains(item.Id))
             .ToDictionaryAsync(item => item.Id, cancellationToken);
+        var topicPlans = await _db.ModuleTopics
+            .AsNoTracking()
+            .Where(item => topicIds.Contains(item.Id))
+            .ToDictionaryAsync(
+                item => item.Id,
+                item => new TopicPlanRow(item.ModuleId, item.LessonTypeId, item.Order),
+                cancellationToken);
 
         var rows = new List<PlacementRow>(pendingDrafts.Count);
         foreach (var item in pendingDrafts)
@@ -180,6 +198,11 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             if (item.RoomId is int roomId)
             {
                 rooms.TryGetValue(roomId, out room);
+            }
+            TopicPlanRow? topicPlan = null;
+            if (item.ModuleTopicId is int topicId)
+            {
+                topicPlans.TryGetValue(topicId, out topicPlan);
             }
 
             rows.Add(new PlacementRow(
@@ -197,6 +220,9 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
                 lessonType.Name,
                 lessonType.PreferredFirstInWeek,
                 item.ModuleTopicId,
+                topicPlan?.Order,
+                topicPlan?.LessonTypeId,
+                topicPlan?.ModuleId,
                 item.TeacherId,
                 item.TeacherId is int teacherId && teachers.TryGetValue(teacherId, out var teacherName) ? teacherName : null,
                 item.RoomId,
@@ -252,6 +278,9 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
                 item.LessonType.Name,
                 item.LessonType.PreferredFirstInWeek,
                 item.ModuleTopicId,
+                item.ModuleTopic != null ? item.ModuleTopic.Order : null,
+                item.ModuleTopic != null ? item.ModuleTopic.LessonTypeId : null,
+                item.ModuleTopic != null ? item.ModuleTopic.ModuleId : null,
                 item.TeacherId,
                 item.Teacher != null ? item.Teacher.FullName : null,
                 item.RoomId,
@@ -263,6 +292,28 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
                 item.LessonType.BlocksRoom,
                 item.IsSelfStudy))
             .ToListAsync(cancellationToken);
+    }
+
+    private async Task<IReadOnlySet<int>> LoadModulesWithAuditoriumTopicsAsync(
+        IReadOnlyList<PlacementRow> draftRows,
+        CancellationToken cancellationToken)
+    {
+        var moduleIds = draftRows
+            .Select(row => row.ModuleId)
+            .Distinct()
+            .ToList();
+        if (moduleIds.Count == 0)
+        {
+            return new HashSet<int>();
+        }
+
+        var modules = await _db.ModuleTopics
+            .AsNoTracking()
+            .Where(topic => moduleIds.Contains(topic.ModuleId) && topic.AuditoriumHours > 0)
+            .Select(topic => topic.ModuleId)
+            .Distinct()
+            .ToListAsync(cancellationToken);
+        return modules.ToHashSet();
     }
 
     private async Task<IReadOnlyList<string>> FindTimeSlotViolationsAsync(
@@ -419,6 +470,58 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
         }
     }
 
+    private static IEnumerable<string> FindTopicOrderViolations(IReadOnlyList<PlacementRow> draftRows)
+    {
+        foreach (var group in draftRows
+                     .Where(row => row.ModuleTopicId is not null && row.ModuleTopicOrder is not null)
+                     .GroupBy(row => new { row.GroupId, row.ModuleId }))
+        {
+            PlacementRow? previous = null;
+            foreach (var current in group
+                         .OrderBy(row => row.Date)
+                         .ThenBy(row => row.Start)
+                         .ThenBy(row => row.End))
+            {
+                if (previous?.ModuleTopicOrder is int previousOrder
+                    && current.ModuleTopicOrder is int currentOrder
+                    && currentOrder < previousOrder)
+                {
+                    yield return $"{current.Date:yyyy-MM-dd} {current.GroupName} {current.Start:HH\\:mm}: тема #{current.ModuleTopicId} модуля #{current.ModuleId} має порядок {currentOrder} після теми #{previous.ModuleTopicId} з порядком {previousOrder}.";
+                }
+
+                previous = current;
+            }
+        }
+    }
+
+    private static IEnumerable<string> FindModuleTopicPlanViolations(
+        IReadOnlyList<PlacementRow> draftRows,
+        IReadOnlySet<int> modulesWithAuditoriumTopics)
+    {
+        foreach (var row in draftRows.Where(row => !row.IsSelfStudy))
+        {
+            if (row.ModuleTopicId is null)
+            {
+                if (modulesWithAuditoriumTopics.Contains(row.ModuleId))
+                {
+                    yield return $"{row.Date:yyyy-MM-dd} {row.GroupName} {row.Start:HH\\:mm}: модуль #{row.ModuleId} має планові теми, але заняття створено без теми.";
+                }
+
+                continue;
+            }
+
+            if (row.ModuleTopicModuleId is int topicModuleId && topicModuleId != row.ModuleId)
+            {
+                yield return $"{row.Date:yyyy-MM-dd} {row.GroupName} {row.Start:HH\\:mm}: тема #{row.ModuleTopicId} не належить модулю #{row.ModuleId}.";
+            }
+
+            if (row.ModuleTopicLessonTypeId is int topicLessonTypeId && topicLessonTypeId != row.LessonTypeId)
+            {
+                yield return $"{row.Date:yyyy-MM-dd} {row.GroupName} {row.Start:HH\\:mm}: тип заняття #{row.LessonTypeId} не відповідає типу теми #{row.ModuleTopicId}.";
+            }
+        }
+    }
+
     private static RoomCapacityStats AnalyzeRoomCapacity(IReadOnlyList<PlacementRow> placements)
     {
         var violations = new List<string>();
@@ -485,6 +588,11 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
         int MaxSharedGroupCount,
         string MaxSharedGroupLabel);
 
+    private sealed record TopicPlanRow(
+        int ModuleId,
+        int LessonTypeId,
+        int Order);
+
     private sealed record PlacementRow(
         bool IsDraft,
         DateOnly Date,
@@ -500,6 +608,9 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
         string LessonTypeName,
         bool PreferredFirstInWeek,
         int? ModuleTopicId,
+        int? ModuleTopicOrder,
+        int? ModuleTopicLessonTypeId,
+        int? ModuleTopicModuleId,
         int? TeacherId,
         string? TeacherName,
         int? RoomId,
