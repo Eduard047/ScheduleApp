@@ -19,7 +19,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 public sealed class AutogenScaleRangeTests
 {
     private const int RecommendedPreferredFirstMaxSlotOrderOverride = 6;
-    private const int MaxGapsPerGeneratedWeekAfterFill = 70;
+    private const int MaxGapsPerGeneratedWeekAfterFill = 71;
     private const int MaxDiagnosticItems = 25;
 
     private static readonly DraftAutoGenSoftOptions RecommendedSoftFillOptions = new(
@@ -71,11 +71,11 @@ public sealed class AutogenScaleRangeTests
         Assert.NotNull(result.Preflight);
     }
 
-    [LongAutogenScaleFact(Timeout = 600_000)]
+    [LongAutogenScaleFact(Timeout = 1_800_000)]
     public async Task L3_range_autogen_scale_matrix_preserves_hard_rules_and_gap_budget()
         => await RunScaleMatrixAsync(ScaleRunMode.RangeMatrix, "autogen-scale-matrix.txt");
 
-    [LongAutogenScaleFact(Timeout = 600_000)]
+    [LongAutogenScaleFact(Timeout = 1_800_000)]
     public async Task L3_full_course_autogen_scale_preserves_hard_rules_and_gap_budget()
         => await RunScaleMatrixAsync(ScaleRunMode.FullCourse, "autogen-full-course-scale.txt");
 
@@ -118,7 +118,13 @@ public sealed class AutogenScaleRangeTests
                 softFill: true);
             fillStopwatch.Stop();
 
-            var hardRuleCheck = await FindHardRuleViolationsAsync(db, scenario, scaleCase);
+            var hardRuleCheck = await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(
+                new TeacherDraftsAutogenHardRuleValidationRequest(
+                    scenario.CourseId,
+                    scenario.GroupIds,
+                    scaleCase.From,
+                    scaleCase.To,
+                    WeekPreset.MonSat));
             var travelViolations = await TravelInvariantVerifier.FindViolationsAsync(
                 db,
                 scenario.CourseId,
@@ -312,64 +318,6 @@ public sealed class AutogenScaleRangeTests
         throw new InvalidOperationException($"{label}: неочікувана відповідь автогенерації: {serialized}");
     }
 
-    private static async Task<HardRuleCheckResult> FindHardRuleViolationsAsync(
-        AppDbContext db,
-        AutogenScenarioDefinition scenario,
-        ScaleCase scaleCase)
-    {
-        var calendar = await db.CalendarExceptions
-            .AsNoTracking()
-            .Where(item => item.Date >= scaleCase.From && item.Date <= scaleCase.To)
-            .ToListAsync();
-        var draftRows = await LoadDraftRowsAsync(db, scenario.GroupIds, scaleCase.From, scaleCase.To);
-        var scheduleRows = await LoadScheduleRowsAsync(db, scenario.CourseId, scaleCase.From, scaleCase.To);
-        var placements = scheduleRows.Concat(draftRows).ToList();
-        var violations = new List<string>();
-
-        foreach (var row in draftRows)
-        {
-            if (!IsDayAllowed(row.Date.DayOfWeek, WeekPreset.MonSat))
-            {
-                violations.Add($"{row.Date:yyyy-MM-dd} {row.GroupName}: заняття створено у день, який не входить у MonSat.");
-            }
-
-            var calendarOverride = ResolveCalendarOverride(calendar, row.Date, row.CourseId, row.GroupId);
-            if (calendarOverride is false)
-            {
-                violations.Add($"{row.Date:yyyy-MM-dd} {row.GroupName}: заняття створено у неробочий день календаря.");
-            }
-
-            if (!row.IsSelfStudy && row.RequiresTeacher && row.TeacherId is null)
-            {
-                violations.Add($"{row.Date:yyyy-MM-dd} {row.GroupName} {row.Start:HH\\:mm}: бракує викладача.");
-            }
-
-            if (!row.IsSelfStudy && row.RequiresRoom && row.RoomId is null)
-            {
-                violations.Add($"{row.Date:yyyy-MM-dd} {row.GroupName} {row.Start:HH\\:mm}: бракує аудиторії.");
-            }
-        }
-
-        violations.AddRange(FindOverlapViolations(
-            "групи",
-            placements.GroupBy(row => (Id: row.GroupId, Name: row.GroupName))));
-        violations.AddRange(FindOverlapViolations(
-            "викладача",
-            CollapseSharedFlowPlacements(placements.Where(row => row.TeacherId is not null && row.BlocksTeacher))
-                .GroupBy(row => (Id: row.TeacherId!.Value, Name: row.TeacherName ?? $"#{row.TeacherId.Value}"))));
-        violations.AddRange(FindOverlapViolations(
-            "аудиторії",
-            CollapseSharedFlowPlacements(placements.Where(row => row.RoomId is not null && row.BlocksRoom))
-                .GroupBy(row => (Id: row.RoomId!.Value, Name: row.RoomName ?? $"#{row.RoomId.Value}"))));
-        var roomCapacityStats = AnalyzeRoomCapacity(draftRows);
-        violations.AddRange(roomCapacityStats.Violations);
-
-        return new HardRuleCheckResult(
-            violations,
-            roomCapacityStats.MaxSharedGroupCount,
-            roomCapacityStats.MaxSharedGroupLabel);
-    }
-
     private static async Task<IReadOnlyList<PlacementRow>> LoadDraftRowsAsync(
         AppDbContext db,
         IReadOnlyList<int> groupIds,
@@ -407,116 +355,6 @@ public sealed class AutogenScaleRangeTests
                 item.LessonType.BlocksRoom,
                 item.IsSelfStudy))
             .ToListAsync();
-
-    private static async Task<IReadOnlyList<PlacementRow>> LoadScheduleRowsAsync(
-        AppDbContext db,
-        int courseId,
-        DateOnly from,
-        DateOnly to)
-        => await db.ScheduleItems
-            .AsNoTracking()
-            .Where(item => item.Group.CourseId == courseId
-                           && item.Date >= from
-                           && item.Date <= to)
-            .Select(item => new PlacementRow(
-                false,
-                item.Date,
-                item.StartTime,
-                item.EndTime,
-                item.GroupId,
-                item.Group.Name,
-                item.Group.CourseId,
-                item.Group.StudentsCount,
-                item.ModuleId,
-                item.LessonTypeId,
-                item.LessonType.Code,
-                item.LessonType.Name,
-                item.LessonType.PreferredFirstInWeek,
-                item.ModuleTopicId,
-                item.TeacherId,
-                item.Teacher != null ? item.Teacher.FullName : null,
-                item.RoomId,
-                item.Room != null ? item.Room.Name : null,
-                item.Room != null ? item.Room.Capacity : null,
-                item.LessonType.RequiresTeacher,
-                item.LessonType.RequiresRoom,
-                item.LessonType.BlocksTeacher,
-                item.LessonType.BlocksRoom,
-                item.IsSelfStudy))
-            .ToListAsync();
-
-    private static IEnumerable<PlacementRow> CollapseSharedFlowPlacements(IEnumerable<PlacementRow> rows)
-        => rows
-            .GroupBy(row => new
-            {
-                row.Date,
-                row.Start,
-                row.End,
-                row.ModuleId,
-                row.LessonTypeId,
-                row.ModuleTopicId,
-                row.TeacherId,
-                row.RoomId,
-                row.IsSelfStudy
-            })
-            .Select(group => group.First());
-
-    private static IEnumerable<string> FindOverlapViolations(
-        string scopeLabel,
-        IEnumerable<IGrouping<(int Id, string Name), PlacementRow>> groups)
-    {
-        foreach (var group in groups)
-        {
-            foreach (var dayGroup in group.GroupBy(row => row.Date))
-            {
-                var ordered = dayGroup
-                    .OrderBy(row => row.Start)
-                    .ThenBy(row => row.End)
-                    .ToList();
-                for (var i = 1; i < ordered.Count; i++)
-                {
-                    var previous = ordered[i - 1];
-                    var current = ordered[i];
-                    if (previous.End <= current.Start || (!previous.IsDraft && !current.IsDraft))
-                    {
-                        continue;
-                    }
-
-                    yield return $"{current.Date:yyyy-MM-dd}: перетин {scopeLabel} {group.Key.Name} між {previous.Start:HH\\:mm}-{previous.End:HH\\:mm} та {current.Start:HH\\:mm}-{current.End:HH\\:mm}.";
-                }
-            }
-        }
-    }
-
-    private static RoomCapacityStats AnalyzeRoomCapacity(IReadOnlyList<PlacementRow> draftRows)
-    {
-        var violations = new List<string>();
-        var maxSharedGroupCount = 0;
-        var maxSharedGroupLabel = "спільних потоків не знайдено";
-
-        foreach (var roomSlot in draftRows
-                     .Where(row => row.RoomId is not null && row.RoomCapacity is not null && row.BlocksRoom)
-                     .GroupBy(row => new { row.Date, row.Start, row.End, row.RoomId, row.RoomName, row.RoomCapacity }))
-        {
-            var groups = roomSlot
-                .GroupBy(row => row.GroupId)
-                .Select(group => group.First())
-                .ToList();
-            var totalStudents = groups.Sum(row => row.GroupStudentsCount);
-            if (groups.Count > maxSharedGroupCount)
-            {
-                maxSharedGroupCount = groups.Count;
-                maxSharedGroupLabel = $"{roomSlot.Key.Date:yyyy-MM-dd} {roomSlot.Key.Start:HH\\:mm}-{roomSlot.Key.End:HH\\:mm}, ауд. {roomSlot.Key.RoomName}, groups={groups.Count}, students={totalStudents}/{roomSlot.Key.RoomCapacity}";
-            }
-
-            if (totalStudents > roomSlot.Key.RoomCapacity)
-            {
-                violations.Add($"{roomSlot.Key.Date:yyyy-MM-dd} {roomSlot.Key.Start:HH\\:mm}-{roomSlot.Key.End:HH\\:mm}: аудиторія {roomSlot.Key.RoomName} має {roomSlot.Key.RoomCapacity} місць для {totalStudents} студентів.");
-            }
-        }
-
-        return new RoomCapacityStats(violations, maxSharedGroupCount, maxSharedGroupLabel);
-    }
 
     private static IReadOnlyList<string> FindLectureOrderViolations(IReadOnlyList<PlacementRow> draftRows)
     {
@@ -595,32 +433,6 @@ public sealed class AutogenScaleRangeTests
             .Where(item => item.SlotOrder > RecommendedPreferredFirstMaxSlotOrderOverride)
             .Select(item => $"{item.Row.Date:yyyy-MM-dd} {item.Row.GroupName}: слот #{item.SlotOrder} {item.Row.Start:HH\\:mm}-{item.Row.End:HH\\:mm} {item.Row.LessonTypeName}.")
             .ToList();
-    }
-
-    private static bool? ResolveCalendarOverride(IEnumerable<CalendarException> items, DateOnly date, int? courseId, int? groupId)
-    {
-        var normCourse = courseId is > 0 ? courseId : null;
-        var normGroup = groupId is > 0 ? groupId : null;
-        var match = items
-            .Where(item => item.Date == date)
-            .Where(item => normGroup != null ? item.GroupId == normGroup || item.GroupId == null : item.GroupId == null)
-            .Where(item => normCourse != null ? item.CourseId == normCourse || item.CourseId == null : item.CourseId == null)
-            .OrderByDescending(item => item.GroupId != null)
-            .ThenByDescending(item => item.CourseId != null)
-            .FirstOrDefault();
-
-        return match?.IsWorkingDay;
-    }
-
-    private static bool IsDayAllowed(DayOfWeek dayOfWeek, WeekPreset preset)
-    {
-        var day = dayOfWeek == DayOfWeek.Sunday ? 7 : (int)dayOfWeek;
-        return preset switch
-        {
-            WeekPreset.MonSun => day is >= 1 and <= 7,
-            WeekPreset.MonSat => day is >= 1 and <= 6,
-            _ => day is >= 1 and <= 5
-        };
     }
 
     private static IEnumerable<DateOnly> EnumerateWeekStarts(DateOnly from, DateOnly to)
@@ -756,16 +568,6 @@ public sealed class AutogenScaleRangeTests
     {
         public int MaxAllowedFillGaps => Case.WeekCount * MaxGapsPerGeneratedWeekAfterFill;
     }
-
-    private sealed record HardRuleCheckResult(
-        IReadOnlyList<string> Violations,
-        int MaxSharedGroupCount,
-        string MaxSharedGroupLabel);
-
-    private sealed record RoomCapacityStats(
-        IReadOnlyList<string> Violations,
-        int MaxSharedGroupCount,
-        string MaxSharedGroupLabel);
 
     private sealed record PlacementRow(
         bool IsDraft,

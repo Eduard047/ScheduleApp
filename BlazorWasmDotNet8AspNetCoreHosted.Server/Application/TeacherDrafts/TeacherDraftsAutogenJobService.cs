@@ -1,8 +1,10 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 
@@ -12,6 +14,10 @@ public sealed class TeacherDraftsAutogenJobService
     private readonly ILogger<TeacherDraftsAutogenJobService> _logger;
     private readonly ConcurrentDictionary<string, AutoGenJobRuntime> _jobs = new(StringComparer.Ordinal);
     private static readonly TimeSpan CompletedJobTtl = TimeSpan.FromHours(6);
+    private static readonly JsonSerializerOptions PersistenceJsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        WriteIndented = false
+    };
 
     public TeacherDraftsAutogenJobService(IServiceScopeFactory scopeFactory, ILogger<TeacherDraftsAutogenJobService> logger)
     {
@@ -25,22 +31,261 @@ public sealed class TeacherDraftsAutogenJobService
         var normalized = NormalizeRequest(request);
         var job = new AutoGenJobRuntime(normalized);
         _jobs[job.JobId] = job;
+        TryPersistSnapshot(job, "створення завдання");
         _ = Task.Run(() => RunAsync(job));
         return new AutoGenJobStartResult(job.JobId, job.ToDto());
     }
 
     public AutoGenJobStatus? Get(string jobId)
-        => _jobs.TryGetValue(jobId, out var job) ? job.ToDto() : null;
+        => _jobs.TryGetValue(jobId, out var job) ? job.ToDto() : TryReadPersistedStatus(jobId);
 
     public AutoGenJobStatus? Cancel(string jobId)
     {
         if (!_jobs.TryGetValue(jobId, out var job))
         {
-            return null;
+            return TryCancelPersistedJob(jobId);
         }
         job.RequestCancellation();
+        TryPersistSnapshot(job, "запит скасування");
         return job.ToDto();
     }
+
+    private void TryPersistSnapshot(AutoGenJobRuntime job, string operation)
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var status = job.ToDto();
+            var run = db.AutoGenJobRuns.FirstOrDefault(item => item.JobId == job.JobId);
+            if (run is null)
+            {
+                run = new AutoGenJobRun { JobId = job.JobId };
+                db.AutoGenJobRuns.Add(run);
+            }
+            ApplyJobRun(run, status, job.Request);
+            db.SaveChanges();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Не вдалося зберегти стан завдання автогенерації {JobId} під час етапу \"{Operation}\". Завдання продовжує роботу в пам'яті.", job.JobId, operation);
+        }
+    }
+
+    private async Task TryPersistSnapshotAsync(AutoGenJobRuntime job, string operation)
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var status = job.ToDto();
+            var run = await db.AutoGenJobRuns.FirstOrDefaultAsync(item => item.JobId == job.JobId);
+            if (run is null)
+            {
+                run = new AutoGenJobRun { JobId = job.JobId };
+                db.AutoGenJobRuns.Add(run);
+            }
+            ApplyJobRun(run, status, job.Request);
+            await db.SaveChangesAsync(CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Не вдалося зберегти стан завдання автогенерації {JobId} під час етапу \"{Operation}\". Завдання продовжує роботу в пам'яті.", job.JobId, operation);
+        }
+    }
+
+    private AutoGenJobStatus? TryReadPersistedStatus(string jobId)
+    {
+        if (string.IsNullOrWhiteSpace(jobId))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var run = db.AutoGenJobRuns.AsNoTracking().FirstOrDefault(item => item.JobId == jobId);
+            return run is null ? null : DeserializeStatusOrFallback(run);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Не вдалося прочитати стан завдання автогенерації {JobId} з бази.", jobId);
+            return null;
+        }
+    }
+
+    private AutoGenJobStatus? TryCancelPersistedJob(string jobId)
+    {
+        if (string.IsNullOrWhiteSpace(jobId))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var run = db.AutoGenJobRuns.FirstOrDefault(item => item.JobId == jobId);
+            if (run is null)
+            {
+                return null;
+            }
+
+            var state = ToJobState(run.State);
+            if (IsTerminalState(state))
+            {
+                return DeserializeStatusOrFallback(run);
+            }
+
+            var now = DateTime.UtcNow;
+            run.State = (int)AutoGenJobState.Canceled;
+            run.CompletedAtUtc ??= now;
+            run.CancellationRequested = true;
+            run.CurrentStage = "Скасовано після відновлення стану з бази.";
+            run.Percent = 100;
+            run.UpdatedAtUtc = now;
+            var status = BuildStatusFromColumns(run);
+            run.StatusJson = JsonSerializer.Serialize(status, PersistenceJsonOptions);
+            db.SaveChanges();
+            return status;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Не вдалося скасувати збережене завдання автогенерації {JobId}.", jobId);
+            return null;
+        }
+    }
+
+    private static void ApplyJobRun(AutoGenJobRun run, AutoGenJobStatus status, AutoGenJobRequest request)
+    {
+        run.JobId = status.JobId;
+        run.Kind = (int)status.Kind;
+        run.State = (int)status.State;
+        run.Title = Limit(status.Title, 256);
+        run.CurrentStage = Limit(status.CurrentStage, 512);
+        run.CreatedAtUtc = ToUtc(status.CreatedAt);
+        run.StartedAtUtc = ToUtc(status.StartedAt);
+        run.CompletedAtUtc = ToUtc(status.CompletedAt);
+        run.RangeStartDate = status.RangeStartDate;
+        run.RangeEndDate = status.RangeEndDate;
+        run.TotalWeeks = Math.Max(1, status.TotalWeeks);
+        run.CompletedWeeks = status.CompletedWeeks;
+        run.CurrentWeekNumber = status.CurrentWeekNumber;
+        run.CurrentWeekStartDate = status.CurrentWeekStartDate;
+        run.CurrentRangeStartDate = status.CurrentRangeStartDate;
+        run.CurrentRangeEndDate = status.CurrentRangeEndDate;
+        run.CreatedCount = status.Created;
+        run.SkippedCount = status.Skipped;
+        run.WarningCount = status.WarningCount;
+        run.GapCount = status.GapCount;
+        run.DeficitCount = status.DeficitCount;
+        run.Percent = Math.Clamp(status.Percent, 0, 100);
+        run.CancellationRequested = status.CancellationRequested;
+        run.LastCompletedMessage = LimitOptional(status.LastCompletedMessage, 1024);
+        run.Error = status.Error;
+        run.RequestJson = JsonSerializer.Serialize(request, PersistenceJsonOptions);
+        run.StatusJson = JsonSerializer.Serialize(status, PersistenceJsonOptions);
+        run.ResultJson = status.Result is null ? null : JsonSerializer.Serialize(status.Result, PersistenceJsonOptions);
+        run.ReportJson = status.Report is null ? null : JsonSerializer.Serialize(status.Report, PersistenceJsonOptions);
+        run.UpdatedAtUtc = DateTime.UtcNow;
+    }
+
+    private AutoGenJobStatus DeserializeStatusOrFallback(AutoGenJobRun run)
+    {
+        if (!string.IsNullOrWhiteSpace(run.StatusJson))
+        {
+            try
+            {
+                var status = JsonSerializer.Deserialize<AutoGenJobStatus>(run.StatusJson, PersistenceJsonOptions);
+                if (status is not null)
+                {
+                    return status;
+                }
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(ex, "Не вдалося прочитати JSON статусу завдання автогенерації {JobId}.", run.JobId);
+            }
+        }
+
+        return BuildStatusFromColumns(run);
+    }
+
+    private AutoGenJobStatus BuildStatusFromColumns(AutoGenJobRun run)
+        => new(
+            run.JobId,
+            ToJobState(run.State),
+            ToJobKind(run.Kind),
+            run.Title,
+            run.CurrentStage,
+            FromUtc(run.CreatedAtUtc),
+            FromUtc(run.StartedAtUtc),
+            FromUtc(run.CompletedAtUtc),
+            run.RangeStartDate,
+            run.RangeEndDate,
+            Math.Max(1, run.TotalWeeks),
+            run.CompletedWeeks,
+            run.CurrentWeekNumber,
+            run.CurrentWeekStartDate,
+            run.CurrentRangeStartDate,
+            run.CurrentRangeEndDate,
+            run.CreatedCount,
+            run.SkippedCount,
+            run.WarningCount,
+            run.GapCount,
+            run.DeficitCount,
+            Math.Clamp(run.Percent, 0, 100),
+            run.CancellationRequested,
+            run.LastCompletedMessage,
+            TryDeserializePayload<AutoGenResult>(run.ResultJson, run.JobId, "результату"),
+            TryDeserializePayload<AutoGenRunReport>(run.ReportJson, run.JobId, "звіту"),
+            run.Error);
+
+    private T? TryDeserializePayload<T>(string? json, string jobId, string payloadName)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return default;
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<T>(json, PersistenceJsonOptions);
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex, "Не вдалося прочитати JSON {PayloadName} завдання автогенерації {JobId}.", payloadName, jobId);
+            return default;
+        }
+    }
+
+    private static AutoGenJobKind ToJobKind(int kind)
+        => Enum.IsDefined(typeof(AutoGenJobKind), kind) ? (AutoGenJobKind)kind : AutoGenJobKind.Generate;
+
+    private static AutoGenJobState ToJobState(int state)
+        => Enum.IsDefined(typeof(AutoGenJobState), state) ? (AutoGenJobState)state : AutoGenJobState.Failed;
+
+    private static bool IsTerminalState(AutoGenJobState state)
+        => state is AutoGenJobState.Succeeded or AutoGenJobState.Failed or AutoGenJobState.Canceled;
+
+    private static DateTime ToUtc(DateTimeOffset value)
+        => value.UtcDateTime;
+
+    private static DateTime? ToUtc(DateTimeOffset? value)
+        => value?.UtcDateTime;
+
+    private static DateTimeOffset FromUtc(DateTime value)
+        => new(DateTime.SpecifyKind(value, DateTimeKind.Utc));
+
+    private static DateTimeOffset? FromUtc(DateTime? value)
+        => value is null ? null : FromUtc(value.Value);
+
+    private static string Limit(string value, int maxLength)
+        => value.Length <= maxLength ? value : value[..maxLength];
+
+    private static string? LimitOptional(string? value, int maxLength)
+        => string.IsNullOrEmpty(value) || value.Length <= maxLength ? value : value[..maxLength];
 
     private static AutoGenJobRequest NormalizeRequest(AutoGenJobRequest request)
     {
@@ -85,6 +330,7 @@ public sealed class TeacherDraftsAutogenJobService
         var failed = false;
         var weekStarts = BuildWeekStarts(job.Request.FromDate, job.Request.ToDate);
         job.MarkRunning(weekStarts.Count);
+        await TryPersistSnapshotAsync(job, "запуск завдання");
 
         try
         {
@@ -105,6 +351,7 @@ public sealed class TeacherDraftsAutogenJobService
                 }
 
                 job.StartWeek(weekIndex, weekStart, rangeStartDate, rangeEndDate);
+                await TryPersistSnapshotAsync(job, "початок тижня");
                 var request = BuildDraftRequest(job.Request, weekStart, rangeStartDate, rangeEndDate);
                 var action = await autogen.DraftAutoGen(request, job.Token);
                 var (weekSucceeded, weekResult, fallbackWarning) = ExtractAutoGenResult(action);
@@ -130,12 +377,13 @@ public sealed class TeacherDraftsAutogenJobService
                     preflight.AddRange(weekResult.Preflight);
                 }
 
-                var partialResult = BuildResult(created, skipped, warnings, gapDetails, preflight);
+                var partialResult = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight);
                 job.CompleteWeek(weekIndex, rangeStartDate, rangeEndDate, weekResult, partialResult);
+                await TryPersistSnapshotAsync(job, "завершення тижня");
             }
 
-            var result = BuildResult(created, skipped, warnings, gapDetails, preflight);
-            var report = BuildReport(job.Request.FromDate, job.Request.ToDate, weekStarts.Count, result);
+            var result = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight);
+            var report = TeacherDraftsAutogenReportBuilder.BuildReport(job.Request.FromDate, job.Request.ToDate, weekStarts.Count, result);
             if (failed)
             {
                 job.MarkFailed("Один або кілька тижнів завершилися з помилками.", result, report);
@@ -144,19 +392,22 @@ public sealed class TeacherDraftsAutogenJobService
             {
                 job.MarkSucceeded(result, report);
             }
+            await TryPersistSnapshotAsync(job, "завершення завдання");
         }
         catch (OperationCanceledException)
         {
-            var result = BuildResult(created, skipped, warnings, gapDetails, preflight);
-            var report = BuildReport(job.Request.FromDate, job.Request.ToDate, Math.Max(1, weekStarts.Count), result);
+            var result = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight);
+            var report = TeacherDraftsAutogenReportBuilder.BuildReport(job.Request.FromDate, job.Request.ToDate, Math.Max(1, weekStarts.Count), result);
             job.MarkCanceled(result, report);
+            await TryPersistSnapshotAsync(job, "скасування завдання");
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "AutoGen job {JobId} failed.", job.JobId);
-            var result = BuildResult(created, skipped, warnings, gapDetails, preflight);
-            var report = BuildReport(job.Request.FromDate, job.Request.ToDate, Math.Max(1, weekStarts.Count), result);
+            var result = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight);
+            var report = TeacherDraftsAutogenReportBuilder.BuildReport(job.Request.FromDate, job.Request.ToDate, Math.Max(1, weekStarts.Count), result);
             job.MarkFailed(ex.Message, result, report);
+            await TryPersistSnapshotAsync(job, "помилка завдання");
         }
     }
 
@@ -225,187 +476,6 @@ public sealed class TeacherDraftsAutogenJobService
         }
         return (false, new AutoGenResult(0, 0, new()), "Сервер не повернув результат автогенерації.");
     }
-
-    private static AutoGenResult BuildResult(
-        int created,
-        int skipped,
-        IEnumerable<string> warnings,
-        IEnumerable<AutoGenGapDetail> gapDetails,
-        IEnumerable<AutoGenPreflightItem> preflight)
-    {
-        var gaps = gapDetails.ToList();
-        var preflightItems = MergePreflight(preflight);
-        return new AutoGenResult(
-            created,
-            skipped,
-            warnings.Where(warning => !string.IsNullOrWhiteSpace(warning)).Distinct(StringComparer.Ordinal).ToList(),
-            gaps,
-            BuildGapSummary(gaps),
-            preflightItems);
-    }
-
-    private static AutoGenRunReport BuildReport(DateOnly fromDate, DateOnly toDate, int totalWeeks, AutoGenResult result)
-    {
-        var gaps = result.GapDetails ?? new();
-        var preflight = result.Preflight ?? new();
-        var gapSummary = result.GapSummary ?? BuildGapSummary(gaps);
-        var worstGroups = gaps
-            .GroupBy(gap => new { gap.GroupId, gap.GroupName })
-            .OrderByDescending(group => group.Count())
-            .ThenBy(group => group.Key.GroupName, StringComparer.Ordinal)
-            .Take(8)
-            .Select(group => new AutoGenRunReportGroupItem(
-                group.Key.GroupId,
-                group.Key.GroupName,
-                group.Count(),
-                group.Take(4).Select(FormatGapExample).ToList()))
-            .ToList();
-        var worstModules = gaps
-            .GroupBy(gap => new
-            {
-                gap.ModuleId,
-                ModuleName = string.IsNullOrWhiteSpace(gap.ModuleName)
-                    ? gap.ModuleId is int moduleId ? $"Модуль #{moduleId}" : "Модуль не визначено"
-                    : gap.ModuleName!
-            })
-            .OrderByDescending(group => group.Count())
-            .ThenBy(group => group.Key.ModuleName, StringComparer.Ordinal)
-            .Take(8)
-            .Select(group => new AutoGenRunReportModuleItem(
-                group.Key.ModuleId,
-                group.Key.ModuleName,
-                group.Count(),
-                group.Take(4).Select(FormatGapExample).ToList()))
-            .ToList();
-        return new AutoGenRunReport(
-            DateTimeOffset.UtcNow,
-            fromDate,
-            toDate,
-            Math.Max(1, totalWeeks),
-            result.Created,
-            result.Skipped,
-            result.Warnings.Count,
-            gaps.Count,
-            preflight.Sum(item => item.Count),
-            gapSummary,
-            preflight,
-            worstGroups,
-            worstModules,
-            BuildRecommendations(gapSummary, preflight, worstGroups, worstModules));
-    }
-
-    private static string FormatGapExample(AutoGenGapDetail gap)
-        => $"{gap.Date:yyyy-MM-dd} {gap.SlotLabel}, {gap.GroupName}";
-
-    private static List<string> BuildRecommendations(
-        IReadOnlyList<AutoGenGapSummaryItem> gapSummary,
-        IReadOnlyList<AutoGenPreflightItem> preflight,
-        IReadOnlyList<AutoGenRunReportGroupItem> worstGroups,
-        IReadOnlyList<AutoGenRunReportModuleItem> worstModules)
-    {
-        var recommendations = new List<string>();
-        foreach (var item in preflight.OrderByDescending(item => item.Count).Take(5))
-        {
-            recommendations.Add(item.Recommendation);
-        }
-        foreach (var item in gapSummary.Take(5))
-        {
-            recommendations.Add(item.Code switch
-            {
-                "teacher" => "Додайте або звільніть викладачів для модулів, які найчастіше блокують порожні слоти.",
-                "room" => "Розширте доступні аудиторії або корпуси для груп із найбільшою кількістю порожніх слотів.",
-                "travel" => "Перевірте переходи між корпусами: частину занять варто рознести або призначити в одному корпусі.",
-                "topic-order" => "Перевірте порядок тем і години модулів: автогенерація не може порушувати хронологію тем.",
-                "module-block" => "Залишайте поруч кілька слотів для модулів, які мають іти суцільним блоком.",
-                "limit" => "Зменште обсяг на діапазон або розширте навчальні дні/слоти для проблемних груп.",
-                _ => "Перегляньте приклади порожніх слотів і додайте повторюваний обмежений ресурс."
-            });
-        }
-        if (worstGroups.Count > 0)
-        {
-            recommendations.Add($"Почніть ручну перевірку з груп: {string.Join(", ", worstGroups.Take(3).Select(group => group.GroupName))}.");
-        }
-        if (worstModules.Count > 0)
-        {
-            recommendations.Add($"Найчастіше проблемні модулі: {string.Join(", ", worstModules.Take(3).Select(module => module.ModuleName))}.");
-        }
-        return recommendations
-            .Where(text => !string.IsNullOrWhiteSpace(text))
-            .Distinct(StringComparer.Ordinal)
-            .Take(10)
-            .ToList();
-    }
-
-    private static (string Code, string Title) ClassifyGapReason(string? reason)
-    {
-        if (string.IsNullOrWhiteSpace(reason))
-        {
-            return ("unknown", "Причину не визначено");
-        }
-        var text = reason.ToLowerInvariant();
-        if (text.Contains("викладач", StringComparison.Ordinal))
-        {
-            return ("teacher", "Немає доступного викладача");
-        }
-        if (text.Contains("аудитор", StringComparison.Ordinal))
-        {
-            return ("room", "Немає доступної аудиторії");
-        }
-        if (text.Contains("перех", StringComparison.Ordinal) || text.Contains("корпус", StringComparison.Ordinal))
-        {
-            return ("travel", "Недостатньо часу на перехід");
-        }
-        if (text.Contains("тем", StringComparison.Ordinal) || text.Contains("хронолог", StringComparison.Ordinal))
-        {
-            return ("topic-order", "Порядок тем не дозволив слот");
-        }
-        if (text.Contains("блок", StringComparison.Ordinal))
-        {
-            return ("module-block", "Модуль має йти суцільним блоком");
-        }
-        if (text.Contains("ліміт", StringComparison.Ordinal) || text.Contains("обмеж", StringComparison.Ordinal))
-        {
-            return ("limit", "Спрацювали денні або слотні ліміти");
-        }
-        if (text.Contains("спільн", StringComparison.Ordinal))
-        {
-            return ("shared-flow", "Спільний потік не готовий");
-        }
-        return ("other", "Інші причини");
-    }
-
-    private static List<AutoGenGapSummaryItem> BuildGapSummary(IEnumerable<AutoGenGapDetail> gapDetails)
-        => gapDetails
-            .GroupBy(gap => ClassifyGapReason(gap.Reason))
-            .OrderByDescending(group => group.Count())
-            .ThenBy(group => group.Key.Title, StringComparer.Ordinal)
-            .Select(group => new AutoGenGapSummaryItem(
-                group.Key.Code,
-                group.Key.Title,
-                group.Count(),
-                group.Take(5).Select(FormatGapExample).ToList()))
-            .ToList();
-
-    private static List<AutoGenPreflightItem> MergePreflight(IEnumerable<AutoGenPreflightItem> items)
-        => items
-            .GroupBy(item => item.Code, StringComparer.Ordinal)
-            .Select(group =>
-            {
-                var first = group.First();
-                return new AutoGenPreflightItem(
-                    first.Code,
-                    first.Title,
-                    group.Sum(item => item.Count),
-                    first.Recommendation,
-                    group.SelectMany(item => item.Examples)
-                        .Where(example => !string.IsNullOrWhiteSpace(example))
-                        .Distinct(StringComparer.Ordinal)
-                        .Take(5)
-                        .ToList());
-            })
-            .OrderByDescending(item => item.Count)
-            .ThenBy(item => item.Title, StringComparer.Ordinal)
-            .ToList();
 
     private void CleanupOldJobs()
     {

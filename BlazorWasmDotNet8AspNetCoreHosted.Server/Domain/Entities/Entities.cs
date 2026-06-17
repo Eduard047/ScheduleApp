@@ -309,3 +309,39 @@ public class TeacherDraftItem
     public bool IsLocked { get; set; }   
     public bool IsSelfStudy { get; set; } = false;
 }
+
+// Збережений стан запуску автогенерації для відновлення статусу після перезапуску сервера.
+public class AutoGenJobRun
+{
+    public int Id { get; set; }
+    public string JobId { get; set; } = default!;
+    public int Kind { get; set; }
+    public int State { get; set; }
+    public string Title { get; set; } = default!;
+    public string CurrentStage { get; set; } = default!;
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime? StartedAtUtc { get; set; }
+    public DateTime? CompletedAtUtc { get; set; }
+    public DateOnly RangeStartDate { get; set; }
+    public DateOnly RangeEndDate { get; set; }
+    public int TotalWeeks { get; set; } = 1;
+    public int CompletedWeeks { get; set; }
+    public int CurrentWeekNumber { get; set; }
+    public DateOnly? CurrentWeekStartDate { get; set; }
+    public DateOnly? CurrentRangeStartDate { get; set; }
+    public DateOnly? CurrentRangeEndDate { get; set; }
+    public int CreatedCount { get; set; }
+    public int SkippedCount { get; set; }
+    public int WarningCount { get; set; }
+    public int GapCount { get; set; }
+    public int DeficitCount { get; set; }
+    public int Percent { get; set; }
+    public bool CancellationRequested { get; set; }
+    public string? LastCompletedMessage { get; set; }
+    public string? Error { get; set; }
+    public string RequestJson { get; set; } = default!;
+    public string StatusJson { get; set; } = default!;
+    public string? ResultJson { get; set; }
+    public string? ReportJson { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+}

@@ -41,6 +41,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     public DbSet<ModuleFiller> ModuleFillers => Set<ModuleFiller>();
     public DbSet<TeacherDraftItem> TeacherDraftItems => Set<TeacherDraftItem>();
     public DbSet<TimeSlot> TimeSlots => Set<TimeSlot>();
+    public DbSet<AutoGenJobRun> AutoGenJobRuns => Set<AutoGenJobRun>();
     // Налаштовує зв'язки, обмеження та індекси для сутностей.
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -242,6 +243,25 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             e.HasIndex(x => new { x.Date, x.GroupId });
             e.HasIndex(x => new { x.Date, x.TeacherId });
             e.HasIndex(x => new { x.Date, x.RoomId });
+        });
+        // Зберігаємо перебіг автогенерації окремо від чернеток, щоб статус можна було переглянути після перезапуску.
+        b.Entity<AutoGenJobRun>(e =>
+        {
+            e.HasKey(x => x.Id);
+            e.Property(x => x.JobId).HasMaxLength(64).IsRequired();
+            e.Property(x => x.Title).HasMaxLength(256).IsRequired();
+            e.Property(x => x.CurrentStage).HasMaxLength(512).IsRequired();
+            e.Property(x => x.LastCompletedMessage).HasMaxLength(1024);
+            e.Property(x => x.Error).HasColumnType("longtext");
+            e.Property(x => x.RequestJson).HasColumnType("longtext").IsRequired();
+            e.Property(x => x.StatusJson).HasColumnType("longtext").IsRequired();
+            e.Property(x => x.ResultJson).HasColumnType("longtext");
+            e.Property(x => x.ReportJson).HasColumnType("longtext");
+            e.Property(x => x.TotalWeeks).HasDefaultValue(1);
+            e.HasIndex(x => x.JobId).IsUnique();
+            e.HasIndex(x => x.State);
+            e.HasIndex(x => x.CreatedAtUtc);
+            e.HasIndex(x => x.UpdatedAtUtc);
         });
         // Забезпечуємо роботу з тематичним наповненням модулів.
         b.Entity<ModuleTopic>(e =>
