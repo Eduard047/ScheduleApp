@@ -1076,8 +1076,14 @@ public sealed class TeacherDraftsAutogenService
         var topicsAll = await _db.ModuleTopics
             .Where(t => moduleIdsForPlans.Contains(t.ModuleId))
             .ToListAsync();
-        // Сортуємо теми за кодом, щоб автоген відповідав порядку у плані модуля.
-        topicsAll.Sort((a, b) => TeacherDraftsHelpers.CompareTopicCodes(a.TopicCode, b.TopicCode));
+        // Сортуємо теми за явним порядком із БД, а код використовуємо лише як стабільний fallback.
+        topicsAll.Sort((a, b) =>
+        {
+            var orderDiff = a.Order.CompareTo(b.Order);
+            return orderDiff != 0
+                ? orderDiff
+                : TeacherDraftsHelpers.CompareTopicCodes(a.TopicCode, b.TopicCode);
+        });
         // Модулі, де всі теми міжзборові (їх пропускаємо у розкладі).
         var interAssemblyOnlyModules = topicsAll
             .GroupBy(t => t.ModuleId)
@@ -1390,7 +1396,7 @@ public sealed class TeacherDraftsAutogenService
             TimeOnly end)
         {
             var candidateCode = string.IsNullOrWhiteSpace(topic.TopicCode) ? null : topic.TopicCode.Trim();
-            if (candidateCode is null)
+            if (candidateCode is null && topic.Order <= 0)
             {
                 return false;
             }
@@ -1407,9 +1413,14 @@ public sealed class TeacherDraftsAutogenService
                     continue;
                 }
                 var existingCode = string.IsNullOrWhiteSpace(existingTopic.TopicCode) ? null : existingTopic.TopicCode.Trim();
-                if (existingCode is null)
+                if (existingCode is null && existingTopic.Order <= 0)
                 {
                     continue;
+                }
+                var orderComparison = topic.Order.CompareTo(existingTopic.Order);
+                if (orderComparison == 0 && candidateCode is not null && existingCode is not null)
+                {
+                    orderComparison = TeacherDraftsHelpers.CompareTopicCodes(candidateCode, existingCode);
                 }
                 var slotPosition = CompareSlotPosition(
                     slot.Date,
@@ -1418,13 +1429,11 @@ public sealed class TeacherDraftsAutogenService
                     date,
                     start,
                     end);
-                if (slotPosition < 0
-                    && TeacherDraftsHelpers.CompareTopicCodes(existingCode, candidateCode) > 0)
+                if (slotPosition < 0 && orderComparison < 0)
                 {
                     return true;
                 }
-                if (slotPosition > 0
-                    && TeacherDraftsHelpers.CompareTopicCodes(candidateCode, existingCode) > 0)
+                if (slotPosition > 0 && orderComparison > 0)
                 {
                     return true;
                 }
@@ -4885,7 +4894,6 @@ public sealed class TeacherDraftsAutogenService
                     }
                     if (!isSelfStudyPlacement
                         && topicSelection is not null
-                        && !allowEmergencyTopicOrderRelaxation
                         && ViolatesTopicCalendarOrder(grp.Id, moduleId, topicSelection, date, s, e))
                     {
                         RecordSlotFailureReason(

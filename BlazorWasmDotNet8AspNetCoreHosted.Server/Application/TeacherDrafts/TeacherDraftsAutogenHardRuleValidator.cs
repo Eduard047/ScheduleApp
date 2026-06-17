@@ -71,6 +71,7 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             "аудиторії",
             CollapseSharedFlowPlacements(placements.Where(row => row.RoomId is not null && row.BlocksRoom))
                 .GroupBy(row => (Id: row.RoomId!.Value, Name: row.RoomName ?? $"#{row.RoomId.Value}"))));
+        violations.AddRange(FindTopicOrderViolations(draftRows));
         var roomCapacityStats = AnalyzeRoomCapacity(placements);
         violations.AddRange(roomCapacityStats.Violations);
 
@@ -113,6 +114,7 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
                 item.LessonType.Name,
                 item.LessonType.PreferredFirstInWeek,
                 item.ModuleTopicId,
+                item.ModuleTopic != null ? item.ModuleTopic.Order : null,
                 item.TeacherId,
                 item.Teacher != null ? item.Teacher.FullName : null,
                 item.RoomId,
@@ -149,6 +151,11 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             .Select(item => item.RoomId!.Value)
             .Distinct()
             .ToList();
+        var topicIds = pendingDrafts
+            .Where(item => item.ModuleTopicId is not null)
+            .Select(item => item.ModuleTopicId!.Value)
+            .Distinct()
+            .ToList();
 
         var groups = await _db.Groups
             .AsNoTracking()
@@ -166,6 +173,10 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             .AsNoTracking()
             .Where(item => roomIds.Contains(item.Id))
             .ToDictionaryAsync(item => item.Id, cancellationToken);
+        var topicOrders = await _db.ModuleTopics
+            .AsNoTracking()
+            .Where(item => topicIds.Contains(item.Id))
+            .ToDictionaryAsync(item => item.Id, item => item.Order, cancellationToken);
 
         var rows = new List<PlacementRow>(pendingDrafts.Count);
         foreach (var item in pendingDrafts)
@@ -197,6 +208,9 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
                 lessonType.Name,
                 lessonType.PreferredFirstInWeek,
                 item.ModuleTopicId,
+                item.ModuleTopicId is int topicId && topicOrders.TryGetValue(topicId, out var topicOrder)
+                    ? topicOrder
+                    : null,
                 item.TeacherId,
                 item.TeacherId is int teacherId && teachers.TryGetValue(teacherId, out var teacherName) ? teacherName : null,
                 item.RoomId,
@@ -252,6 +266,7 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
                 item.LessonType.Name,
                 item.LessonType.PreferredFirstInWeek,
                 item.ModuleTopicId,
+                item.ModuleTopic != null ? item.ModuleTopic.Order : null,
                 item.TeacherId,
                 item.Teacher != null ? item.Teacher.FullName : null,
                 item.RoomId,
@@ -419,6 +434,30 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
         }
     }
 
+    private static IEnumerable<string> FindTopicOrderViolations(IReadOnlyList<PlacementRow> draftRows)
+    {
+        foreach (var group in draftRows
+                     .Where(row => row.ModuleTopicId is not null && row.ModuleTopicOrder is not null)
+                     .GroupBy(row => new { row.GroupId, row.ModuleId }))
+        {
+            PlacementRow? previous = null;
+            foreach (var current in group
+                         .OrderBy(row => row.Date)
+                         .ThenBy(row => row.Start)
+                         .ThenBy(row => row.End))
+            {
+                if (previous?.ModuleTopicOrder is int previousOrder
+                    && current.ModuleTopicOrder is int currentOrder
+                    && currentOrder < previousOrder)
+                {
+                    yield return $"{current.Date:yyyy-MM-dd} {current.GroupName} {current.Start:HH\\:mm}: тема #{current.ModuleTopicId} модуля #{current.ModuleId} має порядок {currentOrder} після теми #{previous.ModuleTopicId} з порядком {previousOrder}.";
+                }
+
+                previous = current;
+            }
+        }
+    }
+
     private static RoomCapacityStats AnalyzeRoomCapacity(IReadOnlyList<PlacementRow> placements)
     {
         var violations = new List<string>();
@@ -500,6 +539,7 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
         string LessonTypeName,
         bool PreferredFirstInWeek,
         int? ModuleTopicId,
+        int? ModuleTopicOrder,
         int? TeacherId,
         string? TeacherName,
         int? RoomId,
