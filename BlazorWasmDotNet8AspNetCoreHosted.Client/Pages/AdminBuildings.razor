@@ -26,29 +26,17 @@ else
     <div class="card p-3 mb-3">
         <div class="d-flex justify-content-between align-items-center mb-2 gap-2 flex-wrap">
             <button class="btn btn-primary" @onclick="OpenCreateBuilding">Додати корпус</button>
-            <div class="input-group ms-auto" style="max-width:360px;">
-                <span class="input-group-text">Пошук</span>
-                <input class="form-control" @bind="filterBuildings" @bind:event="oninput" placeholder="Id / назва / адреса" />
-            </div>
+            <AdminSearchBox @bind-Value="filterBuildings" Class="ms-auto" Style="max-width:360px;" Placeholder="Id / назва / адреса" />
             <div class="small text-muted">Показано: @SortedBuildings.Count() з @buildings.Count</div>
         </div>
         <div class="table-responsive">
             <table class="table table-sm align-middle">
                 <thead>
                     <tr>
-                        <th style="width:80px;" class="sortable-th" role="button"
-                            @onclick="() => ToggleSortB(nameof(BuildingEditDto.Id))">
-                            Id @HeaderIconB(nameof(BuildingEditDto.Id))
-                        </th>
-                        <th class="sortable-th" role="button"
-                            @onclick="() => ToggleSortB(nameof(BuildingEditDto.Name))">
-                            Назва @HeaderIconB(nameof(BuildingEditDto.Name))
-                        </th>
-                        <th class="sortable-th" role="button"
-                            @onclick="() => ToggleSortB(nameof(BuildingEditDto.Address))">
-                            Адреса @HeaderIconB(nameof(BuildingEditDto.Address))
-                        </th>
-                        <th style="width:160px;"></th>
+                        <SortableHeader Field="@nameof(BuildingEditDto.Id)" ActiveField="@sortFieldB" SortAscending="@sortAscB" OnSort="@ToggleSortB" Style="width:80px;">Id</SortableHeader>
+                        <SortableHeader Field="@nameof(BuildingEditDto.Name)" ActiveField="@sortFieldB" SortAscending="@sortAscB" OnSort="@ToggleSortB">Назва</SortableHeader>
+                        <SortableHeader Field="@nameof(BuildingEditDto.Address)" ActiveField="@sortFieldB" SortAscending="@sortAscB" OnSort="@ToggleSortB">Адреса</SortableHeader>
+                        <th style="width:220px;"></th>
                     </tr>
                 </thead>
                 <tbody>
@@ -58,7 +46,7 @@ else
                             <td>@b.Id</td>
                             <td>@b.Name</td>
                             <td>@b.Address</td>
-                            <td class="text-end">
+                            <td class="text-end text-nowrap">
                                 <button class="btn btn-sm btn-outline-primary me-2" @onclick="() => OpenEditBuilding(b)">Редагувати</button>
                                 <button class="btn btn-sm btn-outline-danger" @onclick="() => DeleteBuilding(b.Id!.Value)">Видалити</button>
                             </td>
@@ -66,33 +54,23 @@ else
                     }
                 </tbody>
             </table>
-            <div class="small text-muted">Показано: @SortedBuildings.Count() з @buildings.Count</div>
         </div>
     </div>
     <h4 class="mt-4 mb-2">Час на дорогу між корпусами</h4>
     <div class="card p-3">
         <div class="d-flex justify-content-between align-items-center mb-2 gap-2 flex-wrap">
             <button class="btn btn-primary" @onclick="OpenCreateTravel">Додати маршрут</button>
-            <div class="input-group ms-auto" style="max-width:420px;">
-                <span class="input-group-text">Пошук</span>
-                <input class="form-control" @bind="filterTravels" @bind:event="oninput" placeholder="з / до / хвилин" />
-            </div>
+            <AdminSearchBox @bind-Value="filterTravels" Class="ms-auto" Style="max-width:420px;" Placeholder="з / до / хвилин" />
             <div class="small text-muted">Показано: @SortedTravels.Count() з @travels.Count</div>
         </div>
         <div class="table-responsive">
             <table class="table table-sm align-middle">
                 <thead>
                     <tr>
-                        <th class="sortable-th" role="button" @onclick="() => ToggleSortT(FromField)">
-                            З @HeaderIconT(FromField)
-                        </th>
-                        <th class="sortable-th" role="button" @onclick="() => ToggleSortT(ToField)">
-                            До @HeaderIconT(ToField)
-                        </th>
-                        <th style="width:120px;" class="sortable-th" role="button" @onclick="() => ToggleSortT(nameof(BuildingTravelEditDto.Minutes))">
-                            Хвилин @HeaderIconT(nameof(BuildingTravelEditDto.Minutes))
-                        </th>
-                        <th style="width:120px;"></th>
+                        <SortableHeader Field="@FromField" ActiveField="@sortFieldT" SortAscending="@sortAscT" OnSort="@ToggleSortT">З</SortableHeader>
+                        <SortableHeader Field="@ToField" ActiveField="@sortFieldT" SortAscending="@sortAscT" OnSort="@ToggleSortT">До</SortableHeader>
+                        <SortableHeader Field="@nameof(BuildingTravelEditDto.Minutes)" ActiveField="@sortFieldT" SortAscending="@sortAscT" OnSort="@ToggleSortT" Style="width:120px;">Хвилин</SortableHeader>
+                        <th style="width:220px;"></th>
                     </tr>
                 </thead>
                 <tbody>
@@ -102,7 +80,7 @@ else
                             <td>@NameOf(t.FromBuildingId)</td>
                             <td>@NameOf(t.ToBuildingId)</td>
                             <td>@t.Minutes</td>
-                            <td class="text-end">
+                            <td class="text-end text-nowrap">
                                 <button class="btn btn-sm btn-outline-primary me-2" @onclick="() => OpenEditTravel(t)">Редагувати</button>
                                 <button class="btn btn-sm btn-outline-danger" @onclick="() => DeleteTravel(t)">Видалити</button>
                             </td>
@@ -116,118 +94,65 @@ else
 
 @if (buildingEditorOpen)
 {
-    <div class="editor-overlay" @onclick="CloseBuildingEditor">
-        <div class="editor editor-modal building-editor" role="dialog" aria-modal="true" @onclick:stopPropagation="true">
-            <div class="editor-modal-head">
-                <div>
-                    <div class="editor-title">@((form.Id is null ? "Створення корпусу" : $"Редагування корпусу #{form.Id}"))</div>
-                    <div class="editor-subtitle">Вкажіть назву корпусу та за потреби адресу.</div>
-                </div>
-                <button type="button" class="btn btn-outline-secondary editor-close" title="Закрити" @onclick="CloseBuildingEditor">×</button>
+    <AdminEditorModal Title="@BuildingEditorTitle"
+                      Subtitle="Вкажіть назву корпусу та за потреби адресу."
+                      CssClass="building-editor"
+                      OnClose="@CloseBuildingEditor">
+        <div class="row g-3">
+            <div class="col-12">
+                <label class="form-label">Назва</label>
+                <input class="form-control" @bind="form.Name" />
             </div>
-            <div class="row g-3">
-                <div class="col-12">
-                    <label class="form-label">Назва</label>
-                    <input class="form-control" @bind="form.Name" />
-                </div>
-                <div class="col-12">
-                    <label class="form-label">Адреса</label>
-                    <input class="form-control" @bind="form.Address" />
-                </div>
-            </div>
-            <div class="editor-actions">
-                <button class="btn btn-primary" @onclick="SaveBuilding">Зберегти</button>
-                <button class="btn btn-outline-secondary" @onclick="CloseBuildingEditor">Скасувати</button>
+            <div class="col-12">
+                <label class="form-label">Адреса</label>
+                <input class="form-control" @bind="form.Address" />
             </div>
         </div>
-    </div>
+        <div class="editor-actions">
+            <button class="btn btn-primary" @onclick="SaveBuilding">Зберегти</button>
+            <button class="btn btn-outline-secondary" @onclick="CloseBuildingEditor">Скасувати</button>
+        </div>
+    </AdminEditorModal>
 }
 
 @if (travelEditorOpen)
 {
-    <div class="editor-overlay" @onclick="CloseTravelEditor">
-        <div class="editor editor-modal travel-editor" role="dialog" aria-modal="true" @onclick:stopPropagation="true">
-            <div class="editor-modal-head">
-                <div>
-                    <div class="editor-title">@(travelEditing ? "Редагування маршруту між корпусами" : "Створення маршруту між корпусами")</div>
-                    <div class="editor-subtitle">Виберіть корпуси та вкажіть час у хвилинах.</div>
-                </div>
-                <button type="button" class="btn btn-outline-secondary editor-close" title="Закрити" @onclick="CloseTravelEditor">×</button>
+    <AdminEditorModal Title="@TravelEditorTitle"
+                      Subtitle="Виберіть корпуси та вкажіть час у хвилинах."
+                      CssClass="travel-editor"
+                      OnClose="@CloseTravelEditor">
+        <div class="row g-3">
+            <div class="col-12 col-md-5">
+                <label class="form-label">З корпусу</label>
+                <select class="form-select" @bind="travelFromId">
+                    <option value="0">— Оберіть —</option>
+                    @foreach (var b in buildings.OrderBy(x => x.Name))
+                    {
+                        <option value="@b.Id">@b.Name</option>
+                    }
+                </select>
             </div>
-            <div class="row g-3">
-                <div class="col-12 col-md-5">
-                    <label class="form-label">З корпусу</label>
-                    <select class="form-select" @bind="travelFromId">
-                        <option value="0">— Оберіть —</option>
-                        @foreach (var b in buildings.OrderBy(x => x.Name))
-                        {
-                            <option value="@b.Id">@b.Name</option>
-                        }
-                    </select>
-                </div>
-                <div class="col-12 col-md-5">
-                    <label class="form-label">До корпусу</label>
-                    <select class="form-select" @bind="travelToId">
-                        <option value="0">— Оберіть —</option>
-                        @foreach (var b in buildings.OrderBy(x => x.Name))
-                        {
-                            <option value="@b.Id">@b.Name</option>
-                        }
-                    </select>
-                </div>
-                <div class="col-12 col-md-2">
-                    <label class="form-label">Хвилин</label>
-                    <input type="number" min="0" class="form-control" @bind="travelMinutes" />
-                </div>
+            <div class="col-12 col-md-5">
+                <label class="form-label">До корпусу</label>
+                <select class="form-select" @bind="travelToId">
+                    <option value="0">— Оберіть —</option>
+                    @foreach (var b in buildings.OrderBy(x => x.Name))
+                    {
+                        <option value="@b.Id">@b.Name</option>
+                    }
+                </select>
             </div>
-            <div class="editor-actions">
-                <button class="btn btn-primary" @onclick="SaveTravel">Зберегти</button>
-                <button class="btn btn-outline-secondary" @onclick="CloseTravelEditor">Скасувати</button>
+            <div class="col-12 col-md-2">
+                <label class="form-label">Хвилин</label>
+                <input type="number" min="0" class="form-control" @bind="travelMinutes" />
             </div>
         </div>
-    </div>
+        <div class="editor-actions">
+            <button class="btn btn-primary" @onclick="SaveTravel">Зберегти</button>
+            <button class="btn btn-outline-secondary" @onclick="CloseTravelEditor">Скасувати</button>
+        </div>
+    </AdminEditorModal>
 }
-
-<style>
-    .editor-overlay {
-        position: fixed;
-        inset: 0;
-        background: rgba(15, 23, 42, 0.5);
-        backdrop-filter: blur(2px);
-        display: flex;
-        justify-content: center;
-        align-items: flex-start;
-        padding: 72px 18px 24px;
-        overflow-y: auto;
-        z-index: 2500;
-    }
-    .editor {
-        margin-top: 14px;
-        background: #fff;
-        border: 1px solid #e5e7eb;
-        border-radius: 12px;
-        padding: 14px;
-        width: min(680px, 100%);
-        box-shadow: 0 20px 50px rgba(15, 23, 42, 0.25);
-    }
-    .editor-modal-head {
-        display: flex;
-        align-items: flex-start;
-        justify-content: space-between;
-        gap: 12px;
-        margin-bottom: 12px;
-    }
-    .editor-title { font-weight: 800; font-size: 1.1rem; }
-    .editor-subtitle { color: #475569; font-size: .92rem; margin-top: 4px; }
-    .editor-close { min-width: 44px; height: 44px; font-size: 1.3rem; padding: 0 .6rem; }
-    .editor-actions {
-        margin-top: 14px;
-        display: flex;
-        gap: 10px;
-        justify-content: flex-end;
-        flex-wrap: wrap;
-    }
-</style>
 
 @code {
     private sealed class BuildingsVm
@@ -252,6 +177,12 @@ else
     private const string ToField = "To";
     private string sortFieldT = FromField;
     private bool sortAscT = true;
+    private string BuildingEditorTitle => form.Id is null
+        ? "Створення корпусу"
+        : $"Редагування корпусу #{form.Id}";
+    private string TravelEditorTitle => travelEditing
+        ? "Редагування маршруту між корпусами"
+        : "Створення маршруту між корпусами";
     private static BuildingEditDto NewBuildingForm() => new() { Id = null, Name = string.Empty, Address = null };
     private void OpenCreateBuilding()
     {
@@ -394,9 +325,6 @@ else
         if (sortFieldB == field) sortAscB = !sortAscB;
         else { sortFieldB = field; sortAscB = true; }
     }
-    // Повертає піктограму сортування для корпусів.
-    private MarkupString HeaderIconB(string field)
-        => new(sortFieldB == field ? $"<span class=\"ms-1\">{(sortAscB ? "▲" : "▼")}</span>" : "");
     // Фільтрує маршрути за пошуковим рядком.
     private IEnumerable<BuildingTravelEditDto> ApplyFilterT(IEnumerable<BuildingTravelEditDto> seq)
     {
@@ -429,7 +357,4 @@ else
         if (sortFieldT == field) sortAscT = !sortAscT;
         else { sortFieldT = field; sortAscT = true; }
     }
-    // Повертає піктограму сортування для маршрутів.
-    private MarkupString HeaderIconT(string field)
-        => new(sortFieldT == field ? $"<span class=\"ms-1\">{(sortAscT ? "▲" : "▼")}</span>" : "");
 }

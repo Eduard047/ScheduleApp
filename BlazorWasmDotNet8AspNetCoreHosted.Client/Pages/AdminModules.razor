@@ -63,108 +63,27 @@
     }
     @if (importResult is not null)
     {
-        <div class="mt-3">
-            <div class="d-flex flex-wrap gap-3 align-items-center">
-                <span class="fw-semibold">Курс: @importResult.CourseName</span>
-                <span class="badge @(importResult.CourseFound ? "bg-success" : "bg-danger")">
-                    @(importResult.CourseFound ? "Знайдено у БД" : "Не знайдено у БД")
-                </span>
-                <span class="text-muted small">Модулів: @importResult.Modules.Count | Занять: @ImportedTopicsCount</span>
-            </div>
-            @if (importResult.Warnings.Any())
-            {
-                <div class="alert alert-warning mt-2">
-                    <div class="fw-semibold mb-1">Попередження:</div>
-                    <ul class="mb-0">
-                        @foreach (var w in importResult.Warnings.Take(10))
-                        {
-                            <li>@w</li>
-                        }
-                        @if (importResult.Warnings.Count > 10)
-                        {
-                            <li>... ще @((importResult.Warnings.Count - 10)) попереджень</li>
-                        }
-                    </ul>
-                </div>
-            }
-            <div class="table-responsive mt-3">
-                <table class="table table-sm">
-                    <thead class="table-light">
-                        <tr>
-                            <th>Код</th>
-                            <th>Назва</th>
-                            <th>Кредити</th>
-                            <th>Занять</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        @foreach (var m in importResult.Modules)
-                        {
-                            <tr>
-                                <td>@m.Code</td>
-                                <td>@m.Title</td>
-                                <td>@m.Credits</td>
-                                <td>@(m.Topics?.Count ?? 0)</td>
-                            </tr>
-                        }
-                    </tbody>
-                </table>
-            </div>
-        </div>
+        <ModuleImportPreview Result="@importResult" ImportedTopicsCount="@ImportedTopicsCount" />
     }
 </div>
 
-<div class="card p-3 mb-3">
-    <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
-        <div>
-            <h5 class="mb-0">Очистити всі модулі</h5>
-            <div class="text-muted small">Видаляє всі модулі, плани та теми.</div>
-        </div>
-        <button class="btn btn-outline-danger" @onclick="ClearAllModules" disabled="@clearBusy">Очистити все</button>
-    </div>
-    @if (!string.IsNullOrWhiteSpace(clearError))
-    {
-        <div class="alert alert-danger mt-2">@clearError</div>
-    }
-    @if (!string.IsNullOrWhiteSpace(clearOk))
-    {
-        <div class="alert alert-success mt-2">@clearOk</div>
-    }
-</div>
+<ClearAllModulesCard Busy="@clearBusy" Error="@clearError" Ok="@clearOk" OnClear="@ClearAllModules" />
 
 <div class="card p-3 mb-3">
     <div class="d-flex justify-content-between align-items-center mb-2 gap-2 flex-wrap">
         <button class="btn btn-primary" @onclick="OpenCreateModule">Додати модуль</button>
-        <div class="input-group ms-auto" style="max-width:320px;">
-            <span class="input-group-text">Пошук</span>
-            <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / код / назва / курс / кредити" />
-        </div>
+        <AdminSearchBox @bind-Value="filter" Class="ms-auto" Style="max-width:320px;" Placeholder="Id / код / назва / курс / кредити" />
         <div class="text-muted small">Відібрано: @SortedAndFiltered.Count() з @items.Count</div>
     </div>
     <div class="table-responsive">
         <table class="table table-sm align-middle">
             <thead>
                 <tr>
-                    <th style="width:80px;" class="sortable-th" role="button"
-                        @onclick="() => ToggleSort(nameof(ModuleEditDto.Id))">
-                        Id @HeaderIcon(nameof(ModuleEditDto.Id))
-                    </th>
-                    <th class="sortable-th" role="button"
-                        @onclick="() => ToggleSort(nameof(ModuleEditDto.Code))">
-                        Код @HeaderIcon(nameof(ModuleEditDto.Code))
-                    </th>
-                    <th class="sortable-th" role="button"
-                        @onclick="() => ToggleSort(nameof(ModuleEditDto.Title))">
-                        Назва @HeaderIcon(nameof(ModuleEditDto.Title))
-                    </th>
-                    <th class="sortable-th" role="button"
-                        @onclick="() => ToggleSort(CourseField)">
-                        Курси @HeaderIcon(CourseField)
-                    </th>
-                    <th class="sortable-th" role="button"
-                        @onclick="() => ToggleSort(nameof(ModuleEditDto.Credits))">
-                        Обсяг кредитів @HeaderIcon(nameof(ModuleEditDto.Credits))
-                    </th>
+                    <SortableHeader Field="@nameof(ModuleEditDto.Id)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort" Style="width:80px;">Id</SortableHeader>
+                    <SortableHeader Field="@nameof(ModuleEditDto.Code)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Код</SortableHeader>
+                    <SortableHeader Field="@nameof(ModuleEditDto.Title)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Назва</SortableHeader>
+                    <SortableHeader Field="@CourseField" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Курси</SortableHeader>
+                    <SortableHeader Field="@nameof(ModuleEditDto.Credits)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Обсяг кредитів</SortableHeader>
                     <th style="width:230px;"></th>
                 </tr>
             </thead>
@@ -177,7 +96,7 @@
                         <td>@m.Title</td>
                         <td>@ModuleCourseSummary(m)</td>
                         <td>@m.Credits</td>
-                        <td class="text-end">
+                        <td class="text-end text-nowrap">
                             <button class="btn btn-sm btn-outline-secondary me-2" title="План модуля"
                                     @onclick="() => OpenPlans(m)">
                                 План модуля
@@ -424,7 +343,7 @@
                                             <td class="module-topics-col-groups">
                                                 <span>@GroupsHoursCaption(topic.CompletedGroupsHours ?? new())</span>
                                             </td>
-                                            <td class="module-topics-col-actions text-end">
+                                            <td class="module-topics-col-actions text-end text-nowrap">
                                                 <div class="btn-group btn-group-sm me-1 mb-1 mb-sm-0">
                                                     <button class="btn btn-outline-secondary" @onclick="() => EditTopic(topic)">Редагувати</button>
                                                     <button class="btn btn-outline-danger" @onclick="() => DeleteTopic(topic.Id)">Видалити</button>
@@ -1276,13 +1195,6 @@ private string plansModuleCode = "";
         var truncated = trimmed.Substring(0, Math.Min(trimmed.Length, max)).TrimEnd();
         return $"{truncated}…";
     }
-    // Повертає піктограму напряму сортування для заголовка.
-    private MarkupString HeaderIcon(string field)
-    {
-        if (sortField != field) return new MarkupString(string.Empty);
-        var icon = sortAsc ? "&#9650;" : "&#9660;";
-        return new MarkupString($"<span class=\"ms-1\">{icon}</span>");
-    }
     // Позначає всі доступні аудиторії для модуля.
     private void SelectAllRooms()
     {
@@ -1357,158 +1269,4 @@ private string plansModuleCode = "";
         public bool IsInterAssembly { get; set; }
         public bool SelfStudyBySupervisor { get; set; }
     }
-
 }
-
-<style>
-
-    .editor-overlay {
-        position: fixed;
-        inset: 0;
-        background: rgba(15, 23, 42, 0.5);
-        backdrop-filter: blur(2px);
-        display: flex;
-        justify-content: center;
-        align-items: flex-start;
-        padding: 72px 18px 24px;
-        overflow-y: auto;
-        z-index: 2500;
-    }
-    .editor {
-        margin-top: 14px;
-        background: #fff;
-        border: 1px solid #e5e7eb;
-        border-radius: 12px;
-        padding: 14px;
-        width: min(1100px, 100%);
-        box-shadow: 0 20px 50px rgba(15, 23, 42, 0.25);
-    }
-    .editor-modal-head {
-        display: flex;
-        align-items: flex-start;
-        justify-content: space-between;
-        gap: 12px;
-        margin-bottom: 12px;
-    }
-    .editor-title { font-weight: 800; font-size: 1.1rem; }
-    .editor-subtitle { color: #475569; font-size: .92rem; margin-top: 4px; }
-    .editor-close { min-width: 44px; height: 44px; font-size: 1.3rem; padding: 0 .6rem; }
-    .module-editor-body {
-        display: flex;
-        flex-direction: column;
-        gap: 12px;
-    }
-    .topic-editor-overlay {
-        z-index: 3200;
-    }
-    .topic-editor {
-        width: min(920px, 100%);
-    }
-    .editor-actions {
-        margin-top: 14px;
-        display: flex;
-        gap: 10px;
-        justify-content: flex-end;
-        flex-wrap: wrap;
-    }
-    .course-chip-grid {
-        display: flex;
-        flex-wrap: wrap;
-        gap: .5rem;
-    }
-    .course-chip {
-        min-width: 120px;
-        font-weight: 600;
-    }
-    .sortable-th {
-        cursor: pointer;
-        user-select: none;
-        white-space: nowrap;
-    }
-    .module-topics-card {
-        border: 1px solid #e5e7eb;
-        background: #f9fafb;
-        border-radius: 12px;
-    }
-    .module-topics-header {
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-        margin-bottom: 12px;
-    }
-    .module-topics-actions .btn {
-        min-width: 140px;
-    }
-    .module-topics-table th,
-    .module-topics-table td {
-        vertical-align: middle;
-    }
-    .module-topics-col-groups .topic-text-truncate {
-        max-width: 220px;
-    }
-    .topic-text-truncate {
-        display: inline-block;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        vertical-align: bottom;
-    }
-    .module-topics-col-actions {
-        width: 200px;
-        white-space: nowrap;
-    }
-    .topic-flag-btn {
-        min-width: 140px;
-        font-weight: 600;
-    }
-    /* Стилі модального вікна для плану модуля */
-    .plan-modal-overlay {
-        position: fixed;
-        inset: 0;
-        z-index: 1080;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        padding: 2rem 1rem;
-    }
-    .plan-modal-backdrop {
-        position: absolute;
-        inset: 0;
-        background: rgba(0, 0, 0, 0.55);
-    }
-    .plan-modal-dialog {
-        position: relative;
-        width: 100%;
-        max-width: 1600px;
-        max-height: 90vh;
-        background: #fff;
-        border-radius: 12px;
-        box-shadow: 0 20px 45px rgba(0, 0, 0, 0.25);
-        display: flex;
-        flex-direction: column;
-        overflow: hidden;
-    }
-    .plan-modal-header {
-        position: sticky;
-        top: 0;
-        z-index: 1;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 1rem;
-        padding: 1rem 1.25rem;
-        background: #fff;
-        border-bottom: 1px solid #e5e7eb;
-    }
-    .plan-modal-body {
-        padding: 1.25rem;
-        overflow: auto;
-    }
-    @@media (max-width: 576px) {
-        .plan-modal-header {
-            flex-direction: column;
-            align-items: flex-start;
-        }
-    }
-
-</style>

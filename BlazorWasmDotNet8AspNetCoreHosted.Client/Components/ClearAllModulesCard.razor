@@ -1,0 +1,32 @@
+@* Окрема картка небезпечної дії очищення модулів. *@
+<div class="card p-3 mb-3">
+    <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
+        <div>
+            <h5 class="mb-0">Очистити всі модулі</h5>
+            <div class="text-muted small">Видаляє всі модулі, плани та теми.</div>
+        </div>
+        <button class="btn btn-outline-danger" @onclick="OnClear" disabled="@Busy">Очистити все</button>
+    </div>
+    @if (!string.IsNullOrWhiteSpace(Error))
+    {
+        <div class="alert alert-danger mt-2">@Error</div>
+    }
+    @if (!string.IsNullOrWhiteSpace(Ok))
+    {
+        <div class="alert alert-success mt-2">@Ok</div>
+    }
+</div>
+
+@code {
+    [Parameter]
+    public bool Busy { get; set; }
+
+    [Parameter]
+    public string? Error { get; set; }
+
+    [Parameter]
+    public string? Ok { get; set; }
+
+    [Parameter, EditorRequired]
+    public EventCallback OnClear { get; set; }
+}

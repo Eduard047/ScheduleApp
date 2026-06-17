@@ -23,6 +23,7 @@ public sealed class TeacherDraftsController : ControllerBase
     private readonly TeacherDraftsQueryService _queryService;
     private readonly TeacherDraftsExportService _exportService;
     private readonly TeacherDraftsAutogenService _autogenService;
+    private readonly TeacherDraftsAutogenJobService _autogenJobService;
     private readonly TeacherDraftsPublishService _publishService;
     private static readonly JsonSerializerOptions ValidationJsonOptions = new()
     {
@@ -38,6 +39,7 @@ public sealed class TeacherDraftsController : ControllerBase
         TeacherDraftsQueryService queryService,
         TeacherDraftsExportService exportService,
         TeacherDraftsAutogenService autogenService,
+        TeacherDraftsAutogenJobService autogenJobService,
         TeacherDraftsPublishService publishService)
     {
         _db = db;
@@ -45,6 +47,7 @@ public sealed class TeacherDraftsController : ControllerBase
         _queryService = queryService;
         _exportService = exportService;
         _autogenService = autogenService;
+        _autogenJobService = autogenJobService;
         _publishService = publishService;
     }
     [HttpGet]
@@ -182,19 +185,32 @@ public sealed class TeacherDraftsController : ControllerBase
     [HttpPost("autogen/week")]
     // Викликає автогенерацію чернеток для одного тижня.
     public Task<ActionResult<AutoGenResult>> DraftAutoGenWeek([FromBody] DraftAutoGenRequest r)
-        => _autogenService.DraftAutoGenWeek(r);
+        => _autogenService.DraftAutoGenWeek(r, HttpContext.RequestAborted);
     [HttpPost("autogen/month")]
     // Автоматично генерує чернетки для кожного тижня в межах місяця.
     public async Task<ActionResult<AutoGenResult>> AutogenMonth([FromBody] AutogenMonthRequest r)
-        => await _autogenService.AutogenMonth(r);
+        => await _autogenService.AutogenMonth(r, HttpContext.RequestAborted);
     [HttpPost("autogen/course")]
     // Генерує чернетки для курсу в заданому діапазоні тижнів.
     public async Task<ActionResult<AutoGenResult>> AutogenCourse([FromBody] AutogenCourseRequest r)
-        => await _autogenService.AutogenCourse(r);
+        => await _autogenService.AutogenCourse(r, HttpContext.RequestAborted);
     [HttpPost("autogen")]
     // Створює чернетки на основі правил і доступних даних для заданого тижня.
     public async Task<ActionResult<AutoGenResult>> DraftAutoGen([FromBody] DraftAutoGenRequest r)
-        => await _autogenService.DraftAutoGen(r);
+        => await _autogenService.DraftAutoGen(r, HttpContext.RequestAborted);
+    [HttpPost("autogen/jobs")]
+    public ActionResult<AutoGenJobStartResult> StartAutoGenJob([FromBody] AutoGenJobRequest r)
+        => Ok(_autogenJobService.Start(r));
+    [HttpGet("autogen/jobs/{jobId}")]
+    public ActionResult<AutoGenJobStatus> GetAutoGenJob(string jobId)
+        => _autogenJobService.Get(jobId) is { } status
+            ? Ok(status)
+            : NotFound(new { message = "Задачу автогенерації не знайдено." });
+    [HttpPost("autogen/jobs/{jobId}/cancel")]
+    public ActionResult<AutoGenJobStatus> CancelAutoGenJob(string jobId)
+        => _autogenJobService.Cancel(jobId) is { } status
+            ? Ok(status)
+            : NotFound(new { message = "Задачу автогенерації не знайдено." });
     [HttpPost("approve-week")]
     // Позначає чернетки викладача за тиждень як затверджені.
     public async Task<IActionResult> ApproveWeek([FromBody] ApproveWeekRequest r)

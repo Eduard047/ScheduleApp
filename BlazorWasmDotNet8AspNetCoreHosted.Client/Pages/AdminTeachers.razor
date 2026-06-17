@@ -15,44 +15,20 @@ else
 {
     <div class="d-flex justify-content-between align-items-center mb-2 gap-2">
         <button class="btn btn-primary" @onclick="CreateNew">Додати викладача</button>
-        <div class="input-group" style="max-width:360px;">
-            <span class="input-group-text">Пошук</span>
-            <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / ПІБ / кафедра / курс / ступінь / звання / модуль" />
-        </div>
+        <AdminSearchBox @bind-Value="filter" Style="max-width:360px;" Placeholder="Id / ПІБ / кафедра / курс / ступінь / звання / модуль" />
     </div>
     <div class="small text-muted mb-2">Показано: @SortedAndFiltered.Count() з @list.Count</div>
     <table class="table table-sm">
         <thead>
             <tr>
-                <th class="sortable-th" style="width:80px;" role="button"
-                    @onclick="() => ToggleSort(nameof(TeacherViewDto.Id))">
-                    # @HeaderIcon(nameof(TeacherViewDto.Id))
-                </th>
-                <th class="sortable-th" role="button"
-                    @onclick="() => ToggleSort(nameof(TeacherViewDto.FullName))">
-                    ПІБ @HeaderIcon(nameof(TeacherViewDto.FullName))
-                </th>
-                <th class="sortable-th" role="button"
-                    @onclick="() => ToggleSort(DepartmentField)">
-                    Кафедра @HeaderIcon(DepartmentField)
-                </th>
-                <th class="sortable-th" role="button"
-                    @onclick="() => ToggleSort(nameof(TeacherViewDto.ScientificDegree))">
-                    Науковий ступінь @HeaderIcon(nameof(TeacherViewDto.ScientificDegree))
-                </th>
-                <th class="sortable-th" role="button"
-                    @onclick="() => ToggleSort(nameof(TeacherViewDto.AcademicTitle))">
-                    Наукове звання @HeaderIcon(nameof(TeacherViewDto.AcademicTitle))
-                </th>
-                <th class="sortable-th" role="button"
-                    @onclick="() => ToggleSort(ModulesField)">
-                    Модулі @HeaderIcon(ModulesField)
-                </th>
-                <th class="sortable-th" role="button"
-                    @onclick="() => ToggleSort(ActiveCoursesField)">
-                    Активні @HeaderIcon(ActiveCoursesField)
-                </th>
-                <th></th>
+                <SortableHeader Field="@nameof(TeacherViewDto.Id)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort" Style="width:80px;">#</SortableHeader>
+                <SortableHeader Field="@nameof(TeacherViewDto.FullName)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">ПІБ</SortableHeader>
+                <SortableHeader Field="@DepartmentField" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Кафедра</SortableHeader>
+                <SortableHeader Field="@nameof(TeacherViewDto.ScientificDegree)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Науковий ступінь</SortableHeader>
+                <SortableHeader Field="@nameof(TeacherViewDto.AcademicTitle)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Наукове звання</SortableHeader>
+                <SortableHeader Field="@ModulesField" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Модулі</SortableHeader>
+                <SortableHeader Field="@ActiveCoursesField" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Активні</SortableHeader>
+                <th style="width:220px;"></th>
             </tr>
         </thead>
         <tbody>
@@ -66,9 +42,9 @@ else
                     <td>@t.AcademicTitle</td>
                     <td>@ModulesCaption(t)</td>
                     <td>@ActiveCoursesMarkup(t)</td>
-                    <td class="text-end">
-                        <button class="btn btn-sm btn-secondary me-1" @onclick="() => Edit(t.Id)">Редагувати</button>
-                        <button class="btn btn-sm btn-danger" @onclick="() => Delete(t.Id)">Видалити</button>
+                    <td class="text-end text-nowrap">
+                        <button class="btn btn-sm btn-outline-primary me-2" @onclick="() => Edit(t.Id)">Редагувати</button>
+                        <button class="btn btn-sm btn-outline-danger" @onclick="() => Delete(t.Id)">Видалити</button>
                     </td>
                 </tr>
             }
@@ -78,15 +54,10 @@ else
 
 @if (edit != null)
 {
-    <div class="editor-overlay" @onclick="Cancel">
-        <div class="editor editor-modal teacher-editor" role="dialog" aria-modal="true" @onclick:stopPropagation="true">
-            <div class="editor-modal-head">
-                <div>
-                    <div class="editor-title">@(edit.Id is null ? "Створення викладача" : $"Редагування #{edit.Id}")</div>
-                    <div class="editor-subtitle">Заповніть дані викладача, дозвольте потрібні модулі та робочі вікна.</div>
-                </div>
-                <button type="button" class="btn btn-outline-secondary editor-close" title="Закрити" @onclick="Cancel">×</button>
-            </div>
+    <AdminEditorModal Title="@TeacherEditorTitle"
+                      Subtitle="Заповніть дані викладача, дозвольте потрібні модулі та робочі вікна."
+                      CssClass="teacher-editor"
+                      OnClose="@Cancel">
             <div class="teacher-editor-body">
                 <div class="row g-3">
                     <div class="col-md-5">
@@ -247,61 +218,8 @@ else
                 <button class="btn btn-success" @onclick="Save">Зберегти</button>
                 <button class="btn btn-outline-secondary" @onclick="Cancel">Скасувати</button>
             </div>
-        </div>
-    </div>
+    </AdminEditorModal>
 }
-
-<style>
-    .editor-overlay {
-        position: fixed;
-        inset: 0;
-        background: rgba(15, 23, 42, 0.5);
-        backdrop-filter: blur(2px);
-        display: flex;
-        justify-content: center;
-        align-items: flex-start;
-        padding: 72px 18px 24px;
-        overflow-y: auto;
-        z-index: 2500;
-    }
-    .editor {
-        margin-top: 14px;
-        background: #fff;
-        border: 1px solid #e5e7eb;
-        border-radius: 12px;
-        padding: 14px;
-        width: min(1200px, 100%);
-        box-shadow: 0 20px 50px rgba(15, 23, 42, 0.25);
-    }
-    .editor-modal-head {
-        display: flex;
-        align-items: flex-start;
-        justify-content: space-between;
-        gap: 12px;
-        margin-bottom: 12px;
-    }
-    .editor-title { font-weight: 800; font-size: 1.1rem; }
-    .editor-subtitle { color: #475569; font-size: .92rem; margin-top: 4px; }
-    .editor-close { min-width: 44px; height: 44px; font-size: 1.3rem; padding: 0 .6rem; }
-    .teacher-editor-body {
-        display: flex;
-        flex-direction: column;
-        gap: 12px;
-    }
-    .editor-card {
-        border: 1px solid #e5e7eb;
-        border-radius: 12px;
-        padding: 12px;
-        background: #f8fafc;
-    }
-    .editor-actions {
-        margin-top: 14px;
-        display: flex;
-        gap: 10px;
-        justify-content: flex-end;
-        flex-wrap: wrap;
-    }
-</style>
 
 @code {
 
@@ -315,6 +233,9 @@ else
     private string sortField = nameof(TeacherViewDto.FullName);
     private bool sortAsc = true;
     private string? filter;
+    private string TeacherEditorTitle => edit?.Id is null
+        ? "Створення викладача"
+        : $"Редагування #{edit.Id}";
     // Завантажує метадані та список викладачів.
     protected override async Task OnInitializedAsync()
     {
@@ -570,7 +491,4 @@ else
         if (sortField == field) sortAsc = !sortAsc;
         else { sortField = field; sortAsc = true; }
     }
-    // Повертає піктограму для заголовка сортування.
-    private MarkupString HeaderIcon(string field)
-        => new(sortField == field ? $"<span class=\"ms-1\">{(sortAsc ? "▲" : "▼")}</span>" : "");
 }

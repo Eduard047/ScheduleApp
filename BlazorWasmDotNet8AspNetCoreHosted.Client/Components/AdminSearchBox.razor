@@ -1,0 +1,37 @@
+@* Єдине поле пошуку для адмінських таблиць. *@
+<div class="@SearchClass" style="@Style">
+    <span class="input-group-text">@Label</span>
+    <input class="form-control"
+           value="@Value"
+           @oninput="OnInput"
+           placeholder="@Placeholder" />
+</div>
+
+@code {
+    [Parameter]
+    public string Label { get; set; } = "Пошук";
+
+    [Parameter]
+    public string? Value { get; set; }
+
+    [Parameter]
+    public EventCallback<string?> ValueChanged { get; set; }
+
+    [Parameter]
+    public string? Placeholder { get; set; }
+
+    [Parameter]
+    public string? Class { get; set; }
+
+    [Parameter]
+    public string? Style { get; set; }
+
+    private string SearchClass => string.IsNullOrWhiteSpace(Class)
+        ? "input-group"
+        : $"input-group {Class}";
+
+    private async Task OnInput(ChangeEventArgs e)
+    {
+        await ValueChanged.InvokeAsync(e.Value?.ToString());
+    }
+}

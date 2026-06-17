@@ -1,14 +1,16 @@
-@* Сторінка адміністрування розкладу *@
+﻿@* Сторінка адміністрування розкладу *@
 @using System.Globalization
 @using System.Linq
 @using System.Collections.Generic
 @using System.Net
 @using System.Text.Json
+@using System.Threading
 @using Microsoft.AspNetCore.Components
 @using Microsoft.AspNetCore.Components.Forms
 @using Microsoft.JSInterop
 @using BlazorWasmDotNet8AspNetCoreHosted.Client.Services
 @using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
+@implements IDisposable
 
 @inject IScheduleApi Api
 @inject IAdminApi Admin
@@ -17,187 +19,7 @@
 @inject NavigationManager Nav
 @inject AdminScheduleLogService LogService
 
-<style>
-    .gap-detail-item {
-        padding: .3rem 0;
-        border-bottom: 1px dashed rgba(10, 120, 65, 0.3);
-    }
-    .gap-detail-item:last-child {
-        border-bottom: none;
-    }
-    .gap-reason {
-        font-weight: 700;
-        color: #064e3b;
-        margin: .15rem 0 0 1rem;
-    }
-    .gap-consequence {
-        font-size: .85rem;
-        color: #0f172a;
-        margin: .1rem 0 0 1.25rem;
-    }
-    .warning-item {
-        padding: .25rem 0;
-        border-bottom: 1px solid rgba(56, 189, 248, 0.3);
-    }
-    .warning-item:last-child {
-        border-bottom: none;
-    }
-    .warning-main {
-        font-weight: 600;
-        color: #0f766e;
-    }
-    .warning-reason {
-        font-size: .85rem;
-        color: #0f172a;
-        margin-left: 1rem;
-        margin-top: .1rem;
-    }
-    .warning-consequence {
-        font-size: .8rem;
-        color: #115e59;
-        margin-left: 1.25rem;
-        margin-top: .05rem;
-    }
-    .contiguous-module-block-warning {
-        border-left: 4px solid #b45309;
-        background: #fffbeb;
-        color: #78350f;
-        border-radius: .35rem;
-        padding: .45rem .65rem;
-    }
-    .gap-summary {
-        border-left: 4px solid #0f766e;
-        background: #ecfdf5;
-        color: #064e3b;
-        border-radius: .35rem;
-        padding: .45rem .65rem;
-    }
-    .gap-summary-list {
-        display: flex;
-        flex-wrap: wrap;
-        gap: .4rem;
-        margin-top: .35rem;
-    }
-    .gap-summary-pill {
-        border: 1px solid rgba(15, 118, 110, .25);
-        border-radius: 999px;
-        background: #fff;
-        padding: .15rem .45rem;
-        font-size: .78rem;
-    }
-    .lesson-editor-overlay {
-        position: fixed;
-        inset: 0;
-        background: rgba(15, 23, 42, 0.45);
-        backdrop-filter: blur(2px);
-        display: flex;
-        align-items: flex-start;
-        justify-content: center;
-        padding: 72px 16px 24px;
-        z-index: 1050;
-    }
-    .lesson-editor {
-        width: min(720px, 100%);
-        border-radius: 12px;
-        box-shadow: 0 24px 50px rgba(15, 23, 42, 0.25);
-    }
-    .lesson-editor-head {
-        display: flex;
-        align-items: flex-start;
-        justify-content: space-between;
-        gap: 12px;
-        margin-bottom: 12px;
-    }
-    .lesson-editor-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-        gap: 12px;
-    }
-    .lesson-editor-label {
-        font-size: .72rem;
-        text-transform: uppercase;
-        letter-spacing: .02em;
-        color: #64748b;
-        margin-bottom: 2px;
-    }
-    .group-room-preferences {
-        border: 1px solid rgba(148, 163, 184, 0.35);
-        border-radius: 14px;
-        background: linear-gradient(180deg, rgba(248, 250, 252, 0.92), rgba(255, 255, 255, 0.98));
-        padding: 1rem;
-    }
-    .group-room-preferences__head {
-        display: flex;
-        justify-content: space-between;
-        align-items: flex-start;
-        gap: .75rem;
-        margin-bottom: .75rem;
-    }
-    .group-room-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-        gap: .75rem;
-    }
-    .group-room-card {
-        border: 1px solid rgba(203, 213, 225, 0.9);
-        border-radius: 12px;
-        background: #fff;
-        padding: .8rem .85rem;
-        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
-    }
-    .group-room-card__head {
-        display: flex;
-        align-items: flex-start;
-        justify-content: space-between;
-        gap: .5rem;
-        margin-bottom: .65rem;
-    }
-    .group-room-card__summary {
-        font-size: .8rem;
-        color: #64748b;
-        line-height: 1.3;
-        margin-top: .1rem;
-    }
-    .group-room-card__body {
-        display: grid;
-        gap: .75rem;
-    }
-    .group-room-roomlist {
-        display: flex;
-        flex-wrap: wrap;
-        gap: .45rem;
-        max-height: 8.75rem;
-        overflow: auto;
-        padding-right: .25rem;
-    }
-    .room-chip {
-        display: inline-flex;
-        align-items: center;
-        gap: .35rem;
-        padding: .33rem .7rem;
-        border: 1px solid #cbd5e1;
-        border-radius: 999px;
-        background: #fff;
-        color: #0f172a;
-        font-size: .86rem;
-        line-height: 1.1;
-        cursor: pointer;
-        user-select: none;
-        transition: all .15s ease;
-    }
-    .room-chip input {
-        margin: 0;
-    }
-    .room-chip--selected {
-        border-color: #2563eb;
-        background: #eff6ff;
-        color: #1d4ed8;
-    }
-    .room-chip--disabled {
-        opacity: .6;
-        cursor: not-allowed;
-    }
-</style>
+
 
 @page "/admin/schedule"
 
@@ -247,46 +69,100 @@ else
                         <input type="date"
                                class="form-control"
                                value="@_generationFromDate.ToString("yyyy-MM-dd")"
-                               @onchange="OnGenerationFromDateChanged" />
+                               @onchange="OnGenerationFromDateChanged"
+                               disabled="@IsAutoGenBusy" />
                     </div>
                     <div style="min-width: 180px;">
                         <label class="form-label small mb-1">До дати</label>
                         <input type="date"
                                class="form-control"
                                value="@_generationToDate.ToString("yyyy-MM-dd")"
-                               @onchange="OnGenerationToDateChanged" />
+                               @onchange="OnGenerationToDateChanged"
+                               disabled="@IsAutoGenBusy" />
                     </div>
                     <select class="form-select flex-grow-1 flex-md-grow-0"
                             style="min-width: 220px;"
                             @bind="_selectedCourseId"
-                            @bind:after="OnSelectedCourseChanged">
+                            @bind:after="OnSelectedCourseChanged"
+                            disabled="@IsAutoGenBusy">
                         <option value="">Оберіть курс</option>
                         @foreach (var course in meta.Courses.OrderBy(c => c.Name))
                         {
                             <option value="@course.Id">@course.Name</option>
                         }
                     </select>
-                    <button class="btn btn-outline-primary" @onclick="AutoGenDrafts" disabled="@(!CanAutoGen)">
+                    <button class="btn btn-outline-primary" @onclick="AutoGenDrafts" disabled="@(!CanAutoGen || IsAutoGenBusy)">
                         Автогенерація (у чернетки)
                     </button>
-                    <button class="btn btn-outline-secondary" @onclick="FillWeekDrafts" disabled="@(!CanAutoGen)">
+                    <button class="btn btn-outline-info" @onclick="CheckAutoGenResources" disabled="@(!CanAutoGen || IsAutoGenBusy)">
+                        Перевірити ресурси
+                    </button>
+                    <button class="btn btn-outline-secondary" @onclick="FillWeekDrafts" disabled="@(!CanAutoGen || IsAutoGenBusy)">
                         Заповнити порожні слоти
                     </button>
-                    <button class="btn btn-outline-danger" @onclick="ClearWeekForCurrent">
+                    <button class="btn btn-outline-danger" @onclick="ClearWeekForCurrent" disabled="@IsAutoGenBusy">
                         Очистити тиждень (чернетки, всі групи)
                     </button>
-                    <button class="btn btn-danger" @onclick="ClearWeekOfficial">
+                    <button class="btn btn-danger" @onclick="ClearWeekOfficial" disabled="@IsAutoGenBusy">
                         Очистити тиждень (розклад, всі групи)
                     </button>
                 </div>
             </div>
+            @if (_autoGenProgress is not null)
+            {
+                var progress = _autoGenProgress;
+                var progressPercent = GetAutoGenProgressPercent(progress);
+                <div class="autogen-progress mt-3" role="status" aria-live="polite" aria-busy="true">
+                    <div class="autogen-progress__head">
+                        <div>
+                            <div class="autogen-progress__title">
+                                <span class="spinner-border spinner-border-sm" aria-hidden="true"></span>
+                                <span>@progress.Title</span>
+                            </div>
+                            <div class="autogen-progress__subtitle">@progress.CurrentMessage</div>
+                        </div>
+                        <div class="autogen-progress__actions">
+                            <div class="autogen-progress__badge">@progressPercent%</div>
+                            <button type="button"
+                                    class="btn btn-sm btn-outline-danger"
+                                    @onclick="CancelAutoGenAsync"
+                                    disabled="@(string.IsNullOrWhiteSpace(progress.JobId) || progress.CancellationRequested)">
+                                @(progress.CancellationRequested ? "Скасовується..." : "Скасувати")
+                            </button>
+                        </div>
+                    </div>
+                    <div class="progress autogen-progress__bar" aria-label="Прогрес автогенерації">
+                        <div class="progress-bar progress-bar-striped progress-bar-animated"
+                             role="progressbar"
+                             style="width: @progressPercent%;"
+                             aria-valuenow="@progressPercent"
+                             aria-valuemin="0"
+                             aria-valuemax="100">
+                        </div>
+                    </div>
+                    <div class="autogen-progress__meta">
+                        <span>Крок @progress.CurrentStepNumber із @progress.TotalSteps</span>
+                        <span>Виконано тижнів: @progress.CompletedSteps/@progress.TotalSteps</span>
+                        <span>Минуло: @FormatDuration(GetAutoGenElapsed(progress))</span>
+                        <span>Залишилось: @GetAutoGenRemainingLabel(progress)</span>
+                    </div>
+                    <div class="autogen-progress__range">
+                        Діапазон: @progress.RangeStartDate.ToString("dd.MM.yyyy") – @progress.RangeEndDate.ToString("dd.MM.yyyy")
+                    </div>
+                    @if (!string.IsNullOrWhiteSpace(progress.LastCompletedMessage))
+                    {
+                        <div class="autogen-progress__last">@progress.LastCompletedMessage</div>
+                    }
+                </div>
+            }
             <div class="mt-3 rounded-3 border bg-white p-3">
                 <div class="d-flex flex-column flex-lg-row align-items-start justify-content-between gap-3">
                     <label class="form-check form-switch mb-0">
                         <input class="form-check-input"
                                type="checkbox"
                                @bind="_useRecommendedAutoGenProfile"
-                               @bind:after="PersistAutoGenConfigAsync" />
+                               @bind:after="PersistAutoGenConfigAsync"
+                               disabled="@IsAutoGenBusy" />
                         <span class="form-check-label fw-semibold">Використовувати рекомендований профіль автогенерації</span>
                     </label>
                     <div class="small text-muted">
@@ -297,7 +173,8 @@ else
                                 Для автогенерації застосовується override ліміту "бажано першим" = @RecommendedPreferredFirstMaxSlotOrderOverride.
                                 Для дозаповнення використовується вікно близьких повторів @RecommendedSoftFillRepeatWindowDays день,
                                 ліміт паралельних груп @RecommendedSoftFillMaxParallelGroupsPerModuleInSlot
-                                та межа різних модулів @RecommendedSoftFillPreferredMaxDistinctModulesPerDay/@RecommendedSoftFillMaxDistinctModulesPerDay.
+                                межа різних модулів @RecommendedSoftFillPreferredMaxDistinctModulesPerDay/@RecommendedSoftFillMaxDistinctModulesPerDay
+                                і нульові м'які штрафи за навантаження викладача та зміну корпусу.
                             </span>
                         }
                         else
@@ -313,7 +190,8 @@ else
                         <input class="form-check-input"
                                type="checkbox"
                                @bind="_allowIncompleteDrafts"
-                               @bind:after="PersistAutoGenConfigAsync" />
+                               @bind:after="PersistAutoGenConfigAsync"
+                               disabled="@IsAutoGenBusy" />
                         <span class="form-check-label fw-semibold">Створювати неповні чернетки, якщо не знайдено викладача або аудиторію</span>
                     </label>
                     <div class="small text-muted mt-2">
@@ -328,10 +206,10 @@ else
                     <div class="d-flex flex-column flex-md-row align-items-start align-items-md-center justify-content-between gap-2 mb-2">
                         <div class="fw-semibold">Групи для автогенерації</div>
                         <div class="btn-group btn-group-sm" role="group" aria-label="Вибір груп курсу">
-                            <button type="button" class="btn btn-outline-secondary" @onclick="SelectAllCourseGroupsAsync">
+                            <button type="button" class="btn btn-outline-secondary" @onclick="SelectAllCourseGroupsAsync" disabled="@IsAutoGenBusy">
                                 Усі
                             </button>
-                            <button type="button" class="btn btn-outline-secondary" @onclick="ClearCourseGroupsSelectionAsync">
+                            <button type="button" class="btn btn-outline-secondary" @onclick="ClearCourseGroupsSelectionAsync" disabled="@IsAutoGenBusy">
                                 Жодної
                             </button>
                         </div>
@@ -343,7 +221,8 @@ else
                                 <input class="form-check-input m-0"
                                        type="checkbox"
                                        @bind="row.Selected"
-                                       @bind:after="PersistAutoGenConfigAsync" />
+                                       @bind:after="PersistAutoGenConfigAsync"
+                                       disabled="@IsAutoGenBusy" />
                                 <span class="form-check-label">@row.Caption</span>
                             </label>
                         }
@@ -390,7 +269,7 @@ else
                                             </div>
                                             <button type="button"
                                                     class="btn btn-sm btn-link text-decoration-none p-0"
-                                                    disabled="@(!row.HasRoomPreferences)"
+                                                    disabled="@(!row.HasRoomPreferences || IsAutoGenBusy)"
                                                     @onclick="() => ClearGroupRoomPreferenceAsync(row)">
                                                 Скинути
                                             </button>
@@ -400,7 +279,8 @@ else
                                                 <label class="form-label form-label-sm mb-1">Корпус</label>
                                                 <select class="form-select form-select-sm"
                                                         value="@(row.PreferredBuildingId?.ToString() ?? string.Empty)"
-                                                        @onchange="e => OnGroupBuildingChangedAsync(row, e)">
+                                                        @onchange="e => OnGroupBuildingChangedAsync(row, e)"
+                                                        disabled="@IsAutoGenBusy">
                                                     <option value="">Автоматично</option>
                                                     @foreach (var building in GetOrderedBuildings())
                                                     {
@@ -424,7 +304,8 @@ else
                                                                 <label class="room-chip @(isSelected ? "room-chip--selected" : null)">
                                                                     <input type="checkbox"
                                                                            checked="@isSelected"
-                                                                           @onchange="e => OnGroupRoomToggleAsync(row, roomId, e)" />
+                                                                           @onchange="e => OnGroupRoomToggleAsync(row, roomId, e)"
+                                                                           disabled="@IsAutoGenBusy" />
                                                                     <span>@room.Name</span>
                                                                 </label>
                                                             }
@@ -476,7 +357,8 @@ else
                                             <input class="form-check-input"
                                                    type="checkbox"
                                                    @bind="row.Selected"
-                                                   @bind:after="PersistAutoGenConfigAsync" />
+                                                   @bind:after="PersistAutoGenConfigAsync"
+                                                   disabled="@IsAutoGenBusy" />
                                         </td>
                                         <td>@row.Caption</td>
                                         <td class="text-center">
@@ -486,7 +368,7 @@ else
                                                    step="1"
                                                    @bind="row.Hours"
                                                    @bind:after="PersistAutoGenConfigAsync"
-                                                   disabled="@(!row.Selected)" />
+                                                   disabled="@(!row.Selected || IsAutoGenBusy)" />
                                         </td>
                                     </tr>
                                 }
@@ -525,7 +407,58 @@ else
                     @{
                         var warningsTotal = okWarnings.Count;
                         var gapSummary = _latestGapSummary;
+                        var preflightItems = _latestPreflight;
+                        var report = _latestAutoGenReport;
                         var contiguousModuleBlockWarnings = CountContiguousModuleBlockWarnings();
+                    }
+                    @if (report is not null)
+                    {
+                        <div class="autogen-report small">
+                            <div class="fw-semibold">Звіт автогенерації</div>
+                            <div class="autogen-report-grid">
+                                <span>Тижнів: @report.TotalWeeks</span>
+                                <span>Створено: @report.Created</span>
+                                <span>Пропущено: @report.Skipped</span>
+                                <span>Порожніх слотів: @report.GapCount</span>
+                                <span>Дефіцитів ресурсів: @report.DeficitCount</span>
+                            </div>
+                            @if (report.Recommendations.Count > 0)
+                            {
+                                <div class="autogen-report-section">
+                                    <div class="fw-semibold">Що зробити</div>
+                                    <ul class="mb-0">
+                                        @foreach (var recommendation in report.Recommendations)
+                                        {
+                                            <li>@recommendation</li>
+                                        }
+                                    </ul>
+                                </div>
+                            }
+                            @if (report.WorstGroups.Count > 0)
+                            {
+                                <div class="autogen-report-section">
+                                    <div class="fw-semibold">Найпроблемніші групи</div>
+                                    <div class="autogen-report-pills">
+                                        @foreach (var group in report.WorstGroups)
+                                        {
+                                            <span class="autogen-report-pill">@group.GroupName: @group.GapCount</span>
+                                        }
+                                    </div>
+                                </div>
+                            }
+                            @if (report.WorstModules.Count > 0)
+                            {
+                                <div class="autogen-report-section">
+                                    <div class="fw-semibold">Найпроблемніші модулі</div>
+                                    <div class="autogen-report-pills">
+                                        @foreach (var module in report.WorstModules)
+                                        {
+                                            <span class="autogen-report-pill">@module.ModuleName: @module.GapCount</span>
+                                        }
+                                    </div>
+                                </div>
+                            }
+                        </div>
                     }
                     @if (warningsTotal > 0)
                     {
@@ -535,6 +468,18 @@ else
                                 <div class="fw-semibold">Причини незаповнених слотів</div>
                                 <div class="gap-summary-list">
                                     @foreach (var item in gapSummary)
+                                    {
+                                        <span class="gap-summary-pill">@item.Title: @item.Count</span>
+                                    }
+                                </div>
+                            </div>
+                        }
+                        @if (preflightItems.Count > 0)
+                        {
+                            <div class="gap-summary small">
+                                <div class="fw-semibold">Попередня перевірка ресурсів</div>
+                                <div class="gap-summary-list">
+                                    @foreach (var item in preflightItems)
                                     {
                                         <span class="gap-summary-pill">@item.Title: @item.Count</span>
                                     }
@@ -635,27 +580,21 @@ else
             <div class="small text-muted">
                 Показано @rows.Count із @tableItems.Count записів.
             </div>
-            <div class="input-group" style="max-width:360px;">
-                <span class="input-group-text">Пошук</span>
-                <input class="form-control"
-                       placeholder="Id, група, модуль, викладач, аудиторія..."
-                       @bind="_search"
-                       @bind:event="oninput" />
-            </div>
+            <AdminSearchBox @bind-Value="_search" Style="max-width:360px;" Placeholder="Id, група, модуль, викладач, аудиторія..." />
         </div>
         <div class="table-responsive mt-3">
             <table class="table table-sm align-middle">
                 <thead>
                     <tr>
-                        <th class="sortable-th" role="button" @onclick="() => ToggleSort(SortById)">Id @HeaderIcon(SortById)</th>
-                        <th class="sortable-th" role="button" @onclick="() => ToggleSort(SortByDate)">Дата @HeaderIcon(SortByDate)</th>
-                        <th class="sortable-th" role="button" @onclick="() => ToggleSort(SortByTime)">Час @HeaderIcon(SortByTime)</th>
-                        <th class="sortable-th" role="button" @onclick="() => ToggleSort(SortByGroup)">Група @HeaderIcon(SortByGroup)</th>
-                        <th class="sortable-th" role="button" @onclick="() => ToggleSort(SortByModule)">Модуль @HeaderIcon(SortByModule)</th>
-                        <th class="sortable-th" role="button" @onclick="() => ToggleSort(SortByTeacher)">Викладач @HeaderIcon(SortByTeacher)</th>
-                        <th class="sortable-th" role="button" @onclick="() => ToggleSort(SortByRoom)">Аудиторія @HeaderIcon(SortByRoom)</th>
-                        <th class="sortable-th" role="button" @onclick="() => ToggleSort(SortByLessonType)">Тип @HeaderIcon(SortByLessonType)</th>
-                        <th class="sortable-th" role="button" @onclick="() => ToggleSort(SortByStatus)">Статус @HeaderIcon(SortByStatus)</th>
+                        <SortableHeader Field="@SortById" ActiveField="@_sortField" SortAscending="@_sortAsc" OnSort="@ToggleSort">Id</SortableHeader>
+                        <SortableHeader Field="@SortByDate" ActiveField="@_sortField" SortAscending="@_sortAsc" OnSort="@ToggleSort">Дата</SortableHeader>
+                        <SortableHeader Field="@SortByTime" ActiveField="@_sortField" SortAscending="@_sortAsc" OnSort="@ToggleSort">Час</SortableHeader>
+                        <SortableHeader Field="@SortByGroup" ActiveField="@_sortField" SortAscending="@_sortAsc" OnSort="@ToggleSort">Група</SortableHeader>
+                        <SortableHeader Field="@SortByModule" ActiveField="@_sortField" SortAscending="@_sortAsc" OnSort="@ToggleSort">Модуль</SortableHeader>
+                        <SortableHeader Field="@SortByTeacher" ActiveField="@_sortField" SortAscending="@_sortAsc" OnSort="@ToggleSort">Викладач</SortableHeader>
+                        <SortableHeader Field="@SortByRoom" ActiveField="@_sortField" SortAscending="@_sortAsc" OnSort="@ToggleSort">Аудиторія</SortableHeader>
+                        <SortableHeader Field="@SortByLessonType" ActiveField="@_sortField" SortAscending="@_sortAsc" OnSort="@ToggleSort">Тип</SortableHeader>
+                        <SortableHeader Field="@SortByStatus" ActiveField="@_sortField" SortAscending="@_sortAsc" OnSort="@ToggleSort">Статус</SortableHeader>
                         <th class="text-end">Дії</th>
                     </tr>
                 </thead>
@@ -828,6 +767,12 @@ else
     private bool okWarningsExpanded;
     private List<AutoGenGapDetail> _latestGapDetails = new();
     private List<AutoGenGapSummaryItem> _latestGapSummary = new();
+    private List<AutoGenPreflightItem> _latestPreflight = new();
+    private AutoGenRunReport? _latestAutoGenReport;
+    private AutoGenProgressState? _autoGenProgress;
+    private CancellationTokenSource? _autoGenProgressTimerCts;
+    private string? _currentAutoGenJobId;
+    private bool _autoGenCancelRequested;
     private const string AutoGenStatusStorageKey = "adminSchedule.autoGenStatus.v1";
     private const string AutoGenStatusLocalStorageKey = "adminSchedule.autoGenStatus.local.v1";
     private const string AutoGenConfigStorageKey = "adminSchedule.autoGenConfig.v1";
@@ -839,19 +784,23 @@ else
     private const string LogActionClearSchedule = "clear-schedule-week";
     private const string LogActionDelete = "delete-item";
     private const string ContiguousModuleBlockReasonMarker = "суцільним блоком без повернення після перемикання на інший модуль";
-    private const string RecommendedAutoGenProfileName = "soft-repeat-0-par4-distinct5-pref035";
+    private const string RecommendedAutoGenProfileName = "soft-repeat-0-par5-distinct5-pref035-teacher0-build0";
     private const int RecommendedPreferredFirstMaxSlotOrderOverride = 6;
     private const int RecommendedSoftFillRepeatWindowDays = 0;
-    private const int RecommendedSoftFillMaxParallelGroupsPerModuleInSlot = 4;
+    private const int RecommendedSoftFillMaxParallelGroupsPerModuleInSlot = 5;
     private const int RecommendedSoftFillPreferredMaxDistinctModulesPerDay = 5;
     private const int RecommendedSoftFillMaxDistinctModulesPerDay = 6;
     private const double RecommendedSoftFillPreferredFirstPenaltyMultiplier = 0.35;
+    private const double RecommendedSoftFillTeacherLoadPenaltyWeight = 0.0;
+    private const double RecommendedSoftFillBuildingDistancePenaltyWeight = 0.0;
     private static readonly AutoGenSoftOptionsDto RecommendedSoftFillOptions = new(
         MaxParallelGroupsPerModuleInSlot: RecommendedSoftFillMaxParallelGroupsPerModuleInSlot,
         RecentRepeatWindowDays: RecommendedSoftFillRepeatWindowDays,
         PreferredMaxDistinctModulesPerDay: RecommendedSoftFillPreferredMaxDistinctModulesPerDay,
         MaxDistinctModulesPerDay: RecommendedSoftFillMaxDistinctModulesPerDay,
-        PreferredFirstPenaltyMultiplier: RecommendedSoftFillPreferredFirstPenaltyMultiplier
+        PreferredFirstPenaltyMultiplier: RecommendedSoftFillPreferredFirstPenaltyMultiplier,
+        TeacherLoadPenaltyWeight: RecommendedSoftFillTeacherLoadPenaltyWeight,
+        BuildingDistancePenaltyWeight: RecommendedSoftFillBuildingDistancePenaltyWeight
     );
     private static readonly JsonSerializerOptions AutoGenStatusJsonOptions = new()
     {
@@ -924,6 +873,7 @@ else
         => _selectedCourseId is int
            && _moduleWeekRows.Any(row => row.Selected && row.Hours > 0)
            && _courseGroupRows.Any(row => row.Selected);
+    private bool IsAutoGenBusy => _autoGenProgress is not null;
     // Реагує на зміну обраного курсу для автогенерації.
     private async Task OnSelectedCourseChanged()
     {
@@ -1154,10 +1104,310 @@ else
         okWarningsExpanded = false;
         _latestGapDetails = new();
         _latestGapSummary = new();
+        _latestPreflight = new();
+        _latestAutoGenReport = null;
         if (clearPersisted)
         {
             await RemovePersistedAutoGenStatusAsync();
         }
+    }
+    // Запускає візуальний прогрес для довгих операцій автогенерації.
+    private async Task StartAutoGenProgressAsync(string title, AutoGenProgressKind kind)
+    {
+        StopAutoGenProgress();
+        _autoGenCancelRequested = false;
+        var (fromDate, toDate) = GetNormalizedGenerationDateRange();
+        _autoGenProgress = new AutoGenProgressState
+        {
+            Title = title,
+            Kind = kind,
+            RangeStartDate = fromDate,
+            RangeEndDate = toDate,
+            TotalSteps = Math.Max(1, BuildGenerationWeekStarts().Count),
+            StartedAt = DateTimeOffset.Now,
+            CurrentStepStartedAt = DateTimeOffset.Now,
+            LastUpdatedAt = DateTimeOffset.Now,
+            CurrentMessage = "Підготовка запиту..."
+        };
+        _autoGenProgressTimerCts = new CancellationTokenSource();
+        _ = RunAutoGenProgressTimerAsync(_autoGenProgressTimerCts.Token);
+        await InvokeAsync(StateHasChanged);
+    }
+    // Оновлює таймер прогресу, щоб інтерфейс не виглядав завислим під час одного довгого HTTP-запиту.
+    private async Task RunAutoGenProgressTimerAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+            while (await timer.WaitForNextTickAsync(cancellationToken))
+            {
+                if (_autoGenProgress is null)
+                {
+                    return;
+                }
+                _autoGenProgress.LastUpdatedAt = DateTimeOffset.Now;
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+    }
+    // Зупиняє прогрес і звільняє таймер.
+    private void StopAutoGenProgress()
+    {
+        _autoGenProgressTimerCts?.Cancel();
+        _autoGenProgressTimerCts?.Dispose();
+        _autoGenProgressTimerCts = null;
+        _autoGenProgress = null;
+        _currentAutoGenJobId = null;
+        _autoGenCancelRequested = false;
+    }
+    // Надсилає запит на скасування поточної серверної задачі автогенерації.
+    private async Task CancelAutoGenAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_currentAutoGenJobId))
+        {
+            return;
+        }
+        _autoGenCancelRequested = true;
+        if (_autoGenProgress is not null)
+        {
+            _autoGenProgress.CancellationRequested = true;
+            _autoGenProgress.CurrentMessage = "Скасування запитано, очікуємо безпечного завершення...";
+            _autoGenProgress.LastUpdatedAt = DateTimeOffset.Now;
+        }
+        await InvokeAsync(StateHasChanged);
+        try
+        {
+            var status = await Drafts.CancelAutogenJob(_currentAutoGenJobId);
+            ApplyAutoGenJobStatus(status);
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (Exception ex)
+        {
+            error = $"Не вдалося скасувати автогенерацію: {ex.Message}";
+        }
+    }
+    // Переносить серверний стан задачі автогенерації у локальну модель прогресу.
+    private void ApplyAutoGenJobStatus(AutoGenJobStatus status)
+    {
+        var now = DateTimeOffset.Now;
+        var totalWeeks = Math.Max(1, status.TotalWeeks);
+        var currentStepNumber = status.CurrentWeekNumber > 0
+            ? status.CurrentWeekNumber
+            : Math.Min(totalWeeks, Math.Max(1, status.CompletedWeeks + 1));
+        if (_autoGenProgress is null || _autoGenProgress.JobId != status.JobId)
+        {
+            _autoGenProgress = new AutoGenProgressState
+            {
+                JobId = status.JobId,
+                Title = status.Title,
+                Kind = MapProgressKind(status.Kind),
+                RangeStartDate = status.RangeStartDate,
+                RangeEndDate = status.RangeEndDate,
+                TotalSteps = totalWeeks,
+                StartedAt = (status.StartedAt ?? status.CreatedAt).ToLocalTime(),
+                CurrentStepStartedAt = now,
+                LastUpdatedAt = now
+            };
+        }
+        var currentWeekChanged = status.CurrentWeekStartDate is not null
+            && _autoGenProgress.CurrentWeekStartDate != status.CurrentWeekStartDate;
+        if (currentWeekChanged)
+        {
+            _autoGenProgress.CurrentStepStartedAt = now;
+        }
+        _currentAutoGenJobId = status.JobId;
+        _autoGenProgress.JobId = status.JobId;
+        _autoGenProgress.State = status.State;
+        _autoGenProgress.Title = status.Title;
+        _autoGenProgress.Kind = MapProgressKind(status.Kind);
+        _autoGenProgress.RangeStartDate = status.RangeStartDate;
+        _autoGenProgress.RangeEndDate = status.RangeEndDate;
+        _autoGenProgress.TotalSteps = totalWeeks;
+        _autoGenProgress.CompletedSteps = Math.Clamp(status.CompletedWeeks, 0, totalWeeks);
+        _autoGenProgress.CurrentStepNumber = currentStepNumber;
+        _autoGenProgress.CurrentWeekStartDate = status.CurrentWeekStartDate;
+        _autoGenProgress.CurrentRangeStartDate = status.CurrentRangeStartDate;
+        _autoGenProgress.CurrentRangeEndDate = status.CurrentRangeEndDate;
+        _autoGenProgress.LastUpdatedAt = now;
+        _autoGenProgress.CurrentMessage = status.CurrentStage;
+        _autoGenProgress.LastCompletedMessage = status.LastCompletedMessage;
+        _autoGenProgress.Created = status.Created;
+        _autoGenProgress.Skipped = status.Skipped;
+        _autoGenProgress.WarningCount = status.WarningCount;
+        _autoGenProgress.GapCount = status.GapCount;
+        _autoGenProgress.DeficitCount = status.DeficitCount;
+        _autoGenProgress.Percent = Math.Clamp(status.Percent, 0, 100);
+        _autoGenProgress.CancellationRequested = status.CancellationRequested || _autoGenCancelRequested;
+        if (status.Report is not null)
+        {
+            _latestAutoGenReport = status.Report;
+        }
+    }
+    private static bool IsAutoGenJobTerminal(AutoGenJobState state)
+        => state is AutoGenJobState.Succeeded or AutoGenJobState.Failed or AutoGenJobState.Canceled;
+    private static AutoGenProgressKind MapProgressKind(AutoGenJobKind kind)
+        => kind switch
+        {
+            AutoGenJobKind.Preflight => AutoGenProgressKind.Preflight,
+            AutoGenJobKind.Fill => AutoGenProgressKind.Fill,
+            _ => AutoGenProgressKind.Generate
+        };
+    private static AutoGenJobKind BuildAutoGenJobKind(bool softFill, bool preflightOnly)
+        => preflightOnly ? AutoGenJobKind.Preflight : softFill ? AutoGenJobKind.Fill : AutoGenJobKind.Generate;
+    // Позначає початок обробки конкретного тижня.
+    private async Task UpdateAutoGenProgressBeforeWeekAsync(
+        int weekIndex,
+        DateOnly weekStart,
+        DateOnly rangeStartDate,
+        DateOnly rangeEndDate)
+    {
+        if (_autoGenProgress is null)
+        {
+            return;
+        }
+        _autoGenProgress.CurrentStepNumber = weekIndex + 1;
+        _autoGenProgress.CurrentWeekStartDate = weekStart;
+        _autoGenProgress.CurrentRangeStartDate = rangeStartDate;
+        _autoGenProgress.CurrentRangeEndDate = rangeEndDate;
+        _autoGenProgress.CurrentStepStartedAt = DateTimeOffset.Now;
+        _autoGenProgress.LastUpdatedAt = DateTimeOffset.Now;
+        _autoGenProgress.CurrentMessage = $"{GetAutoGenProgressVerb(_autoGenProgress.Kind)} {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}";
+        await InvokeAsync(StateHasChanged);
+    }
+    // Оновлює підсумок після відповіді сервера за тиждень.
+    private async Task UpdateAutoGenProgressAfterWeekAsync(int weekIndex, DateOnly rangeStartDate, DateOnly rangeEndDate, AutoGenResult result)
+    {
+        if (_autoGenProgress is null)
+        {
+            return;
+        }
+        _autoGenProgress.CompletedSteps = Math.Max(_autoGenProgress.CompletedSteps, weekIndex + 1);
+        _autoGenProgress.Created += result.Created;
+        _autoGenProgress.Skipped += result.Skipped;
+        _autoGenProgress.WarningCount += result.Warnings.Count;
+        _autoGenProgress.GapCount += result.GapDetails?.Count ?? 0;
+        _autoGenProgress.DeficitCount += result.Preflight?.Sum(item => item.Count) ?? 0;
+        _autoGenProgress.LastUpdatedAt = DateTimeOffset.Now;
+        _autoGenProgress.LastCompletedMessage = BuildAutoGenProgressCompletedMessage(rangeStartDate, rangeEndDate, result);
+        _autoGenProgress.CurrentMessage = _autoGenProgress.CompletedSteps >= _autoGenProgress.TotalSteps
+            ? "Завершення операції..."
+            : "Підготовка наступного тижня...";
+        await InvokeAsync(StateHasChanged);
+    }
+    // Показує фінальний технічний крок після генерації.
+    private async Task UpdateAutoGenProgressMessageAsync(string message)
+    {
+        if (_autoGenProgress is null)
+        {
+            return;
+        }
+        _autoGenProgress.CurrentMessage = message;
+        _autoGenProgress.LastUpdatedAt = DateTimeOffset.Now;
+        await InvokeAsync(StateHasChanged);
+    }
+    private static string GetAutoGenProgressVerb(AutoGenProgressKind kind)
+        => kind switch
+        {
+            AutoGenProgressKind.Preflight => "Перевіряємо ресурси",
+            AutoGenProgressKind.Fill => "Заповнюємо порожні слоти",
+            _ => "Генеруємо чернетки"
+        };
+    private static string BuildAutoGenProgressCompletedMessage(DateOnly rangeStartDate, DateOnly rangeEndDate, AutoGenResult result)
+    {
+        var parts = new List<string>
+        {
+            $"Готово {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}",
+            $"створено {result.Created}",
+            $"пропущено {result.Skipped}"
+        };
+        var gapCount = result.GapDetails?.Count ?? 0;
+        var deficitCount = result.Preflight?.Sum(item => item.Count) ?? 0;
+        if (gapCount > 0)
+        {
+            parts.Add($"порожніх слотів {gapCount}");
+        }
+        if (deficitCount > 0)
+        {
+            parts.Add($"дефіцитів {deficitCount}");
+        }
+        return string.Join(", ", parts) + ".";
+    }
+    private static TimeSpan GetAutoGenElapsed(AutoGenProgressState progress)
+        => progress.LastUpdatedAt - progress.StartedAt;
+    private static int GetAutoGenProgressPercent(AutoGenProgressState progress)
+        => progress.Percent >= 0
+            ? Math.Clamp(progress.Percent, 0, 100)
+            : (int)Math.Round(GetAutoGenProgressRatio(progress) * 100, MidpointRounding.AwayFromZero);
+    private static double GetAutoGenProgressRatio(AutoGenProgressState progress)
+    {
+        if (progress.Percent >= 0)
+        {
+            return Math.Clamp(progress.Percent / 100d, 0d, 1d);
+        }
+        var totalSteps = Math.Max(1, progress.TotalSteps);
+        var completedSteps = Math.Clamp(progress.CompletedSteps, 0, totalSteps);
+        if (completedSteps >= totalSteps)
+        {
+            return 1.0;
+        }
+        var stepSeconds = Math.Max(1, GetAutoGenExpectedStepSeconds(progress.Kind));
+        var stepElapsed = Math.Max(0, (progress.LastUpdatedAt - progress.CurrentStepStartedAt).TotalSeconds);
+        var currentStepEstimate = Math.Clamp(stepElapsed / stepSeconds, 0.05, 0.88);
+        return Math.Clamp((completedSteps + currentStepEstimate) / totalSteps, 0.01, 0.99);
+    }
+    private static double GetAutoGenExpectedStepSeconds(AutoGenProgressKind kind)
+        => kind switch
+        {
+            AutoGenProgressKind.Preflight => 6,
+            AutoGenProgressKind.Fill => 24,
+            _ => 28
+        };
+    private static string GetAutoGenRemainingLabel(AutoGenProgressState progress)
+    {
+        var elapsed = GetAutoGenElapsed(progress);
+        if (elapsed < TimeSpan.FromSeconds(1))
+        {
+            return "рахуємо...";
+        }
+        var ratio = GetAutoGenProgressRatio(progress);
+        if (ratio >= 1)
+        {
+            return "0 с";
+        }
+        if (ratio <= 0.01)
+        {
+            return "рахуємо...";
+        }
+        var estimatedTotalSeconds = elapsed.TotalSeconds / ratio;
+        var remaining = TimeSpan.FromSeconds(Math.Max(0, estimatedTotalSeconds - elapsed.TotalSeconds));
+        return $"приблизно {FormatDuration(remaining)}";
+    }
+    private static string FormatDuration(TimeSpan duration)
+    {
+        if (duration < TimeSpan.Zero)
+        {
+            duration = TimeSpan.Zero;
+        }
+        var totalSeconds = Math.Max(0, (int)Math.Round(duration.TotalSeconds, MidpointRounding.AwayFromZero));
+        if (totalSeconds < 60)
+        {
+            return $"{Math.Max(1, totalSeconds)} с";
+        }
+        var totalMinutes = totalSeconds / 60;
+        var seconds = totalSeconds % 60;
+        if (totalMinutes < 60)
+        {
+            return seconds > 0 ? $"{totalMinutes} хв {seconds} с" : $"{totalMinutes} хв";
+        }
+        var hours = totalMinutes / 60;
+        var minutes = totalMinutes % 60;
+        return minutes > 0 ? $"{hours} год {minutes} хв" : $"{hours} год";
     }
     // Встановлює повідомлення успіху та опційні попередження.
     private async Task SetOkMessageAsync(
@@ -1165,11 +1415,15 @@ else
         IEnumerable<string>? warnings = null,
         IEnumerable<AutoGenGapDetail>? gapDetails = null,
         IEnumerable<AutoGenGapSummaryItem>? gapSummary = null,
+        IEnumerable<AutoGenPreflightItem>? preflight = null,
+        AutoGenRunReport? report = null,
         bool persist = true)
     {
         ok = message;
         _latestGapDetails = gapDetails?.ToList() ?? new List<AutoGenGapDetail>();
         _latestGapSummary = gapSummary?.ToList() ?? BuildGapReasonSummary(_latestGapDetails);
+        _latestPreflight = MergePreflight(preflight);
+        _latestAutoGenReport = report;
         okWarnings = BuildSlotGapWarnings(warnings, _latestGapDetails);
         okWarningsExpanded = false;
         if (persist)
@@ -1221,7 +1475,7 @@ else
                 continue;
             }
             var normalized = warning.Trim();
-            if (!IsSlotGapWarning(normalized))
+            if (!IsVisibleAutoGenWarning(normalized))
             {
                 continue;
             }
@@ -1247,6 +1501,33 @@ else
                 group.Key.Title,
                 group.Count(),
                 group.Take(5).Select(BuildGapSummaryExample).ToList()))
+            .ToList();
+    }
+    private static List<AutoGenPreflightItem> MergePreflight(IEnumerable<AutoGenPreflightItem>? preflight)
+    {
+        if (preflight is null)
+        {
+            return new();
+        }
+
+        return preflight
+            .GroupBy(item => item.Code, StringComparer.Ordinal)
+            .Select(group =>
+            {
+                var first = group.First();
+                return new AutoGenPreflightItem(
+                    first.Code,
+                    first.Title,
+                    group.Sum(item => item.Count),
+                    first.Recommendation,
+                    group.SelectMany(item => item.Examples)
+                        .Where(example => !string.IsNullOrWhiteSpace(example))
+                        .Distinct(StringComparer.Ordinal)
+                        .Take(5)
+                        .ToList());
+            })
+            .OrderByDescending(item => item.Count)
+            .ThenBy(item => item.Title, StringComparer.Ordinal)
             .ToList();
     }
     private static string BuildGapSummaryExample(AutoGenGapDetail gap)
@@ -1311,6 +1592,12 @@ else
     }
     private static bool IsSlotGapWarning(string warning)
         => warning.Contains("не заповнила слот", StringComparison.OrdinalIgnoreCase);
+    private static bool IsAutoGenRepairSuggestion(string warning)
+        => warning.StartsWith("Рекомендація автогенерації:", StringComparison.OrdinalIgnoreCase);
+    private static bool IsAutoGenPreflightWarning(string warning)
+        => warning.StartsWith("Попередня перевірка ресурсів", StringComparison.OrdinalIgnoreCase);
+    private static bool IsVisibleAutoGenWarning(string warning)
+        => IsSlotGapWarning(warning) || IsAutoGenRepairSuggestion(warning) || IsAutoGenPreflightWarning(warning);
     // Рахує випадки, коли слот не заповнено через правило суцільного блоку модуля.
     private int CountContiguousModuleBlockWarnings()
     {
@@ -1427,7 +1714,9 @@ else
             Message: ok,
             Warnings: new List<string>(okWarnings),
             GapDetails: new List<AutoGenGapDetail>(_latestGapDetails),
-            GapSummary: new List<AutoGenGapSummaryItem>(_latestGapSummary)
+            GapSummary: new List<AutoGenGapSummaryItem>(_latestGapSummary),
+            Preflight: new List<AutoGenPreflightItem>(_latestPreflight),
+            Report: _latestAutoGenReport
         );
     }
     // Відновлює останній статус автогенерації з storage.
@@ -1436,7 +1725,7 @@ else
         var statuses = await LoadPersistedAutoGenStatusesAsync();
         if (!statuses.TryGetValue(CurrentWeekKey, out var payload))
             return;
-        await SetOkMessageAsync(payload.Message, payload.Warnings, payload.GapDetails, payload.GapSummary, persist: false);
+        await SetOkMessageAsync(payload.Message, payload.Warnings, payload.GapDetails, payload.GapSummary, payload.Preflight, payload.Report, persist: false);
     }
     // Зберігає налаштування автогенерації для тижня.
     private async Task PersistAutoGenConfigAsync()
@@ -1709,13 +1998,14 @@ else
     // За явного перемикача підміняємо збережений у БД ліміт "бажано першим" параметром рекомендованого профілю.
     private int? BuildRecommendedPreferredFirstLimitOverride()
         => _useRecommendedAutoGenProfile ? RecommendedPreferredFirstMaxSlotOrderOverride : null;
-    private async Task<(AutoGenResult Result, DateOnly RangeStartDate, DateOnly RangeEndDate, int WeekCount)> RunAutoGenForRangeAsync(
+    private async Task<(AutoGenResult Result, DateOnly RangeStartDate, DateOnly RangeEndDate, int WeekCount, AutoGenJobStatus FinalStatus)> RunAutoGenForRangeAsync(
         int courseId,
         IReadOnlyList<int> groupIds,
         IReadOnlyList<GroupRoomPreferenceDto> groupRoomPreferences,
         Dictionary<int, int> moduleHours,
         bool clearExisting,
-        bool softFill)
+        bool softFill,
+        bool preflightOnly = false)
     {
         var (fromDate, toDate) = GetNormalizedGenerationDateRange();
         var weekStarts = BuildGenerationWeekStarts();
@@ -1723,49 +2013,54 @@ else
             .Where(groupId => groupId > 0)
             .Distinct()
             .ToList();
-        var warnings = new List<string>();
-        var gapDetails = new List<AutoGenGapDetail>();
-        int created = 0;
-        int skipped = 0;
-        foreach (var weekStart in weekStarts)
+        var request = new AutoGenJobRequest(
+            Kind: BuildAutoGenJobKind(softFill, preflightOnly),
+            FromDate: fromDate,
+            ToDate: toDate,
+            CourseId: courseId,
+            GroupIds: normalizedGroupIds,
+            ModuleHours: moduleHours,
+            Days: _daysPreset,
+            ClearExisting: clearExisting,
+            SoftFill: softFill,
+            PreflightOnly: preflightOnly,
+            AllowIncompleteDrafts: _allowIncompleteDrafts,
+            GroupRoomPreferences: groupRoomPreferences.Count > 0 ? groupRoomPreferences.ToList() : null,
+            SoftOptions: BuildRecommendedSoftOptions(softFill),
+            PreferredFirstMaxSlotOrderOverride: BuildRecommendedPreferredFirstLimitOverride(),
+            Title: preflightOnly
+                ? "Перевірка ресурсів"
+                : softFill
+                    ? "Заповнення порожніх слотів"
+                    : "Автогенерація у чернетки"
+        );
+        var started = await Drafts.StartAutogenJob(request);
+        var status = started.Status;
+        ApplyAutoGenJobStatus(status);
+        await InvokeAsync(StateHasChanged);
+        while (!IsAutoGenJobTerminal(status.State))
         {
-            var weekEnd = weekStart.AddDays(6);
-            var rangeStartDate = fromDate > weekStart ? fromDate : weekStart;
-            var rangeEndDate = toDate < weekEnd ? toDate : weekEnd;
-            if (rangeEndDate < rangeStartDate)
-            {
-                continue;
-            }
-            var res = await Drafts.AutogenWeek(new AutoGenRequest(
-                WeekStart: weekStart,
-                ClearExisting: clearExisting,
-                CourseId: courseId,
-                GroupId: null,
-                GroupIds: normalizedGroupIds,
-                AllowOnDaysOff: false,
-                Days: _daysPreset,
-                ModuleHours: moduleHours,
-                SoftFill: softFill,
-                AllowIncompleteDrafts: _allowIncompleteDrafts,
-                RangeStartDate: rangeStartDate,
-                RangeEndDate: rangeEndDate,
-                GroupRoomPreferences: groupRoomPreferences.Count > 0 ? groupRoomPreferences.ToList() : null,
-                SoftOptions: BuildRecommendedSoftOptions(softFill),
-                PreferredFirstMaxSlotOrderOverride: BuildRecommendedPreferredFirstLimitOverride()
-            ));
-            created += res.Created;
-            skipped += res.Skipped;
-            if (res.Warnings.Count > 0)
-            {
-                warnings.AddRange(res.Warnings);
-            }
-            if (res.GapDetails is { Count: > 0 })
-            {
-                gapDetails.AddRange(res.GapDetails);
-            }
+            await Task.Delay(TimeSpan.FromSeconds(1));
+            status = await Drafts.GetAutogenJob(status.JobId);
+            ApplyAutoGenJobStatus(status);
+            await InvokeAsync(StateHasChanged);
         }
-        var result = new AutoGenResult(created, skipped, warnings, gapDetails, BuildGapReasonSummary(gapDetails));
-        return (result, fromDate, toDate, weekStarts.Count);
+        var result = status.Result ?? new AutoGenResult(status.Created, status.Skipped, new List<string>());
+        if (status.State == AutoGenJobState.Canceled)
+        {
+            result = result with
+            {
+                Warnings = result.Warnings.Concat(new[] { "Операцію скасовано користувачем." }).Distinct(StringComparer.Ordinal).ToList()
+            };
+        }
+        else if (status.State == AutoGenJobState.Failed && !string.IsNullOrWhiteSpace(status.Error))
+        {
+            result = result with
+            {
+                Warnings = result.Warnings.Concat(new[] { status.Error }).Distinct(StringComparer.Ordinal).ToList()
+            };
+        }
+        return (result, fromDate, toDate, weekStarts.Count, status);
     }
     // Запускає автогенерацію чернеток для обраного діапазону.
     private async Task AutoGenDrafts()
@@ -1795,7 +2090,8 @@ else
             }
             var groupRoomPreferences = BuildSelectedGroupRoomPreferences(selectedGroupIds);
             await PersistAutoGenConfigAsync();
-            var (res, rangeStartDate, rangeEndDate, weekCount) = await RunAutoGenForRangeAsync(
+            await StartAutoGenProgressAsync("Автогенерація у чернетки", AutoGenProgressKind.Generate);
+            var (res, rangeStartDate, rangeEndDate, weekCount, finalStatus) = await RunAutoGenForRangeAsync(
                 courseId,
                 selectedGroupIds,
                 groupRoomPreferences,
@@ -1810,7 +2106,14 @@ else
             var summary = isSingleFullWeek
                 ? $"Автогенерація тижня у чернетки (курс: {courseName}, груп: {selectedGroupIds.Count}): створено {res.Created}, пропущено {res.Skipped}."
                 : $"Автогенерація діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): створено {res.Created}, пропущено {res.Skipped}.";
-            await SetOkMessageAsync(summary, res.Warnings, res.GapDetails, res.GapSummary);
+            summary = finalStatus.State switch
+            {
+                AutoGenJobState.Canceled => $"Автогенерацію скасовано для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: створено {res.Created}, пропущено {res.Skipped}.",
+                AutoGenJobState.Failed => $"Автогенерація завершилась з помилками для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: створено {res.Created}, пропущено {res.Skipped}.",
+                _ => summary
+            };
+            await SetOkMessageAsync(summary, res.Warnings, res.GapDetails, res.GapSummary, res.Preflight, finalStatus.Report);
+            await UpdateAutoGenProgressMessageAsync("Оновлюємо таблицю після автогенерації...");
             await LoadWeek();
             await LogAutoGenAsync(
                 summary,
@@ -1829,6 +2132,73 @@ else
         catch (Exception ex)
         {
             error = ex.Message;
+        }
+        finally
+        {
+            StopAutoGenProgress();
+        }
+    }
+    // Перевіряє ресурси для автогенерації без створення чернеток.
+    private async Task CheckAutoGenResources()
+    {
+        await ResetStatusAsync();
+        try
+        {
+            if (_selectedCourseId is not int courseId)
+            {
+                error = "Оберіть курс для перевірки ресурсів.";
+                return;
+            }
+            var moduleHours = _moduleWeekRows
+                .Where(row => row.Selected && row.Hours > 0)
+                .GroupBy(row => row.ModuleId)
+                .ToDictionary(g => g.Key, g => g.First().Hours);
+            if (moduleHours.Count == 0)
+            {
+                error = "Оберіть хоча б один модуль і вкажіть години > 0.";
+                return;
+            }
+            var selectedGroupIds = GetSelectedGroupIds();
+            if (selectedGroupIds.Count == 0)
+            {
+                error = "Оберіть хоча б одну групу для перевірки ресурсів.";
+                return;
+            }
+            var groupRoomPreferences = BuildSelectedGroupRoomPreferences(selectedGroupIds);
+            await PersistAutoGenConfigAsync();
+            await StartAutoGenProgressAsync("Перевірка ресурсів", AutoGenProgressKind.Preflight);
+            var (res, rangeStartDate, rangeEndDate, _, finalStatus) = await RunAutoGenForRangeAsync(
+                courseId,
+                selectedGroupIds,
+                groupRoomPreferences,
+                moduleHours,
+                clearExisting: true,
+                softFill: false,
+                preflightOnly: true);
+            var courseName = meta?.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
+            var deficitCount = res.Preflight?.Sum(item => item.Count) ?? 0;
+            var summary = deficitCount > 0
+                ? $"Перевірка ресурсів {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): знайдено {deficitCount} потенційних дефіцитів."
+                : $"Перевірка ресурсів {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): явних дефіцитів не знайдено.";
+            summary = finalStatus.State switch
+            {
+                AutoGenJobState.Canceled => $"Перевірку ресурсів скасовано для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: перевірено {finalStatus.CompletedWeeks}/{finalStatus.TotalWeeks} тижнів.",
+                AutoGenJobState.Failed => $"Перевірка ресурсів завершилась з помилками для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: знайдено {deficitCount} потенційних дефіцитів.",
+                _ => summary
+            };
+            await SetOkMessageAsync(summary, res.Warnings, res.GapDetails, res.GapSummary, res.Preflight, finalStatus.Report);
+        }
+        catch (ApiErrorException ex)
+        {
+            await HandleApiError(ex);
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+        }
+        finally
+        {
+            StopAutoGenProgress();
         }
     }
     // Заповнює порожні слоти чернеток на обраному діапазоні.
@@ -1859,7 +2229,8 @@ else
             }
             var groupRoomPreferences = BuildSelectedGroupRoomPreferences(selectedGroupIds);
             await PersistAutoGenConfigAsync();
-            var (res, rangeStartDate, rangeEndDate, weekCount) = await RunAutoGenForRangeAsync(
+            await StartAutoGenProgressAsync("Заповнення порожніх слотів", AutoGenProgressKind.Fill);
+            var (res, rangeStartDate, rangeEndDate, weekCount, finalStatus) = await RunAutoGenForRangeAsync(
                 courseId,
                 selectedGroupIds,
                 groupRoomPreferences,
@@ -1874,7 +2245,14 @@ else
             var summary = isSingleFullWeek
                 ? $"Заповнення порожніх слотів тижня (курс: {courseName}, груп: {selectedGroupIds.Count}): створено {res.Created}, пропущено {res.Skipped}."
                 : $"Заповнення порожніх слотів у діапазоні {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): створено {res.Created}, пропущено {res.Skipped}.";
-            await SetOkMessageAsync(summary, res.Warnings, res.GapDetails, res.GapSummary);
+            summary = finalStatus.State switch
+            {
+                AutoGenJobState.Canceled => $"Дозаповнення скасовано для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: створено {res.Created}, пропущено {res.Skipped}.",
+                AutoGenJobState.Failed => $"Дозаповнення завершилось з помилками для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: створено {res.Created}, пропущено {res.Skipped}.",
+                _ => summary
+            };
+            await SetOkMessageAsync(summary, res.Warnings, res.GapDetails, res.GapSummary, res.Preflight, finalStatus.Report);
+            await UpdateAutoGenProgressMessageAsync("Оновлюємо таблицю після дозаповнення...");
             await LoadWeek();
             await LogAutoGenAsync(
                 summary,
@@ -1893,6 +2271,10 @@ else
         catch (Exception ex)
         {
             error = ex.Message;
+        }
+        finally
+        {
+            StopAutoGenProgress();
         }
     }
     // Очищає чернетки за обраний тиждень.
@@ -1930,6 +2312,10 @@ else
         catch (Exception ex)
         {
             error = ex.Message;
+        }
+        finally
+        {
+            StopAutoGenProgress();
         }
     }
     // Очищає опублікований розклад за обраний тиждень.
@@ -2429,9 +2815,6 @@ else
             _sortAsc = true;
         }
     }
-    // Повертає піктограму напрямку сортування.
-    private MarkupString HeaderIcon(string field)
-        => new(_sortField == field ? $"<span class=\"ms-1\">{(_sortAsc ? "▲" : "▼")}</span>" : "");
     private IEnumerable<TableItem> ViewItems
         => ApplySort(ApplyFilter(tableItems));
     // Фільтрує рядки таблиці за пошуковим рядком.
@@ -2593,7 +2976,42 @@ else
         string Message,
         List<string> Warnings,
         List<AutoGenGapDetail> GapDetails,
-        List<AutoGenGapSummaryItem>? GapSummary = null);
+        List<AutoGenGapSummaryItem>? GapSummary = null,
+        List<AutoGenPreflightItem>? Preflight = null,
+        AutoGenRunReport? Report = null);
+    private sealed class AutoGenProgressState
+    {
+        public string? JobId { get; set; }
+        public AutoGenJobState? State { get; set; }
+        public string Title { get; set; } = string.Empty;
+        public AutoGenProgressKind Kind { get; set; }
+        public DateOnly RangeStartDate { get; set; }
+        public DateOnly RangeEndDate { get; set; }
+        public int TotalSteps { get; set; } = 1;
+        public int CompletedSteps { get; set; }
+        public int CurrentStepNumber { get; set; } = 1;
+        public DateOnly? CurrentWeekStartDate { get; set; }
+        public DateOnly? CurrentRangeStartDate { get; set; }
+        public DateOnly? CurrentRangeEndDate { get; set; }
+        public DateTimeOffset StartedAt { get; set; } = DateTimeOffset.Now;
+        public DateTimeOffset CurrentStepStartedAt { get; set; } = DateTimeOffset.Now;
+        public DateTimeOffset LastUpdatedAt { get; set; } = DateTimeOffset.Now;
+        public string CurrentMessage { get; set; } = string.Empty;
+        public string? LastCompletedMessage { get; set; }
+        public int Percent { get; set; } = -1;
+        public bool CancellationRequested { get; set; }
+        public int Created { get; set; }
+        public int Skipped { get; set; }
+        public int WarningCount { get; set; }
+        public int GapCount { get; set; }
+        public int DeficitCount { get; set; }
+    }
+    private enum AutoGenProgressKind
+    {
+        Generate,
+        Preflight,
+        Fill
+    }
     private enum TableItemSource
     {
         Draft,
@@ -2627,5 +3045,9 @@ else
                 : MissingTeacherAssignment
                     ? "викладача"
                     : "аудиторію";
+    }
+    public void Dispose()
+    {
+        StopAutoGenProgress();
     }
 }

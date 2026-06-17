@@ -8,18 +8,22 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
     // Завантажує чернетки тижня для викладача.
     public async Task<List<TeacherDraftItemDto>> GetWeek(DateOnly weekStart, int? teacherId)
     {
-        var url = $"api/teacher-drafts?weekStart={weekStart:yyyy-MM-dd}" +
-                  (teacherId is int t ? $"&teacherId={t}" : "");
+        var url = ApiClientHelpers.WithQuery(
+            "api/teacher-drafts",
+            ("weekStart", weekStart.ToString("yyyy-MM-dd")),
+            ("teacherId", teacherId?.ToString()));
         return await http.GetFromJsonAsync<List<TeacherDraftItemDto>>(url) ?? new();
     }
     // Експортує чернетки тижня у файл.
     public async Task<byte[]> ExportWeek(DateOnly weekStart, int? teacherId, int? groupId, int? roomId)
     {
-        var query = $"weekStart={weekStart:yyyy-MM-dd}";
-        if (teacherId is int tid) query += $"&teacherId={tid}";
-        if (groupId is int gid) query += $"&groupId={gid}";
-        if (roomId is int rid) query += $"&roomId={rid}";
-        var res = await http.GetAsync($"api/teacher-drafts/export?{query}");
+        var url = ApiClientHelpers.WithQuery(
+            "api/teacher-drafts/export",
+            ("weekStart", weekStart.ToString("yyyy-MM-dd")),
+            ("teacherId", teacherId?.ToString()),
+            ("groupId", groupId?.ToString()),
+            ("roomId", roomId?.ToString()));
+        var res = await http.GetAsync(url);
         await res.EnsureSuccessWithDetailsAsync();
         return await res.Content.ReadAsByteArrayAsync();
     }
@@ -27,6 +31,31 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
     public async Task<AutoGenResult> AutogenWeek(AutoGenRequest req)
     {
         var res = await http.PostAsJsonAsync("api/teacher-drafts/autogen/week", req);
+        await res.EnsureSuccessWithDetailsAsync();
+        return (await res.Content.ReadFromJsonAsync<AutoGenResult>())!;
+    }
+    public async Task<AutoGenJobStartResult> StartAutogenJob(AutoGenJobRequest req)
+    {
+        var res = await http.PostAsJsonAsync("api/teacher-drafts/autogen/jobs", req);
+        await res.EnsureSuccessWithDetailsAsync();
+        return (await res.Content.ReadFromJsonAsync<AutoGenJobStartResult>())!;
+    }
+    public async Task<AutoGenJobStatus> GetAutogenJob(string jobId)
+    {
+        var res = await http.GetAsync($"api/teacher-drafts/autogen/jobs/{Uri.EscapeDataString(jobId)}");
+        await res.EnsureSuccessWithDetailsAsync();
+        return (await res.Content.ReadFromJsonAsync<AutoGenJobStatus>())!;
+    }
+    public async Task<AutoGenJobStatus> CancelAutogenJob(string jobId)
+    {
+        var res = await http.PostAsync($"api/teacher-drafts/autogen/jobs/{Uri.EscapeDataString(jobId)}/cancel", content: null);
+        await res.EnsureSuccessWithDetailsAsync();
+        return (await res.Content.ReadFromJsonAsync<AutoGenJobStatus>())!;
+    }
+    // Виконує попередню перевірку ресурсів без запису чернеток.
+    public async Task<AutoGenResult> AutogenPreflightWeek(AutoGenRequest req)
+    {
+        var res = await http.PostAsJsonAsync("api/teacher-drafts/autogen/week", req with { PreflightOnly = true });
         await res.EnsureSuccessWithDetailsAsync();
         return (await res.Content.ReadFromJsonAsync<AutoGenResult>())!;
     }
@@ -48,9 +77,10 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
     // Видаляє чернетку з параметрами підтвердження.
     public async Task Delete(int id, bool confirm = false, bool unrestricted = false)
     {
-        var flag = confirm ? "true" : "false";
-        var unrestrictedFlag = unrestricted ? "true" : "false";
-        var res = await http.DeleteAsync($"api/teacher-drafts/{id}?confirm={flag}&unrestricted={unrestrictedFlag}");
+        var res = await http.DeleteAsync(ApiClientHelpers.WithQuery(
+            $"api/teacher-drafts/{id}",
+            ("confirm", confirm ? "true" : "false"),
+            ("unrestricted", unrestricted ? "true" : "false")));
         await res.EnsureSuccessWithDetailsAsync();
     }
     // Запускає автогенерацію для місяця.

@@ -1,9 +1,26 @@
 @* Основний макет застосунку *@
 @inherits LayoutComponentBase
+@inject NavigationManager NavigationManager
 
 <div class="layout-root">
     <TopNav />
-    <main class="container-fluid layout-main">
+    <main class="@MainClass">
         @Body
     </main>
 </div>
+
+@code {
+    private string MainClass => IsWorkArea
+        ? "container-fluid layout-main layout-main--work-area"
+        : "container-fluid layout-main";
+
+    private bool IsWorkArea
+    {
+        get
+        {
+            var path = NavigationManager.ToBaseRelativePath(NavigationManager.Uri).Split('?', '#')[0].Trim('/');
+            return path.StartsWith("admin", StringComparison.OrdinalIgnoreCase)
+                || path.Equals("teacher-drafts", StringComparison.OrdinalIgnoreCase);
+        }
+    }
+}

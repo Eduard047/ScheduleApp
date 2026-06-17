@@ -1,0 +1,38 @@
+@* Спільна оболонка модальних редакторів адмінських сторінок. *@
+<div class="editor-overlay" @onclick="OnClose">
+    <div class="@EditorClass" role="dialog" aria-modal="true" @onclick:stopPropagation="true">
+        <div class="editor-modal-head">
+            <div>
+                <div class="editor-title">@Title</div>
+                @if (!string.IsNullOrWhiteSpace(Subtitle))
+                {
+                    <div class="editor-subtitle">@Subtitle</div>
+                }
+            </div>
+            <button type="button" class="btn btn-outline-secondary editor-close" title="Закрити" @onclick="OnClose">×</button>
+        </div>
+
+        @ChildContent
+    </div>
+</div>
+
+@code {
+    [Parameter, EditorRequired]
+    public string Title { get; set; } = string.Empty;
+
+    [Parameter]
+    public string? Subtitle { get; set; }
+
+    [Parameter]
+    public string? CssClass { get; set; }
+
+    [Parameter, EditorRequired]
+    public EventCallback OnClose { get; set; }
+
+    [Parameter, EditorRequired]
+    public RenderFragment ChildContent { get; set; } = default!;
+
+    private string EditorClass => string.IsNullOrWhiteSpace(CssClass)
+        ? "editor editor-modal"
+        : $"editor editor-modal {CssClass}";
+}

@@ -47,7 +47,8 @@ public record AutoGenRequest(
     DateOnly? RangeEndDate = null,
     List<GroupRoomPreferenceDto>? GroupRoomPreferences = null,
     AutoGenSoftOptionsDto? SoftOptions = null,
-    int? PreferredFirstMaxSlotOrderOverride = null
+    int? PreferredFirstMaxSlotOrderOverride = null,
+    bool PreflightOnly = false
 );
 
 // DTO деталі пропущеного слота.
@@ -58,7 +59,9 @@ public record AutoGenGapDetail(
     TimeOnly Start,
     TimeOnly End,
     string SlotLabel,
-    string? Reason
+    string? Reason,
+    int? ModuleId = null,
+    string? ModuleName = null
 );
 
 // Результат автогенерації чернеток.
@@ -69,10 +72,119 @@ public record AutoGenGapSummaryItem(
     List<string> Examples
 );
 
+public record AutoGenPreflightItem(
+    string Code,
+    string Title,
+    int Count,
+    string Recommendation,
+    List<string> Examples
+);
+
 public record AutoGenResult(
     int Created,
     int Skipped,
     List<string> Warnings,
     List<AutoGenGapDetail>? GapDetails = null,
-    List<AutoGenGapSummaryItem>? GapSummary = null
+    List<AutoGenGapSummaryItem>? GapSummary = null,
+    List<AutoGenPreflightItem>? Preflight = null
+);
+
+public enum AutoGenJobKind
+{
+    Generate,
+    Preflight,
+    Fill
+}
+
+public enum AutoGenJobState
+{
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Canceled
+}
+
+public record AutoGenJobRequest(
+    AutoGenJobKind Kind,
+    DateOnly FromDate,
+    DateOnly ToDate,
+    int CourseId,
+    List<int> GroupIds,
+    Dictionary<int, int> ModuleHours,
+    WeekPreset Days,
+    bool ClearExisting,
+    bool SoftFill,
+    bool PreflightOnly,
+    bool AllowIncompleteDrafts = false,
+    List<GroupRoomPreferenceDto>? GroupRoomPreferences = null,
+    AutoGenSoftOptionsDto? SoftOptions = null,
+    int? PreferredFirstMaxSlotOrderOverride = null,
+    string? Title = null
+);
+
+public record AutoGenJobStartResult(
+    string JobId,
+    AutoGenJobStatus Status
+);
+
+public record AutoGenRunReportGroupItem(
+    int GroupId,
+    string GroupName,
+    int GapCount,
+    List<string> Examples
+);
+
+public record AutoGenRunReportModuleItem(
+    int? ModuleId,
+    string ModuleName,
+    int GapCount,
+    List<string> Examples
+);
+
+public record AutoGenRunReport(
+    DateTimeOffset GeneratedAt,
+    DateOnly RangeStartDate,
+    DateOnly RangeEndDate,
+    int TotalWeeks,
+    int Created,
+    int Skipped,
+    int WarningCount,
+    int GapCount,
+    int DeficitCount,
+    List<AutoGenGapSummaryItem> GapSummary,
+    List<AutoGenPreflightItem> Preflight,
+    List<AutoGenRunReportGroupItem> WorstGroups,
+    List<AutoGenRunReportModuleItem> WorstModules,
+    List<string> Recommendations
+);
+
+public record AutoGenJobStatus(
+    string JobId,
+    AutoGenJobState State,
+    AutoGenJobKind Kind,
+    string Title,
+    string CurrentStage,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? StartedAt,
+    DateTimeOffset? CompletedAt,
+    DateOnly RangeStartDate,
+    DateOnly RangeEndDate,
+    int TotalWeeks,
+    int CompletedWeeks,
+    int CurrentWeekNumber,
+    DateOnly? CurrentWeekStartDate,
+    DateOnly? CurrentRangeStartDate,
+    DateOnly? CurrentRangeEndDate,
+    int Created,
+    int Skipped,
+    int WarningCount,
+    int GapCount,
+    int DeficitCount,
+    int Percent,
+    bool CancellationRequested,
+    string? LastCompletedMessage = null,
+    AutoGenResult? Result = null,
+    AutoGenRunReport? Report = null,
+    string? Error = null
 );

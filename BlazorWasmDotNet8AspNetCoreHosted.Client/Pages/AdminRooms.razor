@@ -20,33 +20,18 @@
 <div class="card p-3">
     <div class="d-flex justify-content-between align-items-center mb-2 gap-2 flex-wrap">
         <button class="btn btn-primary" @onclick="OpenCreate">Додати аудиторію</button>
-        <div class="input-group ms-auto" style="max-width:360px;">
-            <span class="input-group-text">Пошук</span>
-            <input class="form-control" @bind="filter" @bind:event="oninput" placeholder="Id / назва / місткість / корпус" />
-        </div>
+        <AdminSearchBox @bind-Value="filter" Class="ms-auto" Style="max-width:360px;" Placeholder="Id / назва / місткість / корпус" />
         <div class="small text-muted">Показано: @SortedAndFiltered.Count() з @items.Count</div>
     </div>
     <div class="table-responsive">
         <table class="table table-sm align-middle">
             <thead>
                 <tr>
-                    <th style="width:80px;" class="sortable-th" role="button"
-                        @onclick="() => ToggleSort(nameof(RoomEditDto.Id))">
-                        Id @HeaderIcon(nameof(RoomEditDto.Id))
-                    </th>
-                    <th class="sortable-th" role="button"
-                        @onclick="() => ToggleSort(nameof(RoomEditDto.Name))">
-                        Назва @HeaderIcon(nameof(RoomEditDto.Name))
-                    </th>
-                    <th class="sortable-th" role="button"
-                        @onclick="() => ToggleSort(nameof(RoomEditDto.Capacity))">
-                        Місткість @HeaderIcon(nameof(RoomEditDto.Capacity))
-                    </th>
-                    <th class="sortable-th" role="button"
-                        @onclick="() => ToggleSort(BuildingField)">
-                        Корпус @HeaderIcon(BuildingField)
-                    </th>
-                    <th style="width:140px;"></th>
+                    <SortableHeader Field="@nameof(RoomEditDto.Id)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort" Style="width:80px;">Id</SortableHeader>
+                    <SortableHeader Field="@nameof(RoomEditDto.Name)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Назва</SortableHeader>
+                    <SortableHeader Field="@nameof(RoomEditDto.Capacity)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Місткість</SortableHeader>
+                    <SortableHeader Field="@BuildingField" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Корпус</SortableHeader>
+                    <th style="width:220px;"></th>
                 </tr>
             </thead>
             <tbody>
@@ -57,7 +42,7 @@
                         <td>@r.Name</td>
                         <td>@r.Capacity</td>
                         <td>@NameOf(buildings, r.BuildingId)</td>
-                        <td class="text-end">
+                        <td class="text-end text-nowrap">
                             <button class="btn btn-sm btn-outline-primary me-2" @onclick="() => OpenEdit(r)">Редагувати</button>
                             <button class="btn btn-sm btn-outline-danger" @onclick="() => Delete(r.Id!.Value)">Видалити</button>
                         </td>
@@ -70,83 +55,36 @@
 
 @if (editorOpen)
 {
-    <div class="editor-overlay" @onclick="CloseEditor">
-        <div class="editor editor-modal room-editor" role="dialog" aria-modal="true" @onclick:stopPropagation="true">
-            <div class="editor-modal-head">
-                <div>
-                    <div class="editor-title">@((form.Id is null ? "Створення аудиторії" : $"Редагування аудиторії #{form.Id}"))</div>
-                    <div class="editor-subtitle">Заповніть назву, місткість та виберіть корпус.</div>
-                </div>
-                <button type="button" class="btn btn-outline-secondary editor-close" title="Закрити" @onclick="CloseEditor">×</button>
+    <AdminEditorModal Title="@RoomEditorTitle"
+                      Subtitle="Заповніть назву, місткість та виберіть корпус."
+                      CssClass="room-editor"
+                      OnClose="@CloseEditor">
+        <div class="row g-3">
+            <div class="col-12 col-md-5">
+                <label class="form-label">Назва</label>
+                <input class="form-control" @bind="form.Name" />
             </div>
-            <div class="row g-3">
-                <div class="col-12 col-md-5">
-                    <label class="form-label">Назва</label>
-                    <input class="form-control" @bind="form.Name" />
-                </div>
-                <div class="col-12 col-md-3">
-                    <label class="form-label">Місткість</label>
-                    <input type="number" min="0" class="form-control" @bind="form.Capacity" />
-                </div>
-                <div class="col-12 col-md-4">
-                    <label class="form-label">Корпус</label>
-                    <select class="form-select" @bind="form.BuildingId">
-                        <option value="0">— Оберіть —</option>
-                        @foreach (var b in buildings)
-                        {
-                            <option value="@b.Id">@b.Name</option>
-                        }
-                    </select>
-                </div>
+            <div class="col-12 col-md-3">
+                <label class="form-label">Місткість</label>
+                <input type="number" min="0" class="form-control" @bind="form.Capacity" />
             </div>
-            <div class="editor-actions">
-                <button class="btn btn-primary" @onclick="Save">Зберегти</button>
-                <button class="btn btn-outline-secondary" @onclick="CloseEditor">Скасувати</button>
+            <div class="col-12 col-md-4">
+                <label class="form-label">Корпус</label>
+                <select class="form-select" @bind="form.BuildingId">
+                    <option value="0">— Оберіть —</option>
+                    @foreach (var b in buildings)
+                    {
+                        <option value="@b.Id">@b.Name</option>
+                    }
+                </select>
             </div>
         </div>
-    </div>
+        <div class="editor-actions">
+            <button class="btn btn-primary" @onclick="Save">Зберегти</button>
+            <button class="btn btn-outline-secondary" @onclick="CloseEditor">Скасувати</button>
+        </div>
+    </AdminEditorModal>
 }
-
-<style>
-    .editor-overlay {
-        position: fixed;
-        inset: 0;
-        background: rgba(15, 23, 42, 0.5);
-        backdrop-filter: blur(2px);
-        display: flex;
-        justify-content: center;
-        align-items: flex-start;
-        padding: 72px 18px 24px;
-        overflow-y: auto;
-        z-index: 2500;
-    }
-    .editor {
-        margin-top: 14px;
-        background: #fff;
-        border: 1px solid #e5e7eb;
-        border-radius: 12px;
-        padding: 14px;
-        width: min(760px, 100%);
-        box-shadow: 0 20px 50px rgba(15, 23, 42, 0.25);
-    }
-    .editor-modal-head {
-        display: flex;
-        align-items: flex-start;
-        justify-content: space-between;
-        gap: 12px;
-        margin-bottom: 12px;
-    }
-    .editor-title { font-weight: 800; font-size: 1.1rem; }
-    .editor-subtitle { color: #475569; font-size: .92rem; margin-top: 4px; }
-    .editor-close { min-width: 44px; height: 44px; font-size: 1.3rem; padding: 0 .6rem; }
-    .editor-actions {
-        margin-top: 14px;
-        display: flex;
-        gap: 10px;
-        justify-content: flex-end;
-        flex-wrap: wrap;
-    }
-</style>
 
 @code {
 
@@ -159,6 +97,9 @@
     private string sortField = nameof(RoomEditDto.Name);
     private bool sortAsc = true;
     private string? filter;
+    private string RoomEditorTitle => form.Id is null
+        ? "Створення аудиторії"
+        : $"Редагування аудиторії #{form.Id}";
     private static RoomEditDto NewForm() => new() { Id = null, Name = "", Capacity = 0, BuildingId = 0 };
     private void OpenCreate()
     {
@@ -253,7 +194,4 @@
         if (sortField == field) sortAsc = !sortAsc;
         else { sortField = field; sortAsc = true; }
     }
-    // Повертає піктограму для заголовка сортування.
-    private MarkupString HeaderIcon(string field)
-        => new(sortField == field ? $"<span class=\"ms-1\">{(sortAsc ? "▲" : "▼")}</span>" : "");
 }

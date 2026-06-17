@@ -24,6 +24,7 @@ builder.Services.AddScoped<AggregatesService>();
 builder.Services.AddScoped<TeacherDraftsQueryService>();
 builder.Services.AddScoped<TeacherDraftsExportService>();
 builder.Services.AddScoped<TeacherDraftsAutogenService>();
+builder.Services.AddSingleton<TeacherDraftsAutogenJobService>();
 builder.Services.AddScoped<TeacherDraftsPublishService>();
 
 var app = builder.Build();

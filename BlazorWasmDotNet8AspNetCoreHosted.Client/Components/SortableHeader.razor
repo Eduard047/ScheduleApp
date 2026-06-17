@@ -1,0 +1,49 @@
+@* Заголовок таблиці з єдиною поведінкою сортування. *@
+<th class="@HeaderClass"
+    style="@Style"
+    role="button"
+    title="@Title"
+    @onclick="Sort">
+    @ChildContent
+    @if (IsActive)
+    {
+        <span class="ms-1">@(SortAscending ? "▲" : "▼")</span>
+    }
+</th>
+
+@code {
+    [Parameter, EditorRequired]
+    public string Field { get; set; } = string.Empty;
+
+    [Parameter, EditorRequired]
+    public string ActiveField { get; set; } = string.Empty;
+
+    [Parameter]
+    public bool SortAscending { get; set; }
+
+    [Parameter]
+    public string? Class { get; set; }
+
+    [Parameter]
+    public string? Style { get; set; }
+
+    [Parameter]
+    public string? Title { get; set; }
+
+    [Parameter, EditorRequired]
+    public EventCallback<string> OnSort { get; set; }
+
+    [Parameter, EditorRequired]
+    public RenderFragment ChildContent { get; set; } = default!;
+
+    private bool IsActive => string.Equals(Field, ActiveField, StringComparison.Ordinal);
+
+    private string HeaderClass => string.IsNullOrWhiteSpace(Class)
+        ? "sortable-th"
+        : $"sortable-th {Class}";
+
+    private async Task Sort()
+    {
+        await OnSort.InvokeAsync(Field);
+    }
+}

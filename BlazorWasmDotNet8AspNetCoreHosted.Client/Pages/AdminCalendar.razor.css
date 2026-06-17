@@ -1,0 +1,157 @@
+.calendar-editor-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 12px;
+}
+
+.calendar-editor-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+}
+
+.calendar-editor-switch {
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 14px;
+    padding: 12px;
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+    background: #f8fafc;
+    flex-wrap: wrap;
+    width: 100%;
+    box-sizing: border-box;
+    grid-column: auto;
+    align-self: end;
+    min-width: 260px;
+}
+
+.switch-caption {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.switch-title {
+    font-weight: 700;
+}
+
+.switch-hint {
+    color: #64748b;
+    font-size: .88rem;
+}
+
+.toggle {
+    display: inline-flex;
+    align-items: center;
+    cursor: pointer;
+    position: relative;
+    width: 100%;
+    max-width: 340px;
+    justify-content: flex-start;
+    gap: 10px;
+}
+
+.toggle-input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+    width: 1px;
+    height: 1px;
+}
+
+.toggle-track {
+    --switch-width: 220px;
+    --switch-padding: 6px;
+    --thumb-gap: 8px;
+    position: relative;
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    align-items: center;
+    width: var(--switch-width);
+    max-width: 100%;
+    padding: var(--switch-padding);
+    min-height: 54px;
+    border-radius: 999px;
+    border: 1px solid #e2e8f0;
+    background: #f8fafc;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .7), 0 14px 30px rgba(15, 23, 42, .08);
+    box-sizing: border-box;
+    transition: border-color .2s ease, background .2s ease, box-shadow .2s ease;
+}
+
+.toggle-thumb {
+    position: absolute;
+    inset: var(--switch-padding) auto var(--switch-padding) var(--switch-padding);
+    width: calc(50% - var(--thumb-gap));
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    background: linear-gradient(135deg, #fb7185, #ef4444);
+    color: #fff;
+    font-weight: 800;
+    letter-spacing: .01em;
+    box-shadow: 0 8px 24px rgba(239, 68, 68, .25);
+    transform: translateX(0);
+    transition: transform .22s ease, background .22s ease, box-shadow .22s ease;
+    z-index: 2;
+}
+
+.toggle-thumb::after {
+    content: "Вихідний";
+    font-size: .95rem;
+}
+
+.toggle-text {
+    font-size: .95rem;
+    font-weight: 700;
+    text-align: center;
+    user-select: none;
+    position: relative;
+    z-index: 1;
+    color: #94a3b8;
+    padding: 0 6px;
+}
+
+.toggle-text--on {
+    text-align: left;
+}
+
+.toggle-text--off {
+    text-align: right;
+}
+
+.toggle:focus-within .toggle-track {
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, .22), inset 0 1px 0 rgba(255, 255, 255, .7), 0 14px 30px rgba(15, 23, 42, .08);
+    border-color: #bfdbfe;
+}
+
+.toggle-input:checked + .toggle-track {
+    border-color: #bbf7d0;
+    background: #ecfdf3;
+}
+
+.toggle-input:checked + .toggle-track .toggle-thumb {
+    transform: translateX(calc(100% + var(--thumb-gap)));
+    background: linear-gradient(135deg, #22c55e, #16a34a);
+    box-shadow: 0 8px 24px rgba(22, 163, 74, .25);
+}
+
+.toggle-input:checked + .toggle-track .toggle-thumb::after {
+    content: "Робочий";
+}
+
+.toggle-input:not(:checked) + .toggle-track .toggle-text--off {
+    color: #dc2626;
+}
+
+.toggle-input:checked + .toggle-track .toggle-text--on {
+    color: #15803d;
+}
+
+.toggle-input:checked + .toggle-track .toggle-text--off {
+    color: #cbd5e1;
+}
