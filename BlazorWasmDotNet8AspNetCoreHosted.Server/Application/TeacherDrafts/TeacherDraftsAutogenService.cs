@@ -4803,7 +4803,8 @@ public sealed class TeacherDraftsAutogenService
                     {
                         if (!allowEmergencyTopicOrderRelaxation
                             || isSelfStudyPlacement
-                            || topicSelection is null)
+                            || topicSelection is null
+                            || ModuleHasUsableTopics(moduleId))
                         {
                             return;
                         }
@@ -5597,15 +5598,11 @@ public sealed class TeacherDraftsAutogenService
                 }
                 if (!selectedIsSelfStudy && selectedTopic is null && ModuleHasUsableTopics(moduleId))
                 {
-                    if (!allowEmergencyTopicOrderRelaxation)
-                    {
-                        RecordSlotFailureReason(
-                            date,
-                            selectedSlot,
-                            $"Для модуля <{ModuleLabel()}> не знайдено тему, тому заняття без коду теми не створено.");
-                        return false;
-                    }
-                    warnings.Add($"[{date:yyyy-MM-dd} {startTime:HH\\:mm}-{endTime:HH\\:mm}] {grp.Name}: аварійне дозаповнення створило заняття модуля <{ModuleLabel()}> без коду теми.");
+                    RecordSlotFailureReason(
+                        date,
+                        selectedSlot,
+                        $"Для модуля <{ModuleLabel()}> є планові теми, тому заняття без коду теми не створюється.");
+                    return false;
                 }
                 if (!selectedIsSelfStudy && selectedTopic is not null)
                 {
@@ -5767,10 +5764,6 @@ public sealed class TeacherDraftsAutogenService
                 {
                     var noteText = string.Join("; ", selectedNotes);
                     warnings.Add($"[{date:yyyy-MM-dd} {startTime:HH\\:mm}-{endTime:HH\\:mm}] {grp.Name}: {noteText}");
-                }
-                if (allowEmergencyTopicOrderRelaxation && selectedTopic is not null)
-                {
-                    warnings.Add($"[{date:yyyy-MM-dd} {startTime:HH\\:mm}-{endTime:HH\\:mm}] {grp.Name}: аварійне дозаповнення послабило хронологічний порядок тем модуля <{ModuleLabel()}>.");
                 }
                 var nextShareableTopicUnlocked = !softFill
                     && !selectedIsSelfStudy
@@ -7118,6 +7111,29 @@ public sealed class TeacherDraftsAutogenService
                 else
                 {
                     errors.Add($"Фінальна перевірка: невідомий тип заняття #{draft.LessonTypeId} для групи {groupLabel}.");
+                }
+                if (draft.ModuleTopicId is int draftTopicId)
+                {
+                    if (!topicById.TryGetValue(draftTopicId, out var draftTopic))
+                    {
+                        errors.Add($"Фінальна перевірка: тема #{draftTopicId} для групи {groupLabel} не знайдена у плані модуля.");
+                    }
+                    else
+                    {
+                        if (draftTopic.ModuleId != draft.ModuleId)
+                        {
+                            errors.Add($"Фінальна перевірка: тема #{draftTopicId} не належить модулю #{draft.ModuleId} для групи {groupLabel}.");
+                        }
+
+                        if (!draft.IsSelfStudy && draftTopic.LessonTypeId != draft.LessonTypeId)
+                        {
+                            errors.Add($"Фінальна перевірка: тип заняття #{draft.LessonTypeId} не відповідає типу теми #{draftTopicId} для групи {groupLabel}.");
+                        }
+                    }
+                }
+                else if (!draft.IsSelfStudy && ModuleHasUsableTopics(draft.ModuleId))
+                {
+                    errors.Add($"Фінальна перевірка: модуль #{draft.ModuleId} має планові теми, але заняття для групи {groupLabel} створено без теми.");
                 }
                 if (selectedGroupsById.TryGetValue(draft.GroupId, out var selectedGroup))
                 {
