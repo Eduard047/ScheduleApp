@@ -410,6 +410,13 @@ else
                         var preflightItems = _latestPreflight;
                         var report = _latestAutoGenReport;
                         var contiguousModuleBlockWarnings = CountContiguousModuleBlockWarnings();
+                        var gapRows = _latestGapDetails
+                            .OrderBy(gap => gap.Date)
+                            .ThenBy(gap => gap.GroupName, StringComparer.Ordinal)
+                            .ThenBy(gap => gap.Start)
+                            .Take(25)
+                            .ToList();
+                        var hiddenGapRows = Math.Max(0, _latestGapDetails.Count - gapRows.Count);
                     }
                     @if (report is not null)
                     {
@@ -484,6 +491,67 @@ else
                                         <span class="gap-summary-pill">@item.Title: @item.Count</span>
                                     }
                                 </div>
+                                <div class="table-responsive mt-2">
+                                    <table class="table table-sm align-middle mb-0">
+                                        <thead>
+                                            <tr>
+                                                <th>Дефіцит</th>
+                                                <th class="text-center">К-сть</th>
+                                                <th>Що змінити</th>
+                                                <th>Приклад</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            @foreach (var item in preflightItems.Take(8))
+                                            {
+                                                <tr>
+                                                    <td>@item.Title</td>
+                                                    <td class="text-center">@item.Count</td>
+                                                    <td>@item.Recommendation</td>
+                                                    <td>@(item.Examples.FirstOrDefault() ?? "—")</td>
+                                                </tr>
+                                            }
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        }
+                        @if (gapRows.Count > 0)
+                        {
+                            <div class="gap-summary small">
+                                <div class="fw-semibold">Чому слот порожній</div>
+                                <div class="table-responsive mt-2">
+                                    <table class="table table-sm align-middle mb-0">
+                                        <thead>
+                                            <tr>
+                                                <th>Дата</th>
+                                                <th>Група</th>
+                                                <th>Слот</th>
+                                                <th>Модуль</th>
+                                                <th>Головна причина</th>
+                                                <th>Що перевірити</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            @foreach (var gap in gapRows)
+                                            {
+                                                var diagnosis = BuildGapDiagnosis(gap);
+                                                <tr>
+                                                    <td>@gap.Date.ToString("dd.MM.yyyy")</td>
+                                                    <td>@gap.GroupName</td>
+                                                    <td>@gap.SlotLabel</td>
+                                                    <td>@BuildGapModuleLabel(gap)</td>
+                                                    <td>@diagnosis.MainReason</td>
+                                                    <td>@diagnosis.Action</td>
+                                                </tr>
+                                            }
+                                        </tbody>
+                                    </table>
+                                </div>
+                                @if (hiddenGapRows > 0)
+                                {
+                                    <div class="text-muted mt-1">Показано 25 із @_latestGapDetails.Count, ще @hiddenGapRows у попередженнях і журналі автогенерації.</div>
+                                }
                             </div>
                         }
                         @if (contiguousModuleBlockWarnings > 0)
@@ -1583,6 +1651,37 @@ else
         }
         return ("other", "Інші причини");
     }
+    private static string BuildGapModuleLabel(AutoGenGapDetail gap)
+        => !string.IsNullOrWhiteSpace(gap.ModuleName)
+            ? CompactAutoGenText(gap.ModuleName!, 90)
+            : gap.ModuleId is int moduleId ? $"#{moduleId}" : "—";
+
+    private static (string MainReason, string Action) BuildGapDiagnosis(AutoGenGapDetail gap)
+    {
+        var classified = ClassifyGapReason(gap.Reason);
+        var action = classified.Code switch
+        {
+            "teacher" => "Звільнити або додати викладача для модуля/кафедри.",
+            "room" => "Звільнити аудиторію потрібної місткості або розширити дозволені аудиторії.",
+            "travel" => "Перевірити корпуси, перерви між ними або перенести сусіднє заняття.",
+            "topic-order" => "Перевірити послідовність тем і години модуля в діапазоні.",
+            "module-block" => "Залишити поруч суцільний блок для цього модуля або зменшити години дня.",
+            "limit" => "Перевірити денні ліміти, кількість слотів і паралельні групи.",
+            "shared-flow" => "Вирівняти тему, викладача й аудиторію для груп спільного потоку.",
+            _ => "Переглянути детальну причину в попередженнях автогенерації."
+        };
+        var reason = string.IsNullOrWhiteSpace(gap.Reason)
+            ? classified.Title
+            : CompactAutoGenText(gap.Reason!, 140);
+        return ($"{classified.Title}: {reason}", action);
+    }
+
+    private static string CompactAutoGenText(string text, int maxLength)
+    {
+        var normalized = string.IsNullOrWhiteSpace(text) ? "—" : text.Trim();
+        return normalized.Length <= maxLength ? normalized : normalized[..maxLength] + "...";
+    }
+
     private static string BuildSlotGapWarning(AutoGenGapDetail gap)
     {
         var message = $"Автогенерація не заповнила слот {gap.SlotLabel} для групи {gap.GroupName} на {gap.Date:yyyy-MM-dd}.";
