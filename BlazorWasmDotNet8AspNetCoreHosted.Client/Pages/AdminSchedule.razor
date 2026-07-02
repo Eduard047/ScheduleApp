@@ -528,8 +528,8 @@ else
                                                 <th>Група</th>
                                                 <th>Слот</th>
                                                 <th>Модуль</th>
-                                                <th>Головна причина</th>
-                                                <th>Що перевірити</th>
+                                                <th>Що не так</th>
+                                                <th>Що зробити</th>
                                             </tr>
                                         </thead>
                                         <tbody>
@@ -1661,19 +1661,28 @@ else
         var classified = ClassifyGapReason(gap.Reason);
         var action = classified.Code switch
         {
-            "teacher" => "Звільнити або додати викладача для модуля/кафедри.",
-            "room" => "Звільнити аудиторію потрібної місткості або розширити дозволені аудиторії.",
-            "travel" => "Перевірити корпуси, перерви між ними або перенести сусіднє заняття.",
-            "topic-order" => "Перевірити послідовність тем і години модуля в діапазоні.",
-            "module-block" => "Залишити поруч суцільний блок для цього модуля або зменшити години дня.",
-            "limit" => "Перевірити денні ліміти, кількість слотів і паралельні групи.",
-            "shared-flow" => "Вирівняти тему, викладача й аудиторію для груп спільного потоку.",
-            _ => "Переглянути детальну причину в попередженнях автогенерації."
+            "teacher" => "Додайте викладача до цього модуля або відкрийте його робочий час у цей слот.",
+            "room" => "Звільніть аудиторію потрібної місткості або додайте її в дозволені для модуля/групи.",
+            "travel" => "Поставте сусіднє заняття в той самий корпус або збільшіть перерву між корпусами.",
+            "topic-order" => "Додайте раніший слот для попередньої теми або зменште години модуля в цьому діапазоні.",
+            "module-block" => "Залиште поруч кілька слотів під цей модуль або перенесіть зайву пару з дня.",
+            "limit" => "Додайте слоти/дні для групи або зменште кількість годин у цьому діапазоні.",
+            "shared-flow" => "Для груп потоку зробіть однакові тему, викладача й аудиторію.",
+            _ => "Почніть з модуля й групи в цій строкі: перевірте викладача, аудиторію та зайнятість слоту."
         };
-        var reason = string.IsNullOrWhiteSpace(gap.Reason)
-            ? classified.Title
-            : CompactAutoGenText(gap.Reason!, 140);
-        return ($"{classified.Title}: {reason}", action);
+        var target = BuildGapModuleLabel(gap);
+        var reason = classified.Code switch
+        {
+            "teacher" => $"Для {gap.GroupName} немає вільного викладача на {gap.SlotLabel}.",
+            "room" => $"Для {gap.GroupName} немає вільної аудиторії на {gap.SlotLabel}.",
+            "travel" => $"Для {gap.GroupName} не вистачає часу перейти між корпусами біля {gap.SlotLabel}.",
+            "topic-order" => $"Для {gap.GroupName} тема модуля має йти раніше або пізніше за поточний слот.",
+            "module-block" => $"Модуль {target} розривається в межах дня.",
+            "limit" => $"Для {gap.GroupName} спрацював ліміт дня або слоту.",
+            "shared-flow" => $"Спільний потік для {gap.GroupName} не зібрав однакові ресурси.",
+            _ => $"Не підібрано безпечний варіант для {gap.GroupName}, {gap.SlotLabel}."
+        };
+        return (reason, action);
     }
 
     private static string CompactAutoGenText(string text, int maxLength)
@@ -2276,13 +2285,14 @@ else
                 preflightOnly: true);
             var courseName = meta?.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
             var deficitCount = res.Preflight?.Sum(item => item.Count) ?? 0;
-            var summary = deficitCount > 0
-                ? $"Перевірка ресурсів {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): знайдено {deficitCount} потенційних дефіцитів."
-                : $"Перевірка ресурсів {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): явних дефіцитів не знайдено.";
+            var gapCount = res.GapDetails?.Count ?? 0;
+            var summary = gapCount > 0 || deficitCount > 0
+                ? $"Перевірка ресурсів {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): пробна генерація показала {gapCount} порожніх слотів, ресурсних дефіцитів: {deficitCount}. Чернетки не збережено."
+                : $"Перевірка ресурсів {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): пробна генерація не знайшла порожніх слотів і явних дефіцитів. Чернетки не збережено.";
             summary = finalStatus.State switch
             {
                 AutoGenJobState.Canceled => $"Перевірку ресурсів скасовано для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: перевірено {finalStatus.CompletedWeeks}/{finalStatus.TotalWeeks} тижнів.",
-                AutoGenJobState.Failed => $"Перевірка ресурсів завершилась з помилками для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: знайдено {deficitCount} потенційних дефіцитів.",
+                AutoGenJobState.Failed => $"Перевірка ресурсів завершилась з помилками для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: порожніх слотів {gapCount}, ресурсних дефіцитів {deficitCount}.",
                 _ => summary
             };
             await SetOkMessageAsync(summary, res.Warnings, res.GapDetails, res.GapSummary, res.Preflight, finalStatus.Report);

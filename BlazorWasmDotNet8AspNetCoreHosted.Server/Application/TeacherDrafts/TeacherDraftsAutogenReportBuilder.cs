@@ -84,28 +84,31 @@ internal static class TeacherDraftsAutogenReportBuilder
         var recommendations = new List<string>();
         foreach (var item in preflight.OrderByDescending(item => item.Count).Take(5))
         {
-            recommendations.Add(item.Recommendation);
+            var example = item.Examples.FirstOrDefault();
+            recommendations.Add(string.IsNullOrWhiteSpace(example)
+                ? item.Recommendation
+                : $"{item.Recommendation} Приклад: {example}");
         }
         foreach (var item in gapSummary.Take(5))
         {
             recommendations.Add(item.Code switch
             {
-                "teacher" => "Додайте або звільніть викладачів для модулів, які найчастіше блокують порожні слоти.",
-                "room" => "Розширте доступні аудиторії або корпуси для груп із найбільшою кількістю порожніх слотів.",
-                "travel" => "Перевірте переходи між корпусами: частину занять варто рознести або призначити в одному корпусі.",
-                "topic-order" => "Перевірте порядок тем і години модулів: автогенерація не може порушувати хронологію тем.",
-                "module-block" => "Залишайте поруч кілька слотів для модулів, які мають іти суцільним блоком.",
-                "limit" => "Зменште обсяг на діапазон або розширте навчальні дні/слоти для проблемних груп.",
-                _ => "Перегляньте приклади порожніх слотів і додайте повторюваний обмежений ресурс."
+                "teacher" => "Є порожні слоти через викладачів: відкрийте робочі години або додайте викладача до проблемного модуля.",
+                "room" => "Є порожні слоти через аудиторії: звільніть аудиторію потрібної місткості або розширте дозволені аудиторії/корпуси.",
+                "travel" => "Є порожні слоти через переходи: поставте сусідні заняття в один корпус або збільшіть перерву між корпусами.",
+                "topic-order" => "Є порожні слоти через порядок тем: додайте раніші слоти для попередніх тем або зменште години модуля в цьому діапазоні.",
+                "module-block" => "Є порожні слоти через розрив модуля: залиште поруч кілька слотів під один модуль або перенесіть зайву пару дня.",
+                "limit" => "Є порожні слоти через ліміти дня: додайте слоти/дні або зменште години для проблемної групи.",
+                _ => "Відкрийте таблицю порожніх слотів нижче: там показано групу, час, модуль і першу дію."
             });
         }
         if (worstGroups.Count > 0)
         {
-            recommendations.Add($"Почніть ручну перевірку з груп: {string.Join(", ", worstGroups.Take(3).Select(group => group.GroupName))}.");
+            recommendations.Add($"Почніть з груп: {string.Join(", ", worstGroups.Take(3).Select(group => $"{group.GroupName} ({group.GapCount})"))}.");
         }
         if (worstModules.Count > 0)
         {
-            recommendations.Add($"Найчастіше проблемні модулі: {string.Join(", ", worstModules.Take(3).Select(module => module.ModuleName))}.");
+            recommendations.Add($"Першими перевірте модулі: {string.Join(", ", worstModules.Take(3).Select(module => $"{module.ModuleName} ({module.GapCount})"))}.");
         }
         return recommendations
             .Where(text => !string.IsNullOrWhiteSpace(text))
