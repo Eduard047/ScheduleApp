@@ -704,8 +704,7 @@ public sealed class TeacherDraftsAutogenJobService
             var parts = new List<string>
             {
                 $"Готово {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}",
-                $"створено {result.Created}",
-                $"пропущено {result.Skipped}"
+                $"створено {result.Created}"
             };
             var gapCount = result.GapDetails?.Count ?? 0;
             var deficitCount = result.Preflight?.Sum(item => item.Count) ?? 0;

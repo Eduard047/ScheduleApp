@@ -85,21 +85,19 @@ internal static class TeacherDraftsAutogenReportBuilder
         foreach (var item in preflight.OrderByDescending(item => item.Count).Take(5))
         {
             var example = item.Examples.FirstOrDefault();
-            recommendations.Add(string.IsNullOrWhiteSpace(example)
-                ? item.Recommendation
-                : $"{item.Recommendation} Приклад: {example}");
+            recommendations.Add(BuildPreflightRecommendation(item, example));
         }
         foreach (var item in gapSummary.Take(5))
         {
             recommendations.Add(item.Code switch
             {
-                "teacher" => "Є порожні слоти через викладачів: відкрийте робочі години або додайте викладача до проблемного модуля.",
-                "room" => "Є порожні слоти через аудиторії: звільніть аудиторію потрібної місткості або розширте дозволені аудиторії/корпуси.",
-                "travel" => "Є порожні слоти через переходи: поставте сусідні заняття в один корпус або збільшіть перерву між корпусами.",
-                "topic-order" => "Є порожні слоти через порядок тем: додайте раніші слоти для попередніх тем або зменште години модуля в цьому діапазоні.",
-                "module-block" => "Є порожні слоти через розрив модуля: залиште поруч кілька слотів під один модуль або перенесіть зайву пару дня.",
-                "limit" => "Є порожні слоти через ліміти дня: додайте слоти/дні або зменште години для проблемної групи.",
-                _ => "Відкрийте таблицю порожніх слотів нижче: там показано групу, час, модуль і першу дію."
+                "teacher" => "Перевірте викладачів: прив'язку до модуля, робочі години та зайнятість.",
+                "room" => "Перевірте аудиторії: місткість, дозволені корпуси та зайнятість у потрібний час.",
+                "travel" => "Перевірте переходи між корпусами: сусідні пари мають бути ближче або з більшою перервою.",
+                "topic-order" => "Перевірте порядок тем: попередні теми мають бути поставлені перед наступними.",
+                "module-block" => "Перевірте блоки модулів: пари одного модуля краще тримати поруч у межах дня.",
+                "limit" => "Перевірте сітку групи: додайте навчальний час або зменште години в цьому діапазоні.",
+                _ => "Перевірте проблемні слоти за групою, модулем і часом."
             });
         }
         if (worstGroups.Count > 0)
@@ -115,6 +113,21 @@ internal static class TeacherDraftsAutogenReportBuilder
             .Distinct(StringComparer.Ordinal)
             .Take(10)
             .ToList();
+    }
+
+    private static string BuildPreflightRecommendation(AutoGenPreflightItem item, string? example)
+    {
+        var exampleSuffix = string.IsNullOrWhiteSpace(example) ? string.Empty : $" Приклад: {example}";
+        return item.Code switch
+        {
+            "slot" => $"{item.Count} слотів бракує у сітці груп. Додайте навчальний час або звільніть уже зайняті пари.{exampleSuffix}",
+            "teacher" => $"{item.Count} викладацьких слотів бракує. Перевірте прив'язку викладачів, робочі години та зайнятість.{exampleSuffix}",
+            "room" => $"{item.Count} аудиторних слотів бракує. Додайте або звільніть аудиторії потрібної місткості.{exampleSuffix}",
+            "building" => $"{item.Count} слотів заблокували налаштування корпусів. Розширте дозволені корпуси або пріоритетні аудиторії групи.{exampleSuffix}",
+            "travel" => $"{item.Count} слотів відсіяли переходи. Підберіть ближчі аудиторії або збільшіть перерву.{exampleSuffix}",
+            "topic-order" => $"{item.Count} годин не мають доступних тем. Додайте теми потрібного типу або зменште години модуля.{exampleSuffix}",
+            _ => $"{item.Title}: {item.Count}. {item.Recommendation}{exampleSuffix}"
+        };
     }
 
     private static (string Code, string Title) ClassifyGapReason(string? reason)

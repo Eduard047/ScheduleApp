@@ -45,6 +45,47 @@
         border-radius: .35rem;
         padding: .45rem .65rem;
     }
+    .module-generated-hours {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 5rem;
+        border-radius: .35rem;
+        border: 1px solid rgba(148, 163, 184, .45);
+        background: #fff;
+        padding: .16rem .45rem;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+    }
+    .module-generated-hours--complete {
+        border-color: rgba(22, 163, 74, .35);
+        background: #f0fdf4;
+        color: #166534;
+    }
+    .module-generated-hours--partial {
+        border-color: rgba(234, 179, 8, .45);
+        background: #fefce8;
+        color: #854d0e;
+    }
+    .module-generated-hours--missing {
+        border-color: rgba(239, 68, 68, .35);
+        background: #fef2f2;
+        color: #991b1b;
+    }
+    .module-generated-hours--empty {
+        color: #64748b;
+        background: #f8fafc;
+    }
+    .module-generated-hours__missing {
+        margin-top: .1rem;
+        font-size: .72rem;
+        color: #b45309;
+    }
+    .module-generated-hours__over {
+        margin-top: .1rem;
+        font-size: .72rem;
+        color: #991b1b;
+    }
     .gap-summary {
         border-left: 4px solid #0f766e;
         background: #ecfdf5;
@@ -64,6 +105,29 @@
         background: #fff;
         padding: .15rem .45rem;
         font-size: .78rem;
+    }
+    .autogen-next-steps {
+        border-left: 4px solid #0f766e;
+        background: #ecfdf5;
+        color: #064e3b;
+        border-radius: .35rem;
+        padding: .55rem .7rem;
+    }
+    .autogen-action-list {
+        padding-left: 1.15rem;
+        margin-top: .35rem;
+    }
+    .autogen-action-list li + li {
+        margin-top: .25rem;
+    }
+    .autogen-detail-panel {
+        border-top: 1px solid rgba(15, 118, 110, .18);
+        padding-top: .45rem;
+    }
+    .autogen-detail-panel summary {
+        cursor: pointer;
+        font-weight: 700;
+        color: #0f766e;
     }
     .lesson-editor-overlay {
         position: fixed;
