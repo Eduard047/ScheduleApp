@@ -422,13 +422,13 @@ else
         {
             <div class="alert alert-success mt-3">
                 <div class="d-flex flex-column gap-2">
-                    <div>@ok</div>
                     @{
                         var warningsTotal = okWarnings.Count;
                         var gapSummary = _latestGapSummary;
                         var preflightItems = _latestPreflight;
                         var report = _latestAutoGenReport;
                         var actionItems = BuildAutoGenActionItems(gapSummary, preflightItems, _latestGapDetails);
+                        var outcome = BuildAutoGenOutcomeSummary(ok, report, gapSummary, preflightItems, _latestGapDetails, warningsTotal, actionItems);
                         var gapRows = _latestGapDetails
                             .OrderBy(gap => gap.Date)
                             .ThenBy(gap => gap.GroupName, StringComparer.Ordinal)
@@ -438,33 +438,45 @@ else
                         var hiddenGapRows = Math.Max(0, _latestGapDetails.Count - gapRows.Count);
                         var hasAutoGenIssues = warningsTotal > 0 || actionItems.Count > 0 || gapRows.Count > 0;
                     }
-                    @if (report is not null)
+                    @if (outcome is not null)
                     {
-                        <div class="autogen-report small">
-                            <div class="fw-semibold">Підсумок автогенерації</div>
-                            <div class="autogen-report-grid">
-                                <span>Тижнів: @report.TotalWeeks</span>
-                                <span>Створено: @report.Created</span>
-                                <span>Порожніх слотів: @report.GapCount</span>
-                                <span>Дефіцитів ресурсів: @report.DeficitCount</span>
+                        <div class="autogen-outcome @outcome.CssClass">
+                            <div class="autogen-outcome__head">
+                                <div>
+                                    <div class="autogen-outcome__status">@outcome.StatusLabel</div>
+                                    <div class="autogen-outcome__title">@outcome.Headline</div>
+                                    <div class="autogen-outcome__message">@outcome.Detail</div>
+                                </div>
+                                @if (!string.IsNullOrWhiteSpace(outcome.PrimaryAction))
+                                {
+                                    <div class="autogen-outcome__action">
+                                        <span>Перший крок</span>
+                                        <strong>@outcome.PrimaryAction</strong>
+                                    </div>
+                                }
                             </div>
-                            @if (report.WorstGroups.Count > 0 || report.WorstModules.Count > 0)
-                            {
-                                <div class="autogen-report-section">
-                                    <div class="fw-semibold">Де найбільше перевірити</div>
-                                    <div class="autogen-report-pills">
-                                        @foreach (var group in report.WorstGroups.Take(4))
+                            <div class="autogen-outcome__metrics">
+                                @foreach (var metric in outcome.Metrics)
+                                {
+                                    <div class="autogen-outcome-metric @(metric.IsProblem ? "autogen-outcome-metric--problem" : null)">
+                                        <span>@metric.Label</span>
+                                        <strong>@metric.Value</strong>
+                                        @if (!string.IsNullOrWhiteSpace(metric.Hint))
                                         {
-                                            <span class="autogen-report-pill">Група @group.GroupName: @group.GapCount</span>
-                                        }
-                                        @foreach (var module in report.WorstModules.Take(4))
-                                        {
-                                            <span class="autogen-report-pill">Модуль @module.ModuleName: @module.GapCount</span>
+                                            <small>@metric.Hint</small>
                                         }
                                     </div>
-                                </div>
+                                }
+                            </div>
+                            @if (!string.IsNullOrWhiteSpace(outcome.HotspotText))
+                            {
+                                <div class="autogen-outcome__hotspot">@outcome.HotspotText</div>
                             }
                         </div>
+                    }
+                    else
+                    {
+                        <div>@ok</div>
                     }
                     @if (hasAutoGenIssues)
                     {
@@ -813,13 +825,13 @@ else
     private const string LogActionClearSchedule = "clear-schedule-week";
     private const string LogActionDelete = "delete-item";
     private const string ContiguousModuleBlockReasonMarker = "суцільним блоком без повернення після перемикання на інший модуль";
-    private const string RecommendedAutoGenProfileName = "soft-repeat-0-par3-distinct5-pref035-teacher0-build0";
+    private const string RecommendedAutoGenProfileName = "soft-repeat-0-par3-distinct5-pref015-teacher0-build0";
     private const int RecommendedPreferredFirstMaxSlotOrderOverride = 6;
     private const int RecommendedSoftFillRepeatWindowDays = 0;
     private const int RecommendedSoftFillMaxParallelGroupsPerModuleInSlot = 3;
     private const int RecommendedSoftFillPreferredMaxDistinctModulesPerDay = 5;
     private const int RecommendedSoftFillMaxDistinctModulesPerDay = 6;
-    private const double RecommendedSoftFillPreferredFirstPenaltyMultiplier = 0.35;
+    private const double RecommendedSoftFillPreferredFirstPenaltyMultiplier = 0.15;
     private const double RecommendedSoftFillTeacherLoadPenaltyWeight = 0.0;
     private const double RecommendedSoftFillBuildingDistancePenaltyWeight = 0.0;
     private static readonly AutoGenSoftOptionsDto RecommendedSoftFillOptions = new(
@@ -1668,6 +1680,141 @@ else
             "topic-order" => $"{item.Count} годин не мають доступних тем. Додайте теми потрібного типу або зменште години модуля.{exampleSuffix}",
             _ => $"{item.Title}: {item.Count}. {item.Recommendation}{exampleSuffix}"
         };
+    }
+    private static AutoGenOutcomeSummary? BuildAutoGenOutcomeSummary(
+        string? message,
+        AutoGenRunReport? report,
+        IReadOnlyList<AutoGenGapSummaryItem> gapSummary,
+        IReadOnlyList<AutoGenPreflightItem> preflight,
+        IReadOnlyList<AutoGenGapDetail> gapDetails,
+        int warningsTotal,
+        IReadOnlyList<string> actionItems)
+    {
+        var gapCount = report?.GapCount ?? gapDetails.Count;
+        var deficitCount = report?.DeficitCount ?? preflight.Sum(item => item.Count);
+        var hasOutcomeData = report is not null || gapCount > 0 || deficitCount > 0 || warningsTotal > 0 || actionItems.Count > 0;
+        if (!hasOutcomeData)
+        {
+            return null;
+        }
+
+        var hasIssues = gapCount > 0 || deficitCount > 0 || warningsTotal > 0 || actionItems.Count > 0;
+        var headline = BuildAutoGenOutcomeHeadline(report, gapCount, deficitCount, warningsTotal);
+        var detail = report is not null
+            ? BuildAutoGenOutcomeDetail(report)
+            : string.IsNullOrWhiteSpace(message) ? "Операцію виконано." : message.Trim();
+        var metrics = BuildAutoGenOutcomeMetrics(report, gapCount, deficitCount, warningsTotal);
+
+        return new AutoGenOutcomeSummary(
+            hasIssues ? "autogen-outcome--needs-review" : "autogen-outcome--clean",
+            hasIssues ? "Потрібна перевірка" : "Готово",
+            headline,
+            detail,
+            metrics,
+            BuildAutoGenHotspotText(report, gapSummary, gapDetails),
+            actionItems.FirstOrDefault());
+    }
+
+    private static string BuildAutoGenOutcomeHeadline(AutoGenRunReport? report, int gapCount, int deficitCount, int warningsTotal)
+    {
+        if (gapCount > 0 && deficitCount > 0)
+        {
+            return $"Залишилось {gapCount} порожніх слотів і {deficitCount} ресурсних дефіцитів";
+        }
+        if (gapCount > 0)
+        {
+            return $"Залишилось {gapCount} порожніх слотів";
+        }
+        if (deficitCount > 0)
+        {
+            return $"Знайдено {deficitCount} ресурсних дефіцитів";
+        }
+        if (warningsTotal > 0)
+        {
+            return $"Є {warningsTotal} попереджень після автогенерації";
+        }
+        if (report is not null && report.Created > 0)
+        {
+            return $"Створено {report.Created} чернеток без порожніх слотів";
+        }
+        return "Порожніх слотів не залишилось";
+    }
+
+    private static string BuildAutoGenOutcomeDetail(AutoGenRunReport report)
+    {
+        var range = BuildAutoGenOutcomeRangeText(report.RangeStartDate, report.RangeEndDate);
+        var weeksText = report.TotalWeeks == 1 ? "1 тиждень" : $"{report.TotalWeeks} тижнів";
+        return $"Діапазон {range}: {weeksText}, створено {report.Created}, пропущено {report.Skipped}.";
+    }
+
+    private static string BuildAutoGenOutcomeRangeText(DateOnly fromDate, DateOnly toDate)
+        => fromDate == toDate
+            ? fromDate.ToString("dd.MM.yyyy")
+            : $"{fromDate:dd.MM.yyyy} – {toDate:dd.MM.yyyy}";
+
+    private static List<AutoGenOutcomeMetric> BuildAutoGenOutcomeMetrics(
+        AutoGenRunReport? report,
+        int gapCount,
+        int deficitCount,
+        int warningsTotal)
+    {
+        var metrics = new List<AutoGenOutcomeMetric>();
+        if (report is not null)
+        {
+            metrics.Add(new AutoGenOutcomeMetric("Створено", report.Created.ToString()));
+            metrics.Add(new AutoGenOutcomeMetric("Пропущено", report.Skipped.ToString(), "вже існували або були закріплені"));
+            metrics.Add(new AutoGenOutcomeMetric("Тижнів", report.TotalWeeks.ToString()));
+        }
+        metrics.Add(new AutoGenOutcomeMetric("Порожні слоти", gapCount.ToString(), gapCount > 0 ? "потрібна ручна перевірка" : "не залишились", gapCount > 0));
+        metrics.Add(new AutoGenOutcomeMetric("Дефіцити", deficitCount.ToString(), deficitCount > 0 ? "бракує ресурсу" : "не знайдено", deficitCount > 0));
+        if (warningsTotal > 0)
+        {
+            metrics.Add(new AutoGenOutcomeMetric("Попередження", warningsTotal.ToString(), "деталі нижче", true));
+        }
+        return metrics;
+    }
+
+    private static string? BuildAutoGenHotspotText(
+        AutoGenRunReport? report,
+        IReadOnlyList<AutoGenGapSummaryItem> gapSummary,
+        IReadOnlyList<AutoGenGapDetail> gapDetails)
+    {
+        var parts = new List<string>();
+        var worstGroup = report?.WorstGroups.FirstOrDefault();
+        if (worstGroup is not null)
+        {
+            parts.Add($"група {worstGroup.GroupName} ({worstGroup.GapCount})");
+        }
+        else
+        {
+            var group = gapDetails
+                .GroupBy(gap => gap.GroupName, StringComparer.Ordinal)
+                .OrderByDescending(group => group.Count())
+                .ThenBy(group => group.Key, StringComparer.Ordinal)
+                .FirstOrDefault();
+            if (group is not null)
+            {
+                parts.Add($"група {group.Key} ({group.Count()})");
+            }
+        }
+
+        var worstModule = report?.WorstModules.FirstOrDefault();
+        if (worstModule is not null)
+        {
+            parts.Add($"модуль {CompactAutoGenText(worstModule.ModuleName, 70)} ({worstModule.GapCount})");
+        }
+        var reason = gapSummary
+            .OrderByDescending(item => item.Count)
+            .ThenBy(item => item.Title, StringComparer.Ordinal)
+            .FirstOrDefault();
+        if (reason is not null)
+        {
+            parts.Add($"причина: {reason.Title.ToLowerInvariant()} ({reason.Count})");
+        }
+
+        return parts.Count == 0
+            ? null
+            : $"Найбільше уваги: {string.Join("; ", parts)}.";
     }
     private static List<AutoGenGapSummaryItem> BuildGapReasonSummary(IEnumerable<AutoGenGapDetail>? gapDetails)
     {
@@ -3214,6 +3361,21 @@ else
         public bool Expanded { get; set; } = true;
         public string ToggleLabel => Expanded ? "Приховати" : "Розгорнути";
     }
+    private sealed record AutoGenOutcomeSummary(
+        string CssClass,
+        string StatusLabel,
+        string Headline,
+        string Detail,
+        IReadOnlyList<AutoGenOutcomeMetric> Metrics,
+        string? HotspotText,
+        string? PrimaryAction
+    );
+    private sealed record AutoGenOutcomeMetric(
+        string Label,
+        string Value,
+        string? Hint = null,
+        bool IsProblem = false
+    );
     private sealed record PersistedAutoGenStatus(
         string Message,
         List<string> Warnings,

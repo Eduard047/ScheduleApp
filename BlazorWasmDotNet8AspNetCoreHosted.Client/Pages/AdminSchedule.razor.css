@@ -309,6 +309,118 @@
     .autogen-progress__last {
         color: #166534;
     }
+    .autogen-outcome {
+        border: 1px solid rgba(15, 23, 42, .12);
+        border-left-width: 5px;
+        border-radius: 8px;
+        background: #fff;
+        color: #0f172a;
+        padding: .8rem .9rem;
+    }
+    .autogen-outcome--clean {
+        border-left-color: #16a34a;
+        background: #f8fff9;
+    }
+    .autogen-outcome--needs-review {
+        border-left-color: #d97706;
+        background: #fffaf0;
+    }
+    .autogen-outcome__head {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 1rem;
+    }
+    .autogen-outcome__status {
+        display: inline-flex;
+        align-items: center;
+        border-radius: 999px;
+        background: rgba(15, 23, 42, .08);
+        color: #334155;
+        font-size: .74rem;
+        font-weight: 800;
+        line-height: 1;
+        padding: .25rem .5rem;
+        margin-bottom: .4rem;
+    }
+    .autogen-outcome__title {
+        font-size: 1.02rem;
+        font-weight: 800;
+        line-height: 1.25;
+    }
+    .autogen-outcome__message {
+        margin-top: .25rem;
+        color: #475569;
+        font-size: .86rem;
+    }
+    .autogen-outcome__action {
+        flex: 0 1 340px;
+        border: 1px solid rgba(217, 119, 6, .25);
+        border-radius: 8px;
+        background: #fff;
+        padding: .55rem .65rem;
+        font-size: .82rem;
+    }
+    .autogen-outcome__action span {
+        display: block;
+        color: #92400e;
+        font-weight: 800;
+        margin-bottom: .15rem;
+    }
+    .autogen-outcome__action strong {
+        display: block;
+        color: #0f172a;
+        font-weight: 700;
+        line-height: 1.25;
+    }
+    .autogen-outcome__metrics {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+        gap: .5rem;
+        margin-top: .75rem;
+    }
+    .autogen-outcome-metric {
+        min-height: 4.25rem;
+        border: 1px solid rgba(148, 163, 184, .35);
+        border-radius: 8px;
+        background: #fff;
+        padding: .55rem .65rem;
+    }
+    .autogen-outcome-metric span {
+        display: block;
+        color: #64748b;
+        font-size: .76rem;
+        font-weight: 700;
+    }
+    .autogen-outcome-metric strong {
+        display: block;
+        color: #0f172a;
+        font-size: 1.25rem;
+        line-height: 1.15;
+        margin-top: .1rem;
+    }
+    .autogen-outcome-metric small {
+        display: block;
+        color: #64748b;
+        font-size: .72rem;
+        line-height: 1.2;
+        margin-top: .15rem;
+    }
+    .autogen-outcome-metric--problem {
+        border-color: rgba(217, 119, 6, .35);
+        background: #fffbeb;
+    }
+    .autogen-outcome-metric--problem strong {
+        color: #92400e;
+    }
+    .autogen-outcome__hotspot {
+        border-top: 1px solid rgba(15, 23, 42, .1);
+        margin-top: .7rem;
+        padding-top: .55rem;
+        color: #334155;
+        font-size: .84rem;
+        font-weight: 650;
+    }
     .autogen-report {
         border-left: 4px solid #2563eb;
         background: #eff6ff;
@@ -341,4 +453,13 @@
         color: #1e40af;
         padding: .15rem .45rem;
         font-size: .78rem;
+    }
+    @media (max-width: 767.98px) {
+        .autogen-outcome__head {
+            flex-direction: column;
+        }
+        .autogen-outcome__action {
+            width: 100%;
+            flex-basis: auto;
+        }
     }

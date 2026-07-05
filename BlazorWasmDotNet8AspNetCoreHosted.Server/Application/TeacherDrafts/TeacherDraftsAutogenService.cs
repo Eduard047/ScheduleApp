@@ -1304,7 +1304,7 @@ public sealed class TeacherDraftsAutogenService
         bool CanShareAcrossGroups(int lessonTypeId)
             => IsLectureType(lessonTypeId)
                || preferredFirstTypeIds.Contains(lessonTypeId);
-        // Після 6-ї години лекції не ставимо у перехідні слоти 7-8: там замало часу на зміну корпусу.
+        // Після раннього лекційного вікна потокові заняття ставимо лише як аварійний резерв.
         int RegularLectureMaxSlotOrder(int? configuredMaxSlotOrder = null)
             => configuredMaxSlotOrder is int configured && configured > 0
                 ? Math.Min(configured, latestLectureSlotBeforeLongBreak)
@@ -5261,7 +5261,7 @@ public sealed class TeacherDraftsAutogenService
                         RecordSlotFailureReason(
                             date,
                             sl,
-                            $"Лекційний тип не можна ставити у слот №{currentSlotOrder}: після 6-ї години замалий перехід між корпусами, а аварійний резерв починається з 9-ї.");
+                            $"Лекційний тип не можна ставити у слот №{currentSlotOrder}: раннє лекційне вікно вже завершилось, а аварійний резерв починається з 9-ї.");
                         continue;
                     }
                     if (preferredFirstEnabled
