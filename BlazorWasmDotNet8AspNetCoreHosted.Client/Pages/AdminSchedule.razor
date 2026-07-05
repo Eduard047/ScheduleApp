@@ -450,7 +450,7 @@ else
                                 @if (!string.IsNullOrWhiteSpace(outcome.PrimaryAction))
                                 {
                                     <div class="autogen-outcome__action">
-                                        <span>Перший крок</span>
+                                        <span>Перший крок:</span>@(" ")
                                         <strong>@outcome.PrimaryAction</strong>
                                     </div>
                                 }
@@ -459,11 +459,12 @@ else
                                 @foreach (var metric in outcome.Metrics)
                                 {
                                     <div class="autogen-outcome-metric @(metric.IsProblem ? "autogen-outcome-metric--problem" : null)">
-                                        <span>@metric.Label</span>
+                                        <span>@metric.Label:</span>@(" ")
                                         <strong>@metric.Value</strong>
                                         @if (!string.IsNullOrWhiteSpace(metric.Hint))
                                         {
-                                            <small>@metric.Hint</small>
+                                            @(" ")
+                                            <small>(@metric.Hint)</small>
                                         }
                                     </div>
                                 }
