@@ -3354,8 +3354,10 @@ public sealed class TeacherDraftsAutogenService
                     .Any(b => b.StartTime > afterStart
                               && CanShareAcrossGroups(b.LessonTypeId)
                               && !excludedTypeIds.Contains(b.LessonTypeId));
+            bool SlotFilledForGroup(int groupId, DateOnly date, TimeSlot slot) =>
+                BusyForGroupDate(groupId, date).Any(b => b.StartTime == slot.Start && b.EndTime == slot.End);
             bool SlotFilled(DateOnly date, TimeSlot slot) =>
-                BusyForGroupDate(grp.Id, date).Any(b => b.StartTime == slot.Start && b.EndTime == slot.End);
+                SlotFilledForGroup(grp.Id, date, slot);
             // Повертає викладача, який веде цей модуль у сусідньому слоті.
             int? GetAdjacentSameModuleTeacherId(DateOnly date, TimeSlot slot, int moduleId)
             {
@@ -7211,7 +7213,10 @@ public sealed class TeacherDraftsAutogenService
                 bool CanMoveDraftToGap(TeacherDraftItem candidate, TimeSlot targetGap, out string reason)
                 {
                     reason = string.Empty;
-                    if (SlotFilled(date, targetGap)
+                    var candidateGroup = selectedGroupsById.TryGetValue(candidate.GroupId, out var resolvedCandidateGroup)
+                        ? resolvedCandidateGroup
+                        : grp;
+                    if (SlotFilledForGroup(candidate.GroupId, date, targetGap)
                         || candidate.Date != date
                         || candidate.IsLocked
                         || CanShareAcrossGroups(candidate.LessonTypeId)
@@ -7239,7 +7244,7 @@ public sealed class TeacherDraftsAutogenService
                         reason = ModuleSegmentLimitReason(candidate.ModuleId, maxSegmentsAllowed);
                         return false;
                     }
-                    if (InsertionWouldSplitExistingModuleBlock(grp.Id, date, candidate.ModuleId, targetGap.Start, targetGap.End, out var insertionSplitReason, maxSegmentsAllowed))
+                    if (InsertionWouldSplitExistingModuleBlock(candidate.GroupId, date, candidate.ModuleId, targetGap.Start, targetGap.End, out var insertionSplitReason, maxSegmentsAllowed))
                     {
                         reason = insertionSplitReason;
                         return false;
@@ -7270,7 +7275,7 @@ public sealed class TeacherDraftsAutogenService
                             SlotOverlaps(slot, date, targetGap.Start, targetGap.End)
                             && !IsSameDraftBusySlot(candidate, slot, candidate.StartTime, candidate.EndTime)))
                     {
-                        reason = $"Група {grp.Name} зайнята у слоті {targetGap.Start:HH\\:mm}-{targetGap.End:HH\\:mm}.";
+                        reason = $"Група {candidateGroup.Name} зайнята у слоті {targetGap.Start:HH\\:mm}-{targetGap.End:HH\\:mm}.";
                         return false;
                     }
                     if (candidate.RoomId is int roomId)
@@ -7284,7 +7289,7 @@ public sealed class TeacherDraftsAutogenService
                         }
                     }
                     var shiftedSlotGroupLimit = SlotGroupLimitForPlacement(
-                        grp.CourseId,
+                        candidateGroup.CourseId,
                         candidate.LessonTypeId,
                         candidate.IsSelfStudy);
                     if (CountGroupsWithModuleInSlot(candidate.ModuleId, date, targetGap.Start, targetGap.End) >= shiftedSlotGroupLimit)
@@ -7292,7 +7297,7 @@ public sealed class TeacherDraftsAutogenService
                         reason = $"Досягнуто ліміт паралельних груп модуля <{ModuleTitleLabel(candidate.ModuleId)}> у слоті.";
                         return false;
                     }
-                    if (ViolatesMoveTravel(candidate, targetGap, slot => slot.GroupId == candidate.GroupId, $"групи {grp.Name}", out var groupTravelReason))
+                    if (ViolatesMoveTravel(candidate, targetGap, slot => slot.GroupId == candidate.GroupId, $"групи {candidateGroup.Name}", out var groupTravelReason))
                     {
                         reason = groupTravelReason;
                         return false;
@@ -7382,6 +7387,7 @@ public sealed class TeacherDraftsAutogenService
                     {
                         var oldSlot = candidateEntry.OldSlot!;
                         var moduleBudgetCache = new Dictionary<(TimeOnly Start, TimeOnly End, int ModuleId, bool BypassDistinctLimit), int>();
+                        var repairSegmentLimit = softFill ? 2 : maxModuleSegmentsPerDay;
                         var deficitModulesForOldSlot = BuildGapCandidateModules()
                             .Where(moduleId => moduleId != candidateEntry.Draft.ModuleId
                                                && RemainingFor(grp.Id, moduleId) > 0
@@ -7390,7 +7396,7 @@ public sealed class TeacherDraftsAutogenService
                                                    oldSlot,
                                                    moduleId,
                                                    bypassDistinctLimit: true,
-                                                   maxModuleSegmentsAllowed: maxModuleSegmentsPerDay,
+                                                   maxModuleSegmentsAllowed: repairSegmentLimit,
                                                    moduleBudgetCache) > 0)
                             .OrderByDescending(moduleId => RemainingFor(grp.Id, moduleId))
                             .ThenBy(moduleId => moduleId)
@@ -7446,6 +7452,105 @@ public sealed class TeacherDraftsAutogenService
                     }
                     return false;
                 }
+                TeacherDraftItem? FindCreatedDraftForBusySlot(BusySlot busySlot)
+                    => allCreatedDrafts.FirstOrDefault(draft =>
+                        SlotMatches(
+                            busySlot,
+                            draft.GroupId,
+                            draft.Date,
+                            draft.StartTime,
+                            draft.EndTime,
+                            draft.ModuleId,
+                            draft.TeacherId,
+                            draft.RoomId,
+                            draft.ModuleTopicId));
+                async Task<bool> TryReleaseExternalBlockerAndFillGapAsync(TimeSlot targetGap)
+                {
+                    if (!softFill || SlotFilled(date, targetGap) || CountFor(grp.Id, date) >= maxPerDay)
+                    {
+                        return false;
+                    }
+
+                    var targetIndex = slotIndexByTime.TryGetValue((targetGap.Start, targetGap.End), out var idx)
+                        ? idx
+                        : 0;
+                    var blockers = BusyForDate(date)
+                        .Where(slot => slot.GroupId != grp.Id
+                                       && slot.StartTime == targetGap.Start
+                                       && slot.EndTime == targetGap.End)
+                        .Select(FindCreatedDraftForBusySlot)
+                        .Where(draft => draft is not null
+                                        && draft.Date == date
+                                        && !draft.IsLocked
+                                        && draft.Status == DraftStatus.Draft
+                                        && !CanShareAcrossGroups(draft.LessonTypeId)
+                                        && !excludedTypeIds.Contains(draft.LessonTypeId)
+                                        && selectedGroupsById.TryGetValue(draft.GroupId, out var blockerGroup)
+                                        && blockerGroup.CourseId == grp.CourseId)
+                        .Select(draft => draft!)
+                        .Distinct()
+                        .Select(draft => new
+                        {
+                            Draft = draft,
+                            OldIndex = slotIndexByTime.TryGetValue((draft.StartTime, draft.EndTime), out var oldIndex)
+                                ? oldIndex
+                                : int.MaxValue
+                        })
+                        .OrderBy(entry => Math.Abs(entry.OldIndex - targetIndex))
+                        .ThenBy(entry => entry.OldIndex)
+                        .Take(8)
+                        .ToList();
+                    foreach (var blocker in blockers)
+                    {
+                        var blockerTargetSlots = slots
+                            .Where(slot => !(slot.Start == targetGap.Start && slot.End == targetGap.End))
+                            .Where(slot => !SlotFilledForGroup(blocker.Draft.GroupId, date, slot))
+                            .OrderBy(slot => slotIndexByTime.TryGetValue((slot.Start, slot.End), out var slotIndex)
+                                ? Math.Abs(slotIndex - blocker.OldIndex)
+                                : int.MaxValue)
+                            .ThenBy(slot => slot.Start)
+                            .Take(6)
+                            .ToList();
+                        foreach (var blockerTargetSlot in blockerTargetSlots)
+                        {
+                            if (!CanMoveDraftToGap(blocker.Draft, blockerTargetSlot, out _))
+                            {
+                                continue;
+                            }
+                            if (!TryApplyDraftMove(
+                                    blocker.Draft,
+                                    blockerTargetSlot,
+                                    out var oldStart,
+                                    out var oldEnd,
+                                    out var oldBusySlot,
+                                    out var newBusySlot)
+                                || oldBusySlot is null)
+                            {
+                                continue;
+                            }
+
+                            var filledTargetGap = await TryFillGapWithVariantsAsync(
+                                targetGap,
+                                allowRepeatPreviousDay: true,
+                                allowExtraSameDay: true,
+                                relaxed: true,
+                                bypassDistinctLimit: true,
+                                maxModuleSegmentsAllowed: softFill ? 2 : maxModuleSegmentsPerDay);
+                            if (filledTargetGap)
+                            {
+                                var blockerGroupName = selectedGroupsById.TryGetValue(blocker.Draft.GroupId, out var blockerGroup)
+                                    ? blockerGroup.Name
+                                    : $"#{blocker.Draft.GroupId}";
+                                warnings.Add($"[{date:yyyy-MM-dd}] {grp.Name}: ресурсний repair-pass пересунув заняття групи {blockerGroupName} з {oldStart:HH\\:mm}-{oldEnd:HH\\:mm} у {blockerTargetSlot.Start:HH\\:mm}-{blockerTargetSlot.End:HH\\:mm} і дозаповнив слот {targetGap.Start:HH\\:mm}-{targetGap.End:HH\\:mm}.");
+                                return true;
+                            }
+
+                            RollbackDraftMove(blocker.Draft, oldStart, oldEnd, oldBusySlot, newBusySlot);
+                        }
+                    }
+
+                    return false;
+                }
                 async Task<bool> TryTargetedRepairGapWithMoveChainAsync(TimeSlot targetGap)
                 {
                     if (!softFill || SlotFilled(date, targetGap))
@@ -7475,6 +7580,7 @@ public sealed class TeacherDraftsAutogenService
                             ? idx
                             : 0;
                         var moduleBudgetCache = new Dictionary<(TimeOnly Start, TimeOnly End, int ModuleId, bool BypassDistinctLimit), int>();
+                        var repairSegmentLimit = softFill ? 2 : maxModuleSegmentsPerDay;
                         var candidates = movableDrafts
                             .Where(candidate => candidate.GroupId == grp.Id
                                                 && candidate.Date == date
@@ -7499,7 +7605,7 @@ public sealed class TeacherDraftsAutogenService
                                 DirectBudget = EstimateGapVariantBudget(
                                     entry.OldSlot!,
                                     bypassDistinctLimit: true,
-                                    maxModuleSegmentsAllowed: maxModuleSegmentsPerDay,
+                                    maxModuleSegmentsAllowed: repairSegmentLimit,
                                     moduleBudgetCache)
                             })
                             .OrderByDescending(entry => entry.DirectBudget > 0)
@@ -7575,7 +7681,8 @@ public sealed class TeacherDraftsAutogenService
                     }
 
                     return await TryRepairGapByMoveChainAsync(targetGap, maxDepth)
-                           || await TryTargetedRepairGapAsync(targetGap);
+                           || await TryTargetedRepairGapAsync(targetGap)
+                           || await TryReleaseExternalBlockerAndFillGapAsync(targetGap);
                 }
                 bool TryRepairLectureOrder()
                 {
