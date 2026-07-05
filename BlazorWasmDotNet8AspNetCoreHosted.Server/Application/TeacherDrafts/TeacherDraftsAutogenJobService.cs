@@ -336,50 +336,60 @@ public sealed class TeacherDraftsAutogenJobService
         {
             using var scope = _scopeFactory.CreateScope();
             var autogen = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenService>();
+            var runRanges = new List<(int WeekIndex, DateOnly WeekStart, DateOnly RangeStartDate, DateOnly RangeEndDate)>();
+            if (weekStarts.Count > 1)
+            {
+                runRanges.Add((weekStarts.Count - 1, weekStarts[0], job.Request.FromDate, job.Request.ToDate));
+            }
+            else
+            {
+                for (var weekIndex = 0; weekIndex < weekStarts.Count; weekIndex++)
+                {
+                    var weekStart = weekStarts[weekIndex];
+                    var weekEnd = weekStart.AddDays(6);
+                    var rangeStartDate = job.Request.FromDate > weekStart ? job.Request.FromDate : weekStart;
+                    var rangeEndDate = job.Request.ToDate < weekEnd ? job.Request.ToDate : weekEnd;
+                    if (rangeEndDate >= rangeStartDate)
+                    {
+                        runRanges.Add((weekIndex, weekStart, rangeStartDate, rangeEndDate));
+                    }
+                }
+            }
 
-            for (var weekIndex = 0; weekIndex < weekStarts.Count; weekIndex++)
+            foreach (var runRange in runRanges)
             {
                 job.Token.ThrowIfCancellationRequested();
 
-                var weekStart = weekStarts[weekIndex];
-                var weekEnd = weekStart.AddDays(6);
-                var rangeStartDate = job.Request.FromDate > weekStart ? job.Request.FromDate : weekStart;
-                var rangeEndDate = job.Request.ToDate < weekEnd ? job.Request.ToDate : weekEnd;
-                if (rangeEndDate < rangeStartDate)
-                {
-                    continue;
-                }
-
-                job.StartWeek(weekIndex, weekStart, rangeStartDate, rangeEndDate);
-                await TryPersistSnapshotAsync(job, "початок тижня");
-                var request = BuildDraftRequest(job.Request, weekStart, rangeStartDate, rangeEndDate);
+                job.StartWeek(runRange.WeekIndex, runRange.WeekStart, runRange.RangeStartDate, runRange.RangeEndDate);
+                await TryPersistSnapshotAsync(job, "початок діапазону");
+                var request = BuildDraftRequest(job.Request, runRange.WeekStart, runRange.RangeStartDate, runRange.RangeEndDate);
                 var action = await autogen.DraftAutoGen(request, job.Token);
-                var (weekSucceeded, weekResult, fallbackWarning) = ExtractAutoGenResult(action);
-                if (!weekSucceeded)
+                var (rangeSucceeded, rangeResult, fallbackWarning) = ExtractAutoGenResult(action);
+                if (!rangeSucceeded)
                 {
                     failed = true;
-                    warnings.Add($"[{weekStart:yyyy-MM-dd}] Тиждень не згенеровано повністю.");
+                    warnings.Add($"[{runRange.RangeStartDate:yyyy-MM-dd} – {runRange.RangeEndDate:yyyy-MM-dd}] Діапазон не згенеровано повністю.");
                 }
                 if (!string.IsNullOrWhiteSpace(fallbackWarning))
                 {
                     warnings.Add(fallbackWarning);
                 }
 
-                created += weekResult.Created;
-                skipped += weekResult.Skipped;
-                warnings.AddRange(weekResult.Warnings);
-                if (weekResult.GapDetails is { Count: > 0 })
+                created += rangeResult.Created;
+                skipped += rangeResult.Skipped;
+                warnings.AddRange(rangeResult.Warnings);
+                if (rangeResult.GapDetails is { Count: > 0 })
                 {
-                    gapDetails.AddRange(weekResult.GapDetails);
+                    gapDetails.AddRange(rangeResult.GapDetails);
                 }
-                if (weekResult.Preflight is { Count: > 0 })
+                if (rangeResult.Preflight is { Count: > 0 })
                 {
-                    preflight.AddRange(weekResult.Preflight);
+                    preflight.AddRange(rangeResult.Preflight);
                 }
 
                 var partialResult = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight);
-                job.CompleteWeek(weekIndex, rangeStartDate, rangeEndDate, weekResult, partialResult);
-                await TryPersistSnapshotAsync(job, "завершення тижня");
+                job.CompleteWeek(runRange.WeekIndex, runRange.RangeStartDate, runRange.RangeEndDate, rangeResult, partialResult);
+                await TryPersistSnapshotAsync(job, "завершення діапазону");
             }
 
             var result = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight);
@@ -694,8 +704,7 @@ public sealed class TeacherDraftsAutogenJobService
             var parts = new List<string>
             {
                 $"Готово {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}",
-                $"створено {result.Created}",
-                $"пропущено {result.Skipped}"
+                $"створено {result.Created}"
             };
             var gapCount = result.GapDetails?.Count ?? 0;
             var deficitCount = result.Preflight?.Sum(item => item.Count) ?? 0;

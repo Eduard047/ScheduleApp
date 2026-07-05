@@ -94,6 +94,10 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
                            && item.Date >= request.From
                            && item.Date <= request.To
                            && item.Status == request.DraftStatus);
+        if (request.ExcludedDraftIds is { Count: > 0 })
+        {
+            query = query.Where(item => !request.ExcludedDraftIds.Contains(item.Id));
+        }
 
         if (groupIds.Count > 0)
         {
@@ -631,7 +635,8 @@ public sealed record TeacherDraftsAutogenHardRuleValidationRequest(
     WeekPreset Days = WeekPreset.MonFri,
     bool AllowIncompleteDrafts = false,
     DraftStatus DraftStatus = DraftStatus.Draft,
-    IReadOnlyCollection<TeacherDraftsAutogenPendingDraft>? PendingDrafts = null);
+    IReadOnlyCollection<TeacherDraftsAutogenPendingDraft>? PendingDrafts = null,
+    IReadOnlyCollection<int>? ExcludedDraftIds = null);
 
 public sealed record TeacherDraftsAutogenPendingDraft(
     DateOnly Date,

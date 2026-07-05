@@ -73,7 +73,19 @@ internal static class TeacherDraftsAutogenReportBuilder
     }
 
     private static string FormatGapExample(AutoGenGapDetail gap)
-        => $"{gap.Date:yyyy-MM-dd} {gap.SlotLabel}, {gap.GroupName}";
+    {
+        var module = string.IsNullOrWhiteSpace(gap.ModuleName)
+            ? gap.ModuleId is int moduleId ? $"модуль #{moduleId}" : "модуль не визначено"
+            : CompactReportText(gap.ModuleName!, 80);
+        var reason = ClassifyGapReason(gap.Reason).Title.ToLowerInvariant();
+        return $"{gap.Date:yyyy-MM-dd} {gap.SlotLabel}, {gap.GroupName}, {module}: {reason}";
+    }
+
+    private static string CompactReportText(string text, int maxLength)
+    {
+        var normalized = string.IsNullOrWhiteSpace(text) ? "—" : text.Trim();
+        return normalized.Length <= maxLength ? normalized : normalized[..maxLength] + "...";
+    }
 
     private static List<string> BuildRecommendations(
         IReadOnlyList<AutoGenGapSummaryItem> gapSummary,
@@ -84,34 +96,50 @@ internal static class TeacherDraftsAutogenReportBuilder
         var recommendations = new List<string>();
         foreach (var item in preflight.OrderByDescending(item => item.Count).Take(5))
         {
-            recommendations.Add(item.Recommendation);
+            var example = item.Examples.FirstOrDefault();
+            recommendations.Add(BuildPreflightRecommendation(item, example));
         }
         foreach (var item in gapSummary.Take(5))
         {
             recommendations.Add(item.Code switch
             {
-                "teacher" => "Додайте або звільніть викладачів для модулів, які найчастіше блокують порожні слоти.",
-                "room" => "Розширте доступні аудиторії або корпуси для груп із найбільшою кількістю порожніх слотів.",
-                "travel" => "Перевірте переходи між корпусами: частину занять варто рознести або призначити в одному корпусі.",
-                "topic-order" => "Перевірте порядок тем і години модулів: автогенерація не може порушувати хронологію тем.",
-                "module-block" => "Залишайте поруч кілька слотів для модулів, які мають іти суцільним блоком.",
-                "limit" => "Зменште обсяг на діапазон або розширте навчальні дні/слоти для проблемних груп.",
-                _ => "Перегляньте приклади порожніх слотів і додайте повторюваний обмежений ресурс."
+                "teacher" => "Перевірте викладачів: прив'язку до модуля, робочі години та зайнятість.",
+                "room" => "Перевірте аудиторії: місткість, дозволені корпуси та зайнятість у потрібний час.",
+                "travel" => "Перевірте переходи між корпусами: сусідні пари мають бути ближче або з більшою перервою.",
+                "topic-order" => "Перевірте порядок тем: попередні теми мають бути поставлені перед наступними.",
+                "module-block" => "Перевірте блоки модулів: пари одного модуля краще тримати поруч у межах дня.",
+                "limit" => "Перевірте сітку групи: додайте навчальний час або зменште години в цьому діапазоні.",
+                _ => "Перевірте проблемні слоти за групою, модулем і часом."
             });
         }
         if (worstGroups.Count > 0)
         {
-            recommendations.Add($"Почніть ручну перевірку з груп: {string.Join(", ", worstGroups.Take(3).Select(group => group.GroupName))}.");
+            recommendations.Add($"Почніть з груп: {string.Join(", ", worstGroups.Take(3).Select(group => $"{group.GroupName} ({group.GapCount})"))}.");
         }
         if (worstModules.Count > 0)
         {
-            recommendations.Add($"Найчастіше проблемні модулі: {string.Join(", ", worstModules.Take(3).Select(module => module.ModuleName))}.");
+            recommendations.Add($"Першими перевірте модулі: {string.Join(", ", worstModules.Take(3).Select(module => $"{module.ModuleName} ({module.GapCount})"))}.");
         }
         return recommendations
             .Where(text => !string.IsNullOrWhiteSpace(text))
             .Distinct(StringComparer.Ordinal)
             .Take(10)
             .ToList();
+    }
+
+    private static string BuildPreflightRecommendation(AutoGenPreflightItem item, string? example)
+    {
+        var exampleSuffix = string.IsNullOrWhiteSpace(example) ? string.Empty : $" Приклад: {example}";
+        return item.Code switch
+        {
+            "slot" => $"{item.Count} слотів бракує у сітці груп. Додайте навчальний час або звільніть уже зайняті пари.{exampleSuffix}",
+            "teacher" => $"{item.Count} викладацьких слотів бракує. Перевірте прив'язку викладачів, робочі години та зайнятість.{exampleSuffix}",
+            "room" => $"{item.Count} аудиторних слотів бракує. Додайте або звільніть аудиторії потрібної місткості.{exampleSuffix}",
+            "building" => $"{item.Count} слотів заблокували налаштування корпусів. Розширте дозволені корпуси або пріоритетні аудиторії групи.{exampleSuffix}",
+            "travel" => $"{item.Count} слотів відсіяли переходи. Підберіть ближчі аудиторії або збільшіть перерву.{exampleSuffix}",
+            "topic-order" => $"{item.Count} годин не мають доступних тем. Додайте теми потрібного типу або зменште години модуля.{exampleSuffix}",
+            _ => $"{item.Title}: {item.Count}. {item.Recommendation}{exampleSuffix}"
+        };
     }
 
     private static (string Code, string Title) ClassifyGapReason(string? reason)

@@ -205,6 +205,54 @@ code {
     margin-left: .35rem;
 }
 
+.module-generated-hours {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 5rem;
+    border-radius: .35rem;
+    border: 1px solid rgba(148, 163, 184, .45);
+    background: #fff;
+    padding: .16rem .45rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+.module-generated-hours--complete {
+    border-color: rgba(22, 163, 74, .35);
+    background: #f0fdf4;
+    color: #166534;
+}
+
+.module-generated-hours--partial {
+    border-color: rgba(234, 179, 8, .45);
+    background: #fefce8;
+    color: #854d0e;
+}
+
+.module-generated-hours--missing {
+    border-color: rgba(239, 68, 68, .35);
+    background: #fef2f2;
+    color: #991b1b;
+}
+
+.module-generated-hours--empty {
+    color: #64748b;
+    background: #f8fafc;
+}
+
+.module-generated-hours__missing {
+    margin-top: .1rem;
+    font-size: .72rem;
+    color: #b45309;
+}
+
+.module-generated-hours__over {
+    margin-top: .1rem;
+    font-size: .72rem;
+    color: #991b1b;
+}
+
 @media (max-width: 720px) {
     .table th:last-child,
     .table td:last-child {
