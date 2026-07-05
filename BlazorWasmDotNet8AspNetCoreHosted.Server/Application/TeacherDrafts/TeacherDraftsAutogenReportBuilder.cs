@@ -73,7 +73,19 @@ internal static class TeacherDraftsAutogenReportBuilder
     }
 
     private static string FormatGapExample(AutoGenGapDetail gap)
-        => $"{gap.Date:yyyy-MM-dd} {gap.SlotLabel}, {gap.GroupName}";
+    {
+        var module = string.IsNullOrWhiteSpace(gap.ModuleName)
+            ? gap.ModuleId is int moduleId ? $"модуль #{moduleId}" : "модуль не визначено"
+            : CompactReportText(gap.ModuleName!, 80);
+        var reason = ClassifyGapReason(gap.Reason).Title.ToLowerInvariant();
+        return $"{gap.Date:yyyy-MM-dd} {gap.SlotLabel}, {gap.GroupName}, {module}: {reason}";
+    }
+
+    private static string CompactReportText(string text, int maxLength)
+    {
+        var normalized = string.IsNullOrWhiteSpace(text) ? "—" : text.Trim();
+        return normalized.Length <= maxLength ? normalized : normalized[..maxLength] + "...";
+    }
 
     private static List<string> BuildRecommendations(
         IReadOnlyList<AutoGenGapSummaryItem> gapSummary,
