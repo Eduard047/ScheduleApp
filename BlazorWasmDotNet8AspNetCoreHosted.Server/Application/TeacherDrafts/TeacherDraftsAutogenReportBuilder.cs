@@ -101,16 +101,7 @@ internal static class TeacherDraftsAutogenReportBuilder
         }
         foreach (var item in gapSummary.Take(5))
         {
-            recommendations.Add(item.Code switch
-            {
-                "teacher" => "Перевірте викладачів: прив'язку до модуля, робочі години та зайнятість.",
-                "room" => "Перевірте аудиторії: місткість, дозволені корпуси та зайнятість у потрібний час.",
-                "travel" => "Перевірте переходи між корпусами: сусідні пари мають бути ближче або з більшою перервою.",
-                "topic-order" => "Перевірте порядок тем: попередні теми мають бути поставлені перед наступними.",
-                "module-block" => "Перевірте блоки модулів: пари одного модуля краще тримати поруч у межах дня.",
-                "limit" => "Перевірте сітку групи: додайте навчальний час або зменште години в цьому діапазоні.",
-                _ => "Перевірте проблемні слоти за групою, модулем і часом."
-            });
+            recommendations.Add(BuildGapRecommendation(item));
         }
         if (worstGroups.Count > 0)
         {
@@ -125,6 +116,23 @@ internal static class TeacherDraftsAutogenReportBuilder
             .Distinct(StringComparer.Ordinal)
             .Take(10)
             .ToList();
+    }
+
+    private static string BuildGapRecommendation(AutoGenGapSummaryItem item)
+    {
+        var example = item.Examples.FirstOrDefault();
+        var exampleSuffix = string.IsNullOrWhiteSpace(example) ? string.Empty : $" Приклад: {example}";
+        return item.Code switch
+        {
+            "teacher" => $"{item.Count} слотів вперлися у викладачів. Перевірте прив'язку до модуля, робочі години та зайнятість.{exampleSuffix}",
+            "room" => $"{item.Count} слотів вперлися в аудиторії. Перевірте місткість, дозволені корпуси та зайнятість у потрібний час.{exampleSuffix}",
+            "travel" => $"{item.Count} слотів не стали через переходи між корпусами. Поставте сусідні пари ближче або збільшіть перерву.{exampleSuffix}",
+            "topic-order" => $"{item.Count} слотів заблокував порядок тем. Перевірте, чи попередні теми вже поставлені перед наступними.{exampleSuffix}",
+            "module-block" => $"{item.Count} слотів не стали через правило суцільного модуля. Тримайте пари одного модуля поруч у межах дня.{exampleSuffix}",
+            "limit" => $"{item.Count} слотів зупинили денні або слотні ліміти. Додайте навчальний час або зменште години в цьому діапазоні.{exampleSuffix}",
+            "shared-flow" => $"{item.Count} слотів пов'язані зі спільним потоком. Вирівняйте тему, викладача й аудиторію для груп потоку.{exampleSuffix}",
+            _ => $"{item.Count} слотів треба перевірити вручну за групою, модулем і часом.{exampleSuffix}"
+        };
     }
 
     private static string BuildPreflightRecommendation(AutoGenPreflightItem item, string? example)
