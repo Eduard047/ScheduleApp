@@ -12,7 +12,7 @@ public sealed class AutoGenJobValidationException(string message) : Exception(me
 
 public sealed class AutoGenJobCapacityException(string message) : Exception(message);
 
-public sealed class TeacherDraftsAutogenJobService
+public sealed class TeacherDraftsAutogenJobService : IHostedService
 {
     private const int MaxRangeDays = 370;
     private const int MaxGroupCount = 200;
@@ -31,9 +31,11 @@ public sealed class TeacherDraftsAutogenJobService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<TeacherDraftsAutogenJobService> _logger;
     private readonly ConcurrentDictionary<string, AutoGenJobRuntime> _jobs = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, Task> _runningTasks = new(StringComparer.Ordinal);
     private readonly object _startSync = new();
     private readonly SemaphoreSlim _executionGate = new(1, 1);
     private readonly SemaphoreSlim _persistenceGate = new(1, 1);
+    private int _stopping;
     private static readonly TimeSpan CompletedJobTtl = TimeSpan.FromHours(6);
     private static readonly JsonSerializerOptions PersistenceJsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -48,6 +50,7 @@ public sealed class TeacherDraftsAutogenJobService
 
     public AutoGenJobStartResult Start(AutoGenJobRequest request)
     {
+        ThrowIfStopping();
         var normalized = NormalizeRequest(request);
         if (normalized.ClientJobId is { } clientJobId)
         {
@@ -68,6 +71,7 @@ public sealed class TeacherDraftsAutogenJobService
         AutoGenJobRuntime job;
         lock (_startSync)
         {
+            ThrowIfStopping();
             CleanupOldJobs();
             if (normalized.ClientJobId is { } queuedJobId
                 && _jobs.TryGetValue(queuedJobId, out var existingJob))
@@ -83,10 +87,51 @@ public sealed class TeacherDraftsAutogenJobService
 
             job = new AutoGenJobRuntime(normalized);
             _jobs[job.JobId] = job;
+            TryPersistSnapshot(job, "створення завдання");
+            QueueJob(job);
         }
-        TryPersistSnapshot(job, "створення завдання");
-        _ = Task.Run(() => RunAsync(job));
         return new AutoGenJobStartResult(job.JobId, job.ToDto());
+    }
+
+    public Task StartAsync(CancellationToken cancellationToken)
+        => Task.CompletedTask;
+
+    public async Task StopAsync(CancellationToken cancellationToken)
+    {
+        List<AutoGenJobRuntime> activeJobs;
+        Task[] runningTasks;
+        lock (_startSync)
+        {
+            Interlocked.Exchange(ref _stopping, 1);
+            activeJobs = _jobs.Values
+                .Where(job => !IsTerminalState(job.ToDto().State))
+                .ToList();
+            foreach (var job in activeJobs)
+            {
+                job.RequestCancellation();
+            }
+            runningTasks = _runningTasks.Values.ToArray();
+        }
+
+        if (runningTasks.Length == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            await Task.WhenAll(runningTasks).WaitAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogWarning(
+                "Завершення роботи сервера перервало очікування {JobCount} завдань автогенерації.",
+                _runningTasks.Count);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Під час очікування завершення завдань автогенерації сталася помилка.");
+        }
     }
 
     public AutoGenJobStatus? Get(string jobId)
@@ -101,6 +146,38 @@ public sealed class TeacherDraftsAutogenJobService
         job.RequestCancellation();
         _ = TryPersistSnapshotAsync(job, "запит скасування");
         return job.ToDto();
+    }
+
+    private void ThrowIfStopping()
+    {
+        if (Volatile.Read(ref _stopping) != 0)
+        {
+            throw new AutoGenJobCapacityException(
+                "Сервер завершує роботу, тому нові завдання автогенерації тимчасово не приймаються.");
+        }
+    }
+
+    private void QueueJob(AutoGenJobRuntime job)
+    {
+        var task = Task.Run(() => RunAsync(job));
+        _runningTasks[job.JobId] = task;
+        _ = ObserveJobCompletionAsync(job.JobId, task);
+    }
+
+    private async Task ObserveJobCompletionAsync(string jobId, Task task)
+    {
+        try
+        {
+            await task;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Необроблена помилка фонового завдання автогенерації {JobId}.", jobId);
+        }
+        finally
+        {
+            _runningTasks.TryRemove(jobId, out _);
+        }
     }
 
     private void TryPersistSnapshot(AutoGenJobRuntime job, string operation)
@@ -687,10 +764,17 @@ public sealed class TeacherDraftsAutogenJobService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Завдання автогенерації {JobId} завершилося помилкою.", job.JobId);
+            if (ex is AutoGenJobValidationException or AutoGenJobCapacityException or OperationCanceledException)
+            {
+                _logger.LogWarning(ex, "Завдання автогенерації {JobId} завершилося очікуваною помилкою.", job.JobId);
+            }
+            else
+            {
+                _logger.LogError(ex, "Завдання автогенерації {JobId} завершилося внутрішньою помилкою.", job.JobId);
+            }
             var result = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight);
             var report = TeacherDraftsAutogenReportBuilder.BuildReport(job.Request.FromDate, job.Request.ToDate, Math.Max(1, weekStarts.Count), result);
-            job.MarkFailed(ex.Message, result, report);
+            job.MarkFailed(BuildPublicFailureMessage(ex, job.JobId), result, report);
             await TryPersistSnapshotAsync(job, "помилка завдання");
         }
         finally
@@ -702,6 +786,17 @@ public sealed class TeacherDraftsAutogenJobService
             CleanupOldJobs();
         }
     }
+
+    // Формує безпечний текст статусу без розкриття внутрішніх деталей винятку.
+    private static string BuildPublicFailureMessage(Exception exception, string jobId)
+        => exception switch
+        {
+            AutoGenJobValidationException or AutoGenJobCapacityException
+                => $"{exception.Message} Код завдання: {jobId}.",
+            OperationCanceledException
+                => $"Виконання автогенерації було перервано. Код завдання: {jobId}.",
+            _ => $"Під час автогенерації сталася внутрішня помилка. Код завдання: {jobId}. Передайте цей код адміністратору."
+        };
 
     private static DraftAutoGenRequest BuildDraftRequest(
         AutoGenJobRequest request,

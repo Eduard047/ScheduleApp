@@ -66,6 +66,7 @@
     }
     private DraftUpsertRequest? _edit;
     private TeacherDraftItemDto? _editSourceItem;
+    private readonly Dictionary<int, Guid> _editSourceRevisions = new();
     private bool _unrestrictedMode;
     private bool _isExporting;
     private bool _isPublishing;
@@ -228,6 +229,7 @@
         _publishWarnings.Clear();
         _edit = null;
         _editSourceItem = null;
+        _editSourceRevisions.Clear();
         _extraGroups.Clear();
         _extraTeachers.Clear();
         _topicsCache.Clear();
@@ -321,6 +323,7 @@
         {
             _edit = null;
             _editSourceItem = null;
+            _editSourceRevisions.Clear();
             _editTopicIds.Clear();
         }
         SyncCurrentConflict();
@@ -352,6 +355,7 @@
         {
             _edit = null;
             _editSourceItem = null;
+            _editSourceRevisions.Clear();
             _editTopicIds.Clear();
         }
         SyncCurrentConflict();
@@ -781,7 +785,8 @@
         return request with
         {
             RequiresRoom = actualRequiresRoom,
-            RoomId = normalizedRoomId
+            RoomId = normalizedRoomId,
+            ExpectedRevision = request.Id is null ? null : request.ExpectedRevision
         };
     }
     private DraftUpsertRequest ApplyTopicToRequest(DraftUpsertRequest request, int? topicId)
@@ -1114,9 +1119,15 @@
             BatchKey: currentItem.BatchKey,
             IsLocked: currentItem.IsLocked,
             IgnoreValidationErrors: _unrestrictedMode,
-            IsSelfStudy: currentItem.IsSelfStudy
+            IsSelfStudy: currentItem.IsSelfStudy,
+            ExpectedRevision: currentItem.Revision
         );
         _editSourceItem = currentItem;
+        _editSourceRevisions.Clear();
+        foreach (var row in logicalEventRows)
+        {
+            _editSourceRevisions[row.Id] = row.Revision;
+        }
         _edit = NormalizeRequest(initialRequest);
         ApplyLessonType(_edit.LessonTypeId);
         _editTopicIds.Clear();
@@ -1147,6 +1158,7 @@
         _extraGroups.Clear();
         _extraTeachers.Clear();
         _editSourceItem = null;
+        _editSourceRevisions.Clear();
         if (_meta is null)
         {
             _err = "Метадані не завантажені для створення чернетки.";
@@ -1436,7 +1448,11 @@
     private static TeacherDraftItemDto? FindItem(Dictionary<(int DayNumber, string Start, string End, int GroupId), TeacherDraftItemDto> lookup, int dayNumber, SlotRow slot, int groupId)
         => lookup.TryGetValue((dayNumber, slot.Start, slot.End, groupId), out var value) ? value : null;
     private readonly record struct SlotKey(int DayNumber, string Start, string End, int GroupId);
-    private sealed record DragPayload(int ItemId, SlotKey Origin, TeacherDraftItemDto Snapshot);
+    private sealed record DragPayload(
+        int ItemId,
+        SlotKey Origin,
+        TeacherDraftItemDto Snapshot,
+        IReadOnlyList<TeacherDraftItemDto> EventSnapshot);
     private static int DayNumberFromDate(DateOnly date) => date.DayOfWeek switch
     {
         DayOfWeek.Sunday => 0,
@@ -1814,7 +1830,8 @@
                         RoomId = newRoomId,
                         ModuleId = targetModuleId,
                         BatchKey = batchKey,
-                        IgnoreValidationErrors = true
+                        IgnoreValidationErrors = true,
+                        ExpectedRevision = targetRow.ExistingId is null ? null : source.Revision
                     }, targetRow.ModuleTopicId);
                     upsertRequests.Add(request);
                 }
@@ -1832,7 +1849,8 @@
                     upsertRequests,
                     deleteIds.OrderBy(id => id).ToList(),
                     Confirm: true,
-                    Unrestricted: _unrestrictedMode));
+                    Unrestricted: _unrestrictedMode,
+                    DeleteExpectedRevisions: BuildExpectedRevisionMap(deleteIds, _items)));
                 updated = mutationResult.Upserted + mutationResult.Deleted;
             }
             _ok = $"Оновлено пар: {updated}. Пропущено: {skipped}.";
@@ -1892,8 +1910,33 @@
             BatchKey: item.BatchKey,
             IsLocked: item.IsLocked,
             IgnoreValidationErrors: ignoreValidation,
-            IsSelfStudy: item.IsSelfStudy
+            IsSelfStudy: item.IsSelfStudy,
+            ExpectedRevision: item.Revision
         ));
+    // Формує повний набір очікуваних ревізій для атомарного видалення.
+    private static Dictionary<int, Guid> BuildExpectedRevisionMap(
+        IEnumerable<int> ids,
+        IEnumerable<TeacherDraftItemDto> items)
+        => BuildExpectedRevisionMap(
+            ids,
+            items.ToDictionary(item => item.Id, item => item.Revision));
+    // Не дозволяє видалення без ревізії кожного рядка пакета.
+    private static Dictionary<int, Guid> BuildExpectedRevisionMap(
+        IEnumerable<int> ids,
+        IReadOnlyDictionary<int, Guid> revisions)
+        => ids
+            .Distinct()
+            .OrderBy(id => id)
+            .ToDictionary(id => id, id => RequireExpectedRevision(id, revisions));
+    // Повертає ревізію рядка або зупиняє небезпечну зміну за застарілими даними.
+    private static Guid RequireExpectedRevision(int id, IReadOnlyDictionary<int, Guid> revisions)
+    {
+        if (!revisions.TryGetValue(id, out var revision) || revision == Guid.Empty)
+        {
+            throw new InvalidOperationException($"Не вдалося визначити актуальну ревізію пари #{id}. Оновіть таблицю та повторіть спробу.");
+        }
+        return revision;
+    }
     // Старт перетягування елемента розкладу.
     private void OnItemDragStart(SlotKey origin, TeacherDraftItemDto? item, DragEventArgs e)
     {
@@ -1902,7 +1945,11 @@
             return;
         }
         var snapshot = item! with { };
-        _dragPayload = new DragPayload(item.Id, origin, snapshot);
+        var eventSnapshot = TeacherDraftEditMutationPlanner
+            .SelectLogicalEventRows(_items, item)
+            .Select(row => row with { })
+            .ToList();
+        _dragPayload = new DragPayload(item.Id, origin, snapshot, eventSnapshot);
         _dragHover = origin;
         if (e.DataTransfer is not null)
         {
@@ -1972,11 +2019,8 @@
         {
             return;
         }
-        var sourceItem = _items.FirstOrDefault(x => x.Id == _dragPayload.ItemId) ?? _dragPayload.Snapshot;
-        if (sourceItem is null)
-        {
-            return;
-        }
+        var sourceItem = _dragPayload.Snapshot;
+        var sourceEventSnapshot = _dragPayload.EventSnapshot;
         if (targetItem?.IsLocked == true && targetItem.Id != sourceItem.Id)
         {
             _err = "Неможливо перенести пару у заблокований слот.";
@@ -1995,11 +2039,20 @@
         {
             if (targetItem is null)
             {
-                await MoveItemAsync(sourceItem, targetKey);
+                await MoveItemAsync(sourceItem, sourceEventSnapshot, targetKey);
             }
             else
             {
-                await SwapItemsAsync(sourceItem, targetItem, targetKey);
+                var targetEventSnapshot = TeacherDraftEditMutationPlanner
+                    .SelectLogicalEventRows(_items, targetItem)
+                    .Select(row => row with { })
+                    .ToList();
+                await SwapItemsAsync(
+                    sourceItem,
+                    sourceEventSnapshot,
+                    targetItem,
+                    targetEventSnapshot,
+                    targetKey);
             }
             await ReloadDraftItemsOnlyAsync();
         }
@@ -2019,11 +2072,15 @@
             StateHasChanged();
         }
     }
-    private async Task MoveItemAsync(TeacherDraftItemDto sourceItem, SlotKey targetKey)
+    private async Task MoveItemAsync(
+        TeacherDraftItemDto sourceItem,
+        IReadOnlyList<TeacherDraftItemDto> sourceEventSnapshot,
+        SlotKey targetKey)
     {
         var weekItems = await DraftsApi.GetWeek(FirstMonday(sourceItem.Date), null);
         var currentSource = ResolveCurrentLogicalEventSource(weekItems, sourceItem);
         var sourceRows = ResolveMovableLogicalEventRows(weekItems, currentSource);
+        EnsureLogicalEventSnapshotCurrent(sourceEventSnapshot, sourceRows);
         var target = new TeacherDraftRelocationTarget(
             DayToDate(targetKey.DayNumber),
             targetKey.Start,
@@ -2040,13 +2097,20 @@
             Unrestricted: _unrestrictedMode));
         EnsureCompleteRelocationResult(result, requests.Count);
     }
-    private async Task SwapItemsAsync(TeacherDraftItemDto sourceItem, TeacherDraftItemDto targetItem, SlotKey targetKey)
+    private async Task SwapItemsAsync(
+        TeacherDraftItemDto sourceItem,
+        IReadOnlyList<TeacherDraftItemDto> sourceEventSnapshot,
+        TeacherDraftItemDto targetItem,
+        IReadOnlyList<TeacherDraftItemDto> targetEventSnapshot,
+        SlotKey targetKey)
     {
         var weekItems = await DraftsApi.GetWeek(FirstMonday(sourceItem.Date), null);
         var currentSource = ResolveCurrentLogicalEventSource(weekItems, sourceItem);
         var currentTarget = ResolveCurrentLogicalEventSource(weekItems, targetItem);
         var sourceRows = ResolveMovableLogicalEventRows(weekItems, currentSource);
         var targetRows = ResolveMovableLogicalEventRows(weekItems, currentTarget);
+        EnsureLogicalEventSnapshotCurrent(sourceEventSnapshot, sourceRows);
+        EnsureLogicalEventSnapshotCurrent(targetEventSnapshot, targetRows);
         if (sourceRows.Select(row => row.Id).Intersect(targetRows.Select(row => row.Id)).Any())
         {
             return;
@@ -2090,6 +2154,22 @@
             throw new InvalidOperationException($"Пара #{snapshot.Id} була змінена в іншому вікні. Оновіть таблицю перед перенесенням.");
         }
         return current;
+    }
+
+    // Перевіряє склад і версії всіх рядків події, зафіксованих на початку перетягування.
+    private static void EnsureLogicalEventSnapshotCurrent(
+        IReadOnlyCollection<TeacherDraftItemDto> snapshotRows,
+        IReadOnlyCollection<TeacherDraftItemDto> currentRows)
+    {
+        var currentById = currentRows.ToDictionary(row => row.Id);
+        if (snapshotRows.Count != currentRows.Count
+            || snapshotRows.Any(snapshot =>
+                !currentById.TryGetValue(snapshot.Id, out var current)
+                || !TeacherDraftEditMutationPlanner.HasSameOriginalIdentity(snapshot, current)))
+        {
+            throw new InvalidOperationException(
+                "Склад або дані логічного заняття змінилися в іншому вікні. Оновіть таблицю перед перенесенням.");
+        }
     }
 
     // Повертає повний незаблокований пакет рядків для атомарного перенесення.
@@ -2248,7 +2328,10 @@
                             ModuleTopicId = targetRow.ModuleTopicId,
                             TeacherId = targetRow.TeacherId,
                             BatchKey = resolvedBatchKey,
-                            IgnoreValidationErrors = true
+                            IgnoreValidationErrors = true,
+                            ExpectedRevision = targetRow.ExistingId is int existingId
+                                ? RequireExpectedRevision(existingId, _editSourceRevisions)
+                                : null
                         }, targetRow.ModuleTopicId);
                         requestsToUpsert.Add(request);
                     }
@@ -2334,7 +2417,8 @@
                     requestsToUpsert,
                     deleteIds.OrderBy(id => id).ToList(),
                     Confirm: true,
-                    Unrestricted: _unrestrictedMode));
+                    Unrestricted: _unrestrictedMode,
+                    DeleteExpectedRevisions: BuildExpectedRevisionMap(deleteIds, _editSourceRevisions)));
                 upsertedIds = mutationResult.UpsertedIds;
                 processed = mutationResult.Upserted;
                 deleted = mutationResult.Deleted;
@@ -2469,10 +2553,12 @@
         {
             var deleteResult = await DraftsApi.DeleteBatch(new TeacherDraftBatchDeleteRequest(
                 idsToDelete.OrderBy(id => id).ToList(),
-                Unrestricted: _unrestrictedMode));
+                Unrestricted: _unrestrictedMode,
+                ExpectedRevisions: BuildExpectedRevisionMap(idsToDelete, deletedItemsMap.Values)));
             _ok = $"Видалено {selectedItems.Count} виділених пар ({deleteResult.Deleted} записів).";
             _edit = null;
             _editSourceItem = null;
+            _editSourceRevisions.Clear();
             _extraGroups.Clear();
             _extraTeachers.Clear();
             await LogManualDeleteAsync(
@@ -2519,12 +2605,14 @@
         {
             var deleteResult = await DraftsApi.DeleteBatch(new TeacherDraftBatchDeleteRequest(
                 batch.Select(entry => entry.Id).Distinct().OrderBy(id => id).ToList(),
-                Unrestricted: _unrestrictedMode));
+                Unrestricted: _unrestrictedMode,
+                ExpectedRevisions: BuildExpectedRevisionMap(batch.Select(entry => entry.Id), batch)));
             _ok = deleteResult.Deleted == 1
                 ? $"Видалено (Id = {item.Id})."
                 : $"Видалено {deleteResult.Deleted} записів цієї пари.";
             _edit = null;
             _editSourceItem = null;
+            _editSourceRevisions.Clear();
             _extraGroups.Clear();
             _extraTeachers.Clear();
             await LogManualDeleteAsync(
@@ -2699,6 +2787,7 @@
     {
         _edit = null;
         _editSourceItem = null;
+        _editSourceRevisions.Clear();
         _editTopicIds.Clear();
         _extraGroups.Clear();
         _extraTeachers.Clear();

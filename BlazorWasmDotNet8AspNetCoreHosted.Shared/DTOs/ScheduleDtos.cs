@@ -24,5 +24,6 @@ public record ScheduleItemDto(
     string LessonTypeCode,
     string LessonTypeName,
     bool IsLocked,
-    string? LessonTypeCss = null
+    string? LessonTypeCss = null,
+    Guid Revision = default
 );

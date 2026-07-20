@@ -51,6 +51,18 @@ public class ScheduleController : ControllerBase
         int? TeacherId,
         int? RoomId,
         bool IsSelfStudy);
+    private sealed record ScheduleRevisionRow(
+        int Id,
+        Guid Revision,
+        string? BatchKey,
+        DateOnly Date,
+        TimeOnly StartTime,
+        TimeOnly EndTime,
+        int GroupId,
+        int ModuleId,
+        int LessonTypeId,
+        int? ModuleTopicId,
+        int? TeacherId);
     private static bool TryParseClock(string value, out TimeOnly time)
         => TimeOnly.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out time);
 
@@ -72,24 +84,24 @@ public class ScheduleController : ControllerBase
             .AsNoTracking()
             .Where(x => x.Date >= weekStart && x.Date < weekEnd)
             .AsQueryable();
-        if (courseId is int cid) q = q.Where(x => x.Group.CourseId == cid);
-        if (groupId is int gidFilter) q = q.Where(x => x.GroupId == gidFilter);
-        if (teacherId is int tid) q = q.Where(x => x.TeacherId == tid);
-        if (roomId is int rid) q = q.Where(x => x.RoomId == rid);
         var items = await q
             .OrderBy(x => x.Date)
             .ThenBy(x => x.StartTime)
             .Select(x => new
             {
                 x.Id,
+                x.Revision,
+                x.BatchKey,
                 x.Date,
                 x.StartTime,
                 x.EndTime,
                 x.DayOfWeek,
                 GroupName = x.Group.Name,
                 x.GroupId,
+                CourseId = x.Group.CourseId,
                 ModuleTitle = x.Module.Title,
                 x.ModuleId,
+                x.ModuleTopicId,
                 TeacherName = x.Teacher != null ? x.Teacher.FullName : "",
                 x.TeacherId,
                 RoomName = x.Room != null ? x.Room.Name : "",
@@ -104,8 +116,26 @@ public class ScheduleController : ControllerBase
                 x.IsLocked
             })
             .ToListAsync();
+        var revisionsByItemId = BuildLogicalRevisionMap(items.Select(item => new ScheduleRevisionRow(
+            item.Id,
+            item.Revision,
+            item.BatchKey,
+            item.Date,
+            item.StartTime,
+            item.EndTime,
+            item.GroupId,
+            item.ModuleId,
+            item.LessonTypeId,
+            item.ModuleTopicId,
+            item.TeacherId)));
+        var visibleItems = items
+            .Where(item => courseId is not int cid || item.CourseId == cid)
+            .Where(item => groupId is not int gidFilter || item.GroupId == gidFilter)
+            .Where(item => teacherId is not int tid || item.TeacherId == tid)
+            .Where(item => roomId is not int rid || item.RoomId == rid)
+            .ToList();
         var uk = new CultureInfo("uk-UA");
-        return Ok(items.Select(item =>
+        return Ok(visibleItems.Select(item =>
         {
             var lessonTypeCode = (item.LessonTypeCode ?? string.Empty).ToUpperInvariant();
             var isBreak = string.Equals(lessonTypeCode, "BREAK", StringComparison.OrdinalIgnoreCase);
@@ -139,7 +169,8 @@ public class ScheduleController : ControllerBase
                 LessonTypeCode: lessonTypeCode,
                 LessonTypeName: item.LessonTypeName,
                 IsLocked: item.IsLocked,
-                LessonTypeCss: item.LessonTypeCss ?? (isBreak ? "brk" : null)
+                LessonTypeCss: item.LessonTypeCss ?? (isBreak ? "brk" : null),
+                Revision: revisionsByItemId[item.Id]
             );
         }).ToList());
     }
@@ -153,6 +184,13 @@ public class ScheduleController : ControllerBase
         }
         if (r.Id is int existingId && existingId > 0)
         {
+            if (r.ExpectedRevision is not Guid expectedRevision || expectedRevision == Guid.Empty)
+            {
+                return StatusCode(428, new
+                {
+                    message = "Для оновлення запису потрібна його актуальна версія. Оновіть сторінку та повторіть дію."
+                });
+            }
             return await UpdateLogicalEventAsync(r, existingId);
         }
 
@@ -218,8 +256,15 @@ public class ScheduleController : ControllerBase
         {
             return NotFound(new { message = $"Запис розкладу #{sourceId} не знайдено." });
         }
-
         var logicalEventRows = await LoadLogicalEventRowsAsync(source);
+        if (ComputeLogicalEventRevision(logicalEventRows) != request.ExpectedRevision)
+        {
+            await tx.RollbackAsync();
+            return Conflict(new
+            {
+                message = "Запис розкладу вже змінив інший користувач. Оновіть сторінку перед повторним збереженням."
+            });
+        }
         if (logicalEventRows.Any(item => item.IsLocked))
         {
             return Conflict(new { message = "Логічне заняття містить заблоковані рядки. Часткову зміну заборонено." });
@@ -306,12 +351,35 @@ public class ScheduleController : ControllerBase
             ApplyScheduleRequest(logicalEventRows[index], projectedRequests[index], start, end, normalizedRoomId);
             logicalEventRows[index].BatchKey = resolvedBatchKey;
         }
-        await _db.SaveChangesAsync();
+        try
+        {
+            await _db.SaveChangesAsync();
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            await tx.RollbackAsync(CancellationToken.None);
+            _db.ChangeTracker.Clear();
+            return Conflict(new
+            {
+                message = "Запис розкладу змінився під час збереження. Оновіть сторінку та повторіть дію."
+            });
+        }
 
         var isRescheduled = string.Equals(lessonType.Code, "RESCHEDULED", StringComparison.OrdinalIgnoreCase);
         if (isRescheduled && previousLessonTypeId != request.LessonTypeId)
         {
-            await TryCreateRescheduledCopiesAsync(rescheduleSnapshot, previousRequiresRoom);
+            var replacementCreated = await TryCreateRescheduledCopiesAsync(
+                rescheduleSnapshot,
+                previousRequiresRoom);
+            if (!replacementCreated)
+            {
+                await tx.RollbackAsync(CancellationToken.None);
+                _db.ChangeTracker.Clear();
+                return Conflict(new
+                {
+                    message = "Не вдалося знайти допустимий слот для перенесеного заняття. Розклад не змінено."
+                });
+            }
         }
 
         var newCourseId = await _db.Groups
@@ -378,6 +446,65 @@ public class ScheduleController : ControllerBase
             : legacyRows.Where(item => item.Id == source.Id).ToList();
     }
 
+    private static Guid ComputeLogicalEventRevision(IEnumerable<ScheduleItem> rows)
+        => LogicalRevisionToken.Combine(rows.Select(item =>
+            new KeyValuePair<int, Guid>(item.Id, item.Revision)));
+
+    private static IReadOnlyDictionary<int, Guid> BuildLogicalRevisionMap(IEnumerable<ScheduleRevisionRow> sourceRows)
+    {
+        var rows = sourceRows.ToList();
+        var result = rows.ToDictionary(item => item.Id, item => item.Revision);
+
+        void AssignRevision(IEnumerable<ScheduleRevisionRow> eventRows)
+        {
+            var resolvedRows = eventRows.OrderBy(item => item.Id).ToList();
+            var revision = LogicalRevisionToken.Combine(resolvedRows.Select(item =>
+                new KeyValuePair<int, Guid>(item.Id, item.Revision)));
+            foreach (var row in resolvedRows)
+            {
+                result[row.Id] = revision;
+            }
+        }
+
+        foreach (var eventRows in rows
+                     .Where(item => !string.IsNullOrWhiteSpace(item.BatchKey))
+                     .GroupBy(item => new
+                     {
+                         item.BatchKey,
+                         item.Date,
+                         item.StartTime,
+                         item.EndTime,
+                         item.GroupId,
+                         item.ModuleId,
+                         item.LessonTypeId
+                     }))
+        {
+            AssignRevision(eventRows);
+        }
+
+        foreach (var eventRows in rows
+                     .Where(item => string.IsNullOrWhiteSpace(item.BatchKey))
+                     .GroupBy(item => new
+                     {
+                         item.Date,
+                         item.StartTime,
+                         item.EndTime,
+                         item.GroupId,
+                         item.ModuleId,
+                         item.LessonTypeId
+                     })
+                     .Where(group => group
+                         .Select(item => new { item.ModuleTopicId, item.TeacherId })
+                         .Distinct()
+                         .Skip(1)
+                         .Any()))
+        {
+            AssignRevision(eventRows);
+        }
+
+        return result;
+    }
+
     private static string CreateSafeBatchKey(string prefix)
         => $"{prefix}:{Guid.NewGuid():N}";
     // Переносить дані запиту в доменний об'єкт.
@@ -395,14 +522,14 @@ public class ScheduleController : ControllerBase
         item.IsLocked = request.IsLocked;
     }
     // Створює всі чернеткові рядки перенесеної логічної події одним атомарним пакетом.
-    private async Task TryCreateRescheduledCopiesAsync(
+    private async Task<bool> TryCreateRescheduledCopiesAsync(
         RescheduleEventSnapshot snapshot,
         bool previousRequiresRoom)
     {
         var previousLessonType = await _db.LessonTypes.FindAsync(snapshot.LessonTypeId);
         if (previousLessonType is null || snapshot.Rows.Count == 0)
         {
-            return;
+            return false;
         }
 
         var requiresRoom = previousRequiresRoom || previousLessonType.RequiresRoom;
@@ -412,13 +539,13 @@ public class ScheduleController : ControllerBase
             .FirstOrDefaultAsync();
         if (courseId is null)
         {
-            return;
+            return false;
         }
 
         var nextWeekStart = DateHelpers.StartOfWeek(snapshot.Date).AddDays(7);
         if (!DateHelpers.IsSupportedScheduleDate(nextWeekStart))
         {
-            return;
+            return false;
         }
         var earliestAllowed = nextWeekStart.ToDateTime(snapshot.Start);
         var sequenceItems = await _db.ModuleSequenceItems
@@ -460,7 +587,7 @@ public class ScheduleController : ControllerBase
             || await _db.ScheduleItems.AnyAsync(item => item.BatchKey == batchKey);
         if (packageAlreadyExists)
         {
-            return;
+            return true;
         }
 
         const int daySearchHorizon = 7;
@@ -510,7 +637,9 @@ public class ScheduleController : ControllerBase
                 foreach (var draftRequest in requests)
                 {
                     var validation = await _rules.ValidateDraftAsync(draftRequest);
-                    if (validation.Errors.Count == 0)
+                    var hasNonWorkingDayWarning = validation.Report.Issues.Any(issue =>
+                        string.Equals(issue.Code, "non-working-day", StringComparison.Ordinal));
+                    if (validation.Errors.Count == 0 && !hasNonWorkingDayWarning)
                     {
                         continue;
                     }
@@ -547,20 +676,37 @@ public class ScheduleController : ControllerBase
                 }).ToList();
                 _db.TeacherDraftItems.AddRange(drafts);
                 await _db.SaveChangesAsync();
-                return;
+                return true;
             }
         }
+
+        return false;
     }
     [HttpDelete("{id:int}")]
     [RequireDeletionConfirmation("запис розкладу")]
     // Видаляє пару та перераховує агрегати.
-    public async Task<IActionResult> Delete(int id)
+    public async Task<IActionResult> Delete(int id, [FromQuery] Guid? expectedRevision)
     {
+        if (expectedRevision is not Guid revision || revision == Guid.Empty)
+        {
+            return StatusCode(428, new
+            {
+                message = "Для видалення запису потрібна його актуальна версія. Оновіть сторінку та повторіть дію."
+            });
+        }
         await using var tx = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         var source = await _db.ScheduleItems.FirstOrDefaultAsync(item => item.Id == id);
         if (source is null)
             return NotFound(new { message = $"Запис розкладу #{id} не знайдено." });
         var logicalEventRows = await LoadLogicalEventRowsAsync(source);
+        if (ComputeLogicalEventRevision(logicalEventRows) != revision)
+        {
+            await tx.RollbackAsync();
+            return Conflict(new
+            {
+                message = "Запис розкладу вже змінив інший користувач. Оновіть сторінку перед видаленням."
+            });
+        }
         if (logicalEventRows.Any(item => item.IsLocked))
         {
             return Conflict(new { message = "Логічне заняття містить заблоковані рядки. Часткове видалення заборонено." });
@@ -576,8 +722,20 @@ public class ScheduleController : ControllerBase
             .Select(item => item.TeacherId!.Value)
             .Distinct()
             .ToList();
-        var ids = logicalEventRows.Select(item => item.Id).ToList();
-        await _db.ScheduleItems.Where(item => ids.Contains(item.Id)).ExecuteDeleteAsync();
+        _db.ScheduleItems.RemoveRange(logicalEventRows);
+        try
+        {
+            await _db.SaveChangesAsync();
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            await tx.RollbackAsync(CancellationToken.None);
+            _db.ChangeTracker.Clear();
+            return Conflict(new
+            {
+                message = "Запис розкладу змінився під час видалення. Оновіть сторінку та повторіть дію."
+            });
+        }
         await _aggregates.RecalcAsync(
             plans: new[] { (courseId, moduleId) },
             loads: teacherIds.Select(teacherId => (teacherId, courseId))
@@ -601,9 +759,64 @@ public class ScheduleController : ControllerBase
         await using var tx = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         var start = r.WeekStart;
         var end = start.AddDays(7);
-        var q = _db.ScheduleItems.Where(x => x.Date >= start && x.Date < end && !x.IsLocked);
-        if (r.CourseId is int cid) q = q.Where(x => x.Group.CourseId == cid);
-        if (r.GroupId is int gidFilter) q = q.Where(x => x.GroupId == gidFilter);
+        var scopeQuery = _db.ScheduleItems.Where(x => x.Date >= start && x.Date < end);
+        if (r.CourseId is int cid) scopeQuery = scopeQuery.Where(x => x.Group.CourseId == cid);
+        if (r.GroupId is int gidFilter) scopeQuery = scopeQuery.Where(x => x.GroupId == gidFilter);
+        var scopedRows = await scopeQuery
+            .AsNoTracking()
+            .OrderBy(x => x.Date)
+            .ThenBy(x => x.StartTime)
+            .ThenBy(x => x.GroupId)
+            .ThenBy(x => x.Id)
+            .ToListAsync();
+        var logicalEvents = scopedRows
+            .Where(x => !string.IsNullOrWhiteSpace(x.BatchKey))
+            .GroupBy(x => new
+            {
+                BatchKey = x.BatchKey!,
+                x.Date,
+                x.StartTime,
+                x.EndTime,
+                x.GroupId,
+                x.ModuleId,
+                x.LessonTypeId
+            })
+            .Select(group => group.ToList())
+            .ToList();
+        logicalEvents.AddRange(scopedRows
+            .Where(x => string.IsNullOrWhiteSpace(x.BatchKey))
+            .GroupBy(x => new
+            {
+                x.Date,
+                x.StartTime,
+                x.EndTime,
+                x.GroupId,
+                x.ModuleId,
+                x.LessonTypeId
+            })
+            .Where(group => group
+                .Select(x => new { x.ModuleTopicId, x.TeacherId })
+                .Distinct()
+                .Skip(1)
+                .Any())
+            .Select(group => group.ToList()));
+        foreach (var rows in logicalEvents)
+        {
+            if (!rows.Any(x => x.IsLocked) || !rows.Any(x => !x.IsLocked))
+            {
+                continue;
+            }
+
+            await tx.RollbackAsync();
+            return Conflict(new
+            {
+                message = "Логічне заняття містить заблоковані й незаблоковані рядки. Очищення тижня не може видалити його частково.",
+                batchKey = rows[0].BatchKey,
+                itemIds = rows.Select(x => x.Id).OrderBy(id => id).ToList()
+            });
+        }
+
+        var q = scopeQuery.Where(x => !x.IsLocked);
         var affectedPlans = await q
             .Select(x => new { x.ModuleId, CourseId = x.Group.CourseId })
             .Distinct()

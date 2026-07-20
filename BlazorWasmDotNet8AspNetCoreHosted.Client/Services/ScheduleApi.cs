@@ -39,9 +39,12 @@ public sealed class ScheduleApi(HttpClient http) : IScheduleApi
         return await res.Content.ReadFromJsonAsync<int>();
     }
     // Видаляє пару з розкладу.
-    public async Task Delete(int id)
+    public async Task Delete(int id, Guid expectedRevision)
     {
-        var res = await http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/schedule/{id}"));
+        var url = ApiClientHelpers.WithQuery(
+            ApiClientHelpers.WithConfirm($"api/schedule/{id}"),
+            ("expectedRevision", expectedRevision.ToString("D")));
+        var res = await http.DeleteAsync(url);
         await res.EnsureSuccessWithDetailsAsync();
     }
     // Очищає розклад за тиждень і повертає кількість видалених.

@@ -69,13 +69,101 @@ public sealed class TeacherDraftBatchAtomicityTests
     }
 
     [Fact]
+    public async Task Upsert_rejects_stale_revision_without_overwriting_newer_change()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedAsync(secondDraftLocked: false);
+        var changedByAnotherEditor = await fixture.Db.TeacherDraftItems
+            .SingleAsync(item => item.Id == model.FirstDraftId);
+        changedByAnotherEditor.StartTime = new TimeOnly(7, 30);
+        changedByAnotherEditor.EndTime = new TimeOnly(8, 30);
+        await fixture.Db.SaveChangesAsync();
+        Assert.NotEqual(model.FirstDraftRevision, changedByAnotherEditor.Revision);
+        fixture.Db.ChangeTracker.Clear();
+        var controller = CreateController(fixture.Db);
+
+        var result = await controller.Upsert(
+            CreateUpsertRequest(model.FirstDraftId, model, "09:00", "10:00"));
+
+        Assert.IsType<ConflictObjectResult>(result.Result);
+        fixture.Db.ChangeTracker.Clear();
+        var persisted = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .SingleAsync(item => item.Id == model.FirstDraftId);
+        Assert.Equal(new TimeOnly(7, 30), persisted.StartTime);
+        Assert.Equal(new TimeOnly(8, 30), persisted.EndTime);
+        Assert.Equal(changedByAnotherEditor.Revision, persisted.Revision);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Existing_draft_mutation_requires_revision(bool delete)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedAsync(secondDraftLocked: false);
+        var controller = CreateController(fixture.Db);
+
+        IActionResult action;
+        if (delete)
+        {
+            action = await controller.Delete(
+                model.FirstDraftId,
+                expectedRevision: null,
+                confirm: true);
+        }
+        else
+        {
+            var result = await controller.Upsert(
+                CreateUpsertRequest(model.FirstDraftId, model, "09:00", "10:00") with
+                {
+                    ExpectedRevision = null
+                });
+            action = Assert.IsAssignableFrom<IActionResult>(result.Result);
+        }
+
+        var failure = Assert.IsType<ObjectResult>(action);
+        Assert.Equal(428, failure.StatusCode);
+        Assert.True(await fixture.Db.TeacherDraftItems.AnyAsync(item => item.Id == model.FirstDraftId));
+    }
+
+    [Fact]
+    public async Task Revision_token_detects_database_race_after_both_editors_loaded_the_same_draft()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedAsync(secondDraftLocked: false);
+        await using var staleEditorDb = fixture.CreateSiblingContext();
+        await using var freshEditorDb = fixture.CreateSiblingContext();
+        var staleCopy = await staleEditorDb.TeacherDraftItems
+            .SingleAsync(item => item.Id == model.FirstDraftId);
+        var freshCopy = await freshEditorDb.TeacherDraftItems
+            .SingleAsync(item => item.Id == model.FirstDraftId);
+        freshCopy.StartTime = new TimeOnly(7, 30);
+        freshCopy.EndTime = new TimeOnly(8, 30);
+        await freshEditorDb.SaveChangesAsync();
+        staleCopy.StartTime = new TimeOnly(9, 0);
+        staleCopy.EndTime = new TimeOnly(10, 0);
+
+        await Assert.ThrowsAsync<DbUpdateConcurrencyException>(
+            () => staleEditorDb.SaveChangesAsync());
+
+        fixture.Db.ChangeTracker.Clear();
+        var persisted = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .SingleAsync(item => item.Id == model.FirstDraftId);
+        Assert.Equal(new TimeOnly(7, 30), persisted.StartTime);
+        Assert.Equal(new TimeOnly(8, 30), persisted.EndTime);
+    }
+
+    [Fact]
     public async Task DeleteBatch_rolls_back_first_delete_when_second_item_is_locked()
     {
         await using var fixture = await TestDatabase.CreateAsync();
         var model = await fixture.SeedAsync(secondDraftLocked: true);
         var controller = CreateController(fixture.Db);
         var request = new TeacherDraftBatchDeleteRequest(
-            new List<int> { model.FirstDraftId, model.SecondDraftId });
+            new List<int> { model.FirstDraftId, model.SecondDraftId },
+            ExpectedRevisions: model.Revisions());
 
         var result = await controller.DeleteBatch(request, confirm: true);
 
@@ -143,7 +231,11 @@ public sealed class TeacherDraftBatchAtomicityTests
             },
             DeleteIds: new List<int> { model.SecondDraftId },
             Confirm: true,
-            Unrestricted: false);
+            Unrestricted: false,
+            DeleteExpectedRevisions: new Dictionary<int, Guid>
+            {
+                [model.SecondDraftId] = model.SecondDraftRevision
+            });
 
         var result = await controller.MutateBatch(request);
 
@@ -205,10 +297,19 @@ public sealed class TeacherDraftBatchAtomicityTests
         var partialUpdate = await controller.Upsert(
             CreateLogicalEventRequest(model, model.FirstTopicId, model.FirstTeacherId, batchKey) with
             {
-                Id = created.Ids[0]
+                Id = created.Ids[0],
+                ExpectedRevision = await fixture.Db.TeacherDraftItems
+                    .Where(item => item.Id == created.Ids[0])
+                    .Select(item => item.Revision)
+                    .SingleAsync()
             });
+        var createdRevisions = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => created.Ids.Contains(item.Id))
+            .ToDictionaryAsync(item => item.Id, item => item.Revision);
         var partialDelete = await controller.Delete(
             created.Ids[0],
+            createdRevisions[created.Ids[0]],
             confirm: true,
             unrestricted: true);
 
@@ -219,7 +320,7 @@ public sealed class TeacherDraftBatchAtomicityTests
             .CountAsync(item => item.BatchKey == batchKey));
 
         var batchDelete = await controller.DeleteBatch(
-            new TeacherDraftBatchDeleteRequest(created.Ids),
+            new TeacherDraftBatchDeleteRequest(created.Ids, ExpectedRevisions: createdRevisions),
             confirm: true);
 
         var deleteResponse = Assert.IsType<OkObjectResult>(batchDelete.Result);
@@ -581,8 +682,15 @@ public sealed class TeacherDraftBatchAtomicityTests
             model.FirstDraftId,
             model,
             "09:00",
-            "10:00"));
-        var delete = await controller.Delete(model.FirstDraftId, confirm: true, unrestricted: false);
+            "10:00") with
+        {
+            ExpectedRevision = approved.Revision
+        });
+        var delete = await controller.Delete(
+            model.FirstDraftId,
+            approved.Revision,
+            confirm: true,
+            unrestricted: false);
 
         Assert.IsType<ConflictObjectResult>(update.Result);
         Assert.IsType<ConflictObjectResult>(delete);
@@ -752,7 +860,12 @@ public sealed class TeacherDraftBatchAtomicityTests
             TeacherId: null,
             RoomId: null,
             RequiresRoom: false,
-            LessonTypeId: model.LessonTypeId);
+            LessonTypeId: model.LessonTypeId,
+            ExpectedRevision: id == model.FirstDraftId
+                ? model.FirstDraftRevision
+                : id == model.SecondDraftId
+                    ? model.SecondDraftRevision
+                    : null);
 
     private static DraftUpsertRequest CreateLogicalEventRequest(
         SeedModel model,
@@ -794,6 +907,11 @@ public sealed class TeacherDraftBatchAtomicityTests
         }
 
         public AppDbContext Db { get; }
+
+        public AppDbContext CreateSiblingContext()
+            => new(new DbContextOptionsBuilder<AppDbContext>()
+                .UseSqlite(_connection)
+                .Options);
 
         public static async Task<TestDatabase> CreateAsync()
         {
@@ -873,6 +991,8 @@ public sealed class TeacherDraftBatchAtomicityTests
                 lessonType.Id,
                 firstDraft.Id,
                 secondDraft.Id,
+                firstDraft.Revision,
+                secondDraft.Revision,
                 firstTeacher.Id,
                 secondTeacher.Id,
                 firstTopic.Id,
@@ -913,8 +1033,18 @@ public sealed class TeacherDraftBatchAtomicityTests
         int LessonTypeId,
         int FirstDraftId,
         int SecondDraftId,
+        Guid FirstDraftRevision,
+        Guid SecondDraftRevision,
         int FirstTeacherId,
         int SecondTeacherId,
         int FirstTopicId,
-        int SecondTopicId);
+        int SecondTopicId)
+    {
+        public Dictionary<int, Guid> Revisions()
+            => new()
+            {
+                [FirstDraftId] = FirstDraftRevision,
+                [SecondDraftId] = SecondDraftRevision
+            };
+    }
 }

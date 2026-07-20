@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Data.Common;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
@@ -13,11 +15,37 @@ using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 
 public sealed class AutogenLecturePackingTests
 {
+    [Fact]
+    public async Task Draft_autogen_passes_cancellation_token_to_first_database_query()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var interceptor = new FirstQueryCancellationInterceptor();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .AddInterceptors(interceptor)
+            .Options;
+        await using var db = new AppDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        interceptor.Arm();
+        using var cancellation = new CancellationTokenSource();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            await new TeacherDraftsAutogenService(db).DraftAutoGen(
+                new DraftAutoGenRequest(new DateOnly(2026, 5, 4)),
+                cancellation.Token);
+        });
+
+        Assert.True(interceptor.FirstQueryTokenCanBeCanceled);
+    }
+
     [Theory]
     [InlineData(DraftStatus.Draft, false, null, true)]
     [InlineData(DraftStatus.Draft, true, null, false)]
@@ -1122,6 +1150,7 @@ public sealed class AutogenLecturePackingTests
         Assert.Equal(1, result.Created);
         Assert.Equal(data.FirstSlotStart, movedDraft.StartTime);
         Assert.Equal(data.SecondSlotStart, generated.StartTime);
+        Assert.True(movedDraft.UpdatedAt > new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc));
         Assert.Empty(result.GapDetails ?? new List<AutoGenGapDetail>());
     }
 
@@ -1544,7 +1573,8 @@ public sealed class AutogenLecturePackingTests
             TeacherId = movableTeacherId,
             RoomId = movableRoomId,
             Status = DraftStatus.Draft,
-            IsLocked = false
+            IsLocked = false,
+            UpdatedAt = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc)
         };
         db.TeacherDraftItems.Add(movableDraft);
 
@@ -3893,10 +3923,14 @@ public sealed class AutogenLecturePackingTests
             autogenService: null!,
             autogenJobService: null!,
             publishService: null!);
+        var revision = await fixture.Db.TeacherDraftItems
+            .Where(item => item.Id == draftId)
+            .Select(item => item.Revision)
+            .SingleAsync();
 
-        var withoutFlags = await controller.Delete(draftId);
-        var confirmationOnly = await controller.Delete(draftId, confirm: true);
-        var unrestrictedOnly = await controller.Delete(draftId, unrestricted: true);
+        var withoutFlags = await controller.Delete(draftId, revision);
+        var confirmationOnly = await controller.Delete(draftId, revision, confirm: true);
+        var unrestrictedOnly = await controller.Delete(draftId, revision, unrestricted: true);
 
         Assert.IsType<ConflictObjectResult>(withoutFlags);
         Assert.IsType<ConflictObjectResult>(confirmationOnly);
@@ -3917,8 +3951,12 @@ public sealed class AutogenLecturePackingTests
             autogenService: null!,
             autogenJobService: null!,
             publishService: null!);
+        var revision = await fixture.Db.TeacherDraftItems
+            .Where(item => item.Id == draftId)
+            .Select(item => item.Revision)
+            .SingleAsync();
 
-        var result = await controller.Delete(draftId, confirm: true, unrestricted: true);
+        var result = await controller.Delete(draftId, revision, confirm: true, unrestricted: true);
 
         Assert.IsType<NoContentResult>(result);
         Assert.False(await fixture.Db.TeacherDraftItems.AnyAsync(item => item.Id == draftId));
@@ -4026,6 +4064,11 @@ public sealed class AutogenLecturePackingTests
         await using var fixture = await ControllerValidationFixture.CreateAsync();
         var itemId = await fixture.AddScheduleItemAsync(isLocked: true);
         var controller = new ScheduleController(fixture.Db, new RulesService(fixture.Db), new AggregatesService(fixture.Db));
+        var expectedRevision = await fixture.Db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => item.Id == itemId)
+            .Select(item => item.Revision)
+            .SingleAsync();
 
         var request = new UpsertScheduleItemRequest(
             Id: itemId,
@@ -4037,7 +4080,8 @@ public sealed class AutogenLecturePackingTests
             TeacherId: fixture.TeacherId,
             RoomId: fixture.RoomId,
             LessonTypeId: fixture.LessonTypeId,
-            IsLocked: false);
+            IsLocked: false,
+            ExpectedRevision: expectedRevision);
 
         var result = await controller.Upsert(request);
 
@@ -4050,8 +4094,13 @@ public sealed class AutogenLecturePackingTests
         await using var fixture = await ControllerValidationFixture.CreateAsync();
         var itemId = await fixture.AddScheduleItemAsync(isLocked: true);
         var controller = new ScheduleController(fixture.Db, new RulesService(fixture.Db), new AggregatesService(fixture.Db));
+        var expectedRevision = await fixture.Db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => item.Id == itemId)
+            .Select(item => item.Revision)
+            .SingleAsync();
 
-        var result = await controller.Delete(itemId);
+        var result = await controller.Delete(itemId, expectedRevision);
 
         Assert.IsType<ConflictObjectResult>(result);
         Assert.True(await fixture.Db.ScheduleItems.AnyAsync(item => item.Id == itemId));
@@ -4312,6 +4361,32 @@ public sealed class AutogenLecturePackingTests
         DateOnly Date,
         TimeOnly FirstSlotStart,
         TimeOnly SecondSlotStart);
+
+    private sealed class FirstQueryCancellationInterceptor : DbCommandInterceptor
+    {
+        private bool _armed;
+
+        public bool FirstQueryTokenCanBeCanceled { get; private set; }
+
+        public void Arm()
+            => _armed = true;
+
+        public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (!_armed)
+            {
+                return base.ReaderExecutingAsync(command, eventData, result, cancellationToken);
+            }
+
+            _armed = false;
+            FirstQueryTokenCanBeCanceled = cancellationToken.CanBeCanceled;
+            throw new OperationCanceledException(cancellationToken);
+        }
+    }
 
     private sealed record ForcedLateLectureSeed(
         int CourseId,

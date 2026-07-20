@@ -161,6 +161,13 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         // Детально описуємо позиції розкладу та їх залежності.
         b.Entity<ScheduleItem>(e =>
         {
+            var revision = e.Property(x => x.Revision)
+                .HasColumnType("char(36)")
+                .IsConcurrencyToken();
+            if (Database.ProviderName?.Contains("MySql", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                revision.HasDefaultValueSql("(UUID())");
+            }
             e.HasOne(si => si.Teacher).WithMany()
                 .HasForeignKey(si => si.TeacherId)
                 .OnDelete(DeleteBehavior.SetNull);
@@ -251,6 +258,13 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         b.Entity<TeacherDraftItem>(e =>
         {
             e.HasKey(x => x.Id);
+            var revision = e.Property(x => x.Revision)
+                .HasColumnType("char(36)")
+                .IsConcurrencyToken();
+            if (Database.ProviderName?.Contains("MySql", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                revision.HasDefaultValueSql("(UUID())");
+            }
             e.HasOne(x => x.Teacher).WithMany().HasForeignKey(x => x.TeacherId).OnDelete(DeleteBehavior.SetNull);
             e.HasOne(x => x.Room).WithMany().HasForeignKey(x => x.RoomId).OnDelete(DeleteBehavior.SetNull);
             e.HasOne(x => x.Group).WithMany().HasForeignKey(x => x.GroupId).OnDelete(DeleteBehavior.Restrict);
@@ -307,5 +321,47 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             e.HasIndex(x => new { x.ModuleId, x.TopicCode }).IsUnique();
             e.HasIndex(x => x.DepartmentId);
         });
+    }
+
+    public override int SaveChanges(bool acceptAllChangesOnSuccess)
+    {
+        PrepareRevisionTokens();
+        return base.SaveChanges(acceptAllChangesOnSuccess);
+    }
+
+    public override Task<int> SaveChangesAsync(
+        bool acceptAllChangesOnSuccess,
+        CancellationToken cancellationToken = default)
+    {
+        PrepareRevisionTokens();
+        return base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken);
+    }
+
+    // Оновлює маркер версії кожного зміненого рядка, щоб сервер міг виявити застаріле редагування.
+    private void PrepareRevisionTokens()
+    {
+        ChangeTracker.DetectChanges();
+        RefreshRevisionTokens(ChangeTracker.Entries<ScheduleItem>());
+        RefreshRevisionTokens(ChangeTracker.Entries<TeacherDraftItem>());
+    }
+
+    private static void RefreshRevisionTokens<TEntity>(IEnumerable<Microsoft.EntityFrameworkCore.ChangeTracking.EntityEntry<TEntity>> entries)
+        where TEntity : class
+    {
+        foreach (var entry in entries)
+        {
+            if (entry.State == EntityState.Added)
+            {
+                var revision = entry.Property(nameof(ScheduleItem.Revision));
+                if ((Guid)revision.CurrentValue! == Guid.Empty)
+                {
+                    revision.CurrentValue = Guid.NewGuid();
+                }
+            }
+            else if (entry.State == EntityState.Modified)
+            {
+                entry.Property(nameof(ScheduleItem.Revision)).CurrentValue = Guid.NewGuid();
+            }
+        }
     }
 }

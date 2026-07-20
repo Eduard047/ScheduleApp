@@ -386,7 +386,7 @@ public sealed class ProductionGuardrailTests
             CountInPlan = false,
             CountInLoad = false
         };
-        var topic = new ModuleTopic
+        var firstTopic = new ModuleTopic
         {
             ModuleId = seed.Ids.ModuleId,
             LessonTypeId = seed.LessonTypeId,
@@ -396,7 +396,17 @@ public sealed class ProductionGuardrailTests
             AuditoriumHours = 1,
             SelfStudyHours = 0
         };
-        fixture.Db.AddRange(markerType, topic);
+        var laterTopic = new ModuleTopic
+        {
+            ModuleId = seed.Ids.ModuleId,
+            LessonTypeId = seed.LessonTypeId,
+            TopicCode = "M1.2",
+            Order = 2,
+            TotalHours = 1,
+            AuditoriumHours = 1,
+            SelfStudyHours = 0
+        };
+        fixture.Db.AddRange(markerType, firstTopic, laterTopic);
         fixture.Db.ModuleRooms.Add(new ModuleRoom
         {
             ModuleId = seed.Ids.ModuleId,
@@ -415,8 +425,10 @@ public sealed class ProductionGuardrailTests
                 EndTime = new TimeOnly(9, 0),
                 GroupId = seed.Ids.GroupId,
                 ModuleId = seed.Ids.ModuleId,
+                ModuleTopicId = laterTopic.Id,
                 LessonTypeId = markerType.Id,
-                RoomId = seed.FirstRoomId,
+                TeacherId = seed.TeacherId,
+                RoomId = seed.SecondRoomId,
                 BatchKey = "rescheduled:source:1"
             },
             new ScheduleItem
@@ -427,8 +439,10 @@ public sealed class ProductionGuardrailTests
                 EndTime = new TimeOnly(10, 10),
                 GroupId = seed.Ids.GroupId,
                 ModuleId = seed.Ids.ModuleId,
+                ModuleTopicId = firstTopic.Id,
                 LessonTypeId = markerType.Id,
-                RoomId = seed.FirstRoomId,
+                TeacherId = seed.TeacherId,
+                RoomId = seed.SecondRoomId,
                 BatchKey = "rescheduled:source:2"
             });
         await fixture.Db.SaveChangesAsync();
@@ -452,6 +466,8 @@ public sealed class ProductionGuardrailTests
         var generated = await fixture.Db.TeacherDraftItems.AsNoTracking().SingleAsync(item =>
             item.GroupId == seed.Ids.GroupId && item.Date == seed.Date);
         Assert.Equal(new TimeOnly(9, 10), generated.StartTime);
+        Assert.Equal(firstTopic.Id, generated.ModuleTopicId);
+        Assert.Equal(seed.TeacherId, generated.TeacherId);
         Assert.Equal(seed.SecondRoomId, generated.RoomId);
 
         var hardResult = await new TeacherDraftsAutogenHardRuleValidator(fixture.Db).ValidateAsync(
@@ -479,8 +495,257 @@ public sealed class ProductionGuardrailTests
                 RoomId: seed.SecondRoomId,
                 LessonTypeId: seed.LessonTypeId,
                 IsLocked: false),
-            projectedModuleTopicId: topic.Id);
+            projectedModuleTopicId: firstTopic.Id);
         Assert.Empty(errors);
+    }
+
+    [Fact]
+    public async Task Draft_autogen_treats_spanning_schedule_item_as_filling_each_overlapped_slot()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var ids = await fixture.SeedMinimalScheduleModelAsync();
+        var date = new DateOnly(2026, 5, 4);
+        fixture.Db.TimeSlots.AddRange(
+            new TimeSlot
+            {
+                CourseId = ids.CourseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0),
+                SortOrder = 1,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                CourseId = ids.CourseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(9, 0),
+                End = new TimeOnly(10, 0),
+                SortOrder = 2,
+                IsActive = true
+            });
+        fixture.Db.ScheduleItems.Add(new ScheduleItem
+        {
+            Date = date,
+            DayOfWeek = DayOfWeek.Monday,
+            StartTime = new TimeOnly(8, 0),
+            EndTime = new TimeOnly(10, 0),
+            GroupId = ids.GroupId,
+            ModuleId = ids.ModuleId,
+            LessonTypeId = ids.LessonTypeId
+        });
+        await fixture.Db.SaveChangesAsync();
+
+        var action = await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(
+            new DraftAutoGenRequest(
+                WeekStart: date,
+                ClearExisting: false,
+                CourseId: ids.CourseId,
+                GroupIds: new List<int> { ids.GroupId },
+                Days: WeekPreset.MonFri,
+                ModuleHours: new Dictionary<int, int> { [ids.ModuleId] = 1 },
+                RangeStartDate: date,
+                RangeEndDate: date));
+
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+        Assert.Equal(0, result.Created);
+        Assert.Empty(result.GapDetails ?? new List<AutoGenGapDetail>());
+    }
+
+    [Theory]
+    [InlineData("CANCELED")]
+    [InlineData("RESCHEDULED")]
+    public async Task Draft_autogen_reports_gap_hidden_only_by_non_occupying_marker(string markerCode)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var ids = await fixture.SeedMinimalScheduleModelAsync();
+        var date = new DateOnly(2026, 5, 4);
+        var markerType = new LessonTypeRef
+        {
+            Code = markerCode,
+            Name = markerCode,
+            IsActive = true,
+            RequiresRoom = false,
+            RequiresTeacher = false,
+            BlocksRoom = false,
+            BlocksTeacher = false,
+            CountInPlan = false,
+            CountInLoad = false
+        };
+        fixture.Db.LessonTypes.Add(markerType);
+        fixture.Db.TimeSlots.Add(new TimeSlot
+        {
+            CourseId = ids.CourseId,
+            DayOfWeek = DayOfWeek.Monday,
+            Start = new TimeOnly(8, 0),
+            End = new TimeOnly(9, 0),
+            SortOrder = 1,
+            IsActive = true
+        });
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ScheduleItems.Add(new ScheduleItem
+        {
+            Date = date,
+            DayOfWeek = DayOfWeek.Monday,
+            StartTime = new TimeOnly(8, 0),
+            EndTime = new TimeOnly(9, 0),
+            GroupId = ids.GroupId,
+            ModuleId = ids.ModuleId,
+            LessonTypeId = markerType.Id,
+            BatchKey = $"marker:{markerCode.ToLowerInvariant()}"
+        });
+        await fixture.Db.SaveChangesAsync();
+
+        var action = await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(
+            new DraftAutoGenRequest(
+                WeekStart: date,
+                ClearExisting: false,
+                CourseId: ids.CourseId,
+                GroupIds: new List<int> { ids.GroupId },
+                Days: WeekPreset.MonFri,
+                RangeStartDate: date,
+                RangeEndDate: date));
+
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+        Assert.Equal(0, result.Created);
+        var gap = Assert.Single(result.GapDetails ?? new List<AutoGenGapDetail>());
+        Assert.Equal(new TimeOnly(8, 0), gap.Start);
+        Assert.Equal(new TimeOnly(9, 0), gap.End);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Draft_autogen_counts_keyed_and_legacy_multirow_events_once_without_merging_independent_rows(
+        bool useBatchKey)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var ids = await fixture.SeedMinimalScheduleModelAsync();
+        var date = new DateOnly(2026, 5, 4);
+        fixture.Db.TimeSlots.AddRange(
+            new TimeSlot
+            {
+                CourseId = ids.CourseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0),
+                SortOrder = 1,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                CourseId = ids.CourseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(9, 0),
+                End = new TimeOnly(10, 0),
+                SortOrder = 2,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                CourseId = ids.CourseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(10, 0),
+                End = new TimeOnly(11, 0),
+                SortOrder = 3,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                CourseId = ids.CourseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(11, 0),
+                End = new TimeOnly(12, 0),
+                SortOrder = 4,
+                IsActive = true
+            });
+        var firstTeacher = new Teacher { FullName = "Перший викладач логічної події" };
+        var secondTeacher = new Teacher { FullName = "Другий викладач логічної події" };
+        var room = new Room
+        {
+            Name = "Аудиторія логічної події",
+            Capacity = 30,
+            Building = new Building { Name = "Корпус логічної події" }
+        };
+        fixture.Db.AddRange(firstTeacher, secondTeacher, room);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.TeacherModules.AddRange(
+            new TeacherModule { TeacherId = firstTeacher.Id, ModuleId = ids.ModuleId },
+            new TeacherModule { TeacherId = secondTeacher.Id, ModuleId = ids.ModuleId });
+        fixture.Db.ModuleRooms.Add(new ModuleRoom
+        {
+            ModuleId = ids.ModuleId,
+            RoomId = room.Id
+        });
+        var logicalEventBatchKey = useBatchKey ? "logical-event" : null;
+        fixture.Db.TeacherDraftItems.AddRange(
+            new TeacherDraftItem
+            {
+                Date = date,
+                DayOfWeek = DayOfWeek.Monday,
+                StartTime = new TimeOnly(8, 0),
+                EndTime = new TimeOnly(9, 0),
+                GroupId = ids.GroupId,
+                ModuleId = ids.ModuleId,
+                LessonTypeId = ids.LessonTypeId,
+                TeacherId = firstTeacher.Id,
+                BatchKey = logicalEventBatchKey
+            },
+            new TeacherDraftItem
+            {
+                Date = date,
+                DayOfWeek = DayOfWeek.Monday,
+                StartTime = new TimeOnly(8, 0),
+                EndTime = new TimeOnly(9, 0),
+                GroupId = ids.GroupId,
+                ModuleId = ids.ModuleId,
+                LessonTypeId = ids.LessonTypeId,
+                TeacherId = secondTeacher.Id,
+                BatchKey = logicalEventBatchKey
+            },
+            new TeacherDraftItem
+            {
+                Date = date,
+                DayOfWeek = DayOfWeek.Monday,
+                StartTime = new TimeOnly(9, 0),
+                EndTime = new TimeOnly(10, 0),
+                GroupId = ids.GroupId,
+                ModuleId = ids.ModuleId,
+                LessonTypeId = ids.LessonTypeId,
+                TeacherId = firstTeacher.Id
+            });
+        await fixture.Db.SaveChangesAsync();
+
+        var action = await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(
+            new DraftAutoGenRequest(
+                WeekStart: date,
+                ClearExisting: false,
+                CourseId: ids.CourseId,
+                GroupIds: new List<int> { ids.GroupId },
+                Days: WeekPreset.MonFri,
+                ModuleHours: new Dictionary<int, int> { [ids.ModuleId] = 4 },
+                RangeStartDate: date,
+                RangeEndDate: date));
+
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+        Assert.True(
+            result.Created == 2,
+            $"Очікувалось дві нові чернетки, фактично: {result.Created}. " +
+            $"Прогалини: {string.Join(" | ", result.GapDetails?.Select(item => item.Reason) ?? Array.Empty<string>())}. " +
+            $"Попередження: {string.Join(" | ", result.Warnings)}");
+        fixture.Db.ChangeTracker.Clear();
+        var persisted = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => item.GroupId == ids.GroupId
+                           && item.ModuleId == ids.ModuleId
+                           && item.Date == date)
+            .ToListAsync();
+        Assert.Equal(5, persisted.Count);
+        Assert.Equal(4, persisted.Select(item => (item.StartTime, item.EndTime)).Distinct().Count());
+        Assert.Empty(result.GapDetails ?? new List<AutoGenGapDetail>());
     }
 
     [Fact]
@@ -1421,7 +1686,9 @@ public sealed class ProductionGuardrailTests
         Assert.Equal(AutoGenJobState.Failed, status.State);
         Assert.False(status.CancellationRequested);
         Assert.NotNull(status.CompletedAt);
-        Assert.Contains("тестове переривання", status.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("було перервано", status.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(status.JobId, status.Error, StringComparison.Ordinal);
+        Assert.DoesNotContain("тестове переривання", status.Error, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -1794,7 +2061,7 @@ public sealed class ProductionGuardrailTests
             });
         await fixture.Db.SaveChangesAsync();
 
-        return new NonBlockingTravelSeed(ids, lessonType.Id, firstRoom.Id, secondRoom.Id, date);
+        return new NonBlockingTravelSeed(ids, lessonType.Id, firstRoom.Id, secondRoom.Id, teacher.Id, date);
     }
 
     private sealed record SeedIds(int CourseId, int GroupId, int ModuleId, int LessonTypeId);
@@ -1804,6 +2071,7 @@ public sealed class ProductionGuardrailTests
         int LessonTypeId,
         int FirstRoomId,
         int SecondRoomId,
+        int TeacherId,
         DateOnly Date);
 
     private sealed class TestDatabase : IAsyncDisposable

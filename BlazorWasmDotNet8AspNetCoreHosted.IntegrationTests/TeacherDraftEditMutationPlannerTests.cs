@@ -47,6 +47,17 @@ public sealed class TeacherDraftEditMutationPlannerTests
     }
 
     [Fact]
+    public void HasSameOriginalIdentity_rejects_row_with_newer_revision()
+    {
+        var originalRevision = Guid.NewGuid();
+        var original = Item(1, topicId: 10, teacherId: 101, batchKey: "event-1", revision: originalRevision);
+        var current = original with { Revision = Guid.NewGuid() };
+
+        Assert.False(TeacherDraftEditMutationPlanner.HasSameOriginalIdentity(original, current));
+        Assert.True(TeacherDraftEditMutationPlanner.HasSameOriginalIdentity(original, original));
+    }
+
+    [Fact]
     public void BuildPlan_reuses_co_teacher_rows_and_deletes_removed_or_duplicate_topics()
     {
         var existing = new[]
@@ -176,7 +187,8 @@ public sealed class TeacherDraftEditMutationPlannerTests
         string timeStart = "08:30",
         int groupId = 1,
         int moduleId = 1,
-        int lessonTypeId = 1)
+        int lessonTypeId = 1,
+        Guid? revision = null)
         => new(
             Id: id,
             Date: date ?? new DateOnly(2026, 9, 7),
@@ -202,5 +214,6 @@ public sealed class TeacherDraftEditMutationPlannerTests
             Status: DraftStatusDto.Draft,
             PublishedItemId: null,
             Warnings: null,
-            BatchKey: batchKey);
+            BatchKey: batchKey,
+            Revision: revision ?? Guid.Empty);
 }

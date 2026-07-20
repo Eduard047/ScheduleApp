@@ -3504,11 +3504,11 @@ else
         {
             if (current.Source == TableItemSource.Draft)
             {
-                await Drafts.Delete(current.Id, confirm: true, unrestricted: current.IsLocked);
+                await Drafts.Delete(current.Id, current.Revision, confirm: true, unrestricted: current.IsLocked);
             }
             else
             {
-                await Api.Delete(current.Id);
+                await Api.Delete(current.Id, current.Revision);
             }
             RemoveTableItemFromState(current);
             var summary = $"Видалено заняття #{current.Id}.";
@@ -3639,6 +3639,7 @@ else
             "Чернетка",
             TableItemSource.Draft,
             draft.IsLocked,
+            draft.Revision,
             draft.MissingTeacherAssignment,
             draft.MissingRoomAssignment
         );
@@ -3660,7 +3661,8 @@ else
             "Опубліковано (розклад)",
             "Розклад",
             TableItemSource.Published,
-            item.IsLocked
+            item.IsLocked,
+            item.Revision
         );
     // Форматує короткий статус чернетки з позначкою про відсутні призначення.
     private static string ComposeDraftStatusLabel(TeacherDraftItemDto draft)
@@ -3812,6 +3814,7 @@ else
         string SourceLabel,
         TableItemSource Source,
         bool IsLocked,
+        Guid Revision,
         bool MissingTeacherAssignment = false,
         bool MissingRoomAssignment = false
     )

@@ -57,6 +57,7 @@ public static class TeacherDraftEditMutationPlanner
         ArgumentNullException.ThrowIfNull(current);
 
         return original.Id == current.Id
+               && original.Revision == current.Revision
                && string.Equals(original.BatchKey, current.BatchKey, StringComparison.Ordinal)
                && HasSameEventSignature(original, current);
     }
@@ -103,7 +104,8 @@ public static class TeacherDraftEditMutationPlanner
                 BatchKey: row.BatchKey,
                 IsLocked: row.IsLocked,
                 IgnoreValidationErrors: ignoreValidationErrors,
-                IsSelfStudy: row.IsSelfStudy))
+                IsSelfStudy: row.IsSelfStudy,
+                ExpectedRevision: row.Revision))
             .ToList();
     }
 

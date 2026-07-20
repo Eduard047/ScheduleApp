@@ -85,10 +85,11 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
                ?? throw new InvalidOperationException("Сервер не повернув результат пакетного збереження чернеток.");
     }
     // Видаляє чернетку з параметрами підтвердження.
-    public async Task Delete(int id, bool confirm = false, bool unrestricted = false)
+    public async Task Delete(int id, Guid expectedRevision, bool confirm = false, bool unrestricted = false)
     {
         var res = await http.DeleteAsync(ApiClientHelpers.WithQuery(
             $"api/teacher-drafts/{id}",
+            ("expectedRevision", expectedRevision.ToString("D")),
             ("confirm", confirm ? "true" : "false"),
             ("unrestricted", unrestricted ? "true" : "false")));
         await res.EnsureSuccessWithDetailsAsync();

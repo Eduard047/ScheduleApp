@@ -531,13 +531,41 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
         }
     }
 
-    // Схлопує лише рядки однієї логічної події з явним BatchKey; legacy-рядки завжди лишаються окремими.
+    // Схлопує явні пакети та консервативно розпізнані багаторядкові legacy-події.
     private static IEnumerable<PlacementRow> CollapseLogicalDraftEventPlacements(IEnumerable<PlacementRow> rows)
     {
         var buffered = rows.ToList();
-        foreach (var row in buffered.Where(row => !HasLogicalDraftEventKey(row)))
+        foreach (var legacyGroup in buffered
+                     .Where(row => !HasLogicalDraftEventKey(row))
+                     .GroupBy(row => new
+                     {
+                         row.Date,
+                         row.Start,
+                         row.End,
+                         row.GroupId,
+                         row.ModuleId,
+                         row.LessonTypeId,
+                         row.RoomId,
+                         row.IsSelfStudy
+                     }))
         {
-            yield return row;
+            var legacyRows = legacyGroup.ToList();
+            var isLogicalEvent = legacyRows.Count > 1
+                                 && legacyRows
+                                     .Select(row => (row.ModuleTopicId, row.TeacherId))
+                                     .Distinct()
+                                     .Skip(1)
+                                     .Any();
+            if (isLogicalEvent)
+            {
+                yield return legacyRows[0];
+                continue;
+            }
+
+            foreach (var row in legacyRows)
+            {
+                yield return row;
+            }
         }
 
         foreach (var group in buffered

@@ -46,8 +46,10 @@
     <Compile Include="PublishGuardrailTests.cs" />
     <Compile Include="ScheduleEndpointCorrectnessTests.cs" />
     <Compile Include="ScheduleOverviewLayoutPlannerTests.cs" />
+    <Compile Include="SpaFallbackRoutingTests.cs" />
     <Compile Include="TeacherDraftBatchAtomicityTests.cs" />
     <Compile Include="TeacherDraftEditMutationPlannerTests.cs" />
+    <Compile Include="TeacherDraftsAutogenJobServiceSecurityTests.cs" />
     <Compile Include="TeacherDraftsAutogenServiceRegressionTests.cs" />
     <Compile Include="Infrastructure\TravelInvariantVerifier.cs" />
   </ItemGroup>

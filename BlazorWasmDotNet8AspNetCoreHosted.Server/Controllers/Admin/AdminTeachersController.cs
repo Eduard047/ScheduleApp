@@ -323,12 +323,20 @@ public class AdminTeachersController(AppDbContext db) : ControllerBase
                         message = "Неможливо видалити викладача, доки він призначений заняттям, для яких викладач є обов'язковим. Спочатку перепризначте ці заняття."
                     });
                 }
+                var scheduleRevision = Guid.NewGuid();
                 await db.ScheduleItems
                     .Where(s => s.TeacherId == id)
-                    .ExecuteUpdateAsync(s => s.SetProperty(x => x.TeacherId, (int?)null));
+                    .ExecuteUpdateAsync(s => s
+                        .SetProperty(x => x.TeacherId, (int?)null)
+                        .SetProperty(x => x.Revision, scheduleRevision));
+                var draftRevision = Guid.NewGuid();
+                var updatedAt = DateTime.UtcNow;
                 await db.TeacherDraftItems
                     .Where(draft => draft.TeacherId == id)
-                    .ExecuteUpdateAsync(setters => setters.SetProperty(draft => draft.TeacherId, (int?)null));
+                    .ExecuteUpdateAsync(setters => setters
+                        .SetProperty(draft => draft.TeacherId, (int?)null)
+                        .SetProperty(draft => draft.Revision, draftRevision)
+                        .SetProperty(draft => draft.UpdatedAt, updatedAt));
             }
             db.TeacherCourseLoads.RemoveRange(db.TeacherCourseLoads.Where(l => l.TeacherId == id));
             db.TeacherWorkingHours.RemoveRange(db.TeacherWorkingHours.Where(w => w.TeacherId == id));

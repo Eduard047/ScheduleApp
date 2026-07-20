@@ -89,13 +89,25 @@ public sealed class TeacherDraftsController : ControllerBase
         => Get(weekStart, teacherId, groupId, roomId);
     [HttpDelete("{id:int}")]
     // Видаляє чернетку, якщо запис існує та не заблокований.
-    public async Task<IActionResult> Delete(int id, [FromQuery] bool confirm = false, [FromQuery] bool unrestricted = false)
+    public async Task<IActionResult> Delete(
+        int id,
+        [FromQuery] Guid? expectedRevision,
+        [FromQuery] bool confirm = false,
+        [FromQuery] bool unrestricted = false)
     {
+        if (expectedRevision is not Guid revision || revision == Guid.Empty)
+        {
+            return StatusCode(428, new
+            {
+                message = "Для видалення чернетки потрібна її актуальна версія. Оновіть сторінку та повторіть дію."
+            });
+        }
         await using var transaction = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         try
         {
             var action = await DeleteCoreAsync(
                 id,
+                revision,
                 confirm,
                 unrestricted,
                 allowLogicalEventBatchMutation: false);
@@ -109,6 +121,12 @@ public sealed class TeacherDraftsController : ControllerBase
             }
             return action;
         }
+        catch (DbUpdateConcurrencyException)
+        {
+            await transaction.RollbackAsync(CancellationToken.None);
+            _db.ChangeTracker.Clear();
+            return ConcurrencyConflict("видалення");
+        }
         catch
         {
             await transaction.RollbackAsync(CancellationToken.None);
@@ -119,6 +137,7 @@ public sealed class TeacherDraftsController : ControllerBase
 
     private async Task<IActionResult> DeleteCoreAsync(
         int id,
+        Guid expectedRevision,
         bool confirm,
         bool unrestricted,
         bool allowLogicalEventBatchMutation)
@@ -130,6 +149,10 @@ public sealed class TeacherDraftsController : ControllerBase
         }
         var item = await _db.TeacherDraftItems.FirstOrDefaultAsync(x => x.Id == id);
         if (item is null) return NotFound(new { message = $"Чернетку #{id} не знайдено." });
+        if (item.Revision != expectedRevision)
+        {
+            return ConcurrencyConflict("видалення");
+        }
         if (item.Status != DraftStatus.Draft && !(confirm && unrestricted))
         {
             return Conflict(new
@@ -164,6 +187,14 @@ public sealed class TeacherDraftsController : ControllerBase
         {
             return BadRequest(new { message = "Пакет видалення містить повторювані ідентифікатори чернеток." });
         }
+        if (request.ExpectedRevisions is null
+            || request.Ids.Any(id => !request.ExpectedRevisions.TryGetValue(id, out var revision) || revision == Guid.Empty))
+        {
+            return StatusCode(428, new
+            {
+                message = "Для пакетного видалення потрібні актуальні версії всіх чернеток. Оновіть сторінку та повторіть дію."
+            });
+        }
 
         await using var transaction = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         try
@@ -178,6 +209,7 @@ public sealed class TeacherDraftsController : ControllerBase
             {
                 var action = await DeleteCoreAsync(
                     request.Ids[index],
+                    request.ExpectedRevisions[request.Ids[index]],
                     confirm,
                     request.Unrestricted,
                     allowLogicalEventBatchMutation: true);
@@ -193,6 +225,12 @@ public sealed class TeacherDraftsController : ControllerBase
 
             await transaction.CommitAsync();
             return Ok(new TeacherDraftBatchDeleteResult(request.Ids.Count));
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            await transaction.RollbackAsync(CancellationToken.None);
+            _db.ChangeTracker.Clear();
+            return ConcurrencyConflict("пакетного видалення");
         }
         catch
         {
@@ -219,6 +257,12 @@ public sealed class TeacherDraftsController : ControllerBase
             }
             return action;
         }
+        catch (DbUpdateConcurrencyException)
+        {
+            await transaction.RollbackAsync(CancellationToken.None);
+            _db.ChangeTracker.Clear();
+            return ConcurrencyConflict("збереження");
+        }
         catch
         {
             await transaction.RollbackAsync(CancellationToken.None);
@@ -238,6 +282,13 @@ public sealed class TeacherDraftsController : ControllerBase
         if (!DateHelpers.IsSupportedScheduleDate(r.Date))
         {
             return BadRequest(new { message = DateHelpers.SupportedScheduleDateMessage });
+        }
+        if (r.Id is > 0 && (r.ExpectedRevision is not Guid revision || revision == Guid.Empty))
+        {
+            return StatusCode(428, new
+            {
+                message = "Для оновлення чернетки потрібна її актуальна версія. Оновіть сторінку та повторіть дію."
+            });
         }
         var normalizedBatchKey = string.IsNullOrWhiteSpace(r.BatchKey) ? null : r.BatchKey.Trim();
         var request = r with { BatchKey = normalizedBatchKey };
@@ -296,6 +347,10 @@ public sealed class TeacherDraftsController : ControllerBase
         {
             var item = await _db.TeacherDraftItems.FirstOrDefaultAsync(x => x.Id == id);
             if (item is null) return NotFound(new { message = $"Чернетку #{id} не знайдено." });
+            if (item.Revision != request.ExpectedRevision)
+            {
+                return ConcurrencyConflict("збереження");
+            }
             if (item.IsLocked) return Conflict(new { message = "Чернетка заблокована. Зміна заблокованих чернеток через API заборонена." });
             if (item.Status != DraftStatus.Draft)
             {
@@ -389,6 +444,12 @@ public sealed class TeacherDraftsController : ControllerBase
             await transaction.CommitAsync();
             return Ok(new TeacherDraftBatchUpsertResult(ids, ids.Count));
         }
+        catch (DbUpdateConcurrencyException)
+        {
+            await transaction.RollbackAsync(CancellationToken.None);
+            _db.ChangeTracker.Clear();
+            return ConcurrencyConflict("пакетного збереження");
+        }
         catch
         {
             await transaction.RollbackAsync(CancellationToken.None);
@@ -425,6 +486,15 @@ public sealed class TeacherDraftsController : ControllerBase
         if (request.DeleteIds.Distinct().Count() != request.DeleteIds.Count)
         {
             return BadRequest(new { message = "Спільний пакет змін містить повторювані ідентифікатори видалення." });
+        }
+        if (request.DeleteIds.Count > 0
+            && (request.DeleteExpectedRevisions is null
+                || request.DeleteIds.Any(id => !request.DeleteExpectedRevisions.TryGetValue(id, out var revision) || revision == Guid.Empty)))
+        {
+            return StatusCode(428, new
+            {
+                message = "Для видалення у спільному пакеті потрібні актуальні версії всіх чернеток. Оновіть сторінку та повторіть дію."
+            });
         }
         var duplicateExistingId = request.Upserts
             .Where(item => item.Id is > 0)
@@ -484,6 +554,7 @@ public sealed class TeacherDraftsController : ControllerBase
             {
                 var action = await DeleteCoreAsync(
                     request.DeleteIds[index],
+                    request.DeleteExpectedRevisions![request.DeleteIds[index]],
                     request.Confirm,
                     request.Unrestricted,
                     allowLogicalEventBatchMutation: true);
@@ -514,6 +585,12 @@ public sealed class TeacherDraftsController : ControllerBase
                 upsertedIds,
                 upsertedIds.Count,
                 request.DeleteIds.Count));
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            await transaction.RollbackAsync(CancellationToken.None);
+            _db.ChangeTracker.Clear();
+            return ConcurrencyConflict("спільної пакетної зміни");
         }
         catch
         {
@@ -679,6 +756,13 @@ public sealed class TeacherDraftsController : ControllerBase
 
         return null;
     }
+
+    private ConflictObjectResult ConcurrencyConflict(string operation)
+        => Conflict(new
+        {
+            message = $"Чернетка вже змінилася під час {operation}. Оновіть сторінку та повторіть дію."
+        });
+
     private static bool HasBlockingValidationErrors(
         RulesService.DraftValidationResult validation,
         bool allowBypassableErrors,

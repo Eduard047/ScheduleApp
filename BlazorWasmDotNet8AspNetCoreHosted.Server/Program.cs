@@ -52,6 +52,8 @@ builder.Services.AddScoped<TeacherDraftsQueryService>();
 builder.Services.AddScoped<TeacherDraftsExportService>();
 builder.Services.AddScoped<TeacherDraftsAutogenService>();
 builder.Services.AddSingleton<TeacherDraftsAutogenJobService>();
+builder.Services.AddHostedService<TeacherDraftsAutogenJobService>(services =>
+    services.GetRequiredService<TeacherDraftsAutogenJobService>());
 builder.Services.AddScoped<TeacherDraftsPublishService>();
 builder.Services.AddSingleton<StartupReadinessState>();
 builder.Services.AddHostedService<DefaultLessonTypesSeederHostedService>();
@@ -147,6 +149,19 @@ app.MapGet("/health/ready", async (
             statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 }).ExcludeFromDescription();
-app.MapFallbackToFile("index.html");
+Program.MapSpaFallbackRoutes(app);
 
 app.Run();
+
+public partial class Program
+{
+    // Відокремлює невідомі API-запити від клієнтського SPA fallback.
+    public static void MapSpaFallbackRoutes(WebApplication app)
+    {
+        app.MapFallback("/api/{**path}", () => Results.Problem(
+            title: "API-маршрут не знайдено",
+            detail: "Запитаний API-маршрут не існує.",
+            statusCode: StatusCodes.Status404NotFound));
+        app.MapFallbackToFile("index.html");
+    }
+}

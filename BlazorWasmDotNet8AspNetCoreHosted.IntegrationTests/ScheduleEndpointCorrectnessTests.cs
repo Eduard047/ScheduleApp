@@ -36,7 +36,8 @@ public sealed class ScheduleEndpointCorrectnessTests
             RoomId: null,
             LessonTypeId: model.LessonTypeId,
             IsLocked: false,
-            OverrideNonWorkingDay: false));
+            OverrideNonWorkingDay: false,
+            ExpectedRevision: await GetScheduleItemRevisionAsync(fixture.Db, model.ScheduleItemId)));
 
         Assert.IsType<OkObjectResult>(result.Result);
         fixture.Db.ChangeTracker.Clear();
@@ -74,7 +75,8 @@ public sealed class ScheduleEndpointCorrectnessTests
             RoomId: null,
             LessonTypeId: model.OriginalLessonTypeId,
             IsLocked: false,
-            OverrideNonWorkingDay: false));
+            OverrideNonWorkingDay: false,
+            ExpectedRevision: await GetScheduleItemRevisionAsync(fixture.Db, model.FirstItemId)));
 
         Assert.IsType<OkObjectResult>(result.Result);
         fixture.Db.ChangeTracker.Clear();
@@ -122,7 +124,8 @@ public sealed class ScheduleEndpointCorrectnessTests
             RoomId: null,
             LessonTypeId: model.OriginalLessonTypeId,
             IsLocked: false,
-            OverrideNonWorkingDay: false));
+            OverrideNonWorkingDay: false,
+            ExpectedRevision: await GetScheduleItemRevisionAsync(fixture.Db, model.FirstItemId)));
 
         Assert.IsType<OkObjectResult>(result.Result);
         fixture.Db.ChangeTracker.Clear();
@@ -168,7 +171,8 @@ public sealed class ScheduleEndpointCorrectnessTests
                 RoomId: null,
                 LessonTypeId: lessonTypeId,
                 IsLocked: false,
-                OverrideNonWorkingDay: false));
+                OverrideNonWorkingDay: false,
+                ExpectedRevision: await GetScheduleItemRevisionAsync(fixture.Db, model.FirstItemId)));
 
         Assert.IsType<OkObjectResult>((await ChangeTypeAsync(rescheduledType.Id)).Result);
         fixture.Db.ChangeTracker.Clear();
@@ -194,6 +198,69 @@ public sealed class ScheduleEndpointCorrectnessTests
         Assert.All(
             await fixture.Db.TeacherDraftItems.AsNoTracking().ToListAsync(),
             item => Assert.Equal(packageKey, item.BatchKey));
+    }
+
+    [Fact]
+    public async Task Upsert_rescheduled_rolls_back_when_no_replacement_slot_is_available()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedLogicalEventAsync();
+        var rescheduledType = new LessonTypeRef
+        {
+            Code = "RESCHEDULED",
+            Name = "Перенесено",
+            RequiresRoom = false,
+            RequiresTeacher = false,
+            BlocksRoom = false,
+            BlocksTeacher = false,
+            CountInPlan = false,
+            CountInLoad = false
+        };
+        fixture.Db.LessonTypes.Add(rescheduledType);
+        var nextWeekStart = Monday.AddDays(7);
+        for (var offset = 0; offset < 5; offset++)
+        {
+            fixture.Db.CalendarExceptions.Add(new CalendarException
+            {
+                Date = nextWeekStart.AddDays(offset),
+                IsWorkingDay = false,
+                Name = "Тестовий неробочий день",
+                CourseId = model.CourseId
+            });
+        }
+        await fixture.Db.SaveChangesAsync();
+        var originalRevision = await GetScheduleItemRevisionAsync(fixture.Db, model.FirstItemId);
+        var originalRowRevision = await fixture.Db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => item.Id == model.FirstItemId)
+            .Select(item => item.Revision)
+            .SingleAsync();
+        var controller = CreateController(fixture.Db);
+
+        var result = await controller.Upsert(new UpsertScheduleItemRequest(
+            Id: model.FirstItemId,
+            Date: Monday,
+            TimeStart: "08:00",
+            TimeEnd: "09:00",
+            GroupId: model.GroupId,
+            ModuleId: model.ModuleId,
+            TeacherId: model.FirstTeacherId,
+            RoomId: null,
+            LessonTypeId: rescheduledType.Id,
+            IsLocked: false,
+            OverrideNonWorkingDay: false,
+            ExpectedRevision: originalRevision));
+
+        Assert.IsType<ConflictObjectResult>(result.Result);
+        fixture.Db.ChangeTracker.Clear();
+        var persistedRows = await fixture.Db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => item.BatchKey == model.BatchKey)
+            .ToListAsync();
+        Assert.Equal(2, persistedRows.Count);
+        Assert.All(persistedRows, item => Assert.Equal(model.OriginalLessonTypeId, item.LessonTypeId));
+        Assert.Contains(persistedRows, item => item.Id == model.FirstItemId && item.Revision == originalRowRevision);
+        Assert.False(await fixture.Db.TeacherDraftItems.AnyAsync());
     }
 
     [Fact]
@@ -234,7 +301,8 @@ public sealed class ScheduleEndpointCorrectnessTests
             RoomId: null,
             LessonTypeId: model.OriginalLessonTypeId,
             IsLocked: false,
-            OverrideNonWorkingDay: false));
+            OverrideNonWorkingDay: false,
+            ExpectedRevision: await GetScheduleItemRevisionAsync(fixture.Db, model.FirstItemId)));
 
         Assert.IsType<ConflictObjectResult>(result.Result);
         fixture.Db.ChangeTracker.Clear();
@@ -270,6 +338,7 @@ public sealed class ScheduleEndpointCorrectnessTests
         await fixture.Db.SaveChangesAsync();
         await fixture.AddFailingModulePlanUpdateTriggerAsync();
         var controller = CreateController(fixture.Db);
+        var expectedRevision = await GetScheduleItemRevisionAsync(fixture.Db, model.FirstItemId);
 
         await Assert.ThrowsAsync<DbUpdateException>(() => controller.Upsert(new UpsertScheduleItemRequest(
             Id: model.FirstItemId,
@@ -282,7 +351,8 @@ public sealed class ScheduleEndpointCorrectnessTests
             RoomId: null,
             LessonTypeId: model.OriginalLessonTypeId,
             IsLocked: false,
-            OverrideNonWorkingDay: false)));
+            OverrideNonWorkingDay: false,
+            ExpectedRevision: expectedRevision)));
 
         fixture.Db.ChangeTracker.Clear();
         var lessonTypeIds = await fixture.Db.ScheduleItems
@@ -315,7 +385,9 @@ public sealed class ScheduleEndpointCorrectnessTests
         await fixture.Db.SaveChangesAsync();
         var controller = CreateController(fixture.Db);
 
-        var result = await controller.Delete(model.FirstItemId);
+        var result = await controller.Delete(
+            model.FirstItemId,
+            await GetScheduleItemRevisionAsync(fixture.Db, model.FirstItemId));
 
         Assert.IsType<NoContentResult>(result);
         fixture.Db.ChangeTracker.Clear();
@@ -331,7 +403,9 @@ public sealed class ScheduleEndpointCorrectnessTests
         await fixture.AddFailingModulePlanUpdateTriggerAsync();
         var controller = CreateController(fixture.Db);
 
-        await Assert.ThrowsAsync<DbUpdateException>(() => controller.Delete(model.ScheduleItemId));
+        await Assert.ThrowsAsync<DbUpdateException>(() => controller.Delete(
+            model.ScheduleItemId,
+            model.ScheduleItemRevision));
 
         fixture.Db.ChangeTracker.Clear();
         Assert.True(await fixture.Db.ScheduleItems.AnyAsync(item => item.Id == model.ScheduleItemId));
@@ -364,6 +438,207 @@ public sealed class ScheduleEndpointCorrectnessTests
                 .SingleAsync());
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ClearWeek_rejects_mixed_lock_logical_event_without_partial_deletion(bool withBatchKey)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedLogicalEventAsync(withBatchKey);
+        var logicalRows = await fixture.Db.ScheduleItems
+            .Where(item => item.BatchKey == model.BatchKey)
+            .OrderBy(item => item.Id)
+            .ToListAsync();
+        Assert.Equal(2, logicalRows.Count);
+        logicalRows[0].IsLocked = true;
+        await fixture.Db.SaveChangesAsync();
+        var originalIds = logicalRows.Select(item => item.Id).ToArray();
+        var controller = CreateController(fixture.Db);
+
+        var result = await controller.ClearWeek(
+            new ClearWeekRequest(Monday, CourseId: model.CourseId));
+
+        Assert.IsType<ConflictObjectResult>(result.Result);
+        fixture.Db.ChangeTracker.Clear();
+        var persistedRows = await fixture.Db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => item.BatchKey == model.BatchKey)
+            .OrderBy(item => item.Id)
+            .ToListAsync();
+        Assert.Equal(originalIds, persistedRows.Select(item => item.Id));
+        Assert.Contains(persistedRows, item => item.IsLocked);
+        Assert.Contains(persistedRows, item => !item.IsLocked);
+    }
+
+    [Fact]
+    public async Task Upsert_rejects_stale_revision_without_overwriting_newer_schedule_change()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedScheduleAsync();
+        var staleRevision = model.ScheduleItemRevision;
+        var changedByAnotherEditor = await fixture.Db.ScheduleItems
+            .SingleAsync(item => item.Id == model.ScheduleItemId);
+        changedByAnotherEditor.StartTime = new TimeOnly(7, 30);
+        changedByAnotherEditor.EndTime = new TimeOnly(8, 30);
+        await fixture.Db.SaveChangesAsync();
+        var freshRevision = changedByAnotherEditor.Revision;
+        Assert.NotEqual(staleRevision, freshRevision);
+        fixture.Db.ChangeTracker.Clear();
+        var controller = CreateController(fixture.Db);
+
+        var result = await controller.Upsert(new UpsertScheduleItemRequest(
+            Id: model.ScheduleItemId,
+            Date: Monday,
+            TimeStart: "09:00",
+            TimeEnd: "10:00",
+            GroupId: model.GroupId,
+            ModuleId: model.NewModuleId,
+            TeacherId: null,
+            RoomId: null,
+            LessonTypeId: model.LessonTypeId,
+            IsLocked: false,
+            OverrideNonWorkingDay: false,
+            ExpectedRevision: staleRevision));
+
+        Assert.IsType<ConflictObjectResult>(result.Result);
+        fixture.Db.ChangeTracker.Clear();
+        var persisted = await fixture.Db.ScheduleItems
+            .AsNoTracking()
+            .SingleAsync(item => item.Id == model.ScheduleItemId);
+        Assert.Equal(new TimeOnly(7, 30), persisted.StartTime);
+        Assert.Equal(new TimeOnly(8, 30), persisted.EndTime);
+        Assert.Equal(model.OldModuleId, persisted.ModuleId);
+        Assert.Equal(freshRevision, persisted.Revision);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Existing_schedule_mutation_requires_revision(bool delete)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedScheduleAsync();
+        var controller = CreateController(fixture.Db);
+
+        IActionResult action;
+        if (delete)
+        {
+            action = await controller.Delete(model.ScheduleItemId, expectedRevision: null);
+        }
+        else
+        {
+            var result = await controller.Upsert(new UpsertScheduleItemRequest(
+                Id: model.ScheduleItemId,
+                Date: Monday,
+                TimeStart: "09:00",
+                TimeEnd: "10:00",
+                GroupId: model.GroupId,
+                ModuleId: model.NewModuleId,
+                TeacherId: null,
+                RoomId: null,
+                LessonTypeId: model.LessonTypeId,
+                IsLocked: false,
+                OverrideNonWorkingDay: false,
+                ExpectedRevision: null));
+            action = Assert.IsAssignableFrom<IActionResult>(result.Result);
+        }
+
+        var failure = Assert.IsType<ObjectResult>(action);
+        Assert.Equal(428, failure.StatusCode);
+        Assert.True(await fixture.Db.ScheduleItems.AnyAsync(item => item.Id == model.ScheduleItemId));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Logical_event_mutation_rejects_stale_revision_when_only_sibling_changed(bool delete)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedLogicalEventAsync();
+        var staleRevision = await GetScheduleItemRevisionAsync(fixture.Db, model.FirstItemId);
+        var originalSourceRevision = await fixture.Db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => item.Id == model.FirstItemId)
+            .Select(item => item.Revision)
+            .SingleAsync();
+        var sibling = await fixture.Db.ScheduleItems
+            .SingleAsync(item => item.ModuleTopicId == model.SecondTopicId);
+        sibling.TeacherId = model.FirstTeacherId;
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        Assert.Equal(
+            originalSourceRevision,
+            await fixture.Db.ScheduleItems
+                .AsNoTracking()
+                .Where(item => item.Id == model.FirstItemId)
+                .Select(item => item.Revision)
+                .SingleAsync());
+        Assert.NotEqual(staleRevision, await GetScheduleItemRevisionAsync(fixture.Db, model.FirstItemId));
+        var controller = CreateController(fixture.Db);
+
+        IActionResult action;
+        if (delete)
+        {
+            action = await controller.Delete(model.FirstItemId, staleRevision);
+        }
+        else
+        {
+            var result = await controller.Upsert(new UpsertScheduleItemRequest(
+                Id: model.FirstItemId,
+                Date: Monday,
+                TimeStart: "08:00",
+                TimeEnd: "09:00",
+                GroupId: model.GroupId,
+                ModuleId: model.ModuleId,
+                TeacherId: model.FirstTeacherId,
+                RoomId: null,
+                LessonTypeId: model.TargetLessonTypeId,
+                IsLocked: false,
+                OverrideNonWorkingDay: false,
+                ExpectedRevision: staleRevision));
+            action = Assert.IsAssignableFrom<IActionResult>(result.Result);
+        }
+
+        Assert.IsType<ConflictObjectResult>(action);
+        fixture.Db.ChangeTracker.Clear();
+        var persistedRows = await fixture.Db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => item.BatchKey == model.BatchKey)
+            .ToListAsync();
+        Assert.Equal(2, persistedRows.Count);
+        Assert.All(persistedRows, item => Assert.Equal(model.OriginalLessonTypeId, item.LessonTypeId));
+        Assert.Contains(persistedRows, item =>
+            item.ModuleTopicId == model.SecondTopicId && item.TeacherId == model.FirstTeacherId);
+    }
+
+    [Fact]
+    public async Task Delete_rejects_stale_revision_without_removing_newer_schedule_change()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedScheduleAsync();
+        var staleRevision = model.ScheduleItemRevision;
+        var changedByAnotherEditor = await fixture.Db.ScheduleItems
+            .SingleAsync(item => item.Id == model.ScheduleItemId);
+        changedByAnotherEditor.StartTime = new TimeOnly(7, 30);
+        changedByAnotherEditor.EndTime = new TimeOnly(8, 30);
+        await fixture.Db.SaveChangesAsync();
+        var freshRevision = changedByAnotherEditor.Revision;
+        Assert.NotEqual(staleRevision, freshRevision);
+        fixture.Db.ChangeTracker.Clear();
+        var controller = CreateController(fixture.Db);
+
+        var result = await controller.Delete(model.ScheduleItemId, staleRevision);
+
+        Assert.IsType<ConflictObjectResult>(result);
+        fixture.Db.ChangeTracker.Clear();
+        var persisted = await fixture.Db.ScheduleItems
+            .AsNoTracking()
+            .SingleAsync(item => item.Id == model.ScheduleItemId);
+        Assert.Equal(new TimeOnly(7, 30), persisted.StartTime);
+        Assert.Equal(new TimeOnly(8, 30), persisted.EndTime);
+        Assert.Equal(freshRevision, persisted.Revision);
+    }
+
     [Fact]
     public async Task Upsert_rejects_missing_teacher_without_changing_schedule()
     {
@@ -382,7 +657,8 @@ public sealed class ScheduleEndpointCorrectnessTests
             RoomId: null,
             LessonTypeId: model.LessonTypeId,
             IsLocked: false,
-            OverrideNonWorkingDay: false));
+            OverrideNonWorkingDay: false,
+            ExpectedRevision: await GetScheduleItemRevisionAsync(fixture.Db, model.ScheduleItemId)));
 
         Assert.IsType<ConflictObjectResult>(result.Result);
         Assert.Null(await fixture.Db.ScheduleItems
@@ -417,7 +693,8 @@ public sealed class ScheduleEndpointCorrectnessTests
             RoomId: null,
             LessonTypeId: model.LessonTypeId,
             IsLocked: false,
-            OverrideNonWorkingDay: false);
+            OverrideNonWorkingDay: false,
+            ExpectedRevision: await GetScheduleItemRevisionAsync(fixture.Db, model.ScheduleItemId));
         var controller = CreateController(fixture.Db);
 
         var rejected = await controller.Upsert(request);
@@ -479,7 +756,8 @@ public sealed class ScheduleEndpointCorrectnessTests
             RoomId: null,
             LessonTypeId: teacherLessonType.Id,
             IsLocked: false,
-            OverrideNonWorkingDay: false));
+            OverrideNonWorkingDay: false,
+            ExpectedRevision: await GetScheduleItemRevisionAsync(fixture.Db, model.ScheduleItemId)));
 
         Assert.IsType<ConflictObjectResult>(result.Result);
         Assert.Equal(
@@ -504,6 +782,7 @@ public sealed class ScheduleEndpointCorrectnessTests
         });
         await fixture.Db.SaveChangesAsync();
         var controller = CreateController(fixture.Db);
+        var expectedRevision = await GetScheduleItemRevisionAsync(fixture.Db, model.ScheduleItemId);
         UpsertScheduleItemRequest Request(bool allow) => new(
             Id: model.ScheduleItemId,
             Date: Monday,
@@ -515,7 +794,8 @@ public sealed class ScheduleEndpointCorrectnessTests
             RoomId: null,
             LessonTypeId: model.LessonTypeId,
             IsLocked: false,
-            OverrideNonWorkingDay: allow);
+            OverrideNonWorkingDay: allow,
+            ExpectedRevision: expectedRevision);
 
         var rejected = await controller.Upsert(Request(false));
         var accepted = await controller.Upsert(Request(true));
@@ -542,7 +822,8 @@ public sealed class ScheduleEndpointCorrectnessTests
             RoomId: null,
             LessonTypeId: model.TargetLessonTypeId,
             IsLocked: false,
-            OverrideNonWorkingDay: false));
+            OverrideNonWorkingDay: false,
+            ExpectedRevision: await GetScheduleItemRevisionAsync(fixture.Db, model.FirstItemId)));
 
         Assert.IsType<ConflictObjectResult>(result.Result);
         Assert.All(
@@ -796,6 +1077,24 @@ public sealed class ScheduleEndpointCorrectnessTests
     private static ScheduleController CreateController(AppDbContext db)
         => new(db, new RulesService(db), new AggregatesService(db));
 
+    private static async Task<Guid> GetScheduleItemRevisionAsync(AppDbContext db, int id)
+    {
+        var date = await db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => item.Id == id)
+            .Select(item => item.Date)
+            .SingleAsync();
+        var result = await CreateController(db).Get(
+            DateHelpers.StartOfWeek(date),
+            courseId: null,
+            groupId: null,
+            teacherId: null,
+            roomId: null);
+        var ok = Assert.IsType<OkObjectResult>(result.Result);
+        var items = Assert.IsAssignableFrom<IReadOnlyList<ScheduleItemDto>>(ok.Value);
+        return Assert.Single(items, item => item.Id == id).Revision;
+    }
+
     private static byte[] CreateMinimalImportDocx()
     {
         using var stream = new MemoryStream();
@@ -873,7 +1172,8 @@ public sealed class ScheduleEndpointCorrectnessTests
         int OldModuleId,
         int NewModuleId,
         int LessonTypeId,
-        int ScheduleItemId);
+        int ScheduleItemId,
+        Guid ScheduleItemRevision);
 
     private sealed record LogicalEventSeedModel(
         int CourseId,
@@ -977,7 +1277,8 @@ public sealed class ScheduleEndpointCorrectnessTests
                 oldModule.Id,
                 newModule.Id,
                 lessonType.Id,
-                item.Id);
+                item.Id,
+                item.Revision);
         }
 
         public async Task<LogicalEventSeedModel> SeedLogicalEventAsync(bool withBatchKey = true)

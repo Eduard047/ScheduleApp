@@ -198,6 +198,7 @@ public class ModulePlan
 public class ScheduleItem
 {
     public int Id { get; set; }
+    public Guid Revision { get; set; } = Guid.NewGuid();
     public DateOnly Date { get; set; }
     public DayOfWeek DayOfWeek { get; set; }
     public TimeOnly StartTime { get; set; }
@@ -285,6 +286,7 @@ public enum DraftStatus { Draft = 0, Published = 1 }
 public class TeacherDraftItem
 {
     public int Id { get; set; }
+    public Guid Revision { get; set; } = Guid.NewGuid();
     public DateOnly Date { get; set; }
     public DayOfWeek DayOfWeek { get; set; }
     public TimeOnly StartTime { get; set; }

@@ -38,8 +38,21 @@ public sealed class TeacherDraftsAutogenService
         int ModuleId, // Модуль, до якого належить слот.
         int LessonTypeId, // Тип заняття (для обмежень).
         int? ModuleTopicId, // Тема модуля для точного зіставлення спільних потоків.
-        bool JoinableDraft // Чи можна приєднати до цього слоту нові групи як до чернеткового потоку.
+        bool JoinableDraft, // Чи можна приєднати до цього слоту нові групи як до чернеткового потоку.
+        string? BatchKey = null // Ключ логічної події для схлопування багаторядкових занять у лічильниках.
     );
+    private sealed record LogicalEventUsageRow(
+        int GroupId,
+        int ModuleId,
+        int LessonTypeId,
+        int? ModuleTopicId,
+        int? TeacherId,
+        int? RoomId,
+        bool IsSelfStudy,
+        DateOnly Date,
+        TimeOnly StartTime,
+        TimeOnly EndTime,
+        string? BatchKey);
     private sealed record PlacementCandidate(
         TimeSlot Slot, // Слот розкладу для можливого розміщення.
         int TeacherId, // Обраний викладач.
@@ -428,7 +441,7 @@ public sealed class TeacherDraftsAutogenService
     {
         cancellationToken.ThrowIfCancellationRequested();
         // ЕТАП 1: збираємо типи занять і готуємо довідники правил.
-        var types = await _db.LessonTypes.AsNoTracking().ToListAsync();
+        var types = await _db.LessonTypes.AsNoTracking().ToListAsync(cancellationToken);
         if (types.Count == 0)
             return BadRequest(new AutoGenResult(0, 0, new() { "Типи занять відсутні або вимкнені." }));
         // Мапа типів за ідентифікатором для швидких перевірок.
@@ -536,7 +549,7 @@ public sealed class TeacherDraftsAutogenService
         // Витягуємо календарні винятки для всього діапазону (робочі/вихідні).
         var calendar = await _db.CalendarExceptions
             .Where(c => c.Date >= rangeStartDate && c.Date < rangeEndDateExclusive)
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Перевіряємо, чи дата робоча для конкретної групи з урахуванням винятків.
         bool IsWorking(DateOnly d, Group grp)
         {
@@ -591,7 +604,7 @@ public sealed class TeacherDraftsAutogenService
             .Include(x => x.Course)
             .Where(x => courseId == null || x.CourseId == courseId)
             .Where(x => !hasGroupFilter || requestedGroupIds.Contains(x.Id))
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         if (hasGroupFilter)
         {
             var foundGroupIds = groups.Select(g => g.Id).ToHashSet();
@@ -627,7 +640,7 @@ public sealed class TeacherDraftsAutogenService
                 .AsNoTracking()
                 .Where(m => m.CourseId == cid || m.ModuleCourses.Any(mc => mc.CourseId == cid))
                 .Select(m => m.Id)
-                .ToListAsync();
+                .ToListAsync(cancellationToken);
             var allowedSet = allowedModuleIds.ToHashSet();
             var invalidModuleIds = moduleHoursByModuleId.Keys
                 .Where(mid => !allowedSet.Contains(mid))
@@ -715,8 +728,8 @@ public sealed class TeacherDraftsAutogenService
             }
         }
         // Конфігурації ліміту слота для типу з прапорцем "Бажано першим у тижні" та список аудиторій для підбору.
-        var preferredFirstSlotLimitsAll = await _db.PreferredFirstSlotLimitConfigs.AsNoTracking().ToListAsync();
-        var roomsAll = await _db.Rooms.AsNoTracking().ToListAsync();
+        var preferredFirstSlotLimitsAll = await _db.PreferredFirstSlotLimitConfigs.AsNoTracking().ToListAsync(cancellationToken);
+        var roomsAll = await _db.Rooms.AsNoTracking().ToListAsync(cancellationToken);
         var roomBuildingById = roomsAll.ToDictionary(r => r.Id, r => r.BuildingId);
         var availableBuildingIds = roomsAll
             .Select(r => r.BuildingId)
@@ -787,19 +800,19 @@ public sealed class TeacherDraftsAutogenService
             }
         }
         var travelMinutesByBuildingPair = await _db.BuildingTravels.AsNoTracking()
-            .ToDictionaryAsync(k => (k.FromBuildingId, k.ToBuildingId), v => v.Minutes);
+            .ToDictionaryAsync(k => (k.FromBuildingId, k.ToBuildingId), v => v.Minutes, cancellationToken);
         int TravelMinutes(int fromBuildingId, int toBuildingId)
             => TravelTimePolicy.Resolve(travelMinutesByBuildingPair, fromBuildingId, toBuildingId);
         // Список модулів для формування допустимих аудиторій/будівель.
-        var moduleIdsAll = await _db.Modules.Select(m => m.Id).ToListAsync();
+        var moduleIdsAll = await _db.Modules.Select(m => m.Id).ToListAsync(cancellationToken);
         var allowedRoomsByModule = await _db.ModuleRooms
             .Where(mr => moduleIdsAll.Contains(mr.ModuleId))
             .GroupBy(mr => mr.ModuleId)
-            .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.RoomId).ToHashSet());
+            .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.RoomId).ToHashSet(), cancellationToken);
         var allowedBuildingsByModule = await _db.ModuleBuildings
             .Where(mb => moduleIdsAll.Contains(mb.ModuleId))
             .GroupBy(mb => mb.ModuleId)
-            .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.BuildingId).ToHashSet());
+            .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.BuildingId).ToHashSet(), cancellationToken);
         // Історичне вікно для перевірки повторів.
         const int historyMonthsForRepeats = 12;
         var historyStart = rangeStartDate.AddMonths(-historyMonthsForRepeats);
@@ -821,8 +834,9 @@ public sealed class TeacherDraftsAutogenService
                 x.ModuleTopicId,
                 x.Status == DraftStatus.Draft
                 && !x.IsLocked
-                && (x.BatchKey == null || x.BatchKey == string.Empty)))
-            .ToListAsync();
+                && (x.BatchKey == null || x.BatchKey == string.Empty),
+                x.BatchKey))
+            .ToListAsync(cancellationToken);
         var busySchedule = await _db.ScheduleItems
             .Include(x => x.Room)
             .Where(x => x.Date >= historyStart && x.Date < planningWeekEndExclusive)
@@ -837,11 +851,13 @@ public sealed class TeacherDraftsAutogenService
                 x.ModuleId,
                 x.LessonTypeId,
                 x.ModuleTopicId,
-                false))
-            .ToListAsync();
+                false,
+                x.BatchKey))
+            .ToListAsync(cancellationToken);
         var topicOrderDrafts = await _db.TeacherDraftItems
             .Include(x => x.Room)
             .Where(x => x.ModuleTopicId != null
+                        && !nonOccupyingMarkerTypeIds.Contains(x.LessonTypeId)
                         && x.Date >= historyStart
                         && x.Date < planningWeekEndExclusive
                         && courseIds.Contains(x.Group.CourseId))
@@ -856,11 +872,13 @@ public sealed class TeacherDraftsAutogenService
                 x.ModuleId,
                 x.LessonTypeId,
                 x.ModuleTopicId,
-                true))
-            .ToListAsync();
+                true,
+                x.BatchKey))
+            .ToListAsync(cancellationToken);
         var topicOrderSchedule = await _db.ScheduleItems
             .Include(x => x.Room)
             .Where(x => x.ModuleTopicId != null
+                        && !nonOccupyingMarkerTypeIds.Contains(x.LessonTypeId)
                         && x.Date >= historyStart
                         && x.Date < planningWeekEndExclusive
                         && courseIds.Contains(x.Group.CourseId))
@@ -875,8 +893,9 @@ public sealed class TeacherDraftsAutogenService
                 x.ModuleId,
                 x.LessonTypeId,
                 x.ModuleTopicId,
-                false))
-            .ToListAsync();
+                false,
+                x.BatchKey))
+            .ToListAsync(cancellationToken);
         var busy = busyDrafts
             .Concat(busySchedule)
             .ToList();
@@ -1098,11 +1117,54 @@ public sealed class TeacherDraftsAutogenService
             .Where(b => !excludedTypeIds.Contains(b.LessonTypeId))
             .GroupBy(b => b.GroupId)
             .ToDictionary(g => g.Key, g => g.Select(x => x.ModuleId).Distinct().ToHashSet());
+        int CountLogicalBusyEvents(IEnumerable<BusySlot> source)
+        {
+            var workload = source
+                .Where(slot => !excludedTypeIds.Contains(slot.LessonTypeId))
+                .ToList();
+            var legacyCount = workload
+                .Where(slot => string.IsNullOrWhiteSpace(slot.BatchKey))
+                .GroupBy(slot => new
+                {
+                    slot.Date,
+                    slot.StartTime,
+                    slot.EndTime,
+                    slot.GroupId,
+                    slot.ModuleId,
+                    slot.LessonTypeId,
+                    slot.RoomId
+                })
+                .Sum(group => IsLegacyLogicalEvent(group) ? 1 : group.Count());
+            var batchedCount = workload
+                .Where(slot => !string.IsNullOrWhiteSpace(slot.BatchKey))
+                .GroupBy(slot => new
+                {
+                    slot.BatchKey,
+                    slot.Date,
+                    slot.StartTime,
+                    slot.EndTime,
+                    slot.GroupId,
+                    slot.ModuleId,
+                    slot.LessonTypeId
+                })
+                .Count();
+            return legacyCount + batchedCount;
+        }
+        static bool IsLegacyLogicalEvent(IEnumerable<BusySlot> rows)
+        {
+            var buffered = rows.ToList();
+            return buffered.Count > 1
+                   && buffered
+                       .Select(row => (row.ModuleTopicId, row.TeacherId))
+                       .Distinct()
+                       .Skip(1)
+                       .Any();
+        }
         // Лічильник кількості пар на день для кожної групи.
         var perDayCount = new Dictionary<(int groupId, DateOnly date), int>();
         foreach (var indexedDay in busyByGroupDate)
         {
-            var count = indexedDay.Value.Count(b => !excludedTypeIds.Contains(b.LessonTypeId));
+            var count = CountLogicalBusyEvents(indexedDay.Value);
             if (count > 0)
             {
                 perDayCount[indexedDay.Key] = count;
@@ -1111,8 +1173,7 @@ public sealed class TeacherDraftsAutogenService
         // Допоміжні методи для підрахунків навантаження по днях.
         int CountFor(int gid, DateOnly date) => perDayCount.TryGetValue((gid, date), out var c) ? c : 0;
         int CountModuleForDay(int gid, DateOnly date, int moduleId) =>
-            BusyForGroupDate(gid, date).Count(x => x.ModuleId == moduleId
-                                                   && !excludedTypeIds.Contains(x.LessonTypeId));
+            CountLogicalBusyEvents(BusyForGroupDate(gid, date).Where(x => x.ModuleId == moduleId));
         int CountDistinctModulesForDay(int gid, DateOnly date) =>
             BusyForGroupDate(gid, date)
                 .Where(x => !excludedTypeIds.Contains(x.LessonTypeId))
@@ -1170,8 +1231,8 @@ public sealed class TeacherDraftsAutogenService
         bool UsedLastWeek(int gid, int mid) =>
             lastWeekModulesByGroup.TryGetValue(gid, out var mods) && mods.Contains(mid);
         // Базові зв'язки модуль -> викладачі / керівники самостійної роботи.
-        var teachersForModule = await _db.TeacherModules.AsNoTracking().ToListAsync();
-        var supervisorsForModule = await _db.ModuleSupervisors.AsNoTracking().ToListAsync();
+        var teachersForModule = await _db.TeacherModules.AsNoTracking().ToListAsync(cancellationToken);
+        var supervisorsForModule = await _db.ModuleSupervisors.AsNoTracking().ToListAsync(cancellationToken);
         if (requestedTeacherId is int teacherFilterId)
         {
             teachersForModule = teachersForModule
@@ -1190,18 +1251,18 @@ public sealed class TeacherDraftsAutogenService
                 Name = string.IsNullOrWhiteSpace(t.FullName) ? $"#{t.Id}" : t.FullName!,
                 t.DepartmentId
             })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Мапи для швидкого доступу до імен та кафедр викладачів.
         var teacherNames = teachersMeta.ToDictionary(x => x.Id, x => x.Name);
         var teacherDepartmentById = teachersMeta.ToDictionary(x => x.Id, x => x.DepartmentId);
         // Назви кафедр для повідомлень та перевірок.
         var departmentNames = await _db.Departments
             .AsNoTracking()
-            .ToDictionaryAsync(d => d.Id, d => string.IsNullOrWhiteSpace(d.Name) ? $"#{d.Id}" : d.Name!);
+            .ToDictionaryAsync(d => d.Id, d => string.IsNullOrWhiteSpace(d.Name) ? $"#{d.Id}" : d.Name!, cancellationToken);
         // Робочі години викладачів (обмеження часу).
         var teacherWorkingHours = await _db.TeacherWorkingHours.AsNoTracking()
             .Select(w => new { w.TeacherId, w.DayOfWeek, w.Start, w.End })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Групуємо робочі години по викладачах та днях тижня.
         var workingHoursByTeacher = teacherWorkingHours
             .GroupBy(w => w.TeacherId)
@@ -1226,24 +1287,28 @@ public sealed class TeacherDraftsAutogenService
         // Навантаження викладачів у вже опублікованому розкладі.
         var teacherLoadSchedule = await _db.ScheduleItems
             .Include(si => si.Group)
-            .Where(si => si.TeacherId != null && courseIds.Contains(si.Group.CourseId))
+            .Where(si => si.TeacherId != null
+                         && !excludedTypeIds.Contains(si.LessonTypeId)
+                         && courseIds.Contains(si.Group.CourseId))
             .GroupBy(si => new { si.TeacherId, si.Group.CourseId })
             .Select(g => new { TeacherId = g.Key.TeacherId!.Value, g.Key.CourseId, C = g.Count() })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Навантаження викладачів у поточних чернетках.
         var teacherLoadDrafts = await _db.TeacherDraftItems
             .Include(di => di.Group)
-            .Where(di => di.TeacherId != null && courseIds.Contains(di.Group.CourseId))
+            .Where(di => di.TeacherId != null
+                         && !excludedTypeIds.Contains(di.LessonTypeId)
+                         && courseIds.Contains(di.Group.CourseId))
             .GroupBy(di => new { di.TeacherId, di.Group.CourseId })
             .Select(g => new { TeacherId = g.Key.TeacherId!.Value, g.Key.CourseId, C = g.Count() })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Об'єднана карта навантажень для балансу.
         var teacherLoadMap = teacherLoadSchedule
             .Concat(teacherLoadDrafts)
             .GroupBy(x => (x.TeacherId, x.CourseId))
             .ToDictionary(g => g.Key, g => g.Sum(x => x.C));
         // Активні плани модулів по курсах.
-        var activePlans = await _db.ModulePlans.Where(p => courseIds.Contains(p.CourseId) && p.IsActive).ToListAsync();
+        var activePlans = await _db.ModulePlans.Where(p => courseIds.Contains(p.CourseId) && p.IsActive).ToListAsync(cancellationToken);
         // Базова метрика навантаження викладача в межах курсу.
         int TeacherLoadScore(int teacherId, int courseId)
         {
@@ -1267,14 +1332,15 @@ public sealed class TeacherDraftsAutogenService
             .Where(m => moduleIdsForPlans.Contains(m.Id))
             .ToDictionaryAsync(
                 m => m.Id,
-                m => string.IsNullOrWhiteSpace(m.Title) ? $"#{m.Id}" : m.Title.Trim());
+                m => string.IsNullOrWhiteSpace(m.Title) ? $"#{m.Id}" : m.Title.Trim(),
+                cancellationToken);
         // Формуємо зручний ярлик модуля.
         string ModuleTitleLabel(int moduleId) =>
             moduleTitles.TryGetValue(moduleId, out var title) ? title : $"#{moduleId}";
         // Теми модулів для підбору тем і самостійної роботи.
         var topicsAll = await _db.ModuleTopics
             .Where(t => moduleIdsForPlans.Contains(t.ModuleId))
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Сортуємо теми за явним порядком із БД, а код використовуємо лише як стабільний fallback.
         topicsAll.Sort((a, b) =>
         {
@@ -1328,39 +1394,43 @@ public sealed class TeacherDraftsAutogenService
         // Самостійні заняття, вже призначені у чернетках.
         var selfStudyAssignmentsDraft = await _db.TeacherDraftItems
             .Where(di => di.IsSelfStudy
+                         && !excludedTypeIds.Contains(di.LessonTypeId)
                          && di.Date < planningWeekEndExclusive
                          && courseIds.Contains(di.Group.CourseId)
                          && (di.ModuleTopicId == null || flaggedSelfStudyTopicIds.Contains(di.ModuleTopicId.Value)))
             .Select(di => new { di.GroupId, di.ModuleId })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Самостійні заняття, вже опубліковані у розкладі.
         var selfStudyAssignmentsSchedule = await _db.ScheduleItems
             .Where(si => si.IsSelfStudy
+                         && !excludedTypeIds.Contains(si.LessonTypeId)
                          && si.Date < planningWeekEndExclusive
                          && courseIds.Contains(si.Group.CourseId)
                          && (si.ModuleTopicId == null || flaggedSelfStudyTopicIds.Contains(si.ModuleTopicId.Value)))
             .Select(si => new { si.GroupId, si.ModuleId })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Самостійні заняття по конкретних темах (чернетки).
         var selfStudyTopicAssignmentsDraft = await _db.TeacherDraftItems
             .Where(di => di.IsSelfStudy
+                         && !excludedTypeIds.Contains(di.LessonTypeId)
                          && di.ModuleTopicId != null
                          && di.Date < planningWeekEndExclusive
                          && flaggedSelfStudyTopicIds.Contains(di.ModuleTopicId!.Value)
                          && courseIds.Contains(di.Group.CourseId))
             .GroupBy(di => new { di.GroupId, di.ModuleId, TopicId = di.ModuleTopicId!.Value })
             .Select(g => new { g.Key.GroupId, g.Key.ModuleId, g.Key.TopicId, C = g.Count() })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Самостійні заняття по конкретних темах (розклад).
         var selfStudyTopicAssignmentsSchedule = await _db.ScheduleItems
             .Where(si => si.IsSelfStudy
+                         && !excludedTypeIds.Contains(si.LessonTypeId)
                          && si.ModuleTopicId != null
                          && si.Date < planningWeekEndExclusive
                          && flaggedSelfStudyTopicIds.Contains(si.ModuleTopicId!.Value)
                          && courseIds.Contains(si.Group.CourseId))
             .GroupBy(si => new { si.GroupId, si.ModuleId, TopicId = si.ModuleTopicId!.Value })
             .Select(g => new { g.Key.GroupId, g.Key.ModuleId, g.Key.TopicId, C = g.Count() })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Зведений лічильник самостійних занять по модулю/групі.
         var selfStudyAssignments = selfStudyAssignmentsDraft
             .Concat(selfStudyAssignmentsSchedule)
@@ -1374,19 +1444,21 @@ public sealed class TeacherDraftsAutogenService
         // Призначені теми по групі/модулю (чернетки).
         var topicAssignmentsDraft = await _db.TeacherDraftItems
             .Where(di => di.ModuleTopicId != null
+                         && !excludedTypeIds.Contains(di.LessonTypeId)
                          && di.Date < planningWeekEndExclusive
                          && courseIds.Contains(di.Group.CourseId)
                          && allowedTopicIds.Contains(di.ModuleTopicId!.Value))
             .Select(di => new { di.GroupId, di.ModuleId, TopicId = di.ModuleTopicId!.Value })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Призначені теми по групі/модулю (розклад).
         var topicAssignmentsSchedule = await _db.ScheduleItems
             .Where(si => si.ModuleTopicId != null
+                         && !excludedTypeIds.Contains(si.LessonTypeId)
                          && si.Date < planningWeekEndExclusive
                          && courseIds.Contains(si.Group.CourseId)
                          && allowedTopicIds.Contains(si.ModuleTopicId!.Value))
             .Select(si => new { si.GroupId, si.ModuleId, TopicId = si.ModuleTopicId!.Value })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Сховище використаних тем по групі/модулю.
         var topicAssignments = new Dictionary<(int GroupId, int ModuleId), Dictionary<int, int>>();
         // Збільшує лічильник використаної теми.
@@ -1700,9 +1772,13 @@ public sealed class TeacherDraftsAutogenService
         static string BusyRoomLabel(Room room)
             => string.IsNullOrWhiteSpace(room.Name) ? $"#{room.Id}" : room.Name!;
         bool BlocksTeacherSlot(int lessonTypeId)
-            => typeById.TryGetValue(lessonTypeId, out var lessonType) && lessonType.BlocksTeacher;
+            => typeById.TryGetValue(lessonTypeId, out var lessonType)
+               && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(lessonType.Code)
+               && lessonType.BlocksTeacher;
         bool BlocksRoomSlot(int lessonTypeId)
-            => typeById.TryGetValue(lessonTypeId, out var lessonType) && lessonType.BlocksRoom;
+            => typeById.TryGetValue(lessonTypeId, out var lessonType)
+               && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(lessonType.Code)
+               && lessonType.BlocksRoom;
         bool IsSameShareableBusySlot(
             BusySlot slot,
             int moduleId,
@@ -2176,7 +2252,7 @@ public sealed class TeacherDraftsAutogenService
             .Where(x => courseIds.Contains(x.CourseId))
             .OrderBy(x => x.Order)
             .Select(x => new SequenceItem(x.CourseId, x.ModuleId, x.GroupOrder, x.Order))
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Мапа курс -> основна послідовність модулів.
         var mainSequenceByCourse = sequenceItems
             .GroupBy(x => x.CourseId)
@@ -2185,7 +2261,7 @@ public sealed class TeacherDraftsAutogenService
         var fillerByCourse = await _db.ModuleFillers
             .Where(x => courseIds.Contains(x.CourseId))
             .GroupBy(x => x.CourseId)
-            .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.ModuleId).ToHashSet());
+            .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.ModuleId).ToHashSet(), cancellationToken);
         // Формуємо порядок модулів з урахуванням основної послідовності та fillers.
         List<int> BuildCourseModuleOrder(int courseId, List<int> planModules)
         {
@@ -2228,7 +2304,103 @@ public sealed class TeacherDraftsAutogenService
         var allGroupsByCourse = await _db.Groups
             .Where(g => courseIds.Contains(g.CourseId))
             .GroupBy(g => g.CourseId)
-            .ToDictionaryAsync(g => g.Key, g => g.OrderBy(x => x.Id).ToList());
+            .ToDictionaryAsync(g => g.Key, g => g.OrderBy(x => x.Id).ToList(), cancellationToken);
+        var draftUsageRows = await _db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => !excludedTypeIds.Contains(item.LessonTypeId)
+                           && item.Date < planningWeekEndExclusive
+                           && courseIds.Contains(item.Group.CourseId))
+            .Select(item => new LogicalEventUsageRow(
+                item.GroupId,
+                item.ModuleId,
+                item.LessonTypeId,
+                item.ModuleTopicId,
+                item.TeacherId,
+                item.RoomId,
+                item.IsSelfStudy,
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                item.BatchKey))
+            .ToListAsync(cancellationToken);
+        var scheduleUsageRows = await _db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => !excludedTypeIds.Contains(item.LessonTypeId)
+                           && item.Date < planningWeekEndExclusive
+                           && courseIds.Contains(item.Group.CourseId))
+            .Select(item => new LogicalEventUsageRow(
+                item.GroupId,
+                item.ModuleId,
+                item.LessonTypeId,
+                item.ModuleTopicId,
+                item.TeacherId,
+                item.RoomId,
+                item.IsSelfStudy,
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                item.BatchKey))
+            .ToListAsync(cancellationToken);
+        void SubtractLogicalEventDuplicates(
+            Dictionary<(int GroupId, int ModuleId), int> fact,
+            IEnumerable<LogicalEventUsageRow> rows,
+            DateOnly? startInclusive = null,
+            DateOnly? endExclusive = null)
+        {
+            var scopedRows = rows
+                .Where(row => startInclusive is null || row.Date >= startInclusive.Value)
+                .Where(row => endExclusive is null || row.Date < endExclusive.Value)
+                .ToList();
+            var logicalEvents = scopedRows
+                .Where(row => !string.IsNullOrWhiteSpace(row.BatchKey))
+                .GroupBy(row => new
+                {
+                    row.BatchKey,
+                    row.Date,
+                    row.StartTime,
+                    row.EndTime,
+                    row.GroupId,
+                    row.ModuleId,
+                    row.LessonTypeId
+                });
+            foreach (var logicalEvent in logicalEvents)
+            {
+                var duplicateCount = logicalEvent.Count() - 1;
+                var key = (logicalEvent.Key.GroupId, logicalEvent.Key.ModuleId);
+                if (duplicateCount > 0 && fact.TryGetValue(key, out var count))
+                {
+                    fact[key] = Math.Max(0, count - duplicateCount);
+                }
+            }
+            var legacyLogicalEvents = scopedRows
+                .Where(row => string.IsNullOrWhiteSpace(row.BatchKey))
+                .GroupBy(row => new
+                {
+                    row.Date,
+                    row.StartTime,
+                    row.EndTime,
+                    row.GroupId,
+                    row.ModuleId,
+                    row.LessonTypeId,
+                    row.RoomId,
+                    row.IsSelfStudy
+                })
+                .Where(group => group.Count() > 1
+                                && group
+                                    .Select(row => (row.ModuleTopicId, row.TeacherId))
+                                    .Distinct()
+                                    .Skip(1)
+                                    .Any());
+            foreach (var logicalEvent in legacyLogicalEvents)
+            {
+                var duplicateCount = logicalEvent.Count() - 1;
+                var key = (logicalEvent.Key.GroupId, logicalEvent.Key.ModuleId);
+                if (fact.TryGetValue(key, out var count))
+                {
+                    fact[key] = Math.Max(0, count - duplicateCount);
+                }
+            }
+        }
         // Факт по модулях у чернетках (без службових типів).
         var factByGroupModule = await _db.TeacherDraftItems
             .Where(si => !excludedTypeIds.Contains(si.LessonTypeId)
@@ -2236,7 +2408,7 @@ public sealed class TeacherDraftsAutogenService
                          && courseIds.Contains(si.Group.CourseId))
             .GroupBy(si => new { si.GroupId, si.ModuleId })
             .Select(g => new { g.Key.GroupId, g.Key.ModuleId, C = g.Count() })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Перетворюємо факт у словник для швидких доступів.
         var factMap = factByGroupModule.ToDictionary(k => (k.GroupId, k.ModuleId), v => v.C);
         // Факт по модулях у вже опублікованому розкладі.
@@ -2246,7 +2418,7 @@ public sealed class TeacherDraftsAutogenService
                          && courseIds.Contains(si.Group.CourseId))
             .GroupBy(si => new { si.GroupId, si.ModuleId })
             .Select(g => new { g.Key.GroupId, g.Key.ModuleId, C = g.Count() })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         foreach (var item in scheduleByGroupModule)
         {
             var key = (item.GroupId, item.ModuleId);
@@ -2259,6 +2431,8 @@ public sealed class TeacherDraftsAutogenService
                 factMap[key] = item.C;
             }
         }
+        SubtractLogicalEventDuplicates(factMap, draftUsageRows);
+        SubtractLogicalEventDuplicates(factMap, scheduleUsageRows);
         // Факт поточного діапазону потрібен для дозаповнення, щоб не перевищувати ручні ліміти модулів.
         var rangeFactByGroupModule = await _db.TeacherDraftItems
             .Where(si => !excludedTypeIds.Contains(si.LessonTypeId)
@@ -2267,7 +2441,7 @@ public sealed class TeacherDraftsAutogenService
                          && courseIds.Contains(si.Group.CourseId))
             .GroupBy(si => new { si.GroupId, si.ModuleId })
             .Select(g => new { g.Key.GroupId, g.Key.ModuleId, C = g.Count() })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         var rangeFactMap = rangeFactByGroupModule.ToDictionary(k => (k.GroupId, k.ModuleId), v => v.C);
         var rangeScheduleByGroupModule = await _db.ScheduleItems
             .Where(si => !excludedTypeIds.Contains(si.LessonTypeId)
@@ -2276,7 +2450,7 @@ public sealed class TeacherDraftsAutogenService
                          && courseIds.Contains(si.Group.CourseId))
             .GroupBy(si => new { si.GroupId, si.ModuleId })
             .Select(g => new { g.Key.GroupId, g.Key.ModuleId, C = g.Count() })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         foreach (var item in rangeScheduleByGroupModule)
         {
             var key = (item.GroupId, item.ModuleId);
@@ -2289,6 +2463,16 @@ public sealed class TeacherDraftsAutogenService
                 rangeFactMap[key] = item.C;
             }
         }
+        SubtractLogicalEventDuplicates(
+            rangeFactMap,
+            draftUsageRows,
+            rangeStartDate,
+            rangeEndDateExclusive);
+        SubtractLogicalEventDuplicates(
+            rangeFactMap,
+            scheduleUsageRows,
+            rangeStartDate,
+            rangeEndDateExclusive);
         int CurrentRangeFactFor(int gid, int mid) =>
             rangeFactMap.TryGetValue((gid, mid), out var used) ? used : 0;
         void AddCurrentRangeFact(int gid, int mid)
@@ -2452,10 +2636,10 @@ public sealed class TeacherDraftsAutogenService
             .Where(s => s.CourseId == null || courseIds.Contains(s.CourseId.Value))
             .OrderBy(s => s.SortOrder)
             .ThenBy(s => s.Start)
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         var sharedLunches = await _db.LunchConfigs.AsNoTracking()
             .Where(lunch => lunch.CourseId == null || courseIds.Contains(lunch.CourseId.Value))
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         var sharedSlotsByCourse = courseIds.ToDictionary(
             cid => cid,
             cid => TimeSlotsResolver.ResolveForWeek(sharedTimeSlots, cid, sharedLunches));
@@ -3662,7 +3846,8 @@ public sealed class TeacherDraftsAutogenService
             }
             bool JoinsExistingTopicOccurrence(DateOnly date, TimeSlot slot)
             {
-                return BusyForDate(date).Any(existing => existing.StartTime == slot.Start
+                return BusyForDate(date).Any(existing => !IsNonOccupyingBusySlot(existing)
+                                                        && existing.StartTime == slot.Start
                                                         && existing.EndTime == slot.End
                                                         && existing.ModuleId == moduleId
                                                         && existing.ModuleTopicId == topic.Id
@@ -3673,7 +3858,8 @@ public sealed class TeacherDraftsAutogenService
             int TopicContinuationDistance(DateOnly date, TimeSlot slot, IReadOnlyList<TimeSlot> slotsForDate)
             {
                 var existingTopicSlots = busy
-                    .Where(existing => existing.ModuleId == moduleId
+                    .Where(existing => !IsNonOccupyingBusySlot(existing)
+                                       && existing.ModuleId == moduleId
                                        && existing.ModuleTopicId == topic.Id
                                        && selectedGroupsById.TryGetValue(existing.GroupId, out var existingGroup)
                                        && existingGroup.CourseId == courseIdValue)
@@ -4251,6 +4437,7 @@ public sealed class TeacherDraftsAutogenService
                     {
                         while (TryPreplaceSharedLectureTopic(courseEntry.Key, moduleId, topic))
                         {
+                            cancellationToken.ThrowIfCancellationRequested();
                             placed++;
                         }
                     }
@@ -4695,7 +4882,7 @@ public sealed class TeacherDraftsAutogenService
                               && CanShareAcrossGroups(b.LessonTypeId)
                               && !excludedTypeIds.Contains(b.LessonTypeId));
             bool SlotFilledForGroup(int groupId, DateOnly date, TimeSlot slot) =>
-                BusyForGroupDate(groupId, date).Any(b => b.StartTime == slot.Start && b.EndTime == slot.End);
+                HasGroupOverlap(groupId, date, slot.Start, slot.End);
             bool SlotFilled(DateOnly date, TimeSlot slot) =>
                 SlotFilledForGroup(grp.Id, date, slot);
             // Повертає викладача, який веде цей модуль у сусідньому слоті.
@@ -5043,6 +5230,7 @@ public sealed class TeacherDraftsAutogenService
                 var attempted = new HashSet<TeacherDraftItem>();
                 while (DayHasGaps(date, out var gap) && gap is not null)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     if (HasLaterLectureFirstPlacement(date, gap.Start))
                     {
                         break;
@@ -5175,7 +5363,8 @@ public sealed class TeacherDraftsAutogenService
                         continue;
                     }
                     bool peopleBusy = BusyForDate(date).Any(x =>
-                        (x.GroupId == grp.Id || (tidCandidate is int t && x.TeacherId == t))
+                        !IsNonOccupyingBusySlot(x)
+                        && (x.GroupId == grp.Id || (tidCandidate is int t && x.TeacherId == t))
                         && !(x.GroupId == candidate.GroupId
                              && x.StartTime == candidate.StartTime
                              && x.EndTime == candidate.EndTime
@@ -5193,7 +5382,8 @@ public sealed class TeacherDraftsAutogenService
                     if (requiresRoom && candidate.RoomId is int rid)
                     {
                         bool roomBusy = BusyForRoomDate(rid, date).Any(x =>
-                            !(x.GroupId == candidate.GroupId
+                            !IsNonOccupyingBusySlot(x)
+                            && !(x.GroupId == candidate.GroupId
                               && x.StartTime == candidate.StartTime
                               && x.EndTime == candidate.EndTime
                               && x.ModuleId == candidate.ModuleId
@@ -5354,7 +5544,11 @@ public sealed class TeacherDraftsAutogenService
             int? lastPrimaryModuleId = null;
             // Лічильник використання аудиторій поточною групою.
             var groupRoomUsage = busy
-                .Where(b => b.GroupId == grp.Id && b.Date >= rangeStartDate && b.Date < rangeEndDateExclusive && b.RoomId != null)
+                .Where(b => b.GroupId == grp.Id
+                            && b.Date >= rangeStartDate
+                            && b.Date < rangeEndDateExclusive
+                            && b.RoomId != null
+                            && !excludedTypeIds.Contains(b.LessonTypeId))
                 .GroupBy(b => b.RoomId!.Value)
                 .ToDictionary(g => g.Key, g => g.Count());
             roomUsageByGroup[grp.Id] = groupRoomUsage;
@@ -5478,7 +5672,8 @@ public sealed class TeacherDraftsAutogenService
                         if (!TeacherFitsWorkingHours(tid, date, start, end))
                             continue;
                         bool peopleBusy = BusyForDate(date).Any(x =>
-                            (x.GroupId == grp.Id || x.TeacherId == tid)
+                            !IsNonOccupyingBusySlot(x)
+                            && (x.GroupId == grp.Id || x.TeacherId == tid)
                             && x.StartTime < end && start < x.EndTime);
                         if (peopleBusy) continue;
                         ModuleTopic? altTopic = null;
@@ -6370,7 +6565,7 @@ public sealed class TeacherDraftsAutogenService
                     moduleTitle = await _db.Modules
                         .Where(m => m.Id == moduleId)
                         .Select(m => m.Title)
-                        .FirstOrDefaultAsync();
+                        .FirstOrDefaultAsync(cancellationToken);
                     if (moduleTitle is null)
                     {
                         if (missingModulesNotified.Add(moduleId))
@@ -7128,7 +7323,8 @@ public sealed class TeacherDraftsAutogenService
                                     : Array.Empty<int>();
                                 var existingSharedLectureGroupSet = existingSharedLectureGroupIds.ToHashSet();
                                 bool teacherBusy = BusyForTeacherDate(tidCandidate, date).Any(x =>
-                                                                 x.StartTime < e && s < x.EndTime
+                                                                 !IsNonOccupyingBusySlot(x)
+                                                                 && x.StartTime < e && s < x.EndTime
                                                                  && !IsSameSharedLectureCluster(
                                                                      x,
                                                                      existingSharedLectureGroupSet,
@@ -7146,7 +7342,8 @@ public sealed class TeacherDraftsAutogenService
                                     continue;
                                 }
                                 bool roomBusy = BusyForRoomDate(rm.Id, date).Any(x =>
-                                                              x.StartTime < e && s < x.EndTime
+                                                              !IsNonOccupyingBusySlot(x)
+                                                              && x.StartTime < e && s < x.EndTime
                                                               && !IsSameSharedLectureCluster(
                                                                   x,
                                                                   existingSharedLectureGroupSet,
@@ -7948,6 +8145,7 @@ public sealed class TeacherDraftsAutogenService
                     bool tryAnotherCycle;
                     do
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         tryAnotherCycle = false;
                         foreach (var moduleId in OrderModulesByCurrentPressure(
                                      PreferNotUsedLastWeek(orderedModulesForDay),
@@ -7992,6 +8190,7 @@ public sealed class TeacherDraftsAutogenService
                     bool progressed;
                     do
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         progressed = false;
                         if (CountDistinctModulesForDay(grp.Id, date) >= targetDistinctCount || CountFor(grp.Id, date) >= maxPerDay)
                         {
@@ -8419,6 +8618,7 @@ public sealed class TeacherDraftsAutogenService
                     }
                     do
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         progress = false;
                         pass++;
                         var placed = await TryFillGapStageAsync(
@@ -8608,11 +8808,13 @@ public sealed class TeacherDraftsAutogenService
                     TimeSlot targetGap,
                     out TimeOnly oldStart,
                     out TimeOnly oldEnd,
+                    out DateTime oldUpdatedAt,
                     out BusySlot? oldBusySlot,
                     out BusySlot newBusySlot)
                 {
                     oldStart = candidate.StartTime;
                     oldEnd = candidate.EndTime;
+                    oldUpdatedAt = candidate.UpdatedAt;
                     oldBusySlot = FindBusySlotForDraft(candidate, oldStart, oldEnd);
                     var buildingId = candidate.RoomId is int roomId && roomBuildingById.TryGetValue(roomId, out var candidateBuildingId)
                         ? candidateBuildingId
@@ -8636,16 +8838,24 @@ public sealed class TeacherDraftsAutogenService
                     candidate.StartTime = targetGap.Start;
                     candidate.EndTime = targetGap.End;
                     candidate.DayOfWeek = date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
+                    candidate.UpdatedAt = DateTime.UtcNow;
                     AddBusySlot(newBusySlot);
                     InvalidateGapResourceCaches();
                     return true;
                 }
-                void RollbackDraftMove(TeacherDraftItem candidate, TimeOnly oldStart, TimeOnly oldEnd, BusySlot oldBusySlot, BusySlot newBusySlot)
+                void RollbackDraftMove(
+                    TeacherDraftItem candidate,
+                    TimeOnly oldStart,
+                    TimeOnly oldEnd,
+                    DateTime oldUpdatedAt,
+                    BusySlot oldBusySlot,
+                    BusySlot newBusySlot)
                 {
                     RemoveBusySlot(newBusySlot);
                     candidate.StartTime = oldStart;
                     candidate.EndTime = oldEnd;
                     candidate.DayOfWeek = date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
+                    candidate.UpdatedAt = oldUpdatedAt;
                     AddBusySlot(oldBusySlot);
                     InvalidateGapResourceCaches();
                 }
@@ -8711,6 +8921,7 @@ public sealed class TeacherDraftsAutogenService
                                 targetGap,
                                 out var oldStart,
                                 out var oldEnd,
+                                out var oldUpdatedAt,
                                 out var oldBusySlot,
                                 out var newBusySlot)
                             || oldBusySlot is null)
@@ -8741,7 +8952,13 @@ public sealed class TeacherDraftsAutogenService
                             warnings.Add($"[{date:yyyy-MM-dd}] {grp.Name}: цільовий repair-pass пересунув заняття {candidateEntry.Draft.ModuleId} у слот {targetGap.Start:HH\\:mm}-{targetGap.End:HH\\:mm} і дозаповнив звільнений слот {oldStart:HH\\:mm}-{oldEnd:HH\\:mm}.");
                             return true;
                         }
-                        RollbackDraftMove(candidateEntry.Draft, oldStart, oldEnd, oldBusySlot, newBusySlot);
+                        RollbackDraftMove(
+                            candidateEntry.Draft,
+                            oldStart,
+                            oldEnd,
+                            oldUpdatedAt,
+                            oldBusySlot,
+                            newBusySlot);
                     }
                     return false;
                 }
@@ -8814,6 +9031,7 @@ public sealed class TeacherDraftsAutogenService
                                     blockerTargetSlot,
                                     out var oldStart,
                                     out var oldEnd,
+                                    out var oldUpdatedAt,
                                     out var oldBusySlot,
                                     out var newBusySlot)
                                 || oldBusySlot is null)
@@ -8837,7 +9055,13 @@ public sealed class TeacherDraftsAutogenService
                                 return true;
                             }
 
-                            RollbackDraftMove(blocker.Draft, oldStart, oldEnd, oldBusySlot, newBusySlot);
+                            RollbackDraftMove(
+                                blocker.Draft,
+                                oldStart,
+                                oldEnd,
+                                oldUpdatedAt,
+                                oldBusySlot,
+                                newBusySlot);
                         }
                     }
 
@@ -8935,6 +9159,7 @@ public sealed class TeacherDraftsAutogenService
                                     currentGap,
                                     out var oldStart,
                                     out var oldEnd,
+                                    out var oldUpdatedAt,
                                     out var oldBusySlot,
                                     out var newBusySlot)
                                 || oldBusySlot is null)
@@ -8966,7 +9191,13 @@ public sealed class TeacherDraftsAutogenService
 
                             movedDrafts.Remove(candidateEntry.Draft);
                             visitedGaps.Remove(oldSlotKey);
-                            RollbackDraftMove(candidateEntry.Draft, oldStart, oldEnd, oldBusySlot, newBusySlot);
+                            RollbackDraftMove(
+                                candidateEntry.Draft,
+                                oldStart,
+                                oldEnd,
+                                oldUpdatedAt,
+                                oldBusySlot,
+                                newBusySlot);
                         }
 
                         return false;
@@ -9045,6 +9276,7 @@ public sealed class TeacherDraftsAutogenService
                                     targetGap,
                                     out var oldStart,
                                     out var oldEnd,
+                                    out _,
                                     out var oldBusySlot,
                                     out _)
                                 && oldBusySlot is not null)
@@ -9112,6 +9344,7 @@ public sealed class TeacherDraftsAutogenService
                         => Stopwatch.GetElapsedTime(optimizationStartedAt) < optimizationBudget;
                     for (var cycle = 0; cycle < Math.Max(1, slots.Count) && HasOptimizationBudget(); cycle++)
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         var beforeGaps = CountDayGaps();
                         if (beforeGaps == 0)
                         {
@@ -9432,6 +9665,7 @@ public sealed class TeacherDraftsAutogenService
                                 candidate.EndTime = targetSlot.End;
                                 candidate.TeacherId = teacherId;
                                 candidate.RoomId = room?.Id;
+                                candidate.UpdatedAt = DateTime.UtcNow;
                                 // EF може відкласти автоматичне виявлення змін до SaveChanges.
                                 // Позначаємо перенесену наявну чернетку одразу, щоб наступні
                                 // пробні знімки та фінальна перевірка бачили її нову позицію.
@@ -9589,6 +9823,12 @@ public sealed class TeacherDraftsAutogenService
                             maxModuleSegmentsOverride: maxSegmentsAllowed);
                         if (placed)
                         {
+                            blocker.UpdatedAt = DateTime.UtcNow;
+                            var blockerEntry = _db.Entry(blocker);
+                            if (blocker.Id > 0 && blockerEntry.State == EntityState.Unchanged)
+                            {
+                                blockerEntry.State = EntityState.Modified;
+                            }
                             completedModuleId = blocker.ModuleId;
                             warnings.Add($"[{gapDate:yyyy-MM-dd}] {grp.Name}: repair-pass переніс попередню тему {blockingTopic.TopicCode} у слот {gapSlot.Start:HH\\:mm}-{gapSlot.End:HH\\:mm} та зберіг наступну тему {pendingTopic.TopicCode} у пізнішому занятті того самого типу.");
                             return true;
@@ -9863,6 +10103,7 @@ public sealed class TeacherDraftsAutogenService
                                                 draft.EndTime = targetSlot.End;
                                                 draft.TeacherId = teacherId;
                                                 draft.RoomId = room?.Id;
+                                                draft.UpdatedAt = DateTime.UtcNow;
                                                 draft.ValidationWarnings = BuildIncompleteDraftWarningJson(
                                                     requiresTeacher && teacherId is null,
                                                     requiresRoom && room is null);
@@ -10150,6 +10391,7 @@ public sealed class TeacherDraftsAutogenService
                     var anyImproved = false;
                     for (var cycle = 0; cycle < Math.Max(1, totalSlotCount); cycle++)
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         var gaps = generationDates
                             .Where(day => IsWorking(day, grp))
                             .SelectMany(day => resolvedByDay.TryGetValue(day.DayOfWeek, out var resolved)
@@ -10702,6 +10944,7 @@ public sealed class TeacherDraftsAutogenService
                         int fillerAttempts = 0;
                         while (CountFor(grp.Id, date) < maxPerDay)
                         {
+                            cancellationToken.ThrowIfCancellationRequested();
                             if (fillerQueue.Count == 0) break;
                             var fillerModuleId = fillerQueue.Dequeue();
                             if (RemainingFor(grp.Id, fillerModuleId) <= 0)
@@ -10797,6 +11040,7 @@ public sealed class TeacherDraftsAutogenService
                     var maxGapCompactionCycles = 3;
                     for (var cycle = 0; cycle < maxGapCompactionCycles; cycle++)
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         var progressed = await RunGapCompactionCycleAsync();
                         if (!progressed || CountFor(grp.Id, date) >= maxPerDay || !DayHasGaps(date, out _))
                         {
@@ -10805,6 +11049,7 @@ public sealed class TeacherDraftsAutogenService
                     }
                     for (var repairCycle = 0; repairCycle < slots.Count; repairCycle++)
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         if (!TryRepairLectureOrder())
                         {
                             break;
@@ -12824,6 +13069,7 @@ public sealed class TeacherDraftsAutogenService
             var safetyBudget = Math.Max(1, allCreatedDrafts.Count);
             while (safetyBudget-- > 0)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 TeacherDraftItem? conflict = null;
                 string conflictReason = string.Empty;
                 foreach (var draft in allCreatedDrafts
@@ -12977,18 +13223,7 @@ public sealed class TeacherDraftsAutogenService
                     foreach (var slot in resolved.Slots)
                     {
                         var key = (group.Id, date, slot.Start, slot.End);
-                        var trackedDraftOccupiesSlot = movableDrafts.Any(draft =>
-                            draft.Status == DraftStatus.Draft
-                            && draft.GroupId == group.Id
-                            && draft.Date == date
-                            && draft.StartTime == slot.Start
-                            && draft.EndTime == slot.End
-                            && _db.Entry(draft).State is not EntityState.Deleted and not EntityState.Detached);
-                        var publishedScheduleOccupiesSlot = BusyForGroupDate(group.Id, date)
-                            .Any(busySlot => !busySlot.JoinableDraft
-                                             && busySlot.StartTime == slot.Start
-                                             && busySlot.EndTime == slot.End);
-                        var isFilled = trackedDraftOccupiesSlot || publishedScheduleOccupiesSlot;
+                        var isFilled = HasGroupOverlap(group.Id, date, slot.Start, slot.End);
                         if (isFilled)
                         {
                             continue;
@@ -13324,12 +13559,16 @@ public sealed class TeacherDraftsAutogenService
             }
 
             var slotCache = new Dictionary<(int CourseId, DayOfWeek Day), List<(TimeOnly Start, TimeOnly End)>>();
-            async Task<List<(TimeOnly Start, TimeOnly End)>> GetSlotsAsync(int courseIdValue, DayOfWeek day)
+            List<(TimeOnly Start, TimeOnly End)> GetSlots(int courseIdValue, DayOfWeek day)
             {
                 var key = (courseIdValue, day);
                 if (!slotCache.TryGetValue(key, out var daySlots))
                 {
-                    var resolved = await TimeSlotsResolver.ResolveForDayAsync(_db, courseIdValue, day);
+                    var resolved = TimeSlotsResolver.ResolveForDay(
+                        sharedTimeSlots,
+                        courseIdValue,
+                        day,
+                        sharedLunches);
                     daySlots = resolved.Slots
                         .Select(s => (s.Start, s.End))
                         .ToList();
@@ -13391,7 +13630,7 @@ public sealed class TeacherDraftsAutogenService
                 }
                 if (selectedGroupsById.TryGetValue(draft.GroupId, out var selectedGroup))
                 {
-                    var daySlots = await GetSlotsAsync(selectedGroup.CourseId, draft.DayOfWeek);
+                    var daySlots = GetSlots(selectedGroup.CourseId, draft.DayOfWeek);
                     if (!SlotRangeAllowed(draft.StartTime, draft.EndTime, daySlots))
                     {
                         errors.Add($"Фінальна перевірка: слот {draft.Date:yyyy-MM-dd} {draft.StartTime:HH\\:mm}-{draft.EndTime:HH\\:mm} для групи {groupLabel} не входить у налаштовані слоти.");
@@ -13466,7 +13705,7 @@ public sealed class TeacherDraftsAutogenService
                                 || (d.TeacherId != null && teacherIdsForValidation.Contains(d.TeacherId.Value))
                                 || (d.RoomId != null && roomIdsForValidation.Contains(d.RoomId.Value))))
                 .Select(d => new { d.Date, d.StartTime, d.EndTime, d.GroupId, d.ModuleId, d.ModuleTopicId, d.TeacherId, d.RoomId, d.LessonTypeId })
-                .ToListAsync();
+            .ToListAsync(cancellationToken);
             var existingSchedule = await _db.ScheduleItems.AsNoTracking()
                 .Where(d => d.Date >= rangeStartDate
                             && d.Date < rangeEndDateExclusive
@@ -13474,7 +13713,7 @@ public sealed class TeacherDraftsAutogenService
                                 || (d.TeacherId != null && teacherIdsForValidation.Contains(d.TeacherId.Value))
                                 || (d.RoomId != null && roomIdsForValidation.Contains(d.RoomId.Value))))
                 .Select(d => new { d.Date, d.StartTime, d.EndTime, d.GroupId, d.ModuleId, d.ModuleTopicId, d.TeacherId, d.RoomId, d.LessonTypeId })
-                .ToListAsync();
+            .ToListAsync(cancellationToken);
 
             foreach (var draft in changedDraftsForValidation)
             {

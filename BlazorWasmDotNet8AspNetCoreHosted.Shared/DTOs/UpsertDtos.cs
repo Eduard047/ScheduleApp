@@ -13,5 +13,6 @@ public record UpsertScheduleItemRequest(
     int? RoomId,
     int LessonTypeId,
     bool IsLocked,
-    bool OverrideNonWorkingDay = false
+    bool OverrideNonWorkingDay = false,
+    Guid? ExpectedRevision = null
 );

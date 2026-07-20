@@ -36,7 +36,8 @@ public record TeacherDraftItemDto(
     string? BatchKey = null,
     List<string>? TeacherNames = null,
     string? LessonTypeCss = null,
-    bool IsSelfStudy = false
+    bool IsSelfStudy = false,
+    Guid Revision = default
 );
 
 // DTO для створення або оновлення чернетки.
@@ -56,7 +57,8 @@ public record DraftUpsertRequest(
     string? BatchKey = null,
     bool IsLocked = false,
     bool IgnoreValidationErrors = false,
-    bool IsSelfStudy = false
+    bool IsSelfStudy = false,
+    Guid? ExpectedRevision = null
 );
 
 // DTO атомарного пакета створення або оновлення чернеток.
@@ -74,7 +76,8 @@ public record TeacherDraftBatchUpsertResult(
 // DTO атомарного пакета видалення чернеток.
 public record TeacherDraftBatchDeleteRequest(
     List<int> Ids,
-    bool Unrestricted = false
+    bool Unrestricted = false,
+    Dictionary<int, Guid>? ExpectedRevisions = null
 );
 
 // Результат атомарного пакета видалення чернеток.
@@ -87,7 +90,8 @@ public record TeacherDraftBatchMutationRequest(
     List<DraftUpsertRequest> Upserts,
     List<int> DeleteIds,
     bool Confirm = false,
-    bool Unrestricted = false
+    bool Unrestricted = false,
+    Dictionary<int, Guid>? DeleteExpectedRevisions = null
 );
 
 // Результат єдиної атомарної зміни пакета чернеток.

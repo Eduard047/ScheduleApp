@@ -114,12 +114,20 @@ public class AdminRoomsController(AppDbContext db) : ControllerBase
                     });
                 }
 
+                var scheduleRevision = Guid.NewGuid();
                 await db.ScheduleItems
                     .Where(item => item.RoomId == id)
-                    .ExecuteUpdateAsync(setters => setters.SetProperty(item => item.RoomId, (int?)null));
+                    .ExecuteUpdateAsync(setters => setters
+                        .SetProperty(item => item.RoomId, (int?)null)
+                        .SetProperty(item => item.Revision, scheduleRevision));
+                var draftRevision = Guid.NewGuid();
+                var updatedAt = DateTime.UtcNow;
                 await db.TeacherDraftItems
                     .Where(item => item.RoomId == id)
-                    .ExecuteUpdateAsync(setters => setters.SetProperty(item => item.RoomId, (int?)null));
+                    .ExecuteUpdateAsync(setters => setters
+                        .SetProperty(item => item.RoomId, (int?)null)
+                        .SetProperty(item => item.Revision, draftRevision)
+                        .SetProperty(item => item.UpdatedAt, updatedAt));
             }
             await db.ModuleRooms.Where(x => x.RoomId == id).ExecuteDeleteAsync();
             var rows = await db.Rooms.Where(x => x.Id == id).ExecuteDeleteAsync();

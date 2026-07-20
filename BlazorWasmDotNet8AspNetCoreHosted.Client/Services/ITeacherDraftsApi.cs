@@ -12,7 +12,7 @@ public interface ITeacherDraftsApi
     // Атомарно створює або оновлює пакет чернеток.
     Task<TeacherDraftBatchUpsertResult> UpsertBatch(TeacherDraftBatchUpsertRequest req);
     // Видаляє чернетку з підтвердженням.
-    Task Delete(int id, bool confirm = false, bool unrestricted = false);
+    Task Delete(int id, Guid expectedRevision, bool confirm = false, bool unrestricted = false);
     // Атомарно видаляє пакет чернеток.
     Task<TeacherDraftBatchDeleteResult> DeleteBatch(TeacherDraftBatchDeleteRequest req);
     // Атомарно створює, оновлює та видаляє чернетки в межах однієї операції.
