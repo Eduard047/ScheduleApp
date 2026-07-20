@@ -728,6 +728,12 @@
         gap: 10px;
         margin-bottom: 10px;
     }
+    .editor-operation-fieldset {
+        min-width: 0;
+        margin: 0;
+        padding: 0;
+        border: 0;
+    }
     .editor-title { font-weight: 800; margin-bottom: 8px; }
     .editor-subtitle { color: #475569; font-size: .9rem; margin-top: 4px; }
     .editor-close { min-width: 42px; height: 42px; font-size: 1.35rem; padding: 0 .6rem; }

@@ -45,8 +45,15 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     // Налаштовує зв'язки, обмеження та індекси для сутностей.
     protected override void OnModelCreating(ModelBuilder b)
     {
-        // Фіксуємо таблицю довідника типів занять.
-        b.Entity<LessonTypeRef>().ToTable("LessonTypes");
+        // Фіксуємо таблицю довідника типів занять та унікальність системних кодів.
+        b.Entity<LessonTypeRef>(e =>
+        {
+            e.ToTable("LessonTypes");
+            e.Property(x => x.Code).HasMaxLength(64).IsRequired();
+            e.Property(x => x.CssKey).HasMaxLength(32);
+            e.HasIndex(x => x.Code).IsUnique();
+            e.HasIndex(x => x.CssKey).IsUnique();
+        });
         // Довідник кафедр.
         b.Entity<Department>(e =>
         {
@@ -86,6 +93,8 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             e.Property(m => m.Credits)
                 .HasColumnType("decimal(6,2)")
                 .HasDefaultValue(0m);
+            e.Property(m => m.Code).HasMaxLength(64).IsRequired();
+            e.HasIndex(m => new { m.CourseId, m.Code }).IsUnique();
         });
         b.Entity<ModuleSupervisor>(e =>
         {
@@ -173,6 +182,8 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             e.HasIndex(x => new { x.Date, x.GroupId });
             e.HasIndex(x => new { x.Date, x.TeacherId });
             e.HasIndex(x => new { x.Date, x.RoomId });
+            e.Property(x => x.BatchKey).HasMaxLength(64);
+            e.HasIndex(x => x.BatchKey);
             e.Property(x => x.IsSelfStudy).HasDefaultValue(false);
         });
         // Унікалізуємо винятки у календарі за датою.
@@ -216,6 +227,15 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             e.Property(x => x.SortOrder).HasDefaultValue(0);
             e.Property(x => x.IsActive).HasDefaultValue(true);
             e.HasIndex(x => new { x.CourseId, x.DayOfWeek, x.SortOrder }).IsUnique();
+        });
+        // Забороняємо кілька обідніх конфігурацій для тієї самої області дії.
+        b.Entity<LunchConfig>(e =>
+        {
+            e.HasKey(x => x.Id);
+            e.HasOne<Course>()
+                .WithMany()
+                .HasForeignKey(x => x.CourseId)
+                .OnDelete(DeleteBehavior.Cascade);
         });
         // Контролюємо чернетки викладачів і їхні залежності.
         b.Entity<PreferredFirstSlotLimitConfig>(e =>

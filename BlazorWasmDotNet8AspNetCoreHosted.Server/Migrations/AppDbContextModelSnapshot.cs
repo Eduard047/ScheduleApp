@@ -315,7 +315,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
 
                     b.Property<string>("Code")
                         .IsRequired()
-                        .HasColumnType("longtext");
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)");
 
                     b.Property<bool>("CountInLoad")
                         .HasColumnType("tinyint(1)");
@@ -324,7 +325,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                         .HasColumnType("tinyint(1)");
 
                     b.Property<string>("CssKey")
-                        .HasColumnType("longtext");
+                        .HasMaxLength(32)
+                        .HasColumnType("varchar(32)");
 
                     b.Property<bool>("IsActive")
                         .HasColumnType("tinyint(1)");
@@ -343,6 +345,12 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                         .HasColumnType("tinyint(1)");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("Code")
+                        .IsUnique();
+
+                    b.HasIndex("CssKey")
+                        .IsUnique();
 
                     b.ToTable("LessonTypes", (string)null);
                 });
@@ -366,6 +374,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
 
                     b.HasKey("Id");
 
+                    b.HasIndex("CourseId");
+
                     b.ToTable("LunchConfigs");
                 });
 
@@ -379,7 +389,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
 
                     b.Property<string>("Code")
                         .IsRequired()
-                        .HasColumnType("longtext");
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)");
 
                     b.Property<int>("CourseId")
                         .HasColumnType("int");
@@ -395,7 +406,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("CourseId");
+                    b.HasIndex("CourseId", "Code")
+                        .IsUnique();
 
                     b.ToTable("Modules");
                 });
@@ -678,6 +690,10 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
 
                     MySqlPropertyBuilderExtensions.UseMySqlIdentityColumn(b.Property<int>("Id"));
 
+                    b.Property<string>("BatchKey")
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)");
+
                     b.Property<DateOnly>("Date")
                         .HasColumnType("date");
 
@@ -717,6 +733,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                         .HasColumnType("int");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("BatchKey");
 
                     b.HasIndex("GroupId");
 
@@ -1009,6 +1027,14 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                         .IsRequired();
 
                     b.Navigation("Course");
+                });
+
+            modelBuilder.Entity("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.LunchConfig", b =>
+                {
+                    b.HasOne("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.Course", null)
+                        .WithMany()
+                        .HasForeignKey("CourseId")
+                        .OnDelete(DeleteBehavior.Cascade);
                 });
 
             modelBuilder.Entity("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.Module", b =>

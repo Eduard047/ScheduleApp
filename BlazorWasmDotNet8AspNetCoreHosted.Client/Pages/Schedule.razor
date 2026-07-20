@@ -6,10 +6,11 @@
 @using BlazorWasmDotNet8AspNetCoreHosted.Client.Services
 @inject HttpClient Http
 @inject IScheduleApi ScheduleApi
+@inject TimeSlotsApi TimeSlotsApi
 
 @code {
 
-    private const string AppVersion = "1.3.27"; // Оновлюйте перед релізом
+    private const string AppVersion = "1.4.0"; // Оновлюйте перед релізом
     private MetaResponseDto? _meta;
     private int? _groupId;
     private int? _teacherId;
@@ -17,6 +18,10 @@
     private DateOnly _weekStart = FirstMonday(DateOnly.FromDateTime(DateTime.Today));
     private List<ScheduleItemDto> _items = new();
     private List<TimeSlotDto> _slots = new();
+    private int _scheduleLoadVersion;
+    private int _slotLoadVersion;
+    private bool _scheduleLoading;
+    private string? _scheduleError;
     private int? _editItemId;
     private int _editLessonTypeId;
     private bool _editSaving;
@@ -42,7 +47,7 @@
         string ModuleCourse,
         string ColorCss);
     private List<SlotRow> _rows = new();
-    private Dictionary<(int DayNumber, string Start, string End), ScheduleCell> _scheduleCells = new();
+    private Dictionary<(int DayNumber, string Start, string End), List<ScheduleCell>> _scheduleCells = new();
     private Dictionary<int, string> _moduleCourseById = new();
     // Формує читабельний діапазон дат для поточного тижня.
     private string WeekRangeLabel
@@ -57,42 +62,98 @@
     // Початкове завантаження метаданих і розкладу.
     protected override async Task OnInitializedAsync()
     {
-        _meta = await Http.GetFromJsonAsync<MetaResponseDto>("api/meta");
-        _moduleCourseById = _meta?.Modules
-            .Where(m => !string.IsNullOrWhiteSpace(m.CourseName))
-            .ToDictionary(m => m.Id, m => m.CourseName!) ?? new();
-        await Reload();
+        try
+        {
+            _meta = await ScheduleApi.GetMeta();
+            _moduleCourseById = _meta.Modules
+                .Where(m => !string.IsNullOrWhiteSpace(m.CourseName))
+                .ToDictionary(m => m.Id, m => m.CourseName!);
+            await Reload();
+        }
+        catch (ApiErrorException ex)
+        {
+            _scheduleError = ex.Errors.FirstOrDefault() ?? ex.Message;
+        }
+        catch (Exception ex)
+        {
+            _scheduleError = ex.Message;
+        }
     }
     // Перезавантажує розклад і тайм-слоти.
     private async Task Reload()
     {
+        _scheduleLoading = true;
+        _scheduleError = null;
         var itemsTask = LoadScheduleItemsAsync();
-        var courseId = ResolveCourseIdForSlots();
-        var slotsUrl = "api/admin/config/slots?includeDayOverrides=true";
-        if (courseId is int cid)
+        var reloadVersion = _scheduleLoadVersion;
+        var slotsTask = ReloadSlotsAsync(rebuildView: false);
+        try
         {
-            slotsUrl += $"&courseId={cid}";
+            await Task.WhenAll(itemsTask, slotsTask);
+            if (reloadVersion != _scheduleLoadVersion)
+            {
+                return;
+            }
+            if (_editItemId is int editing && !_items.Any(i => i.Id == editing))
+            {
+                CancelEdit();
+            }
+            RebuildScheduleCells();
         }
-        var slotsTask = Http.GetFromJsonAsync<EffectiveSlotsResponse>(slotsUrl);
-        await Task.WhenAll(itemsTask, slotsTask);
-        var eff = await slotsTask;
-        _slots = eff?.slots ?? new();
-        _rows = _slots
-            .Select(s => new SlotRow(s.Start, s.End))
-            .GroupBy(x => (x.Start, x.End))
-            .Select(g => g.First())
-            .OrderBy(x => x.Start)
-            .ToList();
-        if (_editItemId is int editing && !_items.Any(i => i.Id == editing))
+        catch (ApiErrorException ex)
         {
-            CancelEdit();
+            if (reloadVersion == _scheduleLoadVersion)
+            {
+                _scheduleError = ex.Errors.FirstOrDefault() ?? ex.Message;
+            }
         }
-        RebuildScheduleCells();
+        catch (Exception ex)
+        {
+            if (reloadVersion == _scheduleLoadVersion)
+            {
+                _scheduleError = ex.Message;
+            }
+        }
+        finally
+        {
+            if (reloadVersion == _scheduleLoadVersion)
+            {
+                _scheduleLoading = false;
+            }
+        }
     }
     private async Task LoadScheduleItemsAsync()
     {
-        _items = await Http.GetFromJsonAsync<List<ScheduleItemDto>>(
-            $"api/schedule?weekStart={_weekStart:yyyy-MM-dd}") ?? new();
+        var loadVersion = ++_scheduleLoadVersion;
+        var requestedWeekStart = _weekStart;
+        var items = await ScheduleApi.GetWeek(requestedWeekStart);
+        if (loadVersion != _scheduleLoadVersion || requestedWeekStart != _weekStart)
+        {
+            return;
+        }
+        _items = items;
+    }
+    // Завантажує ефективну часову сітку вибраного курсу або об'єднання всіх курсів для огляду.
+    private async Task ReloadSlotsAsync(bool rebuildView = true)
+    {
+        var loadVersion = ++_slotLoadVersion;
+        var courseIds = ResolveCourseIdsForSlots();
+        var slotTasks = courseIds
+            .Select(courseId => TimeSlotsApi.GetEffectiveAsync(courseId, includeDayOverrides: true))
+            .ToList();
+        var slotSets = await Task.WhenAll(slotTasks);
+
+        // Не дозволяємо повільнішій попередній відповіді повернути сітку іншої групи.
+        if (loadVersion != _slotLoadVersion)
+        {
+            return;
+        }
+
+        _slots = slotSets.SelectMany(slots => slots).ToList();
+        if (rebuildView)
+        {
+            RebuildScheduleCells();
+        }
     }
     // Вирівнює дату на понеділок поточного тижня.
     private static DateOnly FirstMonday(DateOnly d)
@@ -100,11 +161,25 @@
         int diff = ((int)d.DayOfWeek + 6) % 7; 
         return d.AddDays(-diff);
     }
-    private sealed record EffectiveSlotsResponse(int? courseId, bool usingCourseSpecific, List<TimeSlotDto> slots);
-    private int? ResolveCourseIdForSlots()
+    private IReadOnlyList<int?> ResolveCourseIdsForSlots()
     {
-        if (_meta is null || _groupId is null) return null;
-        return _meta.Groups.FirstOrDefault(g => g.Id == _groupId)?.CourseId;
+        if (_meta is null)
+        {
+            return new int?[] { null };
+        }
+
+        if (_groupId is int groupId)
+        {
+            return new int?[] { _meta.Groups.FirstOrDefault(group => group.Id == groupId)?.CourseId };
+        }
+
+        var courseIds = _meta.Courses
+            .Select(course => (int?)course.Id)
+            .Concat(_meta.Groups.Select(group => group.CourseId))
+            .Where(courseId => courseId is not null)
+            .Distinct()
+            .ToList();
+        return courseIds.Count > 0 ? courseIds : new int?[] { null };
     }
     // Повертає назву дня українською з готового кешу.
     private static string DayNameUk(int d) => DayNamesUk[d];
@@ -116,57 +191,10 @@
         "BREAK" => "brk",
         _ => ""
     };
-    // Перевіряє, чи тип заняття є лекцією для візуального об'єднання.
-    private static bool IsLectureTypeForMerge(ScheduleItemDto item)
-    {
-        var code = item.LessonTypeCode?.Trim();
-        if (!string.IsNullOrWhiteSpace(code))
-        {
-            if (string.Equals(code, "LECTURE", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(code, "LECT", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(code, "LEC", StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-        }
-        var name = item.LessonTypeName?.Trim();
-        if (string.IsNullOrWhiteSpace(name))
-        {
-            return false;
-        }
-        return name.Contains("ЛЕКЦ", StringComparison.CurrentCultureIgnoreCase)
-               || name.Contains("LECTURE", StringComparison.OrdinalIgnoreCase);
-    }
-    // Перевіряє збіг викладача для об'єднаної лекції.
-    private static bool HasSameTeacherForMerge(ScheduleItemDto left, ScheduleItemDto right)
-    {
-        if (left.TeacherId.HasValue || right.TeacherId.HasValue)
-        {
-            return left.TeacherId == right.TeacherId;
-        }
-        return string.Equals(left.Teacher?.Trim(), right.Teacher?.Trim(), StringComparison.CurrentCultureIgnoreCase);
-    }
-    // Перевіряє, чи записи можна показати як одну об'єднану лекцію.
-    private static bool CanMergeLecturePresentation(ScheduleItemDto left, ScheduleItemDto right)
-    {
-        if (!IsLectureTypeForMerge(left) || !IsLectureTypeForMerge(right))
-        {
-            return false;
-        }
-        return left.ModuleId == right.ModuleId
-               && left.LessonTypeId == right.LessonTypeId
-               && left.RoomId == right.RoomId
-               && HasSameTeacherForMerge(left, right);
-    }
     // Формує перелік груп для об'єднаної лекції в межах одного слота.
-    private static List<string> ResolveMergedLectureGroups(List<ScheduleItemDto> slotItems, ScheduleItemDto? anchor)
+    private static List<string> ResolveMergedLectureGroups(IEnumerable<ScheduleItemDto> items)
     {
-        if (anchor is null)
-        {
-            return new List<string>();
-        }
-        return slotItems
-            .Where(item => CanMergeLecturePresentation(anchor, item))
+        return items
             .Select(item => item.Group?.Trim())
             .Where(name => !string.IsNullOrWhiteSpace(name))
             .Select(name => name!)
@@ -174,58 +202,85 @@
             .OrderBy(name => name, StringComparer.CurrentCultureIgnoreCase)
             .ToList();
     }
-    // Визначає, чи є слот візуально об'єднаною лекцією для кількох груп.
-    private static bool IsMergedLectureSlot(List<string> mergedGroups)
-        => mergedGroups.Count > 1;
     private static string LessonModeLabel(bool requiresRoom) => requiresRoom ? "Аудиторна година" : "Без аудиторії";
     // Оновлює швидкий індекс комірок після завантаження або зміни фільтрів.
     private void RebuildScheduleCells()
     {
-        _scheduleCells = _items
+        var visibleItems = _items
             .Where(i =>
                 (_groupId is null || i.GroupId == _groupId) &&
                 (_teacherId is null || i.TeacherId == _teacherId) &&
                 (_roomId is null || i.RoomId == _roomId))
-            .GroupBy(i => (i.DayNumber, i.TimeStart, i.TimeEnd))
-            .Select(group =>
-            {
-                var slotItems = group.OrderBy(item => item.Id).ToList();
-                var item = slotItems.First();
-                var mergedGroups = ResolveMergedLectureGroups(slotItems, item);
-                var isBreak = string.Equals(item.LessonTypeCode, "BREAK", StringComparison.OrdinalIgnoreCase);
-                var moduleCourse = !isBreak && _moduleCourseById.TryGetValue(item.ModuleId, out var course)
-                    ? course
-                    : string.Empty;
+            .ToList();
 
-                return new
+        _rows = ScheduleOverviewLayoutPlanner.BuildSlotRows(_slots, visibleItems)
+            .Select(row => new SlotRow(row.Start, row.End))
+            .ToList();
+        _scheduleCells = ScheduleOverviewLayoutPlanner.GroupEvents(visibleItems)
+            .GroupBy(group => (group.Anchor.DayNumber, group.Anchor.TimeStart, group.Anchor.TimeEnd))
+            .ToDictionary(
+                group => group.Key,
+                group => group.Select(displayGroup =>
                 {
-                    Key = group.Key,
-                    Cell = new ScheduleCell(
+                    var item = displayGroup.Anchor;
+                    var mergedGroups = ResolveMergedLectureGroups(displayGroup.Items);
+                    var isBreak = string.Equals(item.LessonTypeCode, "BREAK", StringComparison.OrdinalIgnoreCase);
+                    var moduleCourse = !isBreak && _moduleCourseById.TryGetValue(item.ModuleId, out var course)
+                        ? course
+                        : string.Empty;
+
+                    return new ScheduleCell(
                         item,
                         mergedGroups,
-                        IsMergedLectureSlot(mergedGroups),
+                        displayGroup.IsMergedLecture,
                         isBreak,
                         moduleCourse,
-                        item.LessonTypeCss ?? CssByCode(item.LessonTypeCode))
-                };
-            })
-            .ToDictionary(x => x.Key, x => x.Cell);
+                        item.LessonTypeCss ?? CssByCode(item.LessonTypeCode));
+                }).ToList());
     }
     private void OnFilterChanged()
     {
         RebuildScheduleCells();
     }
+    private async Task OnGroupFilterChangedAsync()
+    {
+        try
+        {
+            _scheduleError = null;
+            await ReloadSlotsAsync();
+        }
+        catch (ApiErrorException ex)
+        {
+            _scheduleError = ex.Errors.FirstOrDefault() ?? ex.Message;
+        }
+        catch (Exception ex)
+        {
+            _scheduleError = ex.Message;
+        }
+    }
     private Task PrevWeek() { _weekStart = _weekStart.AddDays(-7); return Reload(); }
     private Task NextWeek() { _weekStart = _weekStart.AddDays(+7); return Reload(); }
-    private void ResetFilters()
+    // Змінює тиждень і одразу завантажує дані для обраної дати.
+    private async Task OnWeekChangedAsync(ChangeEventArgs args)
+    {
+        var value = args.Value?.ToString();
+        if (string.IsNullOrWhiteSpace(value) || !DateOnly.TryParse(value, out var date))
+        {
+            _scheduleError = "Оберіть коректну дату.";
+            return;
+        }
+        _weekStart = FirstMonday(date);
+        await Reload();
+    }
+    private async Task ResetFiltersAsync()
     {
         _groupId = _teacherId = _roomId = null;
-        RebuildScheduleCells();
+        await OnGroupFilterChangedAsync();
     }
     // Вмикає режим редагування типу заняття.
     private void BeginEdit(ScheduleItemDto item)
     {
-        if (item.IsLocked) return;
+        if (item.IsLocked || _scheduleLoading || _editSaving) return;
         _editItemId = item.Id;
         _editLessonTypeId = item.LessonTypeId;
         _editError = null;
@@ -297,9 +352,14 @@
 
 <h3 class="page-title">Розклад <span class="weak">(тиждень @_weekStart.ToString("yyyy-MM-dd"))</span></h3>
 
+@if (!string.IsNullOrWhiteSpace(_scheduleError))
+{
+    <div class="alert alert-danger" role="alert">@_scheduleError</div>
+}
+
 <div class="toolbar">
 
-    <select class="select" @bind="_groupId" @bind:after="OnFilterChanged">
+    <select class="select" @bind="_groupId" @bind:after="OnGroupFilterChangedAsync">
         <option value="">Обрати групу</option>
         @if (_meta is not null)
         {
@@ -332,9 +392,10 @@
     <input type="date"
            class="select"
            value="@_weekStart.ToString("yyyy-MM-dd")"
-           @onchange="e => _weekStart = FirstMonday(DateOnly.Parse((string)e.Value!))" />
-    <button class="btn btn-primary" @onclick="Reload">Оновити</button>
-    <button class="btn btn-ghost" @onclick="ResetFilters">Скинути</button>
+           disabled="@(_scheduleLoading || _editSaving)"
+           @onchange="OnWeekChangedAsync" />
+    <button class="btn btn-primary" disabled="@(_scheduleLoading || _editSaving)" @onclick="Reload">@(_scheduleLoading ? "Завантаження..." : "Оновити")</button>
+    <button class="btn btn-ghost" disabled="@(_scheduleLoading || _editSaving)" @onclick="ResetFiltersAsync">Скинути</button>
 </div>
 
 @if (_rows.Count == 0)
@@ -364,12 +425,15 @@ else
                             </th>
                             @foreach (var d in DaysMonFirst)
                             {
-                                var hasCell = _scheduleCells.TryGetValue((d, row.Start, row.End), out var cell);
+                                var hasCells = _scheduleCells.TryGetValue((d, row.Start, row.End), out var cells);
                                 <td class="cell">
-                                    @if (hasCell && cell is not null)
+                                    @if (hasCells && cells is not null)
                                     {
-                                        var item = cell.Item;
-                                        <div class="card @cell.ColorCss @(cell.IsMergedLecture ? "card--merged-lecture" : string.Empty)">
+                                        <div class="cell-stack">
+                                        @foreach (var cell in cells)
+                                        {
+                                            var item = cell.Item;
+                                            <div @key="item.Id" class="card @cell.ColorCss @(cell.IsMergedLecture ? "card--merged-lecture" : string.Empty)">
                                             <div class="card-top">
                                                 <span class="badge">@item.LessonTypeName</span>
                                                 @if (item.IsLocked)
@@ -456,6 +520,8 @@ else
                                                     </div>
                                                 </div>
                                             }
+                                            </div>
+                                        }
                                         </div>
                                     }
                                 </td>
@@ -468,9 +534,9 @@ else
     </div>
 
 <div class="week-nav">
-        <button class="btn btn-ghost" @onclick="PrevWeek">‹ Попередній тиждень</button>
+        <button class="btn btn-ghost" disabled="@(_scheduleLoading || _editSaving)" @onclick="PrevWeek">‹ Попередній тиждень</button>
         <div class="week-label">@WeekRangeLabel</div>
-        <button class="btn btn-ghost" @onclick="NextWeek">Наступний тиждень ›</button>
+        <button class="btn btn-ghost" disabled="@(_scheduleLoading || _editSaving)" @onclick="NextWeek">Наступний тиждень ›</button>
     </div>
 }
 
@@ -598,6 +664,10 @@ else
         min-height: 92px;
         vertical-align: top;
         overflow: hidden;
+    }
+    .cell-stack {
+        display: grid;
+        gap: .5rem;
     }
     .card {
         position: relative;

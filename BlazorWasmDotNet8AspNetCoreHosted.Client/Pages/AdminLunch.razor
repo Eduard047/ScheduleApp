@@ -1,15 +1,28 @@
 @page "/admin/lunch"
 @inject NavigationManager Nav
 
-<PageTitle>Адмін • Обід</PageTitle>
+<PageTitle>Адмін • Обідня перерва</PageTitle>
 
-<div class="alert alert-warning mt-3">
-    Окремий конфіг обіду більше не використовується автогенерацією. Час пар задається у
-    <a class="alert-link" href="/admin/time-slots">«Слотах часу»</a>, а пріоритет типу занять
-    <strong>«Бажано першим у тижні»</strong> тепер налаштовується там же через ліміт слота.
+<h3>Обідня перерва</h3>
+
+<div class="alert alert-info mt-3">
+    Обідня перерва враховується розкладом та автогенерацією: слоти, що перетинаються з нею,
+    недоступні для занять. Для глобального рівня або окремого курсу діє одна спільна перерва
+    на всі дні тижня.
 </div>
 
-<button class="btn btn-primary" @onclick="GoToSlots">Відкрити слоти часу</button>
+<div class="card mb-3">
+    <div class="card-body">
+        <div class="fw-semibold mb-1">Як налаштувати</div>
+        <div class="text-muted">
+            Відкрийте «Слоти часу», оберіть рівень і режим «Усі дні», потім позначте один
+            активний слот як обід. Щоб прибрати власну перерву, зніміть позначку та збережіть шаблон.
+            Для курсу без власної перерви використовується глобальна.
+        </div>
+    </div>
+</div>
+
+<button class="btn btn-primary" @onclick="GoToSlots">Налаштувати у слотах часу</button>
 
 @code {
     // Переходить на сторінку слотів часу.

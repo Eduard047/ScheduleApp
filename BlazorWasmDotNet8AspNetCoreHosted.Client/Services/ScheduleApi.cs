@@ -13,7 +13,9 @@ public sealed class ScheduleApi(HttpClient http) : IScheduleApi
         var url = weekStart is DateOnly d
             ? ApiClientHelpers.WithQuery("api/meta", ("weekStart", d.ToString("yyyy-MM-dd")))
             : "api/meta";
-        return await http.GetFromJsonAsync<MetaResponseDto>(url) ?? ApiClientHelpers.EmptyMeta();
+        var res = await http.GetAsync(url);
+        await res.EnsureSuccessWithDetailsAsync();
+        return await res.Content.ReadFromJsonAsync<MetaResponseDto>() ?? ApiClientHelpers.EmptyMeta();
     }
     // Завантажує розклад тижня з фільтрами.
     public async Task<List<ScheduleItemDto>> GetWeek(DateOnly weekStart, int? courseId = null, int? groupId = null, int? teacherId = null, int? roomId = null)
@@ -25,7 +27,9 @@ public sealed class ScheduleApi(HttpClient http) : IScheduleApi
             ("groupId", groupId?.ToString()),
             ("teacherId", teacherId?.ToString()),
             ("roomId", roomId?.ToString()));
-        return await http.GetFromJsonAsync<List<ScheduleItemDto>>(url) ?? new();
+        var res = await http.GetAsync(url);
+        await res.EnsureSuccessWithDetailsAsync();
+        return await res.Content.ReadFromJsonAsync<List<ScheduleItemDto>>() ?? new();
     }
     // Створює або оновлює пару в розкладі.
     public async Task<int> Upsert(UpsertScheduleItemRequest request)
@@ -43,7 +47,7 @@ public sealed class ScheduleApi(HttpClient http) : IScheduleApi
     // Очищає розклад за тиждень і повертає кількість видалених.
     public async Task<int> ClearWeek(ClearWeekRequest req)
     {
-        var res = await http.PostAsJsonAsync("api/schedule/clear", req);
+        var res = await http.PostAsJsonAsync(ApiClientHelpers.WithConfirm("api/schedule/clear"), req);
         await res.EnsureSuccessWithDetailsAsync();
         var dto = await res.Content.ReadFromJsonAsync<ClearWeekResult>();
         return dto?.Deleted ?? 0;

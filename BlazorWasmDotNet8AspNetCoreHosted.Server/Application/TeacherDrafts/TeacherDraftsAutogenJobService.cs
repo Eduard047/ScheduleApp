@@ -8,11 +8,32 @@ using Microsoft.EntityFrameworkCore;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 
+public sealed class AutoGenJobValidationException(string message) : Exception(message);
+
+public sealed class AutoGenJobCapacityException(string message) : Exception(message);
+
 public sealed class TeacherDraftsAutogenJobService
 {
+    private const int MaxRangeDays = 370;
+    private const int MaxGroupCount = 200;
+    private const int MaxModuleHourEntryCount = 200;
+    private const int MaxHoursPerModulePerWeek = 500;
+    private const int MaxPreferredRoomCountPerGroup = 500;
+    private const int MaxPreferredFirstSlotOrderOverride = 64;
+    private const int MaxRecentRepeatWindowDays = 31;
+    private const int MaxDistinctModulesPerDay = 64;
+    private const double MaxSoftPenaltyWeight = 1_000d;
+    private const int MaxTitleLength = 256;
+    private const int MaxOutstandingJobCount = 8;
+    private const int MaxRetainedTerminalJobCount = 200;
+    private static readonly DateOnly MinSupportedDate = new(2000, 1, 1);
+    private static readonly DateOnly MaxSupportedDate = new(2100, 12, 24);
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<TeacherDraftsAutogenJobService> _logger;
     private readonly ConcurrentDictionary<string, AutoGenJobRuntime> _jobs = new(StringComparer.Ordinal);
+    private readonly object _startSync = new();
+    private readonly SemaphoreSlim _executionGate = new(1, 1);
+    private readonly SemaphoreSlim _persistenceGate = new(1, 1);
     private static readonly TimeSpan CompletedJobTtl = TimeSpan.FromHours(6);
     private static readonly JsonSerializerOptions PersistenceJsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -27,10 +48,42 @@ public sealed class TeacherDraftsAutogenJobService
 
     public AutoGenJobStartResult Start(AutoGenJobRequest request)
     {
-        CleanupOldJobs();
         var normalized = NormalizeRequest(request);
-        var job = new AutoGenJobRuntime(normalized);
-        _jobs[job.JobId] = job;
+        if (normalized.ClientJobId is { } clientJobId)
+        {
+            lock (_startSync)
+            {
+                if (_jobs.TryGetValue(clientJobId, out var existingJob))
+                {
+                    return new AutoGenJobStartResult(clientJobId, existingJob.ToDto());
+                }
+            }
+
+            if (TryReadPersistedStatus(clientJobId) is { } persistedStatus)
+            {
+                return new AutoGenJobStartResult(clientJobId, persistedStatus);
+            }
+        }
+
+        AutoGenJobRuntime job;
+        lock (_startSync)
+        {
+            CleanupOldJobs();
+            if (normalized.ClientJobId is { } queuedJobId
+                && _jobs.TryGetValue(queuedJobId, out var existingJob))
+            {
+                return new AutoGenJobStartResult(queuedJobId, existingJob.ToDto());
+            }
+            var outstandingJobCount = _jobs.Values.Count(item => !IsTerminalState(item.ToDto().State));
+            if (outstandingJobCount >= MaxOutstandingJobCount)
+            {
+                throw new AutoGenJobCapacityException(
+                    $"Черга автогенерації заповнена. Дочекайтеся завершення одного з {MaxOutstandingJobCount} активних завдань і повторіть спробу.");
+            }
+
+            job = new AutoGenJobRuntime(normalized);
+            _jobs[job.JobId] = job;
+        }
         TryPersistSnapshot(job, "створення завдання");
         _ = Task.Run(() => RunAsync(job));
         return new AutoGenJobStartResult(job.JobId, job.ToDto());
@@ -46,18 +99,23 @@ public sealed class TeacherDraftsAutogenJobService
             return TryCancelPersistedJob(jobId);
         }
         job.RequestCancellation();
-        TryPersistSnapshot(job, "запит скасування");
+        _ = TryPersistSnapshotAsync(job, "запит скасування");
         return job.ToDto();
     }
 
     private void TryPersistSnapshot(AutoGenJobRuntime job, string operation)
     {
+        _persistenceGate.Wait();
         try
         {
             using var scope = _scopeFactory.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
             var status = job.ToDto();
             var run = db.AutoGenJobRuns.FirstOrDefault(item => item.JobId == job.JobId);
+            if (run is not null && IsTerminalState(ToJobState(run.State)) && !IsTerminalState(status.State))
+            {
+                return;
+            }
             if (run is null)
             {
                 run = new AutoGenJobRun { JobId = job.JobId };
@@ -70,16 +128,25 @@ public sealed class TeacherDraftsAutogenJobService
         {
             _logger.LogWarning(ex, "Не вдалося зберегти стан завдання автогенерації {JobId} під час етапу \"{Operation}\". Завдання продовжує роботу в пам'яті.", job.JobId, operation);
         }
+        finally
+        {
+            _persistenceGate.Release();
+        }
     }
 
     private async Task TryPersistSnapshotAsync(AutoGenJobRuntime job, string operation)
     {
+        await _persistenceGate.WaitAsync(CancellationToken.None);
         try
         {
             using var scope = _scopeFactory.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
             var status = job.ToDto();
             var run = await db.AutoGenJobRuns.FirstOrDefaultAsync(item => item.JobId == job.JobId);
+            if (run is not null && IsTerminalState(ToJobState(run.State)) && !IsTerminalState(status.State))
+            {
+                return;
+            }
             if (run is null)
             {
                 run = new AutoGenJobRun { JobId = job.JobId };
@@ -92,6 +159,10 @@ public sealed class TeacherDraftsAutogenJobService
         {
             _logger.LogWarning(ex, "Не вдалося зберегти стан завдання автогенерації {JobId} під час етапу \"{Operation}\". Завдання продовжує роботу в пам'яті.", job.JobId, operation);
         }
+        finally
+        {
+            _persistenceGate.Release();
+        }
     }
 
     private AutoGenJobStatus? TryReadPersistedStatus(string jobId)
@@ -101,17 +172,45 @@ public sealed class TeacherDraftsAutogenJobService
             return null;
         }
 
+        _persistenceGate.Wait();
         try
         {
             using var scope = _scopeFactory.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            var run = db.AutoGenJobRuns.AsNoTracking().FirstOrDefault(item => item.JobId == jobId);
-            return run is null ? null : DeserializeStatusOrFallback(run);
+            using var transaction = db.Database.BeginTransaction();
+            var run = db.AutoGenJobRuns.FirstOrDefault(item => item.JobId == jobId);
+            if (run is null)
+            {
+                return null;
+            }
+
+            if (!IsTerminalState(ToJobState(run.State)))
+            {
+                var now = DateTime.UtcNow;
+                run.State = (int)AutoGenJobState.Failed;
+                run.CompletedAtUtc ??= now;
+                run.CurrentStage = "Перервано через перезапуск сервера.";
+                run.Error = "Завдання автогенерації не завершилося, оскільки сервер було перезапущено.";
+                run.Percent = 100;
+                run.UpdatedAtUtc = now;
+                var interruptedStatus = BuildStatusFromColumns(run);
+                run.StatusJson = JsonSerializer.Serialize(interruptedStatus, PersistenceJsonOptions);
+                db.SaveChanges();
+                transaction.Commit();
+                return interruptedStatus;
+            }
+
+            transaction.Commit();
+            return DeserializeStatusOrFallback(run);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Не вдалося прочитати стан завдання автогенерації {JobId} з бази.", jobId);
             return null;
+        }
+        finally
+        {
+            _persistenceGate.Release();
         }
     }
 
@@ -122,6 +221,7 @@ public sealed class TeacherDraftsAutogenJobService
             return null;
         }
 
+        _persistenceGate.Wait();
         try
         {
             using var scope = _scopeFactory.CreateScope();
@@ -154,6 +254,10 @@ public sealed class TeacherDraftsAutogenJobService
         {
             _logger.LogWarning(ex, "Не вдалося скасувати збережене завдання автогенерації {JobId}.", jobId);
             return null;
+        }
+        finally
+        {
+            _persistenceGate.Release();
         }
     }
 
@@ -289,26 +393,190 @@ public sealed class TeacherDraftsAutogenJobService
 
     private static AutoGenJobRequest NormalizeRequest(AutoGenJobRequest request)
     {
+        if (!Enum.IsDefined(request.Kind))
+        {
+            throw new AutoGenJobValidationException("Невідомий тип завдання автогенерації.");
+        }
+        if (request.CourseId <= 0)
+        {
+            throw new AutoGenJobValidationException("Потрібно вибрати коректний курс для автогенерації.");
+        }
+        if (!Enum.IsDefined(request.Days))
+        {
+            throw new AutoGenJobValidationException("Невідомий набір робочих днів для автогенерації.");
+        }
         var fromDate = request.FromDate;
         var toDate = request.ToDate;
+        if (fromDate == default || toDate == default)
+        {
+            throw new AutoGenJobValidationException("Потрібно вказати початок і кінець діапазону автогенерації.");
+        }
+        if (fromDate < MinSupportedDate || toDate > MaxSupportedDate)
+        {
+            throw new AutoGenJobValidationException(
+                $"Діапазон автогенерації має бути в межах {MinSupportedDate:yyyy-MM-dd} — {MaxSupportedDate:yyyy-MM-dd}.");
+        }
         if (toDate < fromDate)
         {
-            (fromDate, toDate) = (toDate, fromDate);
+            throw new AutoGenJobValidationException("Кінець діапазону автогенерації не може бути раніше за початок.");
+        }
+        var rangeDays = toDate.DayNumber - fromDate.DayNumber + 1;
+        if (rangeDays > MaxRangeDays)
+        {
+            throw new AutoGenJobValidationException(
+                $"Діапазон автогенерації не може перевищувати {MaxRangeDays} днів.");
+        }
+        if (request.GroupIds is null)
+        {
+            throw new AutoGenJobValidationException("Список груп для автогенерації відсутній.");
+        }
+        if (request.GroupIds.Count > MaxGroupCount)
+        {
+            throw new AutoGenJobValidationException(
+                $"За один запуск можна передати не більше {MaxGroupCount} груп.");
         }
         var groupIds = request.GroupIds
             .Where(groupId => groupId > 0)
             .Distinct()
             .ToList();
+        if (groupIds.Count == 0)
+        {
+            throw new AutoGenJobValidationException("Потрібно вибрати щонайменше одну коректну групу.");
+        }
+        if (request.ModuleHours is null)
+        {
+            throw new AutoGenJobValidationException("Перелік годин модулів для автогенерації відсутній.");
+        }
+        if (request.ModuleHours.Count > MaxModuleHourEntryCount)
+        {
+            throw new AutoGenJobValidationException(
+                $"За один запуск можна передати не більше {MaxModuleHourEntryCount} записів годин модулів.");
+        }
+        if (request.ModuleHours.Any(entry => entry.Key <= 0 || entry.Value <= 0))
+        {
+            throw new AutoGenJobValidationException("Ідентифікатори модулів і кількість годин мають бути додатними числами.");
+        }
+        if (request.ModuleHours.Any(entry => entry.Value > MaxHoursPerModulePerWeek))
+        {
+            throw new AutoGenJobValidationException(
+                $"Для одного модуля можна вказати не більше {MaxHoursPerModulePerWeek} годин на тиждень.");
+        }
         var moduleHours = request.ModuleHours
-            .Where(entry => entry.Key > 0 && entry.Value > 0)
             .ToDictionary(entry => entry.Key, entry => entry.Value);
+        if (moduleHours.Count == 0)
+        {
+            throw new AutoGenJobValidationException("Потрібно вибрати щонайменше один модуль із годинами.");
+        }
+        if (request.GroupRoomPreferences is { Count: > MaxGroupCount })
+        {
+            throw new AutoGenJobValidationException(
+                $"За один запуск можна передати не більше {MaxGroupCount} налаштувань аудиторій груп.");
+        }
+        if (request.GroupRoomPreferences is { } roomPreferences
+            && roomPreferences.Any(preference => preference.RoomIds is { Count: > MaxPreferredRoomCountPerGroup }))
+        {
+            throw new AutoGenJobValidationException(
+                $"Для однієї групи можна вибрати не більше {MaxPreferredRoomCountPerGroup} пріоритетних аудиторій.");
+        }
+        if (request.PreferredFirstMaxSlotOrderOverride is int preferredFirstSlotOrder
+            && (preferredFirstSlotOrder < 0 || preferredFirstSlotOrder > MaxPreferredFirstSlotOrderOverride))
+        {
+            throw new AutoGenJobValidationException(
+                $"Ліміт пріоритетного слоту має бути від 0 до {MaxPreferredFirstSlotOrderOverride}.");
+        }
+        if (request.SoftOptions is { } softOptions)
+        {
+            if (softOptions.MaxParallelGroupsPerModuleInSlot is int maxParallelGroups
+                && (maxParallelGroups <= 0 || maxParallelGroups > MaxGroupCount))
+            {
+                throw new AutoGenJobValidationException(
+                    $"М'який ліміт паралельних груп має бути від 1 до {MaxGroupCount}.");
+            }
+            if (softOptions.RecentRepeatWindowDays is int repeatWindow
+                && (repeatWindow < 0
+                    || repeatWindow > MaxRecentRepeatWindowDays
+                    || repeatWindow > fromDate.DayNumber
+                    || repeatWindow > DateOnly.MaxValue.DayNumber - toDate.DayNumber))
+            {
+                throw new AutoGenJobValidationException(
+                    $"Вікно близьких повторів має бути від 0 до {MaxRecentRepeatWindowDays} днів і не виходити за межі календаря.");
+            }
+            if (softOptions.PreferredMaxDistinctModulesPerDay is int preferredDistinctModules
+                && (preferredDistinctModules <= 0 || preferredDistinctModules > MaxDistinctModulesPerDay))
+            {
+                throw new AutoGenJobValidationException(
+                    $"Бажана кількість різних модулів на день має бути від 1 до {MaxDistinctModulesPerDay}.");
+            }
+            if (softOptions.MaxDistinctModulesPerDay is int maxDistinctModules
+                && (maxDistinctModules <= 0 || maxDistinctModules > MaxDistinctModulesPerDay))
+            {
+                throw new AutoGenJobValidationException(
+                    $"Максимальна кількість різних модулів на день має бути від 1 до {MaxDistinctModulesPerDay}.");
+            }
+            if (softOptions.PreferredMaxDistinctModulesPerDay is int preferredDistinct
+                && softOptions.MaxDistinctModulesPerDay is int maximumDistinct
+                && preferredDistinct > maximumDistinct)
+            {
+                throw new AutoGenJobValidationException(
+                    "Бажана кількість різних модулів на день не може перевищувати максимальну.");
+            }
+
+            static bool IsInvalidPenalty(double? value)
+                => value is double resolved
+                   && (!double.IsFinite(resolved) || resolved < 0 || resolved > MaxSoftPenaltyWeight);
+
+            if (IsInvalidPenalty(softOptions.PreferredFirstPenaltyMultiplier)
+                || IsInvalidPenalty(softOptions.AdjacentRoomChangePenalty)
+                || IsInvalidPenalty(softOptions.TeacherLoadPenaltyWeight)
+                || IsInvalidPenalty(softOptions.BuildingDistancePenaltyWeight))
+            {
+                throw new AutoGenJobValidationException(
+                    $"Ваги м'яких штрафів мають бути скінченними числами від 0 до {MaxSoftPenaltyWeight:0}.");
+            }
+        }
+        var clearExisting = request.ClearExisting;
+        var softFill = request.SoftFill;
+        var preflightOnly = request.PreflightOnly;
+        if (request.Kind == AutoGenJobKind.Preflight)
+        {
+            clearExisting = false;
+            preflightOnly = true;
+        }
+        else if (request.Kind == AutoGenJobKind.Fill)
+        {
+            clearExisting = false;
+            softFill = true;
+            preflightOnly = false;
+        }
+        var title = string.IsNullOrWhiteSpace(request.Title)
+            ? BuildDefaultTitle(request.Kind)
+            : request.Title.Trim();
+        if (title.Length > MaxTitleLength)
+        {
+            throw new AutoGenJobValidationException(
+                $"Назва завдання автогенерації не може перевищувати {MaxTitleLength} символів.");
+        }
+        string? clientJobId = null;
+        if (!string.IsNullOrWhiteSpace(request.ClientJobId))
+        {
+            if (!Guid.TryParseExact(request.ClientJobId.Trim(), "N", out var parsedClientJobId))
+            {
+                throw new AutoGenJobValidationException(
+                    "Ідентифікатор клієнтського завдання автогенерації має бути GUID у форматі N.");
+            }
+            clientJobId = parsedClientJobId.ToString("N");
+        }
         return request with
         {
             FromDate = fromDate,
             ToDate = toDate,
             GroupIds = groupIds,
             ModuleHours = moduleHours,
-            Title = string.IsNullOrWhiteSpace(request.Title) ? BuildDefaultTitle(request.Kind) : request.Title!.Trim()
+            ClearExisting = clearExisting,
+            SoftFill = softFill,
+            PreflightOnly = preflightOnly,
+            Title = title,
+            ClientJobId = clientJobId
         };
     }
 
@@ -329,11 +597,17 @@ public sealed class TeacherDraftsAutogenJobService
         var skipped = 0;
         var failed = false;
         var weekStarts = BuildWeekStarts(job.Request.FromDate, job.Request.ToDate);
-        job.MarkRunning(weekStarts.Count);
-        await TryPersistSnapshotAsync(job, "запуск завдання");
+        var ownsExecutionGate = false;
 
         try
         {
+            await _executionGate.WaitAsync(job.Token);
+            ownsExecutionGate = true;
+            job.Token.ThrowIfCancellationRequested();
+            job.MarkRunning(weekStarts.Count);
+            await TryPersistSnapshotAsync(job, "запуск завдання");
+            job.Token.ThrowIfCancellationRequested();
+
             using var scope = _scopeFactory.CreateScope();
             var autogen = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenService>();
             var runRanges = new List<(int WeekIndex, DateOnly WeekStart, DateOnly RangeStartDate, DateOnly RangeEndDate)>();
@@ -404,7 +678,7 @@ public sealed class TeacherDraftsAutogenJobService
             }
             await TryPersistSnapshotAsync(job, "завершення завдання");
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (job.Token.IsCancellationRequested)
         {
             var result = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight);
             var report = TeacherDraftsAutogenReportBuilder.BuildReport(job.Request.FromDate, job.Request.ToDate, Math.Max(1, weekStarts.Count), result);
@@ -413,11 +687,19 @@ public sealed class TeacherDraftsAutogenJobService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "AutoGen job {JobId} failed.", job.JobId);
+            _logger.LogError(ex, "Завдання автогенерації {JobId} завершилося помилкою.", job.JobId);
             var result = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight);
             var report = TeacherDraftsAutogenReportBuilder.BuildReport(job.Request.FromDate, job.Request.ToDate, Math.Max(1, weekStarts.Count), result);
             job.MarkFailed(ex.Message, result, report);
             await TryPersistSnapshotAsync(job, "помилка завдання");
+        }
+        finally
+        {
+            if (ownsExecutionGate)
+            {
+                _executionGate.Release();
+            }
+            CleanupOldJobs();
         }
     }
 
@@ -502,6 +784,20 @@ public sealed class TeacherDraftsAutogenJobService
                 _jobs.TryRemove(entry.Key, out _);
             }
         }
+
+        var excessTerminalJobs = _jobs
+            .Select(entry => new { entry.Key, Status = entry.Value.ToDto() })
+            .Where(entry => IsTerminalState(entry.Status.State))
+            .OrderByDescending(entry => entry.Status.CompletedAt ?? entry.Status.CreatedAt)
+            .ThenByDescending(entry => entry.Status.CreatedAt)
+            .ThenBy(entry => entry.Key, StringComparer.Ordinal)
+            .Skip(MaxRetainedTerminalJobCount)
+            .Select(entry => entry.Key)
+            .ToList();
+        foreach (var jobId in excessTerminalJobs)
+        {
+            _jobs.TryRemove(jobId, out _);
+        }
     }
 
     private sealed class AutoGenJobRuntime
@@ -531,7 +827,7 @@ public sealed class TeacherDraftsAutogenJobService
         public AutoGenJobRuntime(AutoGenJobRequest request)
         {
             Request = request;
-            JobId = Guid.NewGuid().ToString("N");
+            JobId = request.ClientJobId ?? Guid.NewGuid().ToString("N");
             CreatedAt = DateTimeOffset.UtcNow;
         }
 

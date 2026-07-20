@@ -1,0 +1,113 @@
+name: ScheduleApp quality
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ConnectionStrings__Default: Server=127.0.0.1;Port=3306;Database=scheduleapp_ci;User=root;Password=scheduleapp_ci;SslMode=None
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: scheduleapp_ci
+          MYSQL_ROOT_HOST: "%"
+          MYSQL_DATABASE: scheduleapp_ci
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pscheduleapp_ci"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore and audit dependencies
+        run: >-
+          dotnet restore BlazorWasmDotNet8AspNetCoreHosted.Server.sln
+          -p:NuGetAudit=true
+          -p:NuGetAuditMode=all
+          -p:NuGetAuditLevel=low
+          -p:WarningsAsErrors=NU1900%3BNU1901%3BNU1902%3BNU1903%3BNU1904%3BNU1905
+
+      - name: Restore repository tools
+        run: dotnet tool restore
+
+      - name: Build
+        run: dotnet build BlazorWasmDotNet8AspNetCoreHosted.Server.sln --configuration Release --no-restore
+
+      - name: Apply migrations to clean MySQL
+        run: >-
+          dotnet ef database update
+          --project BlazorWasmDotNet8AspNetCoreHosted.Server/BlazorWasmDotNet8AspNetCoreHosted.Server.csproj
+          --startup-project BlazorWasmDotNet8AspNetCoreHosted.Server/BlazorWasmDotNet8AspNetCoreHosted.Server.csproj
+          --context AppDbContext
+          --configuration Release
+          --no-build
+
+      - name: Verify EF model has a migration
+        run: >-
+          dotnet ef migrations has-pending-model-changes
+          --project BlazorWasmDotNet8AspNetCoreHosted.Server/BlazorWasmDotNet8AspNetCoreHosted.Server.csproj
+          --startup-project BlazorWasmDotNet8AspNetCoreHosted.Server/BlazorWasmDotNet8AspNetCoreHosted.Server.csproj
+          --context AppDbContext
+          --configuration Release
+          --no-build
+
+      - name: Smoke test production readiness
+        shell: bash
+        run: |
+          ASPNETCORE_URLS=http://127.0.0.1:5080 ASPNETCORE_ENVIRONMENT=Production \
+            ReverseProxy__KnownProxies__0=127.0.0.1 \
+            dotnet run \
+              --project BlazorWasmDotNet8AspNetCoreHosted.Server/BlazorWasmDotNet8AspNetCoreHosted.Server.csproj \
+              --configuration Release \
+              --no-build \
+              --no-launch-profile > "$RUNNER_TEMP/scheduleapp.log" 2>&1 &
+          app_pid=$!
+          cleanup() {
+            kill "$app_pid" 2>/dev/null || true
+            wait "$app_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          ready=0
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:5080/health/ready > /dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            cat "$RUNNER_TEMP/scheduleapp.log"
+            exit 1
+          fi
+
+          curl --fail --silent --show-error http://127.0.0.1:5080/health/live > /dev/null
+          curl --fail --silent --show-error \
+            --header "X-Forwarded-Proto: https" \
+            http://127.0.0.1:5080/ > /dev/null
+
+      - name: Run production guardrails
+        run: dotnet test BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj --configuration Release --no-build --logger "console;verbosity=normal"
+
+      - name: Report vulnerable NuGet packages
+        run: dotnet list BlazorWasmDotNet8AspNetCoreHosted.Server.sln package --vulnerable --include-transitive

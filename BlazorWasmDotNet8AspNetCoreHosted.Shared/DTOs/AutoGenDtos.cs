@@ -120,7 +120,8 @@ public record AutoGenJobRequest(
     List<GroupRoomPreferenceDto>? GroupRoomPreferences = null,
     AutoGenSoftOptionsDto? SoftOptions = null,
     int? PreferredFirstMaxSlotOrderOverride = null,
-    string? Title = null
+    string? Title = null,
+    string? ClientJobId = null
 );
 
 public record AutoGenJobStartResult(

@@ -18,21 +18,22 @@ public static class TimeSlotsResolver
         DayOfWeek day,
         bool activeOnly = true)
     {
-        var query = db.TimeSlots.AsNoTracking();
-        if (activeOnly)
-        {
-            query = query.Where(s => s.IsActive);
-        }
-        var slots = await query
+        var slots = await db.TimeSlots.AsNoTracking()
             .Where(s => s.CourseId == null || s.CourseId == courseId)
             .ToListAsync();
-        return ResolveForDay(slots, courseId, day);
+        var lunches = await db.LunchConfigs
+            .AsNoTracking()
+            .Where(lunch => lunch.CourseId == null || lunch.CourseId == courseId)
+            .ToListAsync();
+        return ResolveForDay(slots, courseId, day, lunches, activeOnly);
     }
 
     public static ResolvedTimeSlots ResolveForDay(
         IEnumerable<TimeSlot> slots,
         int? courseId,
-        DayOfWeek day)
+        DayOfWeek day,
+        IEnumerable<LunchConfig>? lunches = null,
+        bool activeOnly = true)
     {
         var slotList = slots.ToList();
         List<TimeSlot> Pick(IEnumerable<TimeSlot> source, DayOfWeek? targetDay)
@@ -49,15 +50,15 @@ public static class TimeSlotsResolver
                 var courseDay = Pick(courseSlots, day);
                 if (courseDay.Count > 0)
                 {
-                    return new ResolvedTimeSlots(true, true, courseDay);
+                    return Finalize(new ResolvedTimeSlots(true, true, courseDay), courseId, lunches, activeOnly);
                 }
                 var courseAny = Pick(courseSlots, null);
                 if (courseAny.Count > 0)
                 {
-                    return new ResolvedTimeSlots(true, false, courseAny);
+                    return Finalize(new ResolvedTimeSlots(true, false, courseAny), courseId, lunches, activeOnly);
                 }
                 // Якщо курс має власну конфігурацію, глобальні слоти не підмішуємо.
-                return new ResolvedTimeSlots(true, false, new List<TimeSlot>());
+                return Finalize(new ResolvedTimeSlots(true, false, new List<TimeSlot>()), courseId, lunches, activeOnly);
             }
         }
 
@@ -65,21 +66,54 @@ public static class TimeSlotsResolver
         var globalDay = Pick(globalSlots, day);
         if (globalDay.Count > 0)
         {
-            return new ResolvedTimeSlots(false, true, globalDay);
+            return Finalize(new ResolvedTimeSlots(false, true, globalDay), courseId, lunches, activeOnly);
         }
         var globalAny = Pick(globalSlots, null);
-        return new ResolvedTimeSlots(false, false, globalAny);
+        return Finalize(new ResolvedTimeSlots(false, false, globalAny), courseId, lunches, activeOnly);
     }
 
     public static Dictionary<DayOfWeek, ResolvedTimeSlots> ResolveForWeek(
         IEnumerable<TimeSlot> slots,
-        int? courseId)
+        int? courseId,
+        IEnumerable<LunchConfig>? lunches = null,
+        bool activeOnly = true)
     {
         var map = new Dictionary<DayOfWeek, ResolvedTimeSlots>();
         foreach (DayOfWeek day in Enum.GetValues<DayOfWeek>())
         {
-            map[day] = ResolveForDay(slots, courseId, day);
+            map[day] = ResolveForDay(slots, courseId, day, lunches, activeOnly);
         }
         return map;
+    }
+
+    private static ResolvedTimeSlots Finalize(
+        ResolvedTimeSlots resolved,
+        int? courseId,
+        IEnumerable<LunchConfig>? lunches,
+        bool activeOnly)
+    {
+        var filtered = activeOnly
+            ? resolved with { Slots = resolved.Slots.Where(slot => slot.IsActive).ToList() }
+            : resolved;
+        return ExcludeLunch(filtered, courseId, lunches);
+    }
+
+    // Виключає всі слоти, що перетинаються з обідньою перервою курсу або глобальною перервою.
+    private static ResolvedTimeSlots ExcludeLunch(
+        ResolvedTimeSlots resolved,
+        int? courseId,
+        IEnumerable<LunchConfig>? lunches)
+    {
+        if (lunches is null) return resolved;
+        var lunchRows = lunches.ToList();
+        var lunch = courseId is int cid
+            ? lunchRows.Where(item => item.CourseId == cid).OrderBy(item => item.Id).FirstOrDefault()
+            : null;
+        lunch ??= lunchRows.Where(item => item.CourseId == null).OrderBy(item => item.Id).FirstOrDefault();
+        if (lunch is null) return resolved;
+        var available = resolved.Slots
+            .Where(slot => slot.End <= lunch.Start || slot.Start >= lunch.End)
+            .ToList();
+        return resolved with { Slots = available };
     }
 }

@@ -12,7 +12,9 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
             "api/teacher-drafts",
             ("weekStart", weekStart.ToString("yyyy-MM-dd")),
             ("teacherId", teacherId?.ToString()));
-        return await http.GetFromJsonAsync<List<TeacherDraftItemDto>>(url) ?? new();
+        var res = await http.GetAsync(url);
+        await res.EnsureSuccessWithDetailsAsync();
+        return await res.Content.ReadFromJsonAsync<List<TeacherDraftItemDto>>() ?? new();
     }
     // Експортує чернетки тижня у файл.
     public async Task<byte[]> ExportWeek(DateOnly weekStart, int? teacherId, int? groupId, int? roomId)
@@ -62,7 +64,7 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
     // Очищає чернетки тижня.
     public async Task<int> ClearWeek(ClearWeekRequest req)
     {
-        var res = await http.PostAsJsonAsync("api/teacher-drafts/clear-week", req);
+        var res = await http.PostAsJsonAsync(ApiClientHelpers.WithConfirm("api/teacher-drafts/clear-week"), req);
         await res.EnsureSuccessWithDetailsAsync();
         var dto = await res.Content.ReadFromJsonAsync<ClearWeekResult>();
         return dto?.Deleted ?? 0;
@@ -74,6 +76,14 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
         await res.EnsureSuccessWithDetailsAsync();
         return await res.Content.ReadFromJsonAsync<int>();
     }
+    // Атомарно створює або оновлює пакет чернеток.
+    public async Task<TeacherDraftBatchUpsertResult> UpsertBatch(TeacherDraftBatchUpsertRequest req)
+    {
+        var res = await http.PostAsJsonAsync("api/teacher-drafts/upsert-batch", req);
+        await res.EnsureSuccessWithDetailsAsync();
+        return await res.Content.ReadFromJsonAsync<TeacherDraftBatchUpsertResult>()
+               ?? throw new InvalidOperationException("Сервер не повернув результат пакетного збереження чернеток.");
+    }
     // Видаляє чернетку з параметрами підтвердження.
     public async Task Delete(int id, bool confirm = false, bool unrestricted = false)
     {
@@ -82,6 +92,24 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
             ("confirm", confirm ? "true" : "false"),
             ("unrestricted", unrestricted ? "true" : "false")));
         await res.EnsureSuccessWithDetailsAsync();
+    }
+    // Атомарно видаляє пакет чернеток.
+    public async Task<TeacherDraftBatchDeleteResult> DeleteBatch(TeacherDraftBatchDeleteRequest req)
+    {
+        var res = await http.PostAsJsonAsync(
+            ApiClientHelpers.WithQuery("api/teacher-drafts/delete-batch", ("confirm", "true")),
+            req);
+        await res.EnsureSuccessWithDetailsAsync();
+        return await res.Content.ReadFromJsonAsync<TeacherDraftBatchDeleteResult>()
+               ?? throw new InvalidOperationException("Сервер не повернув результат пакетного видалення чернеток.");
+    }
+    // Атомарно застосовує змішаний пакет створень, оновлень і видалень.
+    public async Task<TeacherDraftBatchMutationResult> MutateBatch(TeacherDraftBatchMutationRequest req)
+    {
+        var res = await http.PostAsJsonAsync("api/teacher-drafts/mutate-batch", req);
+        await res.EnsureSuccessWithDetailsAsync();
+        return await res.Content.ReadFromJsonAsync<TeacherDraftBatchMutationResult>()
+               ?? throw new InvalidOperationException("Сервер не повернув результат атомарної зміни чернеток.");
     }
     // Запускає автогенерацію для місяця.
     public async Task<AutoGenResult> AutogenMonth(AutogenMonthRequest req)
@@ -98,9 +126,11 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
         return (await res.Content.ReadFromJsonAsync<AutoGenResult>())!;
     }
     // Публікує чернетки тижня у розклад.
-    public async Task PublishWeek(PublishWeekRequest req)
+    public async Task<PublishWeekResultDto> PublishWeek(PublishWeekRequest req)
     {
         var res = await http.PostAsJsonAsync("api/teacher-drafts/publish-week", req);
         await res.EnsureSuccessWithDetailsAsync();
+        return await res.Content.ReadFromJsonAsync<PublishWeekResultDto>()
+               ?? throw new InvalidOperationException("Сервер не повернув результат публікації.");
     }
 }

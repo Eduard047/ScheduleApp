@@ -1,3 +1,4 @@
+using System.Data;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Infrastructure;
@@ -60,28 +61,38 @@ public sealed class AdminDepartmentsController(AppDbContext db) : ControllerBase
     // Видаляє кафедру, опціонально з очищенням зв'язків.
     public async Task<IActionResult> Delete(int id, [FromQuery] bool force = false)
     {
-        var entity = await db.Departments.FirstOrDefaultAsync(x => x.Id == id);
-        if (entity is null) return NotFound();
-        var usedByTeachers = await db.Teachers.AnyAsync(x => x.DepartmentId == id);
-        var usedByTopics = await db.ModuleTopics.AnyAsync(x => x.DepartmentId == id);
-        if ((usedByTeachers || usedByTopics) && !force)
+        await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
+        try
         {
-            return Conflict(new
+            var entity = await db.Departments.FirstOrDefaultAsync(x => x.Id == id);
+            if (entity is null) return NotFound();
+            var usedByTeachers = await db.Teachers.AnyAsync(x => x.DepartmentId == id);
+            var usedByTopics = await db.ModuleTopics.AnyAsync(x => x.DepartmentId == id);
+            if ((usedByTeachers || usedByTopics) && !force)
             {
-                message = "Кафедра використовується викладачами або темами занять. Для видалення потрібен параметр force=true."
-            });
+                return Conflict(new
+                {
+                    message = "Кафедра використовується викладачами або темами занять. Для видалення потрібен параметр force=true."
+                });
+            }
+            if (force)
+            {
+                await db.Teachers
+                    .Where(x => x.DepartmentId == id)
+                    .ExecuteUpdateAsync(s => s.SetProperty(x => x.DepartmentId, (int?)null));
+                await db.ModuleTopics
+                    .Where(x => x.DepartmentId == id)
+                    .ExecuteUpdateAsync(s => s.SetProperty(x => x.DepartmentId, (int?)null));
+            }
+            db.Departments.Remove(entity);
+            await db.SaveChangesAsync();
+            await tx.CommitAsync();
+            return NoContent();
         }
-        if (force)
+        catch
         {
-            await db.Teachers
-                .Where(x => x.DepartmentId == id)
-                .ExecuteUpdateAsync(s => s.SetProperty(x => x.DepartmentId, (int?)null));
-            await db.ModuleTopics
-                .Where(x => x.DepartmentId == id)
-                .ExecuteUpdateAsync(s => s.SetProperty(x => x.DepartmentId, (int?)null));
+            await tx.RollbackAsync(CancellationToken.None);
+            throw;
         }
-        db.Departments.Remove(entity);
-        await db.SaveChangesAsync();
-        return NoContent();
     }
 }

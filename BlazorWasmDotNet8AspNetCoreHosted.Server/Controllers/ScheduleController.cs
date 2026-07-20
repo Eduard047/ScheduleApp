@@ -37,18 +37,36 @@ public class ScheduleController : ControllerBase
         int ModuleId,
         int LessonTypeId
     );
+    private sealed record RescheduleEventSnapshot(
+        DateOnly Date,
+        TimeOnly Start,
+        TimeOnly End,
+        int GroupId,
+        int ModuleId,
+        int LessonTypeId,
+        IReadOnlyList<RescheduleRowSnapshot> Rows);
+    private sealed record RescheduleRowSnapshot(
+        int SourceId,
+        int? ModuleTopicId,
+        int? TeacherId,
+        int? RoomId,
+        bool IsSelfStudy);
     private static bool TryParseClock(string value, out TimeOnly time)
         => TimeOnly.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out time);
 
     [HttpGet]
     // Повертає розклад за тиждень із фільтрами.
-    public async Task<IReadOnlyList<ScheduleItemDto>> Get(
+    public async Task<ActionResult<IReadOnlyList<ScheduleItemDto>>> Get(
         [FromQuery] DateOnly weekStart,
         [FromQuery] int? courseId,
         [FromQuery] int? groupId,
         [FromQuery] int? teacherId,
         [FromQuery] int? roomId)
     {
+        if (!DateHelpers.IsSupportedScheduleDate(weekStart))
+        {
+            return BadRequest(new { message = DateHelpers.SupportedScheduleDateMessage });
+        }
         var weekEnd = weekStart.AddDays(7);
         var q = _db.ScheduleItems
             .AsNoTracking()
@@ -87,7 +105,7 @@ public class ScheduleController : ControllerBase
             })
             .ToListAsync();
         var uk = new CultureInfo("uk-UA");
-        return items.Select(item =>
+        return Ok(items.Select(item =>
         {
             var lessonTypeCode = (item.LessonTypeCode ?? string.Empty).ToUpperInvariant();
             var isBreak = string.Equals(lessonTypeCode, "BREAK", StringComparison.OrdinalIgnoreCase);
@@ -123,17 +141,26 @@ public class ScheduleController : ControllerBase
                 IsLocked: item.IsLocked,
                 LessonTypeCss: item.LessonTypeCss ?? (isBreak ? "brk" : null)
             );
-        }).ToList();
+        }).ToList());
     }
     [HttpPost("upsert")]
     // Створює або оновлює пару в розкладі з перевіркою правил.
     public async Task<ActionResult<int>> Upsert([FromBody] UpsertScheduleItemRequest r)
     {
+        if (!DateHelpers.IsSupportedScheduleDate(r.Date))
+        {
+            return BadRequest(new { message = DateHelpers.SupportedScheduleDateMessage });
+        }
+        if (r.Id is int existingId && existingId > 0)
+        {
+            return await UpdateLogicalEventAsync(r, existingId);
+        }
+
         var (errors, warnings) = await _rules.ValidateUpsertAsync(r);
-        if (errors.Count > 0) return Conflict(new { message = "Validation failed", errors, warnings });
+        if (errors.Count > 0) return Conflict(new { message = "Перевірка правил не пройдена.", errors, warnings });
         await using var tx = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         var lt = await _db.LessonTypes.FindAsync(r.LessonTypeId);
-        if (lt is null) return BadRequest(new { message = "LessonType not found" });
+        if (lt is null) return BadRequest(new { message = "Тип заняття не знайдено." });
         var ltCode = lt.Code ?? string.Empty;
         var normalizedRoomId = lt.RequiresRoom ? r.RoomId : null;
         if ((string.Equals(ltCode, "CANCELED", StringComparison.OrdinalIgnoreCase) || string.Equals(ltCode, "RESCHEDULED", StringComparison.OrdinalIgnoreCase)) && r.RoomId is int keepRoomId)
@@ -144,71 +171,215 @@ public class ScheduleController : ControllerBase
         {
             return BadRequest(new { message = "Некоректний формат часу. Використовуйте формат HH:mm." });
         }
-        if (r.Id is int id && id > 0)
-        {
-            var item = await _db.ScheduleItems.FirstOrDefaultAsync(x => x.Id == id);
-            if (item is null) return NotFound(new { message = $"ScheduleItem {id} not found" });
-            if (item.IsLocked) return Conflict(new { message = "Запис розкладу заблоковано. Зміна заблокованих записів через API заборонена." });
-            var previousLessonTypeId = item.LessonTypeId;
-            var previousRoomId = item.RoomId;
-            var previousLessonType = await _db.LessonTypes.AsNoTracking().FirstOrDefaultAsync(t => t.Id == previousLessonTypeId);
-            var previousRequiresRoom = previousLessonType?.RequiresRoom ?? true;
-            var oldGroupId = item.GroupId;
-            var oldModuleId = item.ModuleId;
-            var oldTeacherId = item.TeacherId;
-            var oldCourseId = await _db.Groups.Where(g => g.Id == oldGroupId).Select(g => g.CourseId).FirstAsync();
-            ApplyScheduleRequest(item, r, start, end, normalizedRoomId);
-            var recheck = await _rules.ValidateUpsertAsync(new UpsertScheduleItemRequest(
-                item.Id, item.Date, item.StartTime.ToString("HH:mm"), item.EndTime.ToString("HH:mm"),
-                item.GroupId, item.ModuleId, item.TeacherId, item.RoomId, item.LessonTypeId, item.IsLocked, r.OverrideNonWorkingDay));
-            if (recheck.errors.Count > 0)
-                return Conflict(new { message = "Validation failed (recheck)", errors = recheck.errors, warnings = recheck.warnings });
-            await _db.SaveChangesAsync();
-            var isRescheduled = string.Equals(lt.Code, "RESCHEDULED", StringComparison.OrdinalIgnoreCase);
-            if (isRescheduled && previousLessonTypeId != r.LessonTypeId)
-            {
-                await TryCreateRescheduledCopyAsync(item, previousLessonTypeId, start, end, previousRoomId, previousRequiresRoom);
-            }
-            var newCourseId = await _db.Groups.Where(g => g.Id == r.GroupId).Select(g => g.CourseId).FirstAsync();
-            await _aggregates.RecalcAsync(
-                plans: new[] { (newCourseId, r.ModuleId) },
-                loads: new[]
-                {
-                    (oldTeacherId is int t1) ? (t1, oldCourseId) : default,
-                    (r.TeacherId  is int t2) ? (t2, newCourseId) : default
-                }.Where(x => x != default)!);
-            await tx.CommitAsync();
-            return Ok(item.Id);
-        }
-        else
-        {
-            var item = new ScheduleItem();
-            ApplyScheduleRequest(item, r, start, end, normalizedRoomId);
-            _db.ScheduleItems.Add(item);
-            var recheck = await _rules.ValidateUpsertAsync(new UpsertScheduleItemRequest(
-                r.Id,
-                r.Date,
-                r.TimeStart,
-                r.TimeEnd,
-                r.GroupId,
-                r.ModuleId,
-                r.TeacherId,
-                normalizedRoomId,
-                r.LessonTypeId,
-                r.IsLocked,
-                r.OverrideNonWorkingDay));
-            if (recheck.errors.Count > 0)
-                return Conflict(new { message = "Validation failed (recheck)", errors = recheck.errors, warnings = recheck.warnings });
-            await _db.SaveChangesAsync();
-            var courseId = await _db.Groups.Where(g => g.Id == r.GroupId).Select(g => g.CourseId).FirstAsync();
-            await _aggregates.RecalcAsync(
-                plans: new[] { (courseId, r.ModuleId) },
-                loads: (r.TeacherId is int t) ? new[] { (t, courseId) } : null
-            );
-            await tx.CommitAsync();
-            return Ok(item.Id);
-        }
+        var item = new ScheduleItem();
+        ApplyScheduleRequest(item, r, start, end, normalizedRoomId);
+        _db.ScheduleItems.Add(item);
+        var recheck = await _rules.ValidateUpsertAsync(new UpsertScheduleItemRequest(
+            r.Id,
+            r.Date,
+            r.TimeStart,
+            r.TimeEnd,
+            r.GroupId,
+            r.ModuleId,
+            r.TeacherId,
+            normalizedRoomId,
+            r.LessonTypeId,
+            r.IsLocked,
+            r.OverrideNonWorkingDay));
+        if (recheck.errors.Count > 0)
+            return Conflict(new { message = "Повторна перевірка правил не пройдена.", errors = recheck.errors, warnings = recheck.warnings });
+        await _db.SaveChangesAsync();
+        var courseId = await _db.Groups.Where(g => g.Id == r.GroupId).Select(g => g.CourseId).FirstAsync();
+        await _aggregates.RecalcAsync(
+            plans: new[] { (courseId, r.ModuleId) },
+            loads: (r.TeacherId is int t) ? new[] { (t, courseId) } : null
+        );
+        await tx.CommitAsync();
+        return Ok(item.Id);
     }
+
+    // Атомарно оновлює всі рядки одного опублікованого логічного заняття.
+    private async Task<ActionResult<int>> UpdateLogicalEventAsync(UpsertScheduleItemRequest request, int sourceId)
+    {
+        if (!TryParseClock(request.TimeStart, out var start) || !TryParseClock(request.TimeEnd, out var end))
+        {
+            return BadRequest(new { message = "Некоректний формат часу. Використовуйте формат HH:mm." });
+        }
+
+        await using var tx = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
+        var lessonType = await _db.LessonTypes.FindAsync(request.LessonTypeId);
+        if (lessonType is null)
+        {
+            return BadRequest(new { message = "Тип заняття не знайдено." });
+        }
+
+        var source = await _db.ScheduleItems.FirstOrDefaultAsync(item => item.Id == sourceId);
+        if (source is null)
+        {
+            return NotFound(new { message = $"Запис розкладу #{sourceId} не знайдено." });
+        }
+
+        var logicalEventRows = await LoadLogicalEventRowsAsync(source);
+        if (logicalEventRows.Any(item => item.IsLocked))
+        {
+            return Conflict(new { message = "Логічне заняття містить заблоковані рядки. Часткову зміну заборонено." });
+        }
+        if (logicalEventRows
+            .Select(item => item.IsSelfStudy)
+            .Distinct()
+            .Skip(1)
+            .Any())
+        {
+            return Conflict(new
+            {
+                message = "Логічне заняття має неузгоджений режим самостійної роботи. Виправте дані перед оновленням."
+            });
+        }
+
+        var sourceTeacherId = source.TeacherId;
+        var previousLessonTypeId = source.LessonTypeId;
+        var previousLessonType = await _db.LessonTypes
+            .AsNoTracking()
+            .FirstOrDefaultAsync(item => item.Id == previousLessonTypeId);
+        var previousRequiresRoom = previousLessonType?.RequiresRoom ?? true;
+        var rescheduleSnapshot = new RescheduleEventSnapshot(
+            source.Date,
+            source.StartTime,
+            source.EndTime,
+            source.GroupId,
+            source.ModuleId,
+            previousLessonTypeId,
+            logicalEventRows
+                .Select(item => new RescheduleRowSnapshot(
+                    item.Id,
+                    item.ModuleTopicId,
+                    item.TeacherId,
+                    item.RoomId,
+                    item.IsSelfStudy))
+                .ToList());
+        var oldCourseId = await _db.Groups
+            .Where(group => group.Id == source.GroupId)
+            .Select(group => group.CourseId)
+            .FirstAsync();
+        var oldModuleId = source.ModuleId;
+        var oldTeacherIds = logicalEventRows
+            .Where(item => item.TeacherId is not null)
+            .Select(item => item.TeacherId!.Value)
+            .Distinct()
+            .ToList();
+        var scopeIds = logicalEventRows.Select(item => item.Id).ToList();
+        var normalizedRoomId = NormalizeRoomId(lessonType, request.RoomId);
+        var projectedRequests = logicalEventRows
+            .Select(item => request with
+            {
+                Id = item.Id,
+                TeacherId = item.TeacherId == sourceTeacherId ? request.TeacherId : item.TeacherId,
+                RoomId = normalizedRoomId
+            })
+            .ToList();
+        var errors = new List<string>();
+        var warnings = new List<string>();
+        foreach (var projectedRequest in projectedRequests)
+        {
+            var validation = await _rules.ValidateUpsertAsync(projectedRequest, scopeIds);
+            errors.AddRange(validation.errors.Select(error => $"[#{projectedRequest.Id}] {error}"));
+            warnings.AddRange(validation.warnings.Select(warning => $"[#{projectedRequest.Id}] {warning}"));
+        }
+        if (errors.Count > 0)
+        {
+            await tx.RollbackAsync();
+            return Conflict(new
+            {
+                message = "Перевірка правил не пройдена.",
+                errors = errors.Distinct(StringComparer.Ordinal).ToList(),
+                warnings = warnings.Distinct(StringComparer.Ordinal).ToList()
+            });
+        }
+
+        var resolvedBatchKey = !string.IsNullOrWhiteSpace(source.BatchKey)
+            ? source.BatchKey
+            : logicalEventRows.Count > 1
+                ? CreateSafeBatchKey("official")
+                : null;
+        for (var index = 0; index < logicalEventRows.Count; index++)
+        {
+            ApplyScheduleRequest(logicalEventRows[index], projectedRequests[index], start, end, normalizedRoomId);
+            logicalEventRows[index].BatchKey = resolvedBatchKey;
+        }
+        await _db.SaveChangesAsync();
+
+        var isRescheduled = string.Equals(lessonType.Code, "RESCHEDULED", StringComparison.OrdinalIgnoreCase);
+        if (isRescheduled && previousLessonTypeId != request.LessonTypeId)
+        {
+            await TryCreateRescheduledCopiesAsync(rescheduleSnapshot, previousRequiresRoom);
+        }
+
+        var newCourseId = await _db.Groups
+            .Where(group => group.Id == request.GroupId)
+            .Select(group => group.CourseId)
+            .FirstAsync();
+        var newTeacherIds = logicalEventRows
+            .Where(item => item.TeacherId is not null)
+            .Select(item => item.TeacherId!.Value)
+            .Distinct();
+        await _aggregates.RecalcAsync(
+            plans: new[]
+            {
+                (oldCourseId, oldModuleId),
+                (newCourseId, request.ModuleId)
+            }.Distinct(),
+            loads: oldTeacherIds
+                .Select(teacherId => (teacherId, oldCourseId))
+                .Concat(newTeacherIds.Select(teacherId => (teacherId, newCourseId)))
+                .Distinct());
+        await tx.CommitAsync();
+        return Ok(source.Id);
+    }
+
+    private static int? NormalizeRoomId(LessonTypeRef lessonType, int? roomId)
+    {
+        var code = lessonType.Code ?? string.Empty;
+        var preservesServiceRoom = string.Equals(code, "CANCELED", StringComparison.OrdinalIgnoreCase)
+                                   || string.Equals(code, "RESCHEDULED", StringComparison.OrdinalIgnoreCase);
+        return lessonType.RequiresRoom || preservesServiceRoom ? roomId : null;
+    }
+
+    // Для нових даних визначає подію за BatchKey і сигнатурою, а для legacy-рядків застосовує консервативну евристику.
+    private async Task<List<ScheduleItem>> LoadLogicalEventRowsAsync(ScheduleItem source)
+    {
+        var signatureQuery = _db.ScheduleItems
+            .Where(item => item.Date == source.Date
+                           && item.StartTime == source.StartTime
+                           && item.EndTime == source.EndTime
+                           && item.GroupId == source.GroupId
+                           && item.ModuleId == source.ModuleId
+                           && item.LessonTypeId == source.LessonTypeId);
+        if (!string.IsNullOrWhiteSpace(source.BatchKey))
+        {
+            return await signatureQuery
+                .Where(item => item.BatchKey == source.BatchKey)
+                .OrderBy(item => item.Id)
+                .ToListAsync();
+        }
+
+        var signatureRows = await signatureQuery
+            .OrderBy(item => item.Id)
+            .ToListAsync();
+        var legacyRows = signatureRows
+            .Where(item => string.IsNullOrWhiteSpace(item.BatchKey))
+            .ToList();
+        var hasRepresentationalSiblings = legacyRows
+            .Select(item => new { item.ModuleTopicId, item.TeacherId })
+            .Distinct()
+            .Skip(1)
+            .Any();
+        return hasRepresentationalSiblings
+            ? legacyRows
+            : legacyRows.Where(item => item.Id == source.Id).ToList();
+    }
+
+    private static string CreateSafeBatchKey(string prefix)
+        => $"{prefix}:{Guid.NewGuid():N}";
     // Переносить дані запиту в доменний об'єкт.
     private static void ApplyScheduleRequest(ScheduleItem item, UpsertScheduleItemRequest request, TimeOnly start, TimeOnly end, int? normalizedRoomId)
     {
@@ -223,49 +394,56 @@ public class ScheduleController : ControllerBase
         item.LessonTypeId = request.LessonTypeId;
         item.IsLocked = request.IsLocked;
     }
-    // Створює чернетку для перенесеної пари, якщо це можливо.
-    private async Task TryCreateRescheduledCopyAsync(
-        ScheduleItem source,
-        int previousLessonTypeId,
-        TimeOnly originalStart,
-        TimeOnly originalEnd,
-        int? previousRoomId,
+    // Створює всі чернеткові рядки перенесеної логічної події одним атомарним пакетом.
+    private async Task TryCreateRescheduledCopiesAsync(
+        RescheduleEventSnapshot snapshot,
         bool previousRequiresRoom)
     {
-        var prevType = await _db.LessonTypes.FindAsync(previousLessonTypeId);
-        if (prevType is null) return;
-        var requiresRoom = previousRequiresRoom || prevType.RequiresRoom;
-        var normalizedRoomId = requiresRoom ? (previousRoomId ?? source.RoomId) : null;
-        var groupInfo = await _db.Groups
-            .Where(g => g.Id == source.GroupId)
-            .Select(g => new { g.CourseId })
+        var previousLessonType = await _db.LessonTypes.FindAsync(snapshot.LessonTypeId);
+        if (previousLessonType is null || snapshot.Rows.Count == 0)
+        {
+            return;
+        }
+
+        var requiresRoom = previousRequiresRoom || previousLessonType.RequiresRoom;
+        var courseId = await _db.Groups
+            .Where(group => group.Id == snapshot.GroupId)
+            .Select(group => (int?)group.CourseId)
             .FirstOrDefaultAsync();
-        if (groupInfo is null) return;
-        var nextWeekStart = DateHelpers.StartOfWeek(source.Date).AddDays(7);
-        var earliestAllowed = nextWeekStart.ToDateTime(originalStart);
+        if (courseId is null)
+        {
+            return;
+        }
+
+        var nextWeekStart = DateHelpers.StartOfWeek(snapshot.Date).AddDays(7);
+        if (!DateHelpers.IsSupportedScheduleDate(nextWeekStart))
+        {
+            return;
+        }
+        var earliestAllowed = nextWeekStart.ToDateTime(snapshot.Start);
         var sequenceItems = await _db.ModuleSequenceItems
-            .Where(x => x.CourseId == groupInfo.CourseId)
-            .OrderBy(x => x.Order)
-            .Select(x => new { x.ModuleId, x.Order, x.GroupOrder })
+            .Where(item => item.CourseId == courseId.Value)
+            .OrderBy(item => item.Order)
+            .Select(item => new { item.ModuleId, item.Order, item.GroupOrder })
             .ToListAsync();
-        var currentSequence = sequenceItems.FirstOrDefault(x => x.ModuleId == source.ModuleId);
+        var currentSequence = sequenceItems.FirstOrDefault(item => item.ModuleId == snapshot.ModuleId);
         if (currentSequence is not null)
         {
-            var predecessors = sequenceItems
-                .Where(x => x.GroupOrder < currentSequence.GroupOrder)
-                .Select(x => x.ModuleId)
+            var predecessorIds = sequenceItems
+                .Where(item => item.GroupOrder < currentSequence.GroupOrder)
+                .Select(item => item.ModuleId)
                 .Distinct()
                 .ToList();
-            if (predecessors.Count > 0)
+            if (predecessorIds.Count > 0)
             {
                 var predecessorItems = await _db.ScheduleItems
-                    .Where(x => x.GroupId == source.GroupId && predecessors.Contains(x.ModuleId))
-                    .Select(x => new { x.Date, x.EndTime })
+                    .Where(item => item.GroupId == snapshot.GroupId && predecessorIds.Contains(item.ModuleId))
+                    .Select(item => new { item.Date, item.EndTime })
                     .ToListAsync();
                 if (predecessorItems.Count > 0)
                 {
                     var predecessorMax = predecessorItems
-                        .Select(x => x.Date.ToDateTime(x.EndTime))
+                        .Select(item => item.Date.ToDateTime(item.EndTime))
                         .Max()
                         .AddMinutes(1);
                     if (predecessorMax > earliestAllowed)
@@ -275,86 +453,99 @@ public class ScheduleController : ControllerBase
                 }
             }
         }
-        const int daySearchHorizon = 7; 
-        for (int offset = 0; offset < daySearchHorizon; offset++)
+
+        var batchKey = $"rescheduled:{snapshot.Rows.Min(row => row.SourceId)}:{snapshot.LessonTypeId}";
+        var packageAlreadyExists = await _db.TeacherDraftItems
+            .AnyAsync(item => item.BatchKey == batchKey)
+            || await _db.ScheduleItems.AnyAsync(item => item.BatchKey == batchKey);
+        if (packageAlreadyExists)
         {
-            var candidate = nextWeekStart.AddDays(offset);
-            var dayOfWeek = candidate.ToDateTime(TimeOnly.MinValue).DayOfWeek;
-            var resolvedSlots = await TimeSlotsResolver.ResolveForDayAsync(_db, groupInfo.CourseId, dayOfWeek);
-            var candidateSlots = new List<(TimeOnly Start, TimeOnly End)> { (originalStart, originalEnd) };
+            return;
+        }
+
+        const int daySearchHorizon = 7;
+        for (var offset = 0; offset < daySearchHorizon; offset++)
+        {
+            var candidateDate = nextWeekStart.AddDays(offset);
+            var resolvedSlots = await TimeSlotsResolver.ResolveForDayAsync(
+                _db,
+                courseId.Value,
+                candidateDate.DayOfWeek);
+            var candidateSlots = new List<(TimeOnly Start, TimeOnly End)> { (snapshot.Start, snapshot.End) };
             foreach (var slot in resolvedSlots.Slots)
             {
-                if (slot.Start == originalStart && slot.End == originalEnd) continue;
-                if (candidateSlots.Contains((slot.Start, slot.End))) continue;
-                candidateSlots.Add((slot.Start, slot.End));
+                if (!candidateSlots.Contains((slot.Start, slot.End)))
+                {
+                    candidateSlots.Add((slot.Start, slot.End));
+                }
             }
-            if (candidateSlots.Count == 0)
-            {
-                candidateSlots.Add((originalStart, originalEnd));
-            }
+
             foreach (var (slotStart, slotEnd) in candidateSlots)
             {
-                var candidateMoment = candidate.ToDateTime(slotStart);
-                if (candidateMoment < earliestAllowed) continue;
-                var batchKey = $"rescheduled:{source.Id}:{previousLessonTypeId}";
-                var draftRequest = new DraftUpsertRequest(
-                    Id: null,
-                    Date: candidate,
-                    TimeStart: slotStart.ToString("HH:mm"),
-                    TimeEnd: slotEnd.ToString("HH:mm"),
-                    GroupId: source.GroupId,
-                    ModuleId: source.ModuleId,
-                    ModuleTopicId: source.ModuleTopicId,
-                    TeacherId: source.TeacherId,
-                    RoomId: normalizedRoomId,
-                    RequiresRoom: requiresRoom,
-                    LessonTypeId: previousLessonTypeId,
-                    OverrideNonWorkingDay: false,
-                    BatchKey: batchKey,
-                    IsLocked: false,
-                    IgnoreValidationErrors: false
-                );
-                var validation = await _rules.ValidateDraftAsync(draftRequest);
-                if (validation.Errors.Count > 0) continue;
-                var exists = await _db.ScheduleItems.AnyAsync(x =>
-                    x.Date == candidate
-                    && x.StartTime == slotStart
-                    && x.EndTime == slotEnd
-                    && x.GroupId == source.GroupId
-                    && x.ModuleId == source.ModuleId
-                    && x.RoomId == normalizedRoomId
-                    && x.TeacherId == source.TeacherId
-                    && x.LessonTypeId == previousLessonTypeId);
-                if (exists) continue;
-                var existsDraft = await _db.TeacherDraftItems.AnyAsync(x =>
-                    x.Date == candidate
-                    && x.StartTime == slotStart
-                    && x.EndTime == slotEnd
-                    && x.GroupId == source.GroupId
-                    && x.ModuleId == source.ModuleId
-                    && x.RoomId == normalizedRoomId
-                    && x.TeacherId == source.TeacherId);
-                if (existsDraft) continue;
-                var newDraft = new TeacherDraftItem
+                if (candidateDate.ToDateTime(slotStart) < earliestAllowed)
                 {
-                    Date = candidate,
-                    DayOfWeek = candidate.ToDateTime(TimeOnly.MinValue).DayOfWeek,
+                    continue;
+                }
+
+                var requests = snapshot.Rows
+                    .Select(row => new DraftUpsertRequest(
+                        Id: null,
+                        Date: candidateDate,
+                        TimeStart: slotStart.ToString("HH:mm"),
+                        TimeEnd: slotEnd.ToString("HH:mm"),
+                        GroupId: snapshot.GroupId,
+                        ModuleId: snapshot.ModuleId,
+                        ModuleTopicId: row.ModuleTopicId,
+                        TeacherId: row.TeacherId,
+                        RoomId: requiresRoom ? row.RoomId : null,
+                        RequiresRoom: requiresRoom,
+                        LessonTypeId: snapshot.LessonTypeId,
+                        OverrideNonWorkingDay: false,
+                        BatchKey: batchKey,
+                        IsLocked: false,
+                        IgnoreValidationErrors: false,
+                        IsSelfStudy: row.IsSelfStudy))
+                    .ToList();
+                var isValidPackage = true;
+                foreach (var draftRequest in requests)
+                {
+                    var validation = await _rules.ValidateDraftAsync(draftRequest);
+                    if (validation.Errors.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    isValidPackage = false;
+                    break;
+                }
+                if (!isValidPackage)
+                {
+                    continue;
+                }
+
+                var now = DateTime.UtcNow;
+                var drafts = requests.Select(request => new TeacherDraftItem
+                {
+                    Date = request.Date,
+                    DayOfWeek = request.Date.DayOfWeek,
                     StartTime = slotStart,
                     EndTime = slotEnd,
-                    GroupId = source.GroupId,
-                    ModuleId = source.ModuleId,
-                    TeacherId = source.TeacherId,
-                    RoomId = normalizedRoomId,
-                    LessonTypeId = previousLessonTypeId,
+                    GroupId = request.GroupId,
+                    ModuleId = request.ModuleId,
+                    ModuleTopicId = request.ModuleTopicId,
+                    TeacherId = request.TeacherId,
+                    RoomId = request.RoomId,
+                    LessonTypeId = request.LessonTypeId,
                     Status = DraftStatus.Draft,
                     PublishedItemId = null,
                     BatchKey = batchKey,
                     ValidationWarnings = null,
-                    CreatedAt = DateTime.UtcNow,
-                    UpdatedAt = DateTime.UtcNow,
-                    IsLocked = true 
-                };
-                _db.TeacherDraftItems.Add(newDraft);
+                    CreatedAt = now,
+                    UpdatedAt = now,
+                    IsLocked = true,
+                    IsSelfStudy = request.IsSelfStudy
+                }).ToList();
+                _db.TeacherDraftItems.AddRange(drafts);
                 await _db.SaveChangesAsync();
                 return;
             }
@@ -365,29 +556,49 @@ public class ScheduleController : ControllerBase
     // Видаляє пару та перераховує агрегати.
     public async Task<IActionResult> Delete(int id)
     {
-        var info = await _db.ScheduleItems
-            .AsNoTracking()
-            .Where(x => x.Id == id)
-            .Select(x => new { x.GroupId, x.ModuleId, x.TeacherId, x.IsLocked, CourseId = x.Group.CourseId })
-            .FirstOrDefaultAsync();
-        if (info is null)
-            return NotFound(new { message = $"ScheduleItem {id} not found" });
-        if (info.IsLocked) return Conflict(new { message = "Запис розкладу заблоковано. Видалення заблокованих записів через API заборонено." });
-        await _db.ScheduleItems.Where(x => x.Id == id).ExecuteDeleteAsync();
+        await using var tx = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
+        var source = await _db.ScheduleItems.FirstOrDefaultAsync(item => item.Id == id);
+        if (source is null)
+            return NotFound(new { message = $"Запис розкладу #{id} не знайдено." });
+        var logicalEventRows = await LoadLogicalEventRowsAsync(source);
+        if (logicalEventRows.Any(item => item.IsLocked))
+        {
+            return Conflict(new { message = "Логічне заняття містить заблоковані рядки. Часткове видалення заборонено." });
+        }
+
+        var courseId = await _db.Groups
+            .Where(group => group.Id == source.GroupId)
+            .Select(group => group.CourseId)
+            .FirstAsync();
+        var moduleId = source.ModuleId;
+        var teacherIds = logicalEventRows
+            .Where(item => item.TeacherId is not null)
+            .Select(item => item.TeacherId!.Value)
+            .Distinct()
+            .ToList();
+        var ids = logicalEventRows.Select(item => item.Id).ToList();
+        await _db.ScheduleItems.Where(item => ids.Contains(item.Id)).ExecuteDeleteAsync();
         await _aggregates.RecalcAsync(
-            plans: new[] { (info.CourseId, info.ModuleId) },
-            loads: (info.TeacherId is int t) ? new[] { (t, info.CourseId) } : null
+            plans: new[] { (courseId, moduleId) },
+            loads: teacherIds.Select(teacherId => (teacherId, courseId))
         );
+        await tx.CommitAsync();
         return NoContent();
     }
     [HttpPost("clear")]
+    [RequireDeletionConfirmation("незаблоковані записи розкладу за тиждень")]
     // Очищає розклад за тиждень із перерахунком агрегатів.
     public async Task<ActionResult<ClearWeekResult>> ClearWeek([FromBody] ClearWeekRequest r)
     {
+        if (!DateHelpers.IsSupportedScheduleDate(r.WeekStart))
+        {
+            return BadRequest(new { message = DateHelpers.SupportedScheduleDateMessage });
+        }
         if (r.CourseId is null && r.GroupId is null)
         {
             return BadRequest(new { message = "Для очищення тижня потрібно вказати курс або групу." });
         }
+        await using var tx = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         var start = r.WeekStart;
         var end = start.AddDays(7);
         var q = _db.ScheduleItems.Where(x => x.Date >= start && x.Date < end && !x.IsLocked);
@@ -406,6 +617,7 @@ public class ScheduleController : ControllerBase
             plans: affectedPlans.Select(a => (a.CourseId, a.ModuleId)),
             loads: affectedLoads.Select(a => (a.TeacherId!.Value, a.CourseId))
         );
+        await tx.CommitAsync();
         return Ok(new ClearWeekResult(deleted));
     }
 

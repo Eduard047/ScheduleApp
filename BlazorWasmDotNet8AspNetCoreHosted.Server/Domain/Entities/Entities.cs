@@ -214,6 +214,7 @@ public class ScheduleItem
     public Teacher? Teacher { get; set; }
     public int? RoomId { get; set; }
     public Room? Room { get; set; }
+    public string? BatchKey { get; set; }
     public bool IsLocked { get; set; } = false;
     public bool IsSelfStudy { get; set; } = false;
 }

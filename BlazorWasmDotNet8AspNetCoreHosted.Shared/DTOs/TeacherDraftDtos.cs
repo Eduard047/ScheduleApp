@@ -59,6 +59,44 @@ public record DraftUpsertRequest(
     bool IsSelfStudy = false
 );
 
+// DTO атомарного пакета створення або оновлення чернеток.
+public record TeacherDraftBatchUpsertRequest(
+    List<DraftUpsertRequest> Items,
+    bool Unrestricted = false
+);
+
+// Результат атомарного пакета створення або оновлення чернеток.
+public record TeacherDraftBatchUpsertResult(
+    List<int> Ids,
+    int Processed
+);
+
+// DTO атомарного пакета видалення чернеток.
+public record TeacherDraftBatchDeleteRequest(
+    List<int> Ids,
+    bool Unrestricted = false
+);
+
+// Результат атомарного пакета видалення чернеток.
+public record TeacherDraftBatchDeleteResult(
+    int Deleted
+);
+
+// DTO єдиної атомарної операції зі створенням, оновленням і видаленням чернеток.
+public record TeacherDraftBatchMutationRequest(
+    List<DraftUpsertRequest> Upserts,
+    List<int> DeleteIds,
+    bool Confirm = false,
+    bool Unrestricted = false
+);
+
+// Результат єдиної атомарної зміни пакета чернеток.
+public record TeacherDraftBatchMutationResult(
+    List<int> UpsertedIds,
+    int Upserted,
+    int Deleted
+);
+
 // DTO для опису проблеми валідації.
 public record DraftValidationIssueDto(
     string Severity,
