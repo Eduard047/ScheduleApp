@@ -309,3 +309,307 @@ public sealed class DeterministicResourceMatcherTests
         Assert.Equal(1, fallbackCount);
     }
 }
+
+public sealed class DeterministicResidualOptimizerTests
+{
+    [Fact]
+    public void Optimize_preserves_scarce_resource_for_the_only_compatible_gap()
+    {
+        var candidates = new[]
+        {
+            new ResidualPlacementCandidate(1, 10, 100, 0),
+            new ResidualPlacementCandidate(2, 10, 200, 1),
+            new ResidualPlacementCandidate(3, 20, 100, 0)
+        };
+        var capacities = new Dictionary<int, int>
+        {
+            [100] = 1,
+            [200] = 1
+        };
+
+        var result = DeterministicResidualOptimizer.Optimize(
+            candidates,
+            capacities,
+            2,
+            10_000,
+            TimeSpan.FromSeconds(5));
+
+        Assert.False(result.SearchLimitReached);
+        Assert.Equal(2, result.FilledGapCount);
+        Assert.Collection(
+            result.Placements,
+            placement =>
+            {
+                Assert.Equal(10, placement.GapId);
+                Assert.Equal(200, placement.ResourceId);
+            },
+            placement =>
+            {
+                Assert.Equal(20, placement.GapId);
+                Assert.Equal(100, placement.ResourceId);
+            });
+    }
+
+    [Fact]
+    public void Optimize_minimizes_cost_after_maximizing_filled_gaps()
+    {
+        var candidates = new[]
+        {
+            new ResidualPlacementCandidate(1, 10, 100, 9),
+            new ResidualPlacementCandidate(2, 10, 200, 1),
+            new ResidualPlacementCandidate(3, 20, 100, 1),
+            new ResidualPlacementCandidate(4, 20, 200, 8)
+        };
+        var capacities = new Dictionary<int, int>
+        {
+            [100] = 1,
+            [200] = 1
+        };
+
+        var result = DeterministicResidualOptimizer.Optimize(
+            candidates,
+            capacities,
+            2,
+            10_000,
+            TimeSpan.FromSeconds(5));
+
+        Assert.False(result.SearchLimitReached);
+        Assert.Equal(2, result.TotalCost);
+        Assert.Equal(new[] { 2, 3 }, result.Placements.Select(placement => placement.CandidateId));
+    }
+
+    [Fact]
+    public void Optimize_returns_identical_plan_for_shuffled_input()
+    {
+        var candidates = new[]
+        {
+            new ResidualPlacementCandidate(30, 30, 300, 1),
+            new ResidualPlacementCandidate(11, 10, 100, 1),
+            new ResidualPlacementCandidate(21, 20, 200, 1),
+            new ResidualPlacementCandidate(10, 10, 200, 1),
+            new ResidualPlacementCandidate(20, 20, 300, 1),
+            new ResidualPlacementCandidate(31, 30, 100, 1)
+        };
+        var capacities = new Dictionary<int, int>
+        {
+            [100] = 1,
+            [200] = 1,
+            [300] = 1
+        };
+
+        var first = DeterministicResidualOptimizer.Optimize(
+            candidates,
+            capacities,
+            3,
+            10_000,
+            TimeSpan.FromSeconds(5));
+        var second = DeterministicResidualOptimizer.Optimize(
+            candidates.Reverse(),
+            capacities.Reverse().ToDictionary(entry => entry.Key, entry => entry.Value),
+            3,
+            10_000,
+            TimeSpan.FromSeconds(5));
+
+        Assert.False(first.SearchLimitReached);
+        Assert.False(second.SearchLimitReached);
+        Assert.Equal(first.Placements, second.Placements);
+    }
+
+    [Fact]
+    public void Optimize_reports_node_limit_and_keeps_deterministic_warm_start()
+    {
+        var candidates = new[]
+        {
+            new ResidualPlacementCandidate(1, 10, 100, 0),
+            new ResidualPlacementCandidate(2, 10, 200, 0),
+            new ResidualPlacementCandidate(3, 20, 100, 0),
+            new ResidualPlacementCandidate(4, 20, 200, 0)
+        };
+        var capacities = new Dictionary<int, int>
+        {
+            [100] = 1,
+            [200] = 1
+        };
+
+        var first = DeterministicResidualOptimizer.Optimize(
+            candidates,
+            capacities,
+            2,
+            1,
+            TimeSpan.FromSeconds(5));
+        var second = DeterministicResidualOptimizer.Optimize(
+            candidates.Reverse(),
+            capacities,
+            2,
+            1,
+            TimeSpan.FromSeconds(5));
+
+        Assert.True(first.NodeLimitReached);
+        Assert.False(first.EmergencyLimitReached);
+        Assert.Equal(2, first.FilledGapCount);
+        Assert.Equal(first.Placements, second.Placements);
+    }
+
+    [Fact]
+    public void Optimize_consumes_one_shared_budget_across_invocations()
+    {
+        var candidates = new[]
+        {
+            new ResidualPlacementCandidate(1, 10, 100, 0)
+        };
+        var capacities = new Dictionary<int, int>
+        {
+            [100] = 1
+        };
+        var budget = new DeterministicSearchBudget(3, TimeSpan.FromSeconds(5));
+
+        var first = DeterministicResidualOptimizer.Optimize(
+            candidates,
+            capacities,
+            1,
+            budget);
+        var second = DeterministicResidualOptimizer.Optimize(
+            candidates,
+            capacities,
+            1,
+            budget);
+
+        Assert.False(first.SearchLimitReached);
+        Assert.Equal(3, first.VisitedNodes);
+        Assert.True(second.NodeLimitReached);
+        Assert.Equal(0, second.VisitedNodes);
+        Assert.Equal(3, budget.VisitedNodes);
+    }
+
+    [Fact]
+    public async Task TryApplyPlanAtomicallyAsync_commits_only_after_every_placement_improves_cardinality()
+    {
+        var placements = new[]
+        {
+            new ResidualPlacement(1, 10, 100, 0),
+            new ResidualPlacement(2, 20, 200, 0)
+        };
+        var filledGaps = new HashSet<int>();
+        var rollbackCalled = false;
+
+        var result = await DeterministicResidualOptimizer.TryApplyPlanAtomicallyAsync(
+            placements,
+            (placement, _) => Task.FromResult(filledGaps.Add(placement.GapId)),
+            () => filledGaps.Count,
+            () => rollbackCalled = true);
+
+        Assert.True(result.Committed);
+        Assert.Equal(2, result.AppliedPlacements);
+        Assert.Equal(0, result.CardinalityBefore);
+        Assert.Equal(2, result.CardinalityAfter);
+        Assert.False(rollbackCalled);
+        Assert.Equal(new[] { 10, 20 }, filledGaps.OrderBy(gapId => gapId));
+    }
+
+    [Fact]
+    public async Task TryApplyPlanAtomicallyAsync_rolls_back_partial_application()
+    {
+        var placements = new[]
+        {
+            new ResidualPlacement(1, 10, 100, 0),
+            new ResidualPlacement(2, 20, 200, 0)
+        };
+        var filledGaps = new List<int> { 5 };
+        var snapshot = filledGaps.ToArray();
+        var rollbackCalled = false;
+
+        var result = await DeterministicResidualOptimizer.TryApplyPlanAtomicallyAsync(
+            placements,
+            (placement, _) =>
+            {
+                if (placement.GapId == 20)
+                {
+                    return Task.FromResult(false);
+                }
+                filledGaps.Add(placement.GapId);
+                return Task.FromResult(true);
+            },
+            () => filledGaps.Count,
+            () =>
+            {
+                rollbackCalled = true;
+                filledGaps.Clear();
+                filledGaps.AddRange(snapshot);
+            });
+
+        Assert.False(result.Committed);
+        Assert.Equal(1, result.AppliedPlacements);
+        Assert.Equal(1, result.CardinalityBefore);
+        Assert.Equal(1, result.CardinalityAfter);
+        Assert.True(rollbackCalled);
+        Assert.Equal(snapshot, filledGaps);
+    }
+
+    [Fact]
+    public async Task TryApplyPlanAtomicallyAsync_rolls_back_when_success_does_not_improve_cardinality()
+    {
+        var placements = new[]
+        {
+            new ResidualPlacement(1, 10, 100, 0),
+            new ResidualPlacement(2, 20, 200, 0)
+        };
+        var cardinality = 1;
+        var rollbackCalled = false;
+
+        var result = await DeterministicResidualOptimizer.TryApplyPlanAtomicallyAsync(
+            placements,
+            (_, _) => Task.FromResult(true),
+            () => cardinality,
+            () => rollbackCalled = true);
+
+        Assert.False(result.Committed);
+        Assert.Equal(2, result.AppliedPlacements);
+        Assert.Equal(1, result.CardinalityBefore);
+        Assert.Equal(1, result.CardinalityAfter);
+        Assert.True(rollbackCalled);
+    }
+
+    [Fact]
+    public void Search_budget_stops_at_exact_deterministic_node_limit()
+    {
+        var budget = new DeterministicSearchBudget(2, TimeSpan.FromSeconds(5));
+
+        Assert.True(budget.TryVisitNode());
+        Assert.True(budget.TryVisitNode());
+        Assert.False(budget.TryVisitNode());
+        Assert.Equal(2, budget.VisitedNodes);
+        Assert.True(budget.NodeLimitReached);
+        Assert.False(budget.EmergencyLimitReached);
+    }
+
+    [Fact]
+    public void Search_budget_reports_emergency_timeout_separately()
+    {
+        var timeProvider = new ManualTimeProvider();
+        var budget = new DeterministicSearchBudget(
+            10,
+            TimeSpan.FromSeconds(1),
+            timeProvider);
+
+        Assert.True(budget.TryVisitNode());
+        timeProvider.Advance(TimeSpan.FromSeconds(2));
+
+        Assert.False(budget.TryVisitNode());
+        Assert.False(budget.NodeLimitReached);
+        Assert.True(budget.EmergencyLimitReached);
+        Assert.Equal(1, budget.VisitedNodes);
+    }
+
+    private sealed class ManualTimeProvider : TimeProvider
+    {
+        private long _timestamp;
+
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+        public override long GetTimestamp() => _timestamp;
+
+        public void Advance(TimeSpan value)
+        {
+            _timestamp += value.Ticks;
+        }
+    }
+}

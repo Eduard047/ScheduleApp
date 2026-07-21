@@ -61,7 +61,11 @@ public record AutoGenGapDetail(
     string SlotLabel,
     string? Reason,
     int? ModuleId = null,
-    string? ModuleName = null
+    string? ModuleName = null,
+    string? ReasonCode = null,
+    string? ConstraintCode = null,
+    bool SearchLimitReached = false,
+    Dictionary<string, string>? Diagnostics = null
 );
 
 // Результат автогенерації чернеток.

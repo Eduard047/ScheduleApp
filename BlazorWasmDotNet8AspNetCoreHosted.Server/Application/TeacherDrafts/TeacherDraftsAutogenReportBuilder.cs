@@ -11,7 +11,9 @@ internal static class TeacherDraftsAutogenReportBuilder
         IEnumerable<AutoGenGapDetail> gapDetails,
         IEnumerable<AutoGenPreflightItem> preflight)
     {
-        var gaps = gapDetails.ToList();
+        var gaps = gapDetails
+            .Select(AutoGenGapReasonClassifier.EnsureStructured)
+            .ToList();
         var preflightItems = MergePreflight(preflight);
         return new AutoGenResult(
             created,
@@ -24,9 +26,11 @@ internal static class TeacherDraftsAutogenReportBuilder
 
     public static AutoGenRunReport BuildReport(DateOnly fromDate, DateOnly toDate, int totalWeeks, AutoGenResult result)
     {
-        var gaps = result.GapDetails ?? new();
+        var gaps = (result.GapDetails ?? new())
+            .Select(AutoGenGapReasonClassifier.EnsureStructured)
+            .ToList();
         var preflight = result.Preflight ?? new();
-        var gapSummary = result.GapSummary ?? BuildGapSummary(gaps);
+        var gapSummary = BuildGapSummary(gaps);
         var worstGroups = gaps
             .GroupBy(gap => new { gap.GroupId, gap.GroupName })
             .OrderByDescending(group => group.Count())
@@ -77,7 +81,7 @@ internal static class TeacherDraftsAutogenReportBuilder
         var module = string.IsNullOrWhiteSpace(gap.ModuleName)
             ? gap.ModuleId is int moduleId ? $"модуль #{moduleId}" : "модуль не визначено"
             : CompactReportText(gap.ModuleName!, 80);
-        var reason = ClassifyGapReason(gap.Reason).Title.ToLowerInvariant();
+        var reason = AutoGenGapReasonClassifier.Classify(gap).Title.ToLowerInvariant();
         return $"{gap.Date:yyyy-MM-dd} {gap.SlotLabel}, {gap.GroupName}, {module}: {reason}";
     }
 
@@ -124,13 +128,14 @@ internal static class TeacherDraftsAutogenReportBuilder
         var exampleSuffix = string.IsNullOrWhiteSpace(example) ? string.Empty : $" Приклад: {example}";
         return item.Code switch
         {
-            "teacher" => $"{item.Count} слотів вперлися у викладачів. Перевірте прив'язку до модуля, робочі години та зайнятість.{exampleSuffix}",
-            "room" => $"{item.Count} слотів вперлися в аудиторії. Перевірте місткість, дозволені корпуси та зайнятість у потрібний час.{exampleSuffix}",
-            "travel" => $"{item.Count} слотів не стали через переходи між корпусами. Поставте сусідні пари ближче або збільшіть перерву.{exampleSuffix}",
-            "topic-order" => $"{item.Count} слотів заблокував порядок тем. Перевірте, чи попередні теми вже поставлені перед наступними.{exampleSuffix}",
-            "module-block" => $"{item.Count} слотів не стали через правило суцільного модуля. Тримайте пари одного модуля поруч у межах дня.{exampleSuffix}",
-            "limit" => $"{item.Count} слотів зупинили денні або слотні ліміти. Додайте навчальний час або зменште години в цьому діапазоні.{exampleSuffix}",
-            "shared-flow" => $"{item.Count} слотів пов'язані зі спільним потоком. Вирівняйте тему, викладача й аудиторію для груп потоку.{exampleSuffix}",
+            AutoGenGapReasonCodes.Teacher => $"{item.Count} слотів вперлися у викладачів. Перевірте прив'язку до модуля, робочі години та зайнятість.{exampleSuffix}",
+            AutoGenGapReasonCodes.Room => $"{item.Count} слотів вперлися в аудиторії. Перевірте місткість, дозволені корпуси та зайнятість у потрібний час.{exampleSuffix}",
+            AutoGenGapReasonCodes.Travel => $"{item.Count} слотів не стали через переходи між корпусами. Поставте сусідні пари ближче або збільшіть перерву.{exampleSuffix}",
+            AutoGenGapReasonCodes.TopicOrder => $"{item.Count} слотів заблокував порядок тем. Перевірте, чи попередні теми вже поставлені перед наступними.{exampleSuffix}",
+            AutoGenGapReasonCodes.ModuleBlock => $"{item.Count} слотів не стали через правило суцільного модуля. Тримайте пари одного модуля поруч у межах дня.{exampleSuffix}",
+            AutoGenGapReasonCodes.Limit => $"{item.Count} слотів зупинили денні або слотні ліміти. Додайте навчальний час або зменште години в цьому діапазоні.{exampleSuffix}",
+            AutoGenGapReasonCodes.SearchLimit => $"{item.Count} слотів лишилися після досягнення безпечної межі пошуку. Перевірте ресурси й повторіть генерацію після виправлення найвужчих обмежень.{exampleSuffix}",
+            AutoGenGapReasonCodes.SharedFlow => $"{item.Count} слотів пов'язані зі спільним потоком. Вирівняйте тему, викладача й аудиторію для груп потоку.{exampleSuffix}",
             _ => $"{item.Count} слотів треба перевірити вручну за групою, модулем і часом.{exampleSuffix}"
         };
     }
@@ -150,47 +155,9 @@ internal static class TeacherDraftsAutogenReportBuilder
         };
     }
 
-    private static (string Code, string Title) ClassifyGapReason(string? reason)
-    {
-        if (string.IsNullOrWhiteSpace(reason))
-        {
-            return ("unknown", "Причину не визначено");
-        }
-        var text = reason.ToLowerInvariant();
-        if (text.Contains("викладач", StringComparison.Ordinal))
-        {
-            return ("teacher", "Немає доступного викладача");
-        }
-        if (text.Contains("аудитор", StringComparison.Ordinal))
-        {
-            return ("room", "Немає доступної аудиторії");
-        }
-        if (text.Contains("перех", StringComparison.Ordinal) || text.Contains("корпус", StringComparison.Ordinal))
-        {
-            return ("travel", "Недостатньо часу на перехід");
-        }
-        if (text.Contains("тем", StringComparison.Ordinal) || text.Contains("хронолог", StringComparison.Ordinal))
-        {
-            return ("topic-order", "Порядок тем не дозволив слот");
-        }
-        if (text.Contains("блок", StringComparison.Ordinal))
-        {
-            return ("module-block", "Модуль має йти суцільним блоком");
-        }
-        if (text.Contains("ліміт", StringComparison.Ordinal) || text.Contains("обмеж", StringComparison.Ordinal))
-        {
-            return ("limit", "Спрацювали денні або слотні ліміти");
-        }
-        if (text.Contains("спільн", StringComparison.Ordinal))
-        {
-            return ("shared-flow", "Спільний потік не готовий");
-        }
-        return ("other", "Інші причини");
-    }
-
     private static List<AutoGenGapSummaryItem> BuildGapSummary(IEnumerable<AutoGenGapDetail> gapDetails)
         => gapDetails
-            .GroupBy(gap => ClassifyGapReason(gap.Reason))
+            .GroupBy(AutoGenGapReasonClassifier.Classify)
             .OrderByDescending(group => group.Count())
             .ThenBy(group => group.Key.Title, StringComparer.Ordinal)
             .Select(group => new AutoGenGapSummaryItem(

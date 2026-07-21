@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
-using System.Diagnostics;
 using System.Linq;
 using System.Text.Json;
 using System.Threading;
@@ -138,6 +137,18 @@ public sealed class TeacherDraftsAutogenService
         bool MissingRoomCounted,
         bool MissingBothCounted,
         bool EmergencySingletonCounted);
+    private sealed class SearchLimitDiagnostics
+    {
+        public int VisitedNodes { get; set; }
+        public int MaxNodes { get; set; }
+        public bool EmergencyTimeLimitReached { get; set; }
+        public SortedSet<string> Scopes { get; } = new(StringComparer.Ordinal);
+    }
+    private sealed record SearchLimitDiagnosticsState(
+        int VisitedNodes,
+        int MaxNodes,
+        bool EmergencyTimeLimitReached,
+        string[] Scopes);
     // Уніфіковані відповіді для API.
     private static ActionResult<AutoGenResult> Ok(AutoGenResult value) => new OkObjectResult(value);
     private static ActionResult<AutoGenResult> BadRequest(object value) => new BadRequestObjectResult(value);
@@ -164,53 +175,9 @@ public sealed class TeacherDraftsAutogenService
         }
         return $"{gap.Date:yyyy-MM-dd} {gap.SlotLabel}, {gap.GroupName}: {reason}";
     }
-    private static (string Code, string Title) ClassifyGapReason(string? reason)
-    {
-        if (string.IsNullOrWhiteSpace(reason))
-        {
-            return ("unknown", "Причину не визначено");
-        }
-        var text = reason.ToLowerInvariant();
-        if (text.Contains("немає доступних викладач", StringComparison.Ordinal)
-            || text.Contains("викладач", StringComparison.Ordinal) && (text.Contains("кафедр", StringComparison.Ordinal) || text.Contains("зайнят", StringComparison.Ordinal)))
-        {
-            return ("teacher", "Немає доступного викладача");
-        }
-        if (text.Contains("усі аудитор", StringComparison.Ordinal)
-            || text.Contains("аудитор", StringComparison.Ordinal) && (text.Contains("зайнят", StringComparison.Ordinal) || text.Contains("не належ", StringComparison.Ordinal)))
-        {
-            return ("room", "Немає доступної аудиторії");
-        }
-        if (text.Contains("переход", StringComparison.Ordinal)
-            || text.Contains("корпус", StringComparison.Ordinal) && text.Contains("хв", StringComparison.Ordinal))
-        {
-            return ("travel", "Недостатньо часу на перехід");
-        }
-        if (text.Contains("хронолог", StringComparison.Ordinal)
-            || text.Contains("порядок тем", StringComparison.Ordinal)
-            || text.Contains("відкладено", StringComparison.Ordinal) && text.Contains("порядком тем", StringComparison.Ordinal))
-        {
-            return ("topic-order", "Порядок тем не дозволив слот");
-        }
-        if (text.Contains("суцільним блоком", StringComparison.Ordinal))
-        {
-            return ("module-block", "Модуль має йти суцільним блоком");
-        }
-        if (text.Contains("більше двох", StringComparison.Ordinal)
-            || text.Contains("ліміт", StringComparison.Ordinal)
-            || text.Contains("обмеж", StringComparison.Ordinal))
-        {
-            return ("limit", "Спрацювали денні або слотні ліміти");
-        }
-        if (text.Contains("спільн", StringComparison.Ordinal))
-        {
-            return ("shared-flow", "Спільний потік не готовий");
-        }
-        return ("other", "Інші причини");
-    }
     private static List<AutoGenGapSummaryItem> BuildAutoGenGapSummary(IEnumerable<AutoGenGapDetail> gaps)
         => gaps
-            .GroupBy(gap => ClassifyGapReason(gap.Reason))
+            .GroupBy(AutoGenGapReasonClassifier.Classify)
             .OrderByDescending(group => group.Count())
             .ThenBy(group => group.Key.Title, StringComparer.Ordinal)
             .Select(group => new AutoGenGapSummaryItem(
@@ -250,7 +217,7 @@ public sealed class TeacherDraftsAutogenService
         }
 
         var gapsByCode = gapList
-            .GroupBy(gap => ClassifyGapReason(gap.Reason).Code)
+            .GroupBy(gap => AutoGenGapReasonClassifier.Classify(gap).Code)
             .ToDictionary(group => group.Key, group => group.ToList(), StringComparer.Ordinal);
         var suggestions = new List<string>();
 
@@ -276,6 +243,8 @@ public sealed class TeacherDraftsAutogenService
             $"Рекомендація автогенерації: {codeGaps.Count} незаповнених слотів пов'язані зі спільним потоком. Перевірте однаковий модуль, тип заняття, тему, викладача й аудиторію для груп потоку та додайте містку аудиторію. Приклади: {FormatGapSuggestionExamples(codeGaps)}.");
         AddSuggestion("module-block", codeGaps =>
             $"Рекомендація автогенерації: {codeGaps.Count} незаповнених слотів заблоковані правилом суцільного блоку модуля. Залиште поруч кілька слотів для одного модуля або перенесіть зайві заняття цього дня. Приклади: {FormatGapSuggestionExamples(codeGaps)}.");
+        AddSuggestion(AutoGenGapReasonCodes.SearchLimit, codeGaps =>
+            $"Рекомендація автогенерації: для {codeGaps.Count} незаповнених слотів оптимізатор досягнув безпечної межі пошуку. Перевірте діагностику вузлів і спочатку додайте дефіцитні ресурси або звузьте діапазон генерації. Приклади: {FormatGapSuggestionExamples(codeGaps)}.");
         AddSuggestion("unknown", codeGaps =>
             $"Рекомендація автогенерації: {codeGaps.Count} незаповнених слотів не мають точної причини. Перевірте приклади вручну та додайте обмежений ресурс, який там повторюється. Приклади: {FormatGapSuggestionExamples(codeGaps)}.");
         AddSuggestion("other", codeGaps =>
@@ -1602,6 +1571,58 @@ public sealed class TeacherDraftsAutogenService
         var gapDetails = new List<AutoGenGapDetail>();
         var gapWarnings = new HashSet<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End)>();
         var slotFailureReasons = new Dictionary<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End), HashSet<string>>();
+        var searchLimitedGroupDates = new Dictionary<(int GroupId, DateOnly Date), SearchLimitDiagnostics>();
+        var searchBudgetsByGroupDate = new Dictionary<(int GroupId, DateOnly Date), DeterministicSearchBudget>();
+        void RecordSearchLimit(
+            int groupId,
+            DateOnly date,
+            string scope,
+            int visitedNodes,
+            int maxNodes,
+            bool emergencyTimeLimitReached)
+        {
+            var key = (groupId, date);
+            if (!searchLimitedGroupDates.TryGetValue(key, out var diagnostics))
+            {
+                diagnostics = new SearchLimitDiagnostics();
+                searchLimitedGroupDates[key] = diagnostics;
+            }
+
+            diagnostics.VisitedNodes = Math.Max(diagnostics.VisitedNodes, Math.Max(0, visitedNodes));
+            diagnostics.MaxNodes = Math.Max(diagnostics.MaxNodes, Math.Max(0, maxNodes));
+            diagnostics.EmergencyTimeLimitReached |= emergencyTimeLimitReached;
+            if (!string.IsNullOrWhiteSpace(scope))
+            {
+                diagnostics.Scopes.Add(scope.Trim());
+            }
+        }
+        Dictionary<(int GroupId, DateOnly Date), SearchLimitDiagnosticsState> CopySearchLimitDiagnostics()
+            => searchLimitedGroupDates.ToDictionary(
+                entry => entry.Key,
+                entry => new SearchLimitDiagnosticsState(
+                    entry.Value.VisitedNodes,
+                    entry.Value.MaxNodes,
+                    entry.Value.EmergencyTimeLimitReached,
+                    entry.Value.Scopes.ToArray()));
+        void RestoreSearchLimitDiagnostics(
+            IReadOnlyDictionary<(int GroupId, DateOnly Date), SearchLimitDiagnosticsState> snapshot)
+        {
+            searchLimitedGroupDates.Clear();
+            foreach (var (key, state) in snapshot)
+            {
+                var diagnostics = new SearchLimitDiagnostics
+                {
+                    VisitedNodes = state.VisitedNodes,
+                    MaxNodes = state.MaxNodes,
+                    EmergencyTimeLimitReached = state.EmergencyTimeLimitReached
+                };
+                foreach (var scope in state.Scopes)
+                {
+                    diagnostics.Scopes.Add(scope);
+                }
+                searchLimitedGroupDates[key] = diagnostics;
+            }
+        }
         string SummarizeSlotFailureReasons(IEnumerable<string> values, int limit = 6)
         {
             var ordered = values
@@ -8036,6 +8057,28 @@ public sealed class TeacherDraftsAutogenService
                 if (maxPerDay == 0) continue;
                 var modulesAttemptedToday = new HashSet<int>();
                 var orderedModulesForDay = BuildOrderedModulesForDay(date);
+                var groupDateSearchBudgetKey = (grp.Id, date);
+                DeterministicSearchBudget? groupDateSearchBudget = searchBudgetsByGroupDate.GetValueOrDefault(groupDateSearchBudgetKey);
+                DeterministicSearchBudget ResolveGroupDateSearchBudget()
+                {
+                    if (groupDateSearchBudget is not null)
+                    {
+                        return groupDateSearchBudget;
+                    }
+                    var scaledGroupDateSearchNodes = slots.Count
+                                                     * Math.Max(1, orderedModulesForDay.Count)
+                                                     * (softFill ? 2_000 : 1_000);
+                    var maxGroupDateSearchNodes = Math.Clamp(
+                        scaledGroupDateSearchNodes,
+                        softFill ? 50_000 : 20_000,
+                        softFill ? 200_000 : 80_000);
+                    groupDateSearchBudget = new DeterministicSearchBudget(
+                        maxGroupDateSearchNodes,
+                        TimeSpan.FromSeconds(30));
+                    searchBudgetsByGroupDate[groupDateSearchBudgetKey] = groupDateSearchBudget;
+                    return groupDateSearchBudget;
+                }
+                var boundedSearchEnabledForCurrentPass = false;
                 var lectureFirstModulesForDay = orderedModulesForDay
                     .Where(mid => RemainingFor(grp.Id, mid) > 0)
                     .Where(mid => CanShareAcrossGroups(PeekLessonTypeForDate(grp.Id, grp.CourseId, mid, date)))
@@ -8531,13 +8574,20 @@ public sealed class TeacherDraftsAutogenService
                     bool bypassDistinctLimit,
                     int maxModuleSegmentsAllowed,
                     IReadOnlyDictionary<(TimeOnly Start, TimeOnly End), int>? gapVariantBudgetBySlot = null,
-                    Dictionary<(TimeOnly Start, TimeOnly End, int ModuleId, bool BypassDistinctLimit), int>? moduleBudgetCache = null)
+                    Dictionary<(TimeOnly Start, TimeOnly End, int ModuleId, bool BypassDistinctLimit), int>? moduleBudgetCache = null,
+                    IReadOnlyList<int>? residualModuleOrder = null)
                 {
                     int? forcedGapVariantBudget = gapVariantBudgetBySlot is not null
                         && gapVariantBudgetBySlot.TryGetValue((gap.Start, gap.End), out var gapBudget)
                         ? gapBudget
                         : null;
-                    foreach (var moduleId in OrderGapCandidateModulesByScarcity(gap, bypassDistinctLimit, gapVariantBudgetBySlot, moduleBudgetCache))
+                    var orderedModuleIds = residualModuleOrder
+                                           ?? OrderGapCandidateModulesByScarcity(
+                                               gap,
+                                               bypassDistinctLimit,
+                                               gapVariantBudgetBySlot,
+                                               moduleBudgetCache);
+                    foreach (var moduleId in orderedModuleIds)
                     {
                         if (RemainingFor(grp.Id, moduleId) <= 0)
                         {
@@ -8590,6 +8640,177 @@ public sealed class TeacherDraftsAutogenService
                             // Прогалини дозаповнюємо за ходом дня, щоб раніший слот не отримав пізнішу тему після пізнього слоту.
                             .ThenBy(gap => slotIndexByTime.TryGetValue((gap.Start, gap.End), out var gapIndex) ? gapIndex : 0)
                             .ToList();
+
+                        var availableAssignments = Math.Max(0, maxPerDay - CountFor(grp.Id, date));
+                        if (boundedSearchEnabledForCurrentPass
+                            && availableAssignments > 0
+                            && gaps.Count > 1)
+                        {
+                            var residualCandidates = new List<ResidualPlacementCandidate>();
+                            var residualGapById = new Dictionary<int, TimeSlot>();
+                            var capacityByModule = new SortedDictionary<int, int>();
+                            var candidateId = 1;
+                            var candidateModules = BuildGapCandidateModules()
+                                .Distinct()
+                                .OrderBy(moduleId => moduleId)
+                                .ToList();
+                            foreach (var moduleId in candidateModules)
+                            {
+                                capacityByModule[moduleId] = Math.Min(
+                                    availableAssignments,
+                                    Math.Max(0, PlacementRemainingFor(grp.Id, moduleId)));
+                            }
+                            foreach (var gap in gaps)
+                            {
+                                var gapId = slotIndexByTime.TryGetValue((gap.Start, gap.End), out var stableGapIndex)
+                                    ? stableGapIndex
+                                    : residualGapById.Count;
+                                residualGapById[gapId] = gap;
+                                foreach (var moduleId in candidateModules)
+                                {
+                                    var placementBudget = EstimateModuleGapPlacementBudget(
+                                        gap,
+                                        moduleId,
+                                        bypassDistinctLimit,
+                                        maxModuleSegmentsAllowedForGapFill,
+                                        moduleBudgetCache);
+                                    if (placementBudget <= 0 || capacityByModule[moduleId] <= 0)
+                                    {
+                                        continue;
+                                    }
+
+                                    var scarcity = MeasureModuleScarcity(
+                                        moduleId,
+                                        bypassDistinctLimit,
+                                        maxModuleSegmentsAllowedForGapFill,
+                                        moduleBudgetCache);
+                                    var catchUpCost = ModuleHasPendingSharedLectureCatchUp(moduleId) ? 100_000 : 0;
+                                    var scarcityCost = Math.Min(
+                                        10_000,
+                                        scarcity.ViableSlots * 100
+                                        + (int)Math.Round(Math.Min(100, scarcity.Score) * 10));
+                                    var robustnessCost = (9 - Math.Min(9, placementBudget)) * 10;
+                                    residualCandidates.Add(new ResidualPlacementCandidate(
+                                        candidateId++,
+                                        gapId,
+                                        moduleId,
+                                        catchUpCost + scarcityCost + robustnessCost));
+                                }
+                            }
+
+                            if (residualCandidates.Count > 0)
+                            {
+                                var residualSearchBudget = ResolveGroupDateSearchBudget();
+                                var residualPlan = DeterministicResidualOptimizer.Optimize(
+                                    residualCandidates,
+                                    capacityByModule,
+                                    availableAssignments,
+                                    residualSearchBudget,
+                                    cancellationToken);
+                                if (residualPlan.SearchLimitReached)
+                                {
+                                    RecordSearchLimit(
+                                        grp.Id,
+                                        date,
+                                        "residual-optimizer",
+                                        residualSearchBudget.VisitedNodes,
+                                        residualSearchBudget.MaxNodes,
+                                        residualPlan.EmergencyLimitReached);
+                                    var limitKind = residualPlan.EmergencyLimitReached
+                                        ? "аварійну часову межу"
+                                        : $"детерміновану межу {residualSearchBudget.MaxNodes} вузлів";
+                                    var limitMarker = $"[{date:yyyy-MM-dd}] {grp.Name}: [search-limit] залишковий оптимізатор досягнув";
+                                    if (!warnings.Any(warning => warning.StartsWith(limitMarker, StringComparison.Ordinal)))
+                                    {
+                                        warnings.Add($"{limitMarker} {limitKind}; застосовано найкращий знайдений план для {residualPlan.FilledGapCount} слотів.");
+                                    }
+                                }
+
+                                if (residualPlan.Placements.Count > 0)
+                                {
+                                    var residualCreatedSnapshot = allCreatedDrafts.ToHashSet();
+                                    var residualMovableDraftSnapshot = movableDrafts
+                                        .Distinct()
+                                        .ToDictionary(draft => draft, CaptureMovableDraftTrialState);
+                                    var residualBusySnapshot = busy.ToList();
+                                    var residualTopicOrderSnapshot = topicOrderSlots.ToList();
+                                    var residualWarningsCount = warnings.Count;
+                                    var residualGapDetailsCount = gapDetails.Count;
+                                    var residualGapWarnings = CopyGapWarnings();
+                                    var residualSlotFailureReasons = CopySlotFailureReasons();
+                                    var residualSearchLimitDiagnostics = CopySearchLimitDiagnostics();
+                                    var residualAttemptedModules = modulesAttemptedToday.ToHashSet();
+                                    var residualTopicsExhaustedNotified = topicsExhaustedNotified.ToHashSet();
+                                    var residualOverflowTopicNotified = overflowTopicNotified.ToHashSet();
+                                    var residualMissingModulesNotified = missingModulesNotified.ToHashSet();
+                                    var residualCreatedCount = created;
+                                    var residualSkippedCount = skipped;
+                                    var residualIncompleteDrafts = incompleteDraftsCreated;
+                                    var residualIncompleteMissingTeacher = incompleteMissingTeacherCount;
+                                    var residualIncompleteMissingRoom = incompleteMissingRoomCount;
+                                    var residualIncompleteMissingBoth = incompleteMissingBothCount;
+                                    var residualEmergencySingleton = emergencySingletonSharedLecturesCreated;
+                                    var residualLastPrimary = lastPrimaryModuleId;
+                                    var residualLessonTypeIndex = ltIndex;
+
+                                    void RollbackResidualPlan()
+                                    {
+                                        RestoreTrialState(
+                                            residualCreatedSnapshot,
+                                            residualMovableDraftSnapshot,
+                                            residualBusySnapshot,
+                                            residualTopicOrderSnapshot,
+                                            residualWarningsCount,
+                                            residualGapDetailsCount,
+                                            residualGapWarnings,
+                                            residualSlotFailureReasons,
+                                            residualSearchLimitDiagnostics,
+                                            residualAttemptedModules,
+                                            residualTopicsExhaustedNotified,
+                                            residualOverflowTopicNotified,
+                                            residualMissingModulesNotified,
+                                            residualCreatedCount,
+                                            residualSkippedCount,
+                                            residualIncompleteDrafts,
+                                            residualIncompleteMissingTeacher,
+                                            residualIncompleteMissingRoom,
+                                            residualIncompleteMissingBoth,
+                                            residualEmergencySingleton,
+                                            residualLastPrimary,
+                                            residualLessonTypeIndex);
+                                    }
+
+                                    var planApplication = await DeterministicResidualOptimizer.TryApplyPlanAtomicallyAsync(
+                                        residualPlan.Placements,
+                                        async (placement, _) =>
+                                        {
+                                            if (!residualGapById.TryGetValue(placement.GapId, out var plannedGap)
+                                                || SlotFilled(date, plannedGap))
+                                            {
+                                                return false;
+                                            }
+                                            return await TryFillGapWithVariantsAsync(
+                                                plannedGap,
+                                                allowRepeatPreviousDay,
+                                                allowExtraSameDay,
+                                                relaxed,
+                                                bypassDistinctLimit,
+                                                maxModuleSegmentsAllowedForGapFill,
+                                                gapVariantBudgetBySlot,
+                                                moduleBudgetCache,
+                                                new[] { placement.ResourceId });
+                                        },
+                                        () => slots.Count - CountDayGaps(),
+                                        RollbackResidualPlan,
+                                        cancellationToken);
+                                    if (planApplication.Committed)
+                                    {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+
                         foreach (var gap in gaps)
                         {
                             if (CountFor(grp.Id, date) >= maxPerDay)
@@ -9336,13 +9557,10 @@ public sealed class TeacherDraftsAutogenService
                         return false;
                     }
 
+                    var finalSearchBudget = ResolveGroupDateSearchBudget();
                     var bestGapCount = initialGaps;
                     var improved = false;
-                    var optimizationStartedAt = Stopwatch.GetTimestamp();
-                    var optimizationBudget = TimeSpan.FromSeconds(softFill ? 8 : 2);
-                    bool HasOptimizationBudget()
-                        => Stopwatch.GetElapsedTime(optimizationStartedAt) < optimizationBudget;
-                    for (var cycle = 0; cycle < Math.Max(1, slots.Count) && HasOptimizationBudget(); cycle++)
+                    while (finalSearchBudget.TryVisitNode())
                     {
                         cancellationToken.ThrowIfCancellationRequested();
                         var beforeGaps = CountDayGaps();
@@ -9352,23 +9570,44 @@ public sealed class TeacherDraftsAutogenService
                         }
 
                         bool progressed = false;
-                        if (CountFor(grp.Id, date) < maxPerDay && await TryTargetedRepairAnyGapAsync())
+                        if (!finalSearchBudget.TryVisitNode())
+                        {
+                            break;
+                        }
+                        if (CountFor(grp.Id, date) < maxPerDay
+                            && await TryTargetedRepairAnyGapAsync())
                         {
                             progressed = true;
                         }
-                        if (CountFor(grp.Id, date) < maxPerDay && await TryExhaustiveGapFillAsync())
+                        if (!finalSearchBudget.TryVisitNode())
+                        {
+                            break;
+                        }
+                        if (CountFor(grp.Id, date) < maxPerDay
+                            && await TryExhaustiveGapFillAsync())
                         {
                             progressed = true;
+                        }
+                        if (!finalSearchBudget.TryVisitNode())
+                        {
+                            break;
                         }
                         if (TryShiftGaps(date))
                         {
                             progressed = true;
                         }
-                        if (CountFor(grp.Id, date) < maxPerDay && await TryExhaustiveGapFillAsync())
+                        if (!finalSearchBudget.TryVisitNode())
+                        {
+                            break;
+                        }
+                        if (CountFor(grp.Id, date) < maxPerDay
+                            && await TryExhaustiveGapFillAsync())
                         {
                             progressed = true;
                         }
-                        for (var lectureCycle = 0; lectureCycle < slots.Count; lectureCycle++)
+                        for (var lectureCycle = 0;
+                             lectureCycle < slots.Count && finalSearchBudget.TryVisitNode();
+                             lectureCycle++)
                         {
                             if (!TryRepairLectureOrder())
                             {
@@ -9389,6 +9628,20 @@ public sealed class TeacherDraftsAutogenService
                         }
                     }
 
+                    if (finalSearchBudget.SearchLimitReached)
+                    {
+                        RecordSearchLimit(
+                            grp.Id,
+                            date,
+                            "final-repair",
+                            finalSearchBudget.VisitedNodes,
+                            finalSearchBudget.MaxNodes,
+                            finalSearchBudget.EmergencyLimitReached);
+                        var limitKind = finalSearchBudget.EmergencyLimitReached
+                            ? "аварійну часову межу"
+                            : $"детерміновану межу {finalSearchBudget.MaxNodes} вузлів";
+                        warnings.Add($"[{date:yyyy-MM-dd}] {grp.Name}: [search-limit] фінальний repair-pass досягнув {limitKind}; збережено найкращий валідний результат із {bestGapCount} порожніми слотами.");
+                    }
                     if (improved)
                     {
                         warnings.Add($"[{date:yyyy-MM-dd}] {grp.Name}: фінальний repair-pass зменшив кількість порожніх слотів з {initialGaps} до {bestGapCount}.");
@@ -10422,6 +10675,7 @@ public sealed class TeacherDraftsAutogenService
                             var repairGapDetailsCount = gapDetails.Count;
                             var repairGapWarnings = CopyGapWarnings();
                             var repairSlotFailureReasons = CopySlotFailureReasons();
+                            var repairSearchLimitDiagnostics = CopySearchLimitDiagnostics();
                             var repairAttemptedModules = modulesAttemptedToday.ToHashSet();
                             var repairTopicsExhaustedNotified = topicsExhaustedNotified.ToHashSet();
                             var repairOverflowTopicNotified = overflowTopicNotified.ToHashSet();
@@ -10547,6 +10801,7 @@ public sealed class TeacherDraftsAutogenService
                                     repairGapDetailsCount,
                                     repairGapWarnings,
                                     repairSlotFailureReasons,
+                                    repairSearchLimitDiagnostics,
                                     repairAttemptedModules,
                                     repairTopicsExhaustedNotified,
                                     repairOverflowTopicNotified,
@@ -10800,6 +11055,7 @@ public sealed class TeacherDraftsAutogenService
                     int gapDetailsCount,
                     HashSet<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End)> gapWarningSnapshot,
                     Dictionary<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End), HashSet<string>> slotFailureSnapshot,
+                    IReadOnlyDictionary<(int GroupId, DateOnly Date), SearchLimitDiagnosticsState> searchLimitSnapshot,
                     HashSet<int> attemptedModulesSnapshot,
                     HashSet<(int GroupId, int ModuleId)> topicsExhaustedSnapshot,
                     HashSet<(int GroupId, int ModuleId, int TopicId)> overflowTopicSnapshot,
@@ -10844,6 +11100,7 @@ public sealed class TeacherDraftsAutogenService
                     {
                         slotFailureReasons[entry.Key] = entry.Value.ToHashSet();
                     }
+                    RestoreSearchLimitDiagnostics(searchLimitSnapshot);
                     modulesAttemptedToday.Clear();
                     foreach (var moduleId in attemptedModulesSnapshot)
                     {
@@ -10877,8 +11134,9 @@ public sealed class TeacherDraftsAutogenService
                     InvalidateGapResourceCaches();
                 }
 
-                async Task RunDayGenerationPassAsync(int passMode)
+                async Task RunDayGenerationPassAsync(int passMode, bool enableBoundedSearch)
                 {
+                    boundedSearchEnabledForCurrentPass = enableBoundedSearch;
                     // Основний модуль дня (пріоритетний у логіці курсу).
                     var primaryModuleId = ResolvePrimaryModule(moduleIds =>
                         OrderModulesForDayPass(moduleIds, passMode, deferCatchUpModules: false));
@@ -11055,7 +11313,10 @@ public sealed class TeacherDraftsAutogenService
                             break;
                         }
                     }
-                    await RunFinalGapOptimizationAsync();
+                    if (enableBoundedSearch)
+                    {
+                        await RunFinalGapOptimizationAsync();
+                    }
                 }
 
                 var trialCreatedSnapshot = allCreatedDrafts.ToHashSet();
@@ -11068,6 +11329,7 @@ public sealed class TeacherDraftsAutogenService
                 var trialGapDetailsCount = gapDetails.Count;
                 var trialGapWarnings = CopyGapWarnings();
                 var trialSlotFailureReasons = CopySlotFailureReasons();
+                var trialSearchLimitDiagnostics = CopySearchLimitDiagnostics();
                 var trialAttemptedModules = modulesAttemptedToday.ToHashSet();
                 var trialTopicsExhaustedNotified = topicsExhaustedNotified.ToHashSet();
                 var trialOverflowTopicNotified = overflowTopicNotified.ToHashSet();
@@ -11093,7 +11355,9 @@ public sealed class TeacherDraftsAutogenService
                 var bestRemainingNeed = int.MaxValue;
                 foreach (var passMode in passModes)
                 {
-                    await RunDayGenerationPassAsync(passMode);
+                    // Пробні проходи не витрачають спільний бюджет пошуку: після відновлення стану
+                    // обраний режим має відтворити базовий результат перед фінальною оптимізацією.
+                    await RunDayGenerationPassAsync(passMode, enableBoundedSearch: false);
                     var score = ScoreCurrentDay();
                     var gapCount = CountDayGaps();
                     var filledSlots = CountFor(grp.Id, date);
@@ -11121,6 +11385,7 @@ public sealed class TeacherDraftsAutogenService
                         trialGapDetailsCount,
                         trialGapWarnings,
                         trialSlotFailureReasons,
+                        trialSearchLimitDiagnostics,
                         trialAttemptedModules,
                         trialTopicsExhaustedNotified,
                         trialOverflowTopicNotified,
@@ -11140,7 +11405,7 @@ public sealed class TeacherDraftsAutogenService
                     }
                 }
 
-                await RunDayGenerationPassAsync(bestMode);
+                await RunDayGenerationPassAsync(bestMode, enableBoundedSearch: true);
                 if (bestMode != 0)
                 {
                     warnings.Add($"[{date:yyyy-MM-dd}] {grp.Name}: оптимізатор перебудував день зі стратегією #{bestMode}, щоб зменшити прогалини та дефіцит модулів.");
@@ -13199,6 +13464,42 @@ public sealed class TeacherDraftsAutogenService
         }
         void ReconcileFinalGapReport()
         {
+            AutoGenGapDetail StructureFinalDetail(AutoGenGapDetail detail)
+            {
+                var structuredDetail = AutoGenGapReasonClassifier.EnsureStructured(detail);
+                if (!searchLimitedGroupDates.TryGetValue((detail.GroupId, detail.Date), out var searchDiagnostics))
+                {
+                    return structuredDetail;
+                }
+
+                var diagnostics = structuredDetail.Diagnostics is null
+                    ? new Dictionary<string, string>(StringComparer.Ordinal)
+                    : new Dictionary<string, string>(structuredDetail.Diagnostics, StringComparer.Ordinal);
+                diagnostics["searchScopes"] = string.Join(",", searchDiagnostics.Scopes);
+                diagnostics["visitedNodes"] = searchDiagnostics.VisitedNodes.ToString();
+                diagnostics["maxNodes"] = searchDiagnostics.MaxNodes.ToString();
+                diagnostics["limitKind"] = searchDiagnostics.EmergencyTimeLimitReached
+                    ? "emergency-time-limit"
+                    : "deterministic-node-limit";
+                var hasPreciseRootCause = structuredDetail.ReasonCode is not null
+                                          && structuredDetail.ReasonCode != AutoGenGapReasonCodes.Unknown
+                                          && structuredDetail.ReasonCode != AutoGenGapReasonCodes.Other
+                                          && structuredDetail.ReasonCode != AutoGenGapReasonCodes.SearchLimit;
+                return AutoGenGapReasonClassifier.EnsureStructured(structuredDetail with
+                {
+                    ReasonCode = hasPreciseRootCause
+                        ? structuredDetail.ReasonCode
+                        : AutoGenGapReasonCodes.SearchLimit,
+                    ConstraintCode = hasPreciseRootCause
+                        ? structuredDetail.ConstraintCode
+                        : searchDiagnostics.EmergencyTimeLimitReached
+                            ? "time-limit"
+                            : "node-budget",
+                    SearchLimitReached = true,
+                    Diagnostics = diagnostics
+                });
+            }
+
             var previousBySlot = gapDetails
                 .GroupBy(detail => (detail.GroupId, detail.Date, detail.Start, detail.End))
                 .ToDictionary(group => group.Key, group => group.Last());
@@ -13231,7 +13532,7 @@ public sealed class TeacherDraftsAutogenService
 
                         if (previousBySlot.TryGetValue(key, out var previousDetail))
                         {
-                            finalDetails.Add(previousDetail);
+                            finalDetails.Add(StructureFinalDetail(previousDetail));
                             continue;
                         }
 
@@ -13252,7 +13553,7 @@ public sealed class TeacherDraftsAutogenService
                             : moduleIds.Count > 1
                                 ? $"Кілька модулів: {string.Join(", ", moduleIds.Take(3).Select(ModuleTitleLabel))}"
                                 : null;
-                        finalDetails.Add(new AutoGenGapDetail(
+                        finalDetails.Add(StructureFinalDetail(new AutoGenGapDetail(
                             GroupId: group.Id,
                             GroupName: group.Name,
                             Date: date,
@@ -13261,7 +13562,7 @@ public sealed class TeacherDraftsAutogenService
                             SlotLabel: $"{slot.Start:HH\\:mm}-{slot.End:HH\\:mm}",
                             Reason: reason,
                             ModuleId: moduleId,
-                            ModuleName: moduleName));
+                            ModuleName: moduleName)));
                     }
                 }
             }

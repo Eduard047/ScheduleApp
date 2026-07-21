@@ -39,7 +39,9 @@
 
   <ItemGroup>
     <Compile Include="AdminControllerGuardrailTests.cs" />
+    <Compile Include="AutoGenGapReasonClassifierTests.cs" />
     <Compile Include="AutogenLecturePackingTests.cs" />
+    <Compile Include="AutogenQualityMatrixTests.cs" />
     <Compile Include="DeterministicResourceMatcherTests.cs" />
     <Compile Include="LogicalEventRotationPlannerTests.cs" />
     <Compile Include="ProductionGuardrailTests.cs" />

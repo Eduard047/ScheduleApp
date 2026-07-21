@@ -3,12 +3,15 @@ name: ScheduleApp quality
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "17 2 * * *"
 
 permissions:
   contents: read
 
 jobs:
   build-and-test:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -127,8 +130,80 @@ jobs:
           test "$api_status" = "404"
           grep --quiet '"status":404' "$RUNNER_TEMP/unknown-api-response.json"
 
+      - name: Run deterministic autogen quality smoke
+        shell: bash
+        run: |
+          quality_results="$RUNNER_TEMP/autogen-quality-smoke"
+          mkdir -p "$quality_results"
+          dotnet test \
+            BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj \
+            --configuration Release \
+            --no-build \
+            --filter "Category=AutogenQuality" \
+            --results-directory "$quality_results" \
+            --logger "console;verbosity=normal" \
+            --logger "trx;LogFileName=autogen-quality.trx"
+          if ! grep --quiet '<UnitTestResult ' "$quality_results/autogen-quality.trx"; then
+            echo "::error::Фільтр Category=AutogenQuality не знайшов жодного тесту."
+            exit 1
+          fi
+
       - name: Run production guardrails
-        run: dotnet test BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj --configuration Release --no-build --logger "console;verbosity=normal"
+        run: >-
+          dotnet test
+          BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj
+          --configuration Release
+          --no-build
+          --filter "Category!=AutogenQuality"
+          --logger "console;verbosity=normal"
 
       - name: Report vulnerable NuGet packages
         run: dotnet list BlazorWasmDotNet8AspNetCoreHosted.Server.sln package --vulnerable --include-transitive
+
+  autogen-quality-nightly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore quality matrix
+        run: >-
+          dotnet restore
+          BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj
+
+      - name: Build quality matrix
+        run: >-
+          dotnet build
+          BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj
+          --configuration Release
+          --no-restore
+
+      - name: Replay deterministic autogen quality matrix
+        shell: bash
+        run: |
+          for replay in 1 2 3; do
+            echo "Autogen quality replay $replay"
+            quality_results="$RUNNER_TEMP/autogen-quality-nightly-$replay"
+            mkdir -p "$quality_results"
+            dotnet test \
+              BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj \
+              --configuration Release \
+              --no-build \
+              --no-restore \
+              --filter "Category=AutogenQuality" \
+              --results-directory "$quality_results" \
+              --logger "console;verbosity=normal" \
+              --logger "trx;LogFileName=autogen-quality.trx"
+            if ! grep --quiet '<UnitTestResult ' "$quality_results/autogen-quality.trx"; then
+              echo "::error::Фільтр Category=AutogenQuality не знайшов жодного тесту під час повтору $replay."
+              exit 1
+            fi
+          done
