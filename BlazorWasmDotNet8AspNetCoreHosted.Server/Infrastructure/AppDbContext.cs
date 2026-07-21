@@ -68,6 +68,11 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         b.Entity<ModuleRoom>().HasKey(x => new { x.ModuleId, x.RoomId });
         b.Entity<ModuleBuilding>().HasKey(x => new { x.ModuleId, x.BuildingId });
         b.Entity<ModuleCourse>().HasKey(x => new { x.ModuleId, x.CourseId });
+        // Зберігаємо явну нижню межу поточного навчального періоду без обов'язкового значення.
+        b.Entity<Course>(e =>
+        {
+            e.Property(x => x.AcademicPeriodStartDate).HasColumnType("date");
+        });
         // Забороняємо каскадне видалення курсу при видаленні групи.
         b.Entity<Group>()
             .HasOne(g => g.Course)
@@ -283,6 +288,9 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         {
             e.HasKey(x => x.Id);
             e.Property(x => x.JobId).HasMaxLength(64).IsRequired();
+            e.Property(x => x.RequestHash).HasMaxLength(64).IsRequired();
+            e.Property(x => x.OwnerInstanceId).HasMaxLength(64);
+            e.Property(x => x.Version).IsConcurrencyToken();
             e.Property(x => x.Title).HasMaxLength(256).IsRequired();
             e.Property(x => x.CurrentStage).HasMaxLength(512).IsRequired();
             e.Property(x => x.LastCompletedMessage).HasMaxLength(1024);
@@ -294,6 +302,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             e.Property(x => x.TotalWeeks).HasDefaultValue(1);
             e.HasIndex(x => x.JobId).IsUnique();
             e.HasIndex(x => x.State);
+            e.HasIndex(x => new { x.State, x.LeaseExpiresAtUtc });
             e.HasIndex(x => x.CreatedAtUtc);
             e.HasIndex(x => x.UpdatedAtUtc);
         });

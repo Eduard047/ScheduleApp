@@ -1,4 +1,5 @@
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Admin;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
@@ -10,6 +11,71 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 
 public sealed class TeacherDraftsAutogenServiceRegressionTests
 {
+    [Fact]
+    public async Task Meta_course_lookup_exposes_academic_period_start_date()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var academicPeriodStartDate = new DateOnly(2026, 9, 1);
+        var course = new Course
+        {
+            Name = "Курс метаданих навчального періоду",
+            DurationWeeks = 52,
+            AcademicPeriodStartDate = academicPeriodStartDate
+        };
+        fixture.Db.Courses.Add(course);
+        await fixture.Db.SaveChangesAsync();
+
+        var meta = await new MetaController(fixture.Db).Get(weekStart: null);
+
+        var courseLookup = Assert.Single(meta.Courses);
+        Assert.Equal(course.Id, courseLookup.Id);
+        Assert.Equal(academicPeriodStartDate, courseLookup.AcademicPeriodStartDate);
+    }
+
+    [Fact]
+    public async Task Course_upsert_rejects_academic_period_date_outside_supported_range()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var controller = new AdminCoursesController(fixture.Db);
+
+        foreach (var invalidDate in new[] { new DateOnly(1999, 12, 31), new DateOnly(2101, 1, 1) })
+        {
+            var action = await controller.Upsert(new CourseEditDto(
+                id: null,
+                name: "Некоректний навчальний період",
+                durationWeeks: 52,
+                academicPeriodStartDate: invalidDate));
+
+            Assert.IsType<BadRequestObjectResult>(action.Result);
+        }
+
+        Assert.Empty(await fixture.Db.Courses.AsNoTracking().ToListAsync());
+    }
+
+    [Fact]
+    public async Task Course_upsert_without_academic_period_does_not_clear_existing_value()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var academicPeriodStartDate = new DateOnly(2026, 9, 1);
+        var course = new Course
+        {
+            Name = "Курс із захищеним періодом",
+            DurationWeeks = 52,
+            AcademicPeriodStartDate = academicPeriodStartDate
+        };
+        fixture.Db.Courses.Add(course);
+        await fixture.Db.SaveChangesAsync();
+
+        var action = await new AdminCoursesController(fixture.Db).Upsert(
+            new CourseEditDto(course.Id, "Оновлена назва", 48, academicPeriodStartDate: null));
+
+        Assert.IsType<BadRequestObjectResult>(action.Result);
+        fixture.Db.ChangeTracker.Clear();
+        var persisted = await fixture.Db.Courses.AsNoTracking().SingleAsync();
+        Assert.Equal("Курс із захищеним періодом", persisted.Name);
+        Assert.Equal(academicPeriodStartDate, persisted.AcademicPeriodStartDate);
+    }
+
     [Fact]
     public async Task Department_fallback_uses_explicit_module_link_and_is_deterministic()
     {
@@ -74,6 +140,206 @@ public sealed class TeacherDraftsAutogenServiceRegressionTests
         Assert.Equal(expected.IsLocked, actual.IsLocked);
         Assert.Equal(expected.BatchKey, actual.BatchKey);
     }
+
+    [Fact]
+    public async Task Academic_period_start_excludes_earlier_rows_from_topic_and_plan_progress()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var generationDate = new DateOnly(2026, 9, 7);
+        var data = await fixture.SeedCurriculumProgressScenarioAsync(
+            generationDate,
+            academicPeriodStartDate: new DateOnly(2026, 9, 1),
+            targetHours: 1,
+            topicHours: 1);
+        fixture.Db.TeacherDraftItems.Add(new TeacherDraftItem
+        {
+            Date = new DateOnly(2026, 5, 4),
+            DayOfWeek = DayOfWeek.Monday,
+            StartTime = data.Start,
+            EndTime = data.End,
+            GroupId = data.GroupId,
+            ModuleId = data.ModuleId,
+            ModuleTopicId = data.TopicId,
+            LessonTypeId = data.LessonTypeId
+        });
+        fixture.Db.ScheduleItems.Add(new ScheduleItem
+        {
+            Date = new DateOnly(2026, 5, 11),
+            DayOfWeek = DayOfWeek.Monday,
+            StartTime = data.Start,
+            EndTime = data.End,
+            GroupId = data.GroupId,
+            ModuleId = data.ModuleId,
+            ModuleTopicId = data.TopicId,
+            LessonTypeId = data.LessonTypeId
+        });
+        await fixture.Db.SaveChangesAsync();
+
+        var action = await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(
+            BuildCurriculumProgressRequest(data));
+
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+        Assert.True(
+            result.Created == 1,
+            $"Заняття попереднього періоду не мають вичерпувати години й теми. Створено: {result.Created}. " +
+            $"Прогалини: {string.Join(" | ", result.GapDetails?.Select(item => item.Reason) ?? Array.Empty<string>())}. " +
+            $"Попередження: {string.Join(" | ", result.Warnings)}");
+        var generated = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .SingleAsync(item => item.Date == generationDate);
+        Assert.Equal(data.TopicId, generated.ModuleTopicId);
+    }
+
+    [Fact]
+    public async Task Co_teacher_rows_with_same_batch_key_consume_module_topic_once()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var generationDate = new DateOnly(2026, 9, 14);
+        var data = await fixture.SeedCurriculumProgressScenarioAsync(
+            generationDate,
+            academicPeriodStartDate: new DateOnly(2026, 9, 1),
+            targetHours: 2,
+            topicHours: 2);
+        var firstTeacher = new Teacher { FullName = "Перший співвикладач" };
+        var secondTeacher = new Teacher { FullName = "Другий співвикладач" };
+        fixture.Db.Teachers.AddRange(firstTeacher, secondTeacher);
+        await fixture.Db.SaveChangesAsync();
+        const string batchKey = "co-teacher-logical-lesson";
+        var previousLessonDate = generationDate.AddDays(-7);
+        fixture.Db.TeacherDraftItems.AddRange(
+            new TeacherDraftItem
+            {
+                Date = previousLessonDate,
+                DayOfWeek = DayOfWeek.Monday,
+                StartTime = data.Start,
+                EndTime = data.End,
+                GroupId = data.GroupId,
+                ModuleId = data.ModuleId,
+                ModuleTopicId = data.TopicId,
+                LessonTypeId = data.LessonTypeId,
+                TeacherId = firstTeacher.Id,
+                BatchKey = batchKey
+            },
+            new TeacherDraftItem
+            {
+                Date = previousLessonDate,
+                DayOfWeek = DayOfWeek.Monday,
+                StartTime = data.Start,
+                EndTime = data.End,
+                GroupId = data.GroupId,
+                ModuleId = data.ModuleId,
+                ModuleTopicId = data.TopicId,
+                LessonTypeId = data.LessonTypeId,
+                TeacherId = secondTeacher.Id,
+                BatchKey = batchKey
+            });
+        await fixture.Db.SaveChangesAsync();
+
+        var action = await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(
+            BuildCurriculumProgressRequest(data));
+
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+        Assert.True(
+            result.Created == 1,
+            $"Два рядки співвикладачів мають рахуватися як одне заняття. Створено: {result.Created}. " +
+            $"Прогалини: {string.Join(" | ", result.GapDetails?.Select(item => item.Reason) ?? Array.Empty<string>())}. " +
+            $"Попередження: {string.Join(" | ", result.Warnings)}");
+        var generated = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .SingleAsync(item => item.Date == generationDate);
+        Assert.Equal(data.TopicId, generated.ModuleTopicId);
+        Assert.Equal(3, await fixture.Db.TeacherDraftItems.CountAsync());
+    }
+
+    [Fact]
+    public async Task Co_teacher_event_with_distinct_topics_consumes_each_topic_once()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var generationDate = new DateOnly(2026, 9, 14);
+        var data = await fixture.SeedCurriculumProgressScenarioAsync(
+            generationDate,
+            academicPeriodStartDate: new DateOnly(2026, 9, 1),
+            targetHours: 2,
+            topicHours: 1);
+        var secondTopic = new ModuleTopic
+        {
+            ModuleId = data.ModuleId,
+            Order = 2,
+            TopicCode = "ПЕР-2",
+            LessonTypeId = data.LessonTypeId,
+            TotalHours = 1,
+            AuditoriumHours = 1
+        };
+        var thirdTopic = new ModuleTopic
+        {
+            ModuleId = data.ModuleId,
+            Order = 3,
+            TopicCode = "ПЕР-3",
+            LessonTypeId = data.LessonTypeId,
+            TotalHours = 1,
+            AuditoriumHours = 1
+        };
+        var firstTeacher = new Teacher { FullName = "Перший викладач різних тем" };
+        var secondTeacher = new Teacher { FullName = "Другий викладач різних тем" };
+        fixture.Db.AddRange(secondTopic, thirdTopic, firstTeacher, secondTeacher);
+        await fixture.Db.SaveChangesAsync();
+
+        const string batchKey = "co-teacher-distinct-topics";
+        var previousLessonDate = generationDate.AddDays(-7);
+        fixture.Db.TeacherDraftItems.AddRange(
+            new TeacherDraftItem
+            {
+                Date = previousLessonDate,
+                DayOfWeek = previousLessonDate.DayOfWeek,
+                StartTime = data.Start,
+                EndTime = data.End,
+                GroupId = data.GroupId,
+                ModuleId = data.ModuleId,
+                ModuleTopicId = data.TopicId,
+                LessonTypeId = data.LessonTypeId,
+                TeacherId = firstTeacher.Id,
+                BatchKey = batchKey
+            },
+            new TeacherDraftItem
+            {
+                Date = previousLessonDate,
+                DayOfWeek = previousLessonDate.DayOfWeek,
+                StartTime = data.Start,
+                EndTime = data.End,
+                GroupId = data.GroupId,
+                ModuleId = data.ModuleId,
+                ModuleTopicId = secondTopic.Id,
+                LessonTypeId = data.LessonTypeId,
+                TeacherId = secondTeacher.Id,
+                BatchKey = batchKey
+            });
+        await fixture.Db.SaveChangesAsync();
+
+        var action = await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(
+            BuildCurriculumProgressRequest(data));
+
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+        Assert.Equal(1, result.Created);
+        var generated = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .SingleAsync(item => item.Date == generationDate);
+        Assert.Equal(thirdTopic.Id, generated.ModuleTopicId);
+    }
+
+    private static DraftAutoGenRequest BuildCurriculumProgressRequest(CurriculumProgressSeed data)
+        => new(
+            WeekStart: data.GenerationDate,
+            ClearExisting: false,
+            CourseId: data.CourseId,
+            GroupIds: new List<int> { data.GroupId },
+            Days: WeekPreset.MonFri,
+            SoftFill: false,
+            RangeStartDate: data.GenerationDate,
+            RangeEndDate: data.GenerationDate,
+            SoftOptions: new DraftAutoGenSoftOptions(RecentRepeatWindowDays: 0));
 
     private static async Task<DepartmentFallbackResult> RunDepartmentFallbackScenarioAsync()
     {
@@ -149,6 +415,16 @@ public sealed class TeacherDraftsAutogenServiceRegressionTests
         int TargetModuleId,
         int TopicDepartmentId,
         DateOnly Date);
+
+    private sealed record CurriculumProgressSeed(
+        int CourseId,
+        int GroupId,
+        int ModuleId,
+        int TopicId,
+        int LessonTypeId,
+        DateOnly GenerationDate,
+        TimeOnly Start,
+        TimeOnly End);
 
     private sealed record OutOfDepartmentDraft(int DraftId, bool HasExplicitModuleLink);
 
@@ -384,6 +660,119 @@ public sealed class TeacherDraftsAutogenServiceRegressionTests
                 targetModuleId,
                 topicDepartmentId,
                 date);
+        }
+
+        public async Task<CurriculumProgressSeed> SeedCurriculumProgressScenarioAsync(
+            DateOnly generationDate,
+            DateOnly? academicPeriodStartDate,
+            int targetHours,
+            int topicHours)
+        {
+            var course = new Course
+            {
+                Name = "Курс перевірки навчального періоду",
+                DurationWeeks = 52,
+                AcademicPeriodStartDate = academicPeriodStartDate
+            };
+            var group = new Group
+            {
+                Name = "ПЕР-1",
+                StudentsCount = 20,
+                Course = course
+            };
+            var module = new Module
+            {
+                Code = "ПЕР",
+                Title = "Прогрес навчального періоду",
+                Credits = 1,
+                Course = course
+            };
+            var lessonType = new LessonTypeRef
+            {
+                Code = "WORK",
+                Name = "Навчальне заняття",
+                IsActive = true,
+                RequiresRoom = true,
+                RequiresTeacher = true,
+                BlocksRoom = true,
+                BlocksTeacher = true,
+                CountInPlan = true,
+                CountInLoad = true
+            };
+            var topic = new ModuleTopic
+            {
+                Module = module,
+                Order = 1,
+                TopicCode = "ПЕР-1",
+                LessonType = lessonType,
+                TotalHours = topicHours,
+                AuditoriumHours = topicHours,
+                SelfStudyHours = 0
+            };
+            var start = new TimeOnly(8, 0);
+            var end = new TimeOnly(9, 0);
+            var teacher = new Teacher { FullName = "Викладач навчального періоду" };
+            var building = new Building { Name = "Корпус навчального періоду" };
+            var room = new Room
+            {
+                Name = "ПЕР-101",
+                Capacity = 30,
+                Building = building
+            };
+            Db.AddRange(
+                course,
+                group,
+                module,
+                lessonType,
+                topic,
+                teacher,
+                building,
+                room,
+                new ModulePlan
+                {
+                    Course = course,
+                    Module = module,
+                    TargetHours = targetHours,
+                    ScheduledHours = 0,
+                    IsActive = true
+                },
+                new TimeSlot
+                {
+                    Course = course,
+                    DayOfWeek = generationDate.DayOfWeek,
+                    Start = start,
+                    End = end,
+                    SortOrder = 1,
+                    IsActive = true
+                },
+                new TeacherModule
+                {
+                    Teacher = teacher,
+                    Module = module
+                },
+                new TeacherWorkingHour
+                {
+                    Teacher = teacher,
+                    DayOfWeek = generationDate.DayOfWeek,
+                    Start = start,
+                    End = end
+                },
+                new ModuleRoom
+                {
+                    Module = module,
+                    Room = room
+                });
+            await Db.SaveChangesAsync();
+
+            return new CurriculumProgressSeed(
+                course.Id,
+                group.Id,
+                module.Id,
+                topic.Id,
+                lessonType.Id,
+                generationDate,
+                start,
+                end);
         }
 
         public async ValueTask DisposeAsync()

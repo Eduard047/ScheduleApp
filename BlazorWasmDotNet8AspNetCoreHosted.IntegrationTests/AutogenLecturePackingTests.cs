@@ -22,6 +22,273 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 public sealed class AutogenLecturePackingTests
 {
     [Fact]
+    public async Task Hard_rule_validator_compares_pending_topic_order_with_published_previous_week()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        await using var db = new AppDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+
+        var course = new Course
+        {
+            Name = "Курс",
+            DurationWeeks = 18,
+            AcademicPeriodStartDate = new DateOnly(2026, 9, 1)
+        };
+        var group = new Group { Name = "Група", StudentsCount = 20, Course = course };
+        var lessonType = new LessonTypeRef
+        {
+            Code = "PRACTICE",
+            Name = "Практика",
+            RequiresTeacher = false,
+            RequiresRoom = false,
+            BlocksTeacher = false,
+            BlocksRoom = false
+        };
+        var canceledType = new LessonTypeRef
+        {
+            Code = "CANCELED",
+            Name = "Скасовано",
+            RequiresTeacher = false,
+            RequiresRoom = false,
+            BlocksTeacher = false,
+            BlocksRoom = false
+        };
+        var module = new Module { Code = "M1", Title = "Модуль", Course = course };
+        var firstTopic = new ModuleTopic
+        {
+            Module = module,
+            Order = 1,
+            TopicCode = "1.1",
+            LessonType = lessonType,
+            TotalHours = 1,
+            AuditoriumHours = 1
+        };
+        var secondTopic = new ModuleTopic
+        {
+            Module = module,
+            Order = 2,
+            TopicCode = "1.2",
+            LessonType = lessonType,
+            TotalHours = 1,
+            AuditoriumHours = 1
+        };
+        db.AddRange(course, group, lessonType, canceledType, module, firstTopic, secondTopic);
+        await db.SaveChangesAsync();
+
+        var publishedDate = new DateOnly(2026, 9, 7);
+        db.ScheduleItems.Add(new ScheduleItem
+        {
+            Date = publishedDate,
+            DayOfWeek = publishedDate.DayOfWeek,
+            StartTime = new TimeOnly(9, 0),
+            EndTime = new TimeOnly(10, 0),
+            GroupId = group.Id,
+            ModuleId = module.Id,
+            LessonTypeId = lessonType.Id,
+            ModuleTopicId = secondTopic.Id
+        });
+        await db.SaveChangesAsync();
+
+        var pendingDate = publishedDate.AddDays(1);
+        var result = await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(
+            new TeacherDraftsAutogenHardRuleValidationRequest(
+                course.Id,
+                new[] { group.Id },
+                pendingDate,
+                pendingDate,
+                AllowIncompleteDrafts: true,
+                PendingDrafts: new[]
+                {
+                    new TeacherDraftsAutogenPendingDraft(
+                        pendingDate,
+                        new TimeOnly(9, 0),
+                        new TimeOnly(10, 0),
+                        group.Id,
+                        module.Id,
+                        lessonType.Id,
+                        firstTopic.Id,
+                        null,
+                        null,
+                        false)
+                },
+                IncludeStoredDrafts: false));
+
+        Assert.Contains(
+            result.Violations,
+            violation => violation.Contains("має порядок 1 після теми", StringComparison.Ordinal));
+
+        course.AcademicPeriodStartDate = publishedDate.AddDays(1);
+        await db.SaveChangesAsync();
+        var resultAfterPeriodStart = await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(
+            new TeacherDraftsAutogenHardRuleValidationRequest(
+                course.Id,
+                new[] { group.Id },
+                pendingDate,
+                pendingDate,
+                AllowIncompleteDrafts: true,
+                PendingDrafts: new[]
+                {
+                    new TeacherDraftsAutogenPendingDraft(
+                        pendingDate,
+                        new TimeOnly(9, 0),
+                        new TimeOnly(10, 0),
+                        group.Id,
+                        module.Id,
+                        lessonType.Id,
+                        firstTopic.Id,
+                        null,
+                        null,
+                        false)
+                },
+                IncludeStoredDrafts: false));
+
+        Assert.DoesNotContain(
+            resultAfterPeriodStart.Violations,
+            violation => violation.Contains("має порядок 1 після теми", StringComparison.Ordinal));
+
+        var publishedMarker = await db.ScheduleItems.SingleAsync();
+        publishedMarker.LessonTypeId = canceledType.Id;
+        course.AcademicPeriodStartDate = new DateOnly(2026, 9, 1);
+        await db.SaveChangesAsync();
+        var resultWithHistoricalMarker = await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(
+            new TeacherDraftsAutogenHardRuleValidationRequest(
+                course.Id,
+                new[] { group.Id },
+                pendingDate,
+                pendingDate,
+                AllowIncompleteDrafts: true,
+                PendingDrafts: new[]
+                {
+                    new TeacherDraftsAutogenPendingDraft(
+                        pendingDate,
+                        new TimeOnly(9, 0),
+                        new TimeOnly(10, 0),
+                        group.Id,
+                        module.Id,
+                        lessonType.Id,
+                        firstTopic.Id,
+                        null,
+                        null,
+                        false)
+                },
+                IncludeStoredDrafts: false));
+
+        Assert.DoesNotContain(
+            resultWithHistoricalMarker.Violations,
+            violation => violation.Contains("має порядок 1 після теми", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Hard_rule_validator_sums_room_capacity_during_partial_overlap(bool existingPlacementIsDraft)
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        await using var db = new AppDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+
+        var course = new Course { Name = "Курс місткості", DurationWeeks = 18 };
+        var firstGroup = new Group { Name = "Група 1", StudentsCount = 20, Course = course };
+        var secondGroup = new Group { Name = "Група 2", StudentsCount = 20, Course = course };
+        var lessonType = new LessonTypeRef
+        {
+            Code = "SHARED_ROOM_PARTIAL",
+            Name = "Аудиторне заняття",
+            RequiresTeacher = false,
+            RequiresRoom = true,
+            BlocksTeacher = false,
+            BlocksRoom = false
+        };
+        var module = new Module { Code = "ROOM", Title = "Модуль місткості", Course = course };
+        var building = new Building { Name = "Корпус" };
+        var room = new Room { Name = "А-30", Capacity = 30, Building = building };
+        db.AddRange(course, firstGroup, secondGroup, lessonType, module, room);
+        await db.SaveChangesAsync();
+
+        var date = new DateOnly(2026, 9, 7);
+        db.TimeSlots.AddRange(
+            new TimeSlot
+            {
+                CourseId = course.Id,
+                DayOfWeek = date.DayOfWeek,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0),
+                SortOrder = 1,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                CourseId = course.Id,
+                DayOfWeek = date.DayOfWeek,
+                Start = new TimeOnly(9, 0),
+                End = new TimeOnly(10, 0),
+                SortOrder = 2,
+                IsActive = true
+            });
+        db.TeacherDraftItems.Add(new TeacherDraftItem
+        {
+            Date = date,
+            DayOfWeek = date.DayOfWeek,
+            StartTime = new TimeOnly(8, 0),
+            EndTime = new TimeOnly(10, 0),
+            GroupId = firstGroup.Id,
+            ModuleId = module.Id,
+            LessonTypeId = lessonType.Id,
+            RoomId = room.Id
+        });
+        if (existingPlacementIsDraft)
+        {
+            db.TeacherDraftItems.Add(new TeacherDraftItem
+            {
+                Date = date,
+                DayOfWeek = date.DayOfWeek,
+                StartTime = new TimeOnly(9, 0),
+                EndTime = new TimeOnly(10, 0),
+                GroupId = secondGroup.Id,
+                ModuleId = module.Id,
+                LessonTypeId = lessonType.Id,
+                RoomId = room.Id
+            });
+        }
+        else
+        {
+            db.ScheduleItems.Add(new ScheduleItem
+            {
+                Date = date,
+                DayOfWeek = date.DayOfWeek,
+                StartTime = new TimeOnly(9, 0),
+                EndTime = new TimeOnly(10, 0),
+                GroupId = secondGroup.Id,
+                ModuleId = module.Id,
+                LessonTypeId = lessonType.Id,
+                RoomId = room.Id
+            });
+        }
+        await db.SaveChangesAsync();
+
+        var result = await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(
+            new TeacherDraftsAutogenHardRuleValidationRequest(
+                course.Id,
+                new[] { firstGroup.Id },
+                date,
+                date,
+                AllowIncompleteDrafts: true));
+
+        Assert.Contains(
+            result.Violations,
+            violation => violation.Contains("09:00-10:00", StringComparison.Ordinal)
+                         && violation.Contains("30 місць для 40 студентів", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task Draft_autogen_passes_cancellation_token_to_first_database_query()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");

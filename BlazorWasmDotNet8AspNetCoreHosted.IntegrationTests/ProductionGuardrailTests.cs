@@ -12,7 +12,11 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.EntityFrameworkCore.Storage;
+using Pomelo.EntityFrameworkCore.MySql.Infrastructure;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 
@@ -1458,6 +1462,109 @@ public sealed class ProductionGuardrailTests
         Assert.Equal(request.SoftOptions, normalized.SoftOptions);
     }
 
+    [Fact]
+    public void Autogen_job_run_ranges_split_multiweek_scope_into_weekly_segments()
+    {
+        var ranges = InvokeBuildAutogenRunRanges(
+            new DateOnly(2026, 5, 6),
+            new DateOnly(2026, 5, 19),
+            new[]
+            {
+                new DateOnly(2026, 5, 4),
+                new DateOnly(2026, 5, 11),
+                new DateOnly(2026, 5, 18)
+            });
+
+        Assert.Equal(3, ranges.Count);
+        Assert.Equal((0, new DateOnly(2026, 5, 4), new DateOnly(2026, 5, 6), new DateOnly(2026, 5, 10)), ranges[0]);
+        Assert.Equal((1, new DateOnly(2026, 5, 11), new DateOnly(2026, 5, 11), new DateOnly(2026, 5, 17)), ranges[1]);
+        Assert.Equal((2, new DateOnly(2026, 5, 18), new DateOnly(2026, 5, 18), new DateOnly(2026, 5, 19)), ranges[2]);
+    }
+
+    [Fact]
+    public void Autogen_job_run_ranges_preserve_single_week_scope()
+    {
+        var ranges = InvokeBuildAutogenRunRanges(
+            new DateOnly(2026, 5, 6),
+            new DateOnly(2026, 5, 8),
+            new[] { new DateOnly(2026, 5, 4) });
+
+        var range = Assert.Single(ranges);
+        Assert.Equal((0, new DateOnly(2026, 5, 4), new DateOnly(2026, 5, 6), new DateOnly(2026, 5, 8)), range);
+    }
+
+    [Fact]
+    public async Task Autogen_ambient_transaction_saves_week_changes_without_committing_them()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var scenario = await SeedAtomicAutogenScenarioAsync(fixture.Db);
+        var service = new TeacherDraftsAutogenService(fixture.Db);
+
+        await using (var transaction = await fixture.Db.Database.BeginTransactionAsync(
+                         System.Data.IsolationLevel.Serializable))
+        {
+            var action = await InvokeAmbientDraftAutoGenAsync(service, scenario.Request);
+            var ok = Assert.IsType<OkObjectResult>(action.Result);
+            var result = Assert.IsType<AutoGenResult>(ok.Value);
+
+            Assert.True(
+                result.Created == 1,
+                $"Створено: {result.Created}. Пропущено: {result.Skipped}. Попередження: {string.Join(" | ", result.Warnings)}. Прогалини: {string.Join(" | ", result.GapDetails?.Select(item => item.Reason) ?? Array.Empty<string>())}.");
+            Assert.Equal(1, await fixture.Db.TeacherDraftItems.CountAsync(item =>
+                item.GroupId == scenario.Ids.GroupId && item.Date == scenario.Date));
+            await transaction.RollbackAsync();
+        }
+
+        fixture.Db.ChangeTracker.Clear();
+        Assert.Equal(0, await fixture.Db.TeacherDraftItems.CountAsync(item =>
+            item.GroupId == scenario.Ids.GroupId && item.Date == scenario.Date));
+    }
+
+    [Fact]
+    public async Task Autogen_owned_transaction_preserves_existing_commit_behavior()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var scenario = await SeedAtomicAutogenScenarioAsync(fixture.Db);
+
+        var action = await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(scenario.Request);
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+
+        Assert.True(
+            result.Created == 1,
+            $"Створено: {result.Created}. Пропущено: {result.Skipped}. Попередження: {string.Join(" | ", result.Warnings)}. Прогалини: {string.Join(" | ", result.GapDetails?.Select(item => item.Reason) ?? Array.Empty<string>())}.");
+        Assert.Null(fixture.Db.Database.CurrentTransaction);
+        Assert.Equal(1, await fixture.Db.TeacherDraftItems.CountAsync(item =>
+            item.GroupId == scenario.Ids.GroupId && item.Date == scenario.Date));
+    }
+
+    [Fact]
+    public async Task Autogen_ambient_preflight_keeps_simulation_visible_until_outer_rollback()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var scenario = await SeedAtomicAutogenScenarioAsync(fixture.Db);
+        var service = new TeacherDraftsAutogenService(fixture.Db);
+
+        await using (var transaction = await fixture.Db.Database.BeginTransactionAsync(
+                         System.Data.IsolationLevel.Serializable))
+        {
+            var action = await InvokeAmbientDraftAutoGenAsync(
+                service,
+                scenario.Request with { ClearExisting = false, PreflightOnly = true });
+            var ok = Assert.IsType<OkObjectResult>(action.Result);
+            var result = Assert.IsType<AutoGenResult>(ok.Value);
+
+            Assert.Equal(0, result.Created);
+            Assert.Equal(1, await fixture.Db.TeacherDraftItems.CountAsync(item =>
+                item.GroupId == scenario.Ids.GroupId && item.Date == scenario.Date));
+            await transaction.RollbackAsync();
+        }
+
+        fixture.Db.ChangeTracker.Clear();
+        Assert.Equal(0, await fixture.Db.TeacherDraftItems.CountAsync(item =>
+            item.GroupId == scenario.Ids.GroupId && item.Date == scenario.Date));
+    }
+
     [Theory]
     [InlineData(AutoGenJobState.Queued)]
     [InlineData(AutoGenJobState.Running)]
@@ -1468,6 +1575,10 @@ public sealed class ProductionGuardrailTests
         fixture.Db.AutoGenJobRuns.Add(new AutoGenJobRun
         {
             JobId = jobId,
+            OwnerInstanceId = "orphaned-owner",
+            Attempt = 1,
+            LeaseExpiresAtUtc = DateTime.UtcNow.AddMinutes(-1),
+            Version = 3,
             Kind = (int)AutoGenJobKind.Generate,
             State = (int)persistedState,
             Title = "Перерване тестове завдання",
@@ -1495,14 +1606,14 @@ public sealed class ProductionGuardrailTests
         Assert.Equal(AutoGenJobState.Failed, status.State);
         Assert.Equal(100, status.Percent);
         Assert.NotNull(status.CompletedAt);
-        Assert.Contains("перезапущено", status.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("результат виконання невідомий", status.Error, StringComparison.OrdinalIgnoreCase);
 
         fixture.Db.ChangeTracker.Clear();
         var persisted = await fixture.Db.AutoGenJobRuns.AsNoTracking().SingleAsync(item => item.JobId == jobId);
         Assert.Equal((int)AutoGenJobState.Failed, persisted.State);
         Assert.Equal(100, persisted.Percent);
         Assert.NotNull(persisted.CompletedAtUtc);
-        Assert.Contains("перезапуск", persisted.CurrentStage, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("lease", persisted.CurrentStage, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -1541,12 +1652,22 @@ public sealed class ProductionGuardrailTests
     }
 
     [Fact]
-    public void Autogen_job_controller_returns_too_many_requests_when_capacity_is_exhausted()
+    public async Task Autogen_job_controller_returns_too_many_requests_when_capacity_is_exhausted()
     {
-        var scopeFactory = new RejectingScopeFactory();
-        var service = CreateAutogenJobService(scopeFactory);
+        await using var fixture = await TestDatabase.CreateAsync();
         var request = CreateValidAutoGenJobRequest();
-        AddQueuedAutogenJobs(service, request, count: 8);
+        await SeedAutogenAcademicPeriodAsync(fixture.Db, request.CourseId, request.FromDate);
+        fixture.Db.AutoGenJobRuns.AddRange(Enumerable.Range(0, 8).Select(_ =>
+            CreatePersistedAutogenJob(
+                Guid.NewGuid().ToString("N"),
+                request,
+                AutoGenJobState.Queued,
+                DateTime.UtcNow.AddMinutes(5))));
+        await fixture.Db.SaveChangesAsync();
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(fixture.Options));
+        await using var provider = services.BuildServiceProvider();
+        var service = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
         var controller = CreateTeacherDraftsController(service);
 
         var action = controller.StartAutoGenJob(request);
@@ -1554,23 +1675,133 @@ public sealed class ProductionGuardrailTests
         var response = Assert.IsType<ObjectResult>(action.Result);
         Assert.Equal(429, response.StatusCode);
         Assert.IsType<ProblemDetails>(response.Value);
-        Assert.Equal(0, scopeFactory.CreateScopeCallCount);
+        Assert.Empty(GetInMemoryAutogenJobStatuses(service));
+        Assert.Equal(8, await fixture.Db.AutoGenJobRuns.CountAsync());
     }
 
     [Fact]
-    public void Autogen_job_start_is_idempotent_for_client_job_id()
+    public async Task Autogen_job_start_requires_academic_period_but_keeps_existing_idempotent_read()
     {
-        var service = CreateAutogenJobService(new RejectingScopeFactory());
+        await using var fixture = await TestDatabase.CreateAsync();
+        fixture.Db.Courses.Add(new Course
+        {
+            Id = 1,
+            Name = "Курс перевірки періоду",
+            DurationWeeks = 52
+        });
+        await fixture.Db.SaveChangesAsync();
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(fixture.Options));
+        await using var provider = services.BuildServiceProvider();
+        var service = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
+        var request = CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") };
+
+        var missingPeriod = Assert.Throws<AutoGenJobValidationException>(() => service.Start(request));
+        Assert.Contains("навчального періоду", missingPeriod.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(await fixture.Db.AutoGenJobRuns.AsNoTracking().ToListAsync());
+
+        var course = await fixture.Db.Courses.SingleAsync();
+        course.AcademicPeriodStartDate = request.FromDate.AddDays(1);
+        await fixture.Db.SaveChangesAsync();
+        var beforePeriod = Assert.Throws<AutoGenJobValidationException>(() => service.Start(request));
+        Assert.Contains("передує", beforePeriod.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(await fixture.Db.AutoGenJobRuns.AsNoTracking().ToListAsync());
+
+        course.AcademicPeriodStartDate = request.FromDate;
+        await fixture.Db.SaveChangesAsync();
+        var executionGate = await HoldAutogenJobServiceGateAsync(service, "_executionGate");
+        try
+        {
+            var started = service.Start(request);
+            course.AcademicPeriodStartDate = null;
+            await fixture.Db.SaveChangesAsync();
+
+            await using var observerProvider = services.BuildServiceProvider();
+            var observer = CreateAutogenJobService(observerProvider.GetRequiredService<IServiceScopeFactory>());
+            var repeated = observer.Start(request with { Title = "Повторне читання" });
+
+            Assert.Equal(started.JobId, repeated.JobId);
+            Assert.Equal(started.Status.State, repeated.Status.State);
+            Assert.Equal(1, await fixture.Db.AutoGenJobRuns.CountAsync());
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+            executionGate.Release();
+        }
+    }
+
+    [Fact]
+    public async Task Autogen_job_revalidates_academic_period_after_waiting_in_queue()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var request = CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") };
+        await SeedAutogenAcademicPeriodAsync(fixture.Db, request.CourseId, request.FromDate);
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(fixture.Options));
+        services.AddScoped<TeacherDraftsAutogenService>();
+        await using var provider = services.BuildServiceProvider();
+        var service = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
+        var executionGate = await HoldAutogenJobServiceGateAsync(service, "_executionGate");
+        var gateReleased = false;
+
+        try
+        {
+            service.Start(request);
+            var course = await fixture.Db.Courses.SingleAsync(item => item.Id == request.CourseId);
+            course.AcademicPeriodStartDate = null;
+            await fixture.Db.SaveChangesAsync();
+            executionGate.Release();
+            gateReleased = true;
+
+            await WaitUntilAsync(
+                () => service.Get(request.ClientJobId!)?.State == AutoGenJobState.Failed,
+                TimeSpan.FromSeconds(5));
+
+            var status = service.Get(request.ClientJobId!);
+            Assert.NotNull(status);
+            Assert.Contains("навчального періоду", status.Error, StringComparison.OrdinalIgnoreCase);
+            Assert.Empty(await fixture.Db.TeacherDraftItems.AsNoTracking().ToListAsync());
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+            if (!gateReleased)
+            {
+                executionGate.Release();
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Autogen_job_start_is_idempotent_for_client_job_id()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        await SeedAutogenAcademicPeriodAsync(fixture.Db, 1, new DateOnly(2026, 1, 1));
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(fixture.Options));
+        await using var provider = services.BuildServiceProvider();
+        var service = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
+        var executionGate = await HoldAutogenJobServiceGateAsync(service, "_executionGate");
         var clientJobId = Guid.NewGuid().ToString("N");
         var request = CreateValidAutoGenJobRequest() with { ClientJobId = clientJobId };
 
-        var first = service.Start(request);
-        var second = service.Start(request with { Title = "Повторний запит" });
+        try
+        {
+            var first = service.Start(request);
+            var second = service.Start(request with { Title = "Повторний запит" });
 
-        Assert.Equal(clientJobId, first.JobId);
-        Assert.Equal(clientJobId, second.JobId);
-        Assert.Equal(first.Status.Title, second.Status.Title);
-        Assert.Single(GetInMemoryAutogenJobStatuses(service));
+            Assert.Equal(clientJobId, first.JobId);
+            Assert.Equal(clientJobId, second.JobId);
+            Assert.Equal(first.Status.Title, second.Status.Title);
+            Assert.Single(GetInMemoryAutogenJobStatuses(service));
+            Assert.Equal(1, await fixture.Db.AutoGenJobRuns.CountAsync(item => item.JobId == clientJobId));
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+            executionGate.Release();
+        }
     }
 
     [Fact]
@@ -1578,6 +1809,7 @@ public sealed class ProductionGuardrailTests
     {
         await using var fixture = await TestDatabase.CreateAsync();
         var clientJobId = Guid.NewGuid().ToString("N");
+        var request = CreateValidAutoGenJobRequest() with { ClientJobId = clientJobId };
         fixture.Db.AutoGenJobRuns.Add(new AutoGenJobRun
         {
             JobId = clientJobId,
@@ -1593,7 +1825,7 @@ public sealed class ProductionGuardrailTests
             TotalWeeks = 1,
             CompletedWeeks = 1,
             Percent = 100,
-            RequestJson = "{}",
+            RequestJson = System.Text.Json.JsonSerializer.Serialize(request),
             StatusJson = string.Empty,
             UpdatedAtUtc = DateTime.UtcNow
         });
@@ -1604,12 +1836,742 @@ public sealed class ProductionGuardrailTests
         await using var provider = services.BuildServiceProvider();
         var service = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
 
-        var result = service.Start(CreateValidAutoGenJobRequest() with { ClientJobId = clientJobId });
+        var result = service.Start(request);
 
         Assert.Equal(clientJobId, result.JobId);
         Assert.Equal(AutoGenJobState.Succeeded, result.Status.State);
         Assert.Empty(GetInMemoryAutogenJobStatuses(service));
         Assert.Equal(1, await fixture.Db.AutoGenJobRuns.CountAsync(item => item.JobId == clientJobId));
+    }
+
+    [Fact]
+    public async Task Autogen_job_concurrent_duplicate_across_instances_creates_one_run_and_queues_once()
+    {
+        await using var fixture = await SharedAutogenJobDatabase.CreateAsync();
+        await using var firstProvider = fixture.CreateProvider();
+        await using var secondProvider = fixture.CreateProvider();
+        var firstService = CreateAutogenJobService(firstProvider.GetRequiredService<IServiceScopeFactory>());
+        var secondService = CreateAutogenJobService(secondProvider.GetRequiredService<IServiceScopeFactory>());
+        var firstExecutionGate = await HoldAutogenJobServiceGateAsync(firstService, "_executionGate");
+        var secondExecutionGate = await HoldAutogenJobServiceGateAsync(secondService, "_executionGate");
+        var clientJobId = Guid.NewGuid().ToString("N");
+        var request = CreateValidAutoGenJobRequest() with { ClientJobId = clientJobId };
+
+        try
+        {
+            using var startBarrier = new Barrier(2);
+            var firstStart = Task.Run(() =>
+            {
+                Assert.True(startBarrier.SignalAndWait(TimeSpan.FromSeconds(5)));
+                return firstService.Start(request);
+            });
+            var secondStart = Task.Run(() =>
+            {
+                Assert.True(startBarrier.SignalAndWait(TimeSpan.FromSeconds(5)));
+                return secondService.Start(request with { Title = "Повторний запит з іншого вузла" });
+            });
+
+            var results = await Task.WhenAll(firstStart, secondStart).WaitAsync(TimeSpan.FromSeconds(10));
+
+            Assert.All(results, result => Assert.Equal(clientJobId, result.JobId));
+            Assert.Equal(
+                1,
+                GetInMemoryAutogenJobStatuses(firstService).Count
+                + GetInMemoryAutogenJobStatuses(secondService).Count);
+            await using var db = fixture.CreateContext();
+            Assert.Equal(1, await db.AutoGenJobRuns.CountAsync(item => item.JobId == clientJobId));
+        }
+        finally
+        {
+            await firstService.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+            await secondService.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+            firstExecutionGate.Release();
+            secondExecutionGate.Release();
+        }
+    }
+
+    [Fact]
+    public async Task Autogen_job_rejects_reused_client_id_with_different_payload_across_instances()
+    {
+        await using var fixture = await SharedAutogenJobDatabase.CreateAsync();
+        await using var ownerProvider = fixture.CreateProvider();
+        await using var contenderProvider = fixture.CreateProvider();
+        var ownerService = CreateAutogenJobService(ownerProvider.GetRequiredService<IServiceScopeFactory>());
+        var contenderService = CreateAutogenJobService(contenderProvider.GetRequiredService<IServiceScopeFactory>());
+        var ownerExecutionGate = await HoldAutogenJobServiceGateAsync(ownerService, "_executionGate");
+        var contenderExecutionGate = await HoldAutogenJobServiceGateAsync(contenderService, "_executionGate");
+        var clientJobId = Guid.NewGuid().ToString("N");
+        var request = CreateValidAutoGenJobRequest() with { ClientJobId = clientJobId };
+
+        try
+        {
+            ownerService.Start(request);
+            var controller = CreateTeacherDraftsController(contenderService);
+
+            var action = controller.StartAutoGenJob(request with { CourseId = request.CourseId + 1 });
+
+            var response = Assert.IsType<ObjectResult>(action.Result);
+            Assert.Equal(409, response.StatusCode);
+            Assert.IsType<ProblemDetails>(response.Value);
+            Assert.Empty(GetInMemoryAutogenJobStatuses(contenderService));
+            await using var db = fixture.CreateContext();
+            Assert.Equal(1, await db.AutoGenJobRuns.CountAsync(item => item.JobId == clientJobId));
+        }
+        finally
+        {
+            await ownerService.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+            await contenderService.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+            ownerExecutionGate.Release();
+            contenderExecutionGate.Release();
+        }
+    }
+
+    [Fact]
+    public async Task Autogen_job_fresh_remote_get_is_read_only()
+    {
+        await using var fixture = await SharedAutogenJobDatabase.CreateAsync();
+        var request = CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") };
+        await using (var db = fixture.CreateContext())
+        {
+            db.AutoGenJobRuns.Add(CreatePersistedAutogenJob(
+                request.ClientJobId!,
+                request,
+                AutoGenJobState.Running,
+                DateTime.UtcNow.AddMinutes(5)));
+            await db.SaveChangesAsync();
+        }
+
+        await using var provider = fixture.CreateProvider();
+        var service = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
+        AutoGenJobRun before;
+        await using (var db = fixture.CreateContext())
+        {
+            before = await db.AutoGenJobRuns.AsNoTracking().SingleAsync(item => item.JobId == request.ClientJobId);
+        }
+
+        var status = service.Get(request.ClientJobId!);
+
+        Assert.NotNull(status);
+        Assert.Equal(AutoGenJobState.Running, status.State);
+        Assert.Empty(GetInMemoryAutogenJobStatuses(service));
+        await using var verificationDb = fixture.CreateContext();
+        var after = await verificationDb.AutoGenJobRuns.AsNoTracking().SingleAsync(item => item.JobId == request.ClientJobId);
+        Assert.Equal(before.State, after.State);
+        Assert.Equal(before.Version, after.Version);
+        Assert.Equal(before.UpdatedAtUtc, after.UpdatedAtUtc);
+        Assert.Equal(before.LeaseExpiresAtUtc, after.LeaseExpiresAtUtc);
+        Assert.Equal(before.CancellationRequested, after.CancellationRequested);
+        Assert.Equal(before.CurrentStage, after.CurrentStage);
+        Assert.Equal(before.StatusJson, after.StatusJson);
+    }
+
+    [Fact]
+    public async Task Autogen_job_remote_cancel_is_persisted_and_owner_polling_cancels_execution()
+    {
+        await using var fixture = await SharedAutogenJobDatabase.CreateAsync();
+        await using var ownerProvider = fixture.CreateProvider();
+        await using var remoteProvider = fixture.CreateProvider();
+        var ownerService = CreateAutogenJobService(ownerProvider.GetRequiredService<IServiceScopeFactory>());
+        var remoteService = CreateAutogenJobService(remoteProvider.GetRequiredService<IServiceScopeFactory>());
+        var executionGate = await HoldAutogenJobServiceGateAsync(ownerService, "_executionGate");
+        var request = CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") };
+        var ownerStopped = false;
+
+        try
+        {
+            ownerService.Start(request);
+
+            var cancellationStatus = remoteService.Cancel(request.ClientJobId!);
+
+            Assert.NotNull(cancellationStatus);
+            Assert.True(cancellationStatus.CancellationRequested);
+            Assert.NotEqual(AutoGenJobState.Canceled, cancellationStatus.State);
+            await WaitUntilAsync(
+                () => ownerService.Get(request.ClientJobId!)?.CancellationRequested == true,
+                TimeSpan.FromSeconds(7));
+            await ownerService.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+            ownerStopped = true;
+
+            await using var db = fixture.CreateContext();
+            var persisted = await db.AutoGenJobRuns.AsNoTracking().SingleAsync(item => item.JobId == request.ClientJobId);
+            Assert.True(persisted.CancellationRequested);
+            Assert.Equal((int)AutoGenJobState.Canceled, persisted.State);
+            Assert.Null(persisted.LeaseExpiresAtUtc);
+        }
+        finally
+        {
+            if (!ownerStopped)
+            {
+                await ownerService.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            executionGate.Release();
+        }
+    }
+
+    [Fact]
+    public async Task Autogen_job_expired_lease_becomes_failed_and_is_not_replayed()
+    {
+        await using var fixture = await SharedAutogenJobDatabase.CreateAsync();
+        var request = CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") };
+        await using (var db = fixture.CreateContext())
+        {
+            db.AutoGenJobRuns.Add(CreatePersistedAutogenJob(
+                request.ClientJobId!,
+                request,
+                AutoGenJobState.Running,
+                DateTime.UtcNow.AddMinutes(-1)));
+            await db.SaveChangesAsync();
+        }
+        await using var provider = fixture.CreateProvider();
+        var service = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
+
+        var recovered = service.Get(request.ClientJobId!);
+        var retry = service.Start(request);
+
+        Assert.NotNull(recovered);
+        Assert.Equal(AutoGenJobState.Failed, recovered.State);
+        Assert.Contains("результат виконання невідомий", recovered.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(AutoGenJobState.Failed, retry.Status.State);
+        Assert.Empty(GetInMemoryAutogenJobStatuses(service));
+        await using var verificationDb = fixture.CreateContext();
+        var persisted = await verificationDb.AutoGenJobRuns.AsNoTracking().SingleAsync(item => item.JobId == request.ClientJobId);
+        Assert.Equal((int)AutoGenJobState.Failed, persisted.State);
+        Assert.Null(persisted.LeaseExpiresAtUtc);
+        Assert.Equal(1, await verificationDb.AutoGenJobRuns.CountAsync(item => item.JobId == request.ClientJobId));
+    }
+
+    [Theory]
+    [InlineData("other-owner", 1, 5)]
+    [InlineData("runtime-owner", 2, 5)]
+    [InlineData("runtime-owner", 1, -1)]
+    public async Task Autogen_job_terminal_write_requires_current_owner_attempt_and_lease(
+        string persistedOwner,
+        int persistedAttempt,
+        int leaseOffsetMinutes)
+    {
+        await using var fixture = await SharedAutogenJobDatabase.CreateAsync();
+        var request = CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") };
+        var persistedRun = CreatePersistedAutogenJob(
+            request.ClientJobId!,
+            request,
+            AutoGenJobState.Running,
+            DateTime.UtcNow.AddMinutes(leaseOffsetMinutes));
+        persistedRun.OwnerInstanceId = persistedOwner;
+        persistedRun.Attempt = persistedAttempt;
+        await using (var db = fixture.CreateContext())
+        {
+            db.AutoGenJobRuns.Add(persistedRun);
+            await db.SaveChangesAsync();
+        }
+        await using var provider = fixture.CreateProvider();
+        var service = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
+        var runtime = CreateAutogenJobRuntime(request);
+        AttachAutogenJobRuntimeClaim(runtime, "runtime-owner", 1, DateTime.UtcNow.AddMinutes(5));
+        MarkAutogenJobRuntimeSucceeded(runtime, request);
+
+        var persisted = await InvokeTryPersistOwnedSnapshotAsync(service, runtime);
+
+        Assert.False(persisted);
+        await using var verificationDb = fixture.CreateContext();
+        var unchanged = await verificationDb.AutoGenJobRuns.AsNoTracking().SingleAsync(item => item.JobId == request.ClientJobId);
+        Assert.Equal((int)AutoGenJobState.Running, unchanged.State);
+        Assert.Equal(persistedOwner, unchanged.OwnerInstanceId);
+        Assert.Equal(persistedAttempt, unchanged.Attempt);
+        Assert.Equal(7, unchanged.Version);
+    }
+
+    [Fact]
+    public async Task Autogen_job_upgrade_barrier_keeps_legacy_active_run_read_only_and_blocks_new_ids()
+    {
+        await using var fixture = await SharedAutogenJobDatabase.CreateAsync();
+        var legacyRequest = CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") };
+        var legacyRun = CreatePersistedAutogenJob(
+            legacyRequest.ClientJobId!,
+            legacyRequest,
+            AutoGenJobState.Running,
+            leaseExpiresAtUtc: null);
+        legacyRun.OwnerInstanceId = null;
+        legacyRun.Attempt = 0;
+        legacyRun.Version = 11;
+        await using (var db = fixture.CreateContext())
+        {
+            db.AutoGenJobRuns.Add(legacyRun);
+            await db.SaveChangesAsync();
+        }
+        await using var provider = fixture.CreateProvider();
+        var service = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
+
+        var readOnlyStatus = service.Get(legacyRequest.ClientJobId!);
+        var sameId = service.Start(legacyRequest with { Title = "Повтор legacy-запиту" });
+        var blocked = Assert.Throws<AutoGenJobPersistenceException>(() => service.Start(
+            CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") }));
+
+        Assert.NotNull(readOnlyStatus);
+        Assert.Equal(AutoGenJobState.Running, readOnlyStatus.State);
+        Assert.Equal(AutoGenJobState.Running, sameId.Status.State);
+        Assert.Contains("попередньої версії", blocked.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(GetInMemoryAutogenJobStatuses(service));
+        await using var verificationDb = fixture.CreateContext();
+        var unchanged = await verificationDb.AutoGenJobRuns.AsNoTracking().SingleAsync(item => item.JobId == legacyRequest.ClientJobId);
+        Assert.Equal((int)AutoGenJobState.Running, unchanged.State);
+        Assert.Equal(11, unchanged.Version);
+        Assert.Equal(legacyRun.UpdatedAtUtc, unchanged.UpdatedAtUtc);
+        Assert.Equal(legacyRun.StatusJson, unchanged.StatusJson);
+        Assert.Null(unchanged.OwnerInstanceId);
+        Assert.Equal(0, unchanged.Attempt);
+        Assert.Null(unchanged.LeaseExpiresAtUtc);
+    }
+
+    [Fact]
+    public async Task Autogen_job_lease_claim_and_expiry_use_database_utc_under_node_clock_skew()
+    {
+        var databaseUtcNow = DateTime.SpecifyKind(DateTime.UtcNow.AddHours(2), DateTimeKind.Utc);
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        var staleRequest = CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") };
+        await using (var setupDb = new AppDbContext(options))
+        {
+            await setupDb.Database.EnsureCreatedAsync();
+            await SeedAutogenAcademicPeriodAsync(setupDb, 1, new DateOnly(2026, 1, 1));
+            setupDb.AutoGenJobRuns.Add(CreatePersistedAutogenJob(
+                staleRequest.ClientJobId!,
+                staleRequest,
+                AutoGenJobState.Running,
+                DateTime.UtcNow.AddMinutes(30)));
+            await setupDb.SaveChangesAsync();
+        }
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(options));
+        await using var provider = services.BuildServiceProvider();
+        var service = CreateAutogenJobServiceWithTiming(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<TeacherDraftsAutogenJobService>.Instance,
+            applicationLifetime: null,
+            TimeSpan.FromSeconds(30),
+            TimeSpan.FromSeconds(5),
+            TimeSpan.FromSeconds(15),
+            TimeSpan.FromSeconds(1),
+            databaseUtcNow);
+
+        var expired = service.Get(staleRequest.ClientJobId!);
+
+        Assert.NotNull(expired);
+        Assert.Equal(AutoGenJobState.Failed, expired.State);
+        Assert.NotNull(expired.CompletedAt);
+        Assert.InRange(expired.CompletedAt.Value.UtcDateTime, databaseUtcNow.AddSeconds(-1), databaseUtcNow.AddSeconds(1));
+
+        var executionGate = await HoldAutogenJobServiceGateAsync(service, "_executionGate");
+        var claimRequest = CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") };
+        SemaphoreSlim? persistenceGate = null;
+        try
+        {
+            service.Start(claimRequest);
+            persistenceGate = await HoldAutogenJobServiceGateAsync(service, "_persistenceGate");
+            await using var verificationDb = new AppDbContext(options);
+            var claimed = await verificationDb.AutoGenJobRuns.AsNoTracking().SingleAsync(item => item.JobId == claimRequest.ClientJobId);
+            Assert.NotNull(claimed.LeaseExpiresAtUtc);
+            Assert.InRange(
+                claimed.LeaseExpiresAtUtc.Value,
+                databaseUtcNow.AddSeconds(29),
+                databaseUtcNow.AddSeconds(31));
+            Assert.InRange(claimed.UpdatedAtUtc, databaseUtcNow.AddSeconds(-1), databaseUtcNow.AddSeconds(1));
+        }
+        finally
+        {
+            persistenceGate?.Release();
+            await service.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+            executionGate.Release();
+        }
+    }
+
+    [Fact]
+    public async Task Autogen_job_sqlite_exclusive_transaction_uses_extended_lease_without_self_expiry()
+    {
+        await using var fixture = await SharedAutogenJobDatabase.CreateAsync();
+        var request = CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") };
+        await using (var setupDb = fixture.CreateContext())
+        {
+            setupDb.AutoGenJobRuns.Add(CreatePersistedAutogenJob(
+                request.ClientJobId!,
+                request,
+                AutoGenJobState.Running,
+                DateTime.UtcNow.AddMinutes(5)));
+            await setupDb.SaveChangesAsync();
+        }
+        await using var provider = fixture.CreateProvider();
+        var service = CreateAutogenJobServiceWithTiming(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<TeacherDraftsAutogenJobService>.Instance,
+            applicationLifetime: null,
+            leaseDuration: TimeSpan.FromMilliseconds(80),
+            heartbeatInterval: TimeSpan.FromMilliseconds(20),
+            cancellationGrace: TimeSpan.FromSeconds(1),
+            terminalPersistenceHorizon: TimeSpan.FromSeconds(1));
+        var runtime = CreateAutogenJobRuntime(request);
+        AttachAutogenJobRuntimeClaim(runtime, "test-owner", 1, DateTime.UtcNow.AddMinutes(5));
+
+        await using var executionDb = fixture.CreateContext();
+        Assert.True(await InvokeEnterSqliteExclusiveExecutionLeaseAsync(service, executionDb, runtime));
+        using var heartbeatStop = new CancellationTokenSource();
+        var heartbeat = InvokeMaintainLeaseAsync(service, runtime, heartbeatStop.Token);
+        await Task.Delay(250);
+
+        Assert.False(GetAutogenJobRuntimeStatus(runtime).CancellationRequested);
+        await using var verificationDb = fixture.CreateContext();
+        var persisted = await verificationDb.AutoGenJobRuns
+            .AsNoTracking()
+            .SingleAsync(item => item.JobId == request.ClientJobId);
+        Assert.True(persisted.LeaseExpiresAtUtc > DateTime.UtcNow.AddHours(5));
+
+        heartbeatStop.Cancel();
+        await heartbeat.WaitAsync(TimeSpan.FromSeconds(2));
+    }
+
+    [Fact]
+    public async Task Autogen_job_queued_sqlite_heartbeat_cannot_shorten_exclusive_lease()
+    {
+        await using var fixture = await SharedAutogenJobDatabase.CreateAsync();
+        var request = CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") };
+        var run = CreatePersistedAutogenJob(
+            request.ClientJobId!,
+            request,
+            AutoGenJobState.Running,
+            DateTime.UtcNow.AddMinutes(5));
+        await using (var setupDb = fixture.CreateContext())
+        {
+            setupDb.AutoGenJobRuns.Add(run);
+            await setupDb.SaveChangesAsync();
+        }
+        await using var provider = fixture.CreateProvider();
+        var service = CreateAutogenJobServiceWithTiming(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<TeacherDraftsAutogenJobService>.Instance,
+            applicationLifetime: null,
+            leaseDuration: TimeSpan.FromMilliseconds(80),
+            heartbeatInterval: TimeSpan.FromMilliseconds(20),
+            cancellationGrace: TimeSpan.FromSeconds(1),
+            terminalPersistenceHorizon: TimeSpan.FromSeconds(1));
+        var runtime = CreateAutogenJobRuntime(request);
+        AttachAutogenJobRuntimeClaim(runtime, "test-owner", 1, DateTime.UtcNow.AddMinutes(5));
+        var persistenceGate = await HoldAutogenJobServiceGateAsync(service, "_persistenceGate");
+
+        try
+        {
+            var queuedRenewal = InvokeRenewAutogenJobLeaseAsync(service, runtime);
+            var extendedLease = DateTime.UtcNow.AddHours(6);
+            await using (var updateDb = fixture.CreateContext())
+            {
+                await updateDb.AutoGenJobRuns
+                    .Where(item => item.JobId == request.ClientJobId)
+                    .ExecuteUpdateAsync(setters => setters
+                        .SetProperty(item => item.LeaseExpiresAtUtc, extendedLease));
+            }
+            AddSqliteExclusiveExecutionMarker(service, request.ClientJobId!);
+            persistenceGate.Release();
+            persistenceGate = null!;
+
+            await queuedRenewal.WaitAsync(TimeSpan.FromSeconds(2));
+            await using var verificationDb = fixture.CreateContext();
+            var persistedLease = await verificationDb.AutoGenJobRuns
+                .Where(item => item.JobId == request.ClientJobId)
+                .Select(item => item.LeaseExpiresAtUtc)
+                .SingleAsync();
+            Assert.True(persistedLease >= extendedLease.AddSeconds(-1));
+        }
+        finally
+        {
+            persistenceGate?.Release();
+        }
+    }
+
+    [Fact]
+    public async Task Autogen_job_commit_phase_ignores_cancellation_that_arrives_after_commit_starts()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var transaction = new RecordingDbContextTransaction(() => cancellation.Cancel());
+
+        await InvokeCommitExecutionTransactionAsync(transaction);
+
+        Assert.True(cancellation.IsCancellationRequested);
+        Assert.True(transaction.CommitCalled);
+        Assert.False(transaction.CommitCancellationToken.CanBeCanceled);
+    }
+
+    [Theory]
+    [InlineData(true, 5)]
+    [InlineData(false, -1)]
+    public async Task Autogen_job_commit_fence_rejects_remote_cancel_or_expired_lease(
+        bool cancellationRequested,
+        int leaseOffsetMinutes)
+    {
+        await using var fixture = await SharedAutogenJobDatabase.CreateAsync();
+        var request = CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") };
+        var run = CreatePersistedAutogenJob(
+            request.ClientJobId!,
+            request,
+            AutoGenJobState.Running,
+            DateTime.UtcNow.AddMinutes(leaseOffsetMinutes));
+        run.OwnerInstanceId = "commit-fence-owner";
+        run.Attempt = 1;
+        run.CancellationRequested = cancellationRequested;
+        await using (var setupDb = fixture.CreateContext())
+        {
+            setupDb.AutoGenJobRuns.Add(run);
+            await setupDb.SaveChangesAsync();
+        }
+        await using var provider = fixture.CreateProvider();
+        var service = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
+        var runtime = CreateAutogenJobRuntime(request);
+        AttachAutogenJobRuntimeClaim(runtime, "commit-fence-owner", 1, DateTime.UtcNow.AddMinutes(5));
+
+        await using var executionDb = fixture.CreateContext();
+        await using var transaction = await executionDb.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => InvokeEnsureAutogenCommitFenceAsync(service, executionDb, runtime));
+        await transaction.RollbackAsync();
+
+        var status = GetAutogenJobRuntimeStatus(runtime);
+        Assert.True(status.CancellationRequested);
+        Assert.Contains(
+            cancellationRequested ? "скасування" : "lease",
+            status.CurrentStage,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Autogen_job_local_sqlite_cancel_bypasses_blocked_writer_connection()
+    {
+        var service = CreateAutogenJobService(new RejectingScopeFactory());
+        var request = CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") };
+        var runtime = CreateAutogenJobRuntime(request);
+        AddAutogenJobRuntime(service, request.ClientJobId!, runtime);
+        AddSqliteExclusiveExecutionMarker(service, request.ClientJobId!);
+
+        var status = service.Cancel(request.ClientJobId!);
+
+        Assert.NotNull(status);
+        Assert.True(status.CancellationRequested);
+        Assert.Contains("скасування", status.CurrentStage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Autogen_job_hung_cancellation_stops_renewal_and_requests_host_shutdown()
+    {
+        await using var fixture = await SharedAutogenJobDatabase.CreateAsync();
+        await using var provider = fixture.CreateProvider();
+        var lifetime = new TestHostApplicationLifetime();
+        var logger = new TestLogger<TeacherDraftsAutogenJobService>();
+        var service = CreateAutogenJobServiceWithTiming(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            logger,
+            lifetime,
+            TimeSpan.FromSeconds(2),
+            TimeSpan.FromMilliseconds(20),
+            TimeSpan.FromMilliseconds(150),
+            TimeSpan.FromMilliseconds(300));
+        var request = CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") };
+        var runtime = CreateAutogenJobRuntime(request);
+        AttachAutogenJobRuntimeClaim(runtime, "hung-owner", 1, DateTime.UtcNow.AddMinutes(5));
+        var run = CreatePersistedAutogenJob(
+            request.ClientJobId!,
+            request,
+            AutoGenJobState.Running,
+            DateTime.UtcNow.AddMinutes(5));
+        run.OwnerInstanceId = "hung-owner";
+        await using (var db = fixture.CreateContext())
+        {
+            db.AutoGenJobRuns.Add(run);
+            await db.SaveChangesAsync();
+        }
+        RequestAutogenJobRuntimeCancellation(runtime);
+
+        await InvokeMaintainLeaseAsync(service, runtime, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.True(lifetime.StopRequested);
+        Assert.Contains(logger.Entries, entry => entry.Level == LogLevel.Critical);
+        long versionAfterGrace;
+        await using (var db = fixture.CreateContext())
+        {
+            versionAfterGrace = await db.AutoGenJobRuns
+                .Where(item => item.JobId == request.ClientJobId)
+                .Select(item => item.Version)
+                .SingleAsync();
+        }
+        await Task.Delay(100);
+        await using var verificationDb = fixture.CreateContext();
+        Assert.Equal(
+            versionAfterGrace,
+            await verificationDb.AutoGenJobRuns
+                .Where(item => item.JobId == request.ClientJobId)
+                .Select(item => item.Version)
+                .SingleAsync());
+    }
+
+    [Fact]
+    public async Task Autogen_job_terminal_persistence_recovers_after_transient_outage_longer_than_two_seconds()
+    {
+        await using var fixture = await SharedAutogenJobDatabase.CreateAsync();
+        await using var provider = fixture.CreateProvider();
+        var innerScopeFactory = provider.GetRequiredService<IServiceScopeFactory>();
+        var request = CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") };
+        var runtime = CreateAutogenJobRuntime(request);
+        AttachAutogenJobRuntimeClaim(runtime, "recovery-owner", 1, DateTime.UtcNow.AddMinutes(5));
+        MarkAutogenJobRuntimeSucceeded(runtime, request);
+        var run = CreatePersistedAutogenJob(
+            request.ClientJobId!,
+            request,
+            AutoGenJobState.Running,
+            DateTime.UtcNow.AddMinutes(5));
+        run.OwnerInstanceId = "recovery-owner";
+        await using (var db = fixture.CreateContext())
+        {
+            db.AutoGenJobRuns.Add(run);
+            await db.SaveChangesAsync();
+        }
+        var service = CreateAutogenJobServiceWithTiming(
+            new DelayedRecoveryScopeFactory(innerScopeFactory, TimeSpan.FromMilliseconds(2_200)),
+            NullLogger<TeacherDraftsAutogenJobService>.Instance,
+            applicationLifetime: null,
+            TimeSpan.FromSeconds(10),
+            TimeSpan.FromMilliseconds(100),
+            TimeSpan.FromSeconds(1),
+            TimeSpan.FromSeconds(5));
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+
+        await InvokePersistTerminalSnapshotAsync(service, runtime, request).WaitAsync(TimeSpan.FromSeconds(7));
+
+        Assert.True(timer.Elapsed >= TimeSpan.FromSeconds(2));
+        await using var verificationDb = fixture.CreateContext();
+        var persisted = await verificationDb.AutoGenJobRuns.AsNoTracking().SingleAsync(item => item.JobId == request.ClientJobId);
+        Assert.Equal((int)AutoGenJobState.Succeeded, persisted.State);
+        Assert.Null(persisted.LeaseExpiresAtUtc);
+    }
+
+    [Fact]
+    public async Task Autogen_job_cancel_returns_authoritative_expired_terminal_and_marks_local_as_infrastructure_loss()
+    {
+        await using var fixture = await SharedAutogenJobDatabase.CreateAsync();
+        await using var ownerProvider = fixture.CreateProvider();
+        await using var observerProvider = fixture.CreateProvider();
+        var ownerService = CreateAutogenJobServiceWithTiming(
+            ownerProvider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<TeacherDraftsAutogenJobService>.Instance,
+            applicationLifetime: null,
+            TimeSpan.FromSeconds(2),
+            TimeSpan.FromSeconds(1),
+            TimeSpan.FromMilliseconds(200),
+            TimeSpan.FromMilliseconds(300));
+        var observerService = CreateAutogenJobService(observerProvider.GetRequiredService<IServiceScopeFactory>());
+        var executionGate = await HoldAutogenJobServiceGateAsync(ownerService, "_executionGate");
+        var request = CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") };
+        ownerService.Start(request);
+        var runtime = GetAutogenJobRuntime(ownerService, request.ClientJobId!);
+        var persistenceGate = await HoldAutogenJobServiceGateAsync(ownerService, "_persistenceGate");
+
+        try
+        {
+            await using (var db = fixture.CreateContext())
+            {
+                await db.AutoGenJobRuns
+                    .Where(item => item.JobId == request.ClientJobId)
+                    .ExecuteUpdateAsync(setters => setters
+                        .SetProperty(item => item.LeaseExpiresAtUtc, DateTime.UtcNow.AddMinutes(-1))
+                        .SetProperty(item => item.Version, item => item.Version + 1));
+            }
+            var expired = observerService.Get(request.ClientJobId!);
+            Assert.NotNull(expired);
+            Assert.Equal(AutoGenJobState.Failed, expired.State);
+        }
+        finally
+        {
+            persistenceGate.Release();
+        }
+
+        var canceled = ownerService.Cancel(request.ClientJobId!);
+
+        Assert.NotNull(canceled);
+        Assert.Equal(AutoGenJobState.Failed, canceled.State);
+        Assert.Empty(GetInMemoryAutogenJobStatuses(ownerService));
+        await ownerService.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Equal(AutoGenJobState.Failed, GetAutogenJobRuntimeStatus(runtime).State);
+        Assert.Contains("результат виконання невідомий", GetAutogenJobRuntimeStatus(runtime).Error, StringComparison.OrdinalIgnoreCase);
+        executionGate.Release();
+    }
+
+    [Fact]
+    public void Autogen_job_global_lock_name_is_stable_bounded_and_database_namespaced()
+    {
+        var first = InvokeBuildAutogenGlobalExecutionLockName("schedule_a");
+        var repeat = InvokeBuildAutogenGlobalExecutionLockName("SCHEDULE_A");
+        var second = InvokeBuildAutogenGlobalExecutionLockName("schedule_b");
+
+        Assert.Equal(first, repeat);
+        Assert.NotEqual(first, second);
+        Assert.InRange(first.Length, 1, 64);
+        Assert.InRange(second.Length, 1, 64);
+    }
+
+    [Fact]
+    public void Autogen_job_controller_maps_persistence_failures_to_service_unavailable()
+    {
+        var service = CreateAutogenJobService(new RejectingScopeFactory());
+        var controller = CreateTeacherDraftsController(service);
+        var request = CreateValidAutoGenJobRequest();
+
+        var start = Assert.IsType<ObjectResult>(controller.StartAutoGenJob(request).Result);
+        var get = Assert.IsType<ObjectResult>(controller.GetAutoGenJob("missing-job").Result);
+        var cancel = Assert.IsType<ObjectResult>(controller.CancelAutoGenJob("missing-job").Result);
+
+        Assert.Equal(503, start.StatusCode);
+        Assert.Equal(503, get.StatusCode);
+        Assert.Equal(503, cancel.StatusCode);
+        Assert.IsType<ProblemDetails>(start.Value);
+        Assert.IsType<ProblemDetails>(get.Value);
+        Assert.IsType<ProblemDetails>(cancel.Value);
+        Assert.Empty(GetInMemoryAutogenJobStatuses(service));
+    }
+
+    [Fact]
+    public async Task Autogen_job_mysql_named_lock_serializes_instances_when_configured()
+    {
+        var connectionString = Environment.GetEnvironmentVariable("ConnectionStrings__Default");
+        if (string.IsNullOrWhiteSpace(connectionString))
+        {
+            return;
+        }
+
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseMySql(connectionString, new MySqlServerVersion(new Version(8, 0, 13)))
+            .Options;
+        await using var firstDb = new AppDbContext(options);
+        await using var secondDb = new AppDbContext(options);
+        var firstService = CreateAutogenJobService(new RejectingScopeFactory());
+        var secondService = CreateAutogenJobService(new RejectingScopeFactory());
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var firstLock = await AcquireAutogenGlobalExecutionLockAsync(firstService, firstDb, timeout.Token);
+        var firstLockReleased = false;
+
+        try
+        {
+            var secondAcquire = AcquireAutogenGlobalExecutionLockAsync(secondService, secondDb, timeout.Token);
+            await Task.Delay(250, timeout.Token);
+            Assert.False(secondAcquire.IsCompleted);
+
+            await firstLock.DisposeAsync();
+            firstLockReleased = true;
+            var secondLock = await secondAcquire.WaitAsync(TimeSpan.FromSeconds(10));
+            await secondLock.DisposeAsync();
+        }
+        finally
+        {
+            if (!firstLockReleased)
+            {
+                await firstLock.DisposeAsync();
+            }
+        }
     }
 
     [Fact]
@@ -1719,6 +2681,29 @@ public sealed class ProductionGuardrailTests
         Assert.Equal(AutoGenJobState.Canceled, GetAutogenJobRuntimeStatus(runtime).State);
     }
 
+    private static async Task SeedAutogenAcademicPeriodAsync(
+        AppDbContext db,
+        int courseId,
+        DateOnly academicPeriodStartDate)
+    {
+        var course = await db.Courses.SingleOrDefaultAsync(item => item.Id == courseId);
+        if (course is null)
+        {
+            db.Courses.Add(new Course
+            {
+                Id = courseId,
+                Name = $"Курс #{courseId}",
+                DurationWeeks = 52,
+                AcademicPeriodStartDate = academicPeriodStartDate
+            });
+        }
+        else
+        {
+            course.AcademicPeriodStartDate = academicPeriodStartDate;
+        }
+        await db.SaveChangesAsync();
+    }
+
     private static AutoGenJobRequest CreateValidAutoGenJobRequest()
         => new(
             Kind: AutoGenJobKind.Generate,
@@ -1735,6 +2720,35 @@ public sealed class ProductionGuardrailTests
     private static TeacherDraftsAutogenJobService CreateAutogenJobService(IServiceScopeFactory scopeFactory)
         => new(scopeFactory, NullLogger<TeacherDraftsAutogenJobService>.Instance);
 
+    private static TeacherDraftsAutogenJobService CreateAutogenJobServiceWithTiming(
+        IServiceScopeFactory scopeFactory,
+        ILogger<TeacherDraftsAutogenJobService> logger,
+        IHostApplicationLifetime? applicationLifetime,
+        TimeSpan leaseDuration,
+        TimeSpan heartbeatInterval,
+        TimeSpan cancellationGrace,
+        TimeSpan terminalPersistenceHorizon,
+        DateTime? databaseUtcNowOverride = null)
+    {
+        var constructor = typeof(TeacherDraftsAutogenJobService)
+            .GetConstructors(ReflectionBindingFlags.Instance | ReflectionBindingFlags.NonPublic)
+            .Single(item => item.GetParameters().Length == 8);
+        Func<AppDbContext, DateTime>? databaseClock = databaseUtcNowOverride is DateTime databaseUtcNow
+            ? _ => databaseUtcNow
+            : null;
+        return Assert.IsType<TeacherDraftsAutogenJobService>(constructor.Invoke(new object?[]
+        {
+            scopeFactory,
+            logger,
+            applicationLifetime,
+            leaseDuration,
+            heartbeatInterval,
+            cancellationGrace,
+            terminalPersistenceHorizon,
+            databaseClock
+        }));
+    }
+
     private static TeacherDraftsController CreateTeacherDraftsController(TeacherDraftsAutogenJobService jobService)
         => new(
             db: null!,
@@ -1744,6 +2758,129 @@ public sealed class ProductionGuardrailTests
             autogenService: null!,
             autogenJobService: jobService,
             publishService: null!);
+
+    private static AutoGenJobRun CreatePersistedAutogenJob(
+        string jobId,
+        AutoGenJobRequest request,
+        AutoGenJobState state,
+        DateTime? leaseExpiresAtUtc)
+    {
+        var now = DateTime.UtcNow;
+        return new AutoGenJobRun
+        {
+            JobId = jobId,
+            OwnerInstanceId = "test-owner",
+            Attempt = 1,
+            LeaseExpiresAtUtc = leaseExpiresAtUtc,
+            Version = 7,
+            Kind = (int)request.Kind,
+            State = (int)state,
+            Title = request.Title ?? "Тестове завдання автогенерації",
+            CurrentStage = state == AutoGenJobState.Running ? "Виконується" : "У черзі",
+            CreatedAtUtc = now.AddMinutes(-2),
+            StartedAtUtc = state == AutoGenJobState.Running ? now.AddMinutes(-1) : null,
+            RangeStartDate = request.FromDate,
+            RangeEndDate = request.ToDate,
+            TotalWeeks = 1,
+            Percent = state == AutoGenJobState.Running ? 35 : 0,
+            RequestJson = System.Text.Json.JsonSerializer.Serialize(request),
+            StatusJson = string.Empty,
+            UpdatedAtUtc = now.AddSeconds(-10)
+        };
+    }
+
+    private static async Task<SemaphoreSlim> HoldAutogenJobServiceGateAsync(
+        TeacherDraftsAutogenJobService service,
+        string fieldName)
+    {
+        var field = typeof(TeacherDraftsAutogenJobService).GetField(
+            fieldName,
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.NonPublic);
+        var gate = Assert.IsType<SemaphoreSlim>(field?.GetValue(service));
+        await gate.WaitAsync();
+        return gate;
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow.Add(timeout);
+        while (!condition())
+        {
+            if (DateTime.UtcNow >= deadline)
+            {
+                throw new TimeoutException("Умова тесту не виконалася у відведений час.");
+            }
+            await Task.Delay(25);
+        }
+    }
+
+    private static async Task<IAsyncDisposable> AcquireAutogenGlobalExecutionLockAsync(
+        TeacherDraftsAutogenJobService service,
+        AppDbContext db,
+        CancellationToken cancellationToken)
+    {
+        var method = typeof(TeacherDraftsAutogenJobService).GetMethod(
+            "AcquireGlobalExecutionLockAsync",
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.NonPublic);
+        Assert.NotNull(method);
+        var invocation = Assert.IsAssignableFrom<Task>(method.Invoke(service, new object[] { db, cancellationToken }));
+        await invocation;
+        var resultProperty = invocation.GetType().GetProperty("Result");
+        return Assert.IsAssignableFrom<IAsyncDisposable>(resultProperty?.GetValue(invocation));
+    }
+
+    private static string InvokeBuildAutogenGlobalExecutionLockName(string databaseName)
+    {
+        var method = typeof(TeacherDraftsAutogenJobService).GetMethod(
+            "BuildGlobalExecutionLockName",
+            ReflectionBindingFlags.Static | ReflectionBindingFlags.NonPublic);
+        Assert.NotNull(method);
+        return Assert.IsType<string>(method.Invoke(null, new object?[] { databaseName }));
+    }
+
+    private static IReadOnlyList<(
+        int WeekIndex,
+        DateOnly WeekStart,
+        DateOnly RangeStartDate,
+        DateOnly RangeEndDate)> InvokeBuildAutogenRunRanges(
+        DateOnly fromDate,
+        DateOnly toDate,
+        IReadOnlyList<DateOnly> weekStarts)
+    {
+        var method = typeof(TeacherDraftsAutogenJobService).GetMethod(
+            "BuildRunRanges",
+            ReflectionBindingFlags.Static | ReflectionBindingFlags.NonPublic);
+        Assert.NotNull(method);
+        var result = Assert.IsAssignableFrom<System.Collections.IEnumerable>(
+            method.Invoke(null, new object[] { fromDate, toDate, weekStarts }));
+        var ranges = new List<(int, DateOnly, DateOnly, DateOnly)>();
+
+        foreach (var item in result)
+        {
+            Assert.NotNull(item);
+            var itemType = item.GetType();
+            ranges.Add((
+                Assert.IsType<int>(itemType.GetProperty("WeekIndex")?.GetValue(item)),
+                Assert.IsType<DateOnly>(itemType.GetProperty("WeekStart")?.GetValue(item)),
+                Assert.IsType<DateOnly>(itemType.GetProperty("RangeStartDate")?.GetValue(item)),
+                Assert.IsType<DateOnly>(itemType.GetProperty("RangeEndDate")?.GetValue(item))));
+        }
+
+        return ranges;
+    }
+
+    private static Task<ActionResult<AutoGenResult>> InvokeAmbientDraftAutoGenAsync(
+        TeacherDraftsAutogenService service,
+        DraftAutoGenRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var method = typeof(TeacherDraftsAutogenService).GetMethod(
+            "DraftAutoGenInAmbientTransaction",
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.NonPublic);
+        Assert.NotNull(method);
+        return Assert.IsAssignableFrom<Task<ActionResult<AutoGenResult>>>(
+            method.Invoke(service, new object[] { request, cancellationToken }));
+    }
 
     private static AutoGenJobRequest InvokeNormalizeAutoGenJobRequest(AutoGenJobRequest request)
     {
@@ -1881,6 +3018,201 @@ public sealed class ProductionGuardrailTests
         return Assert.IsAssignableFrom<object>(runtime);
     }
 
+    private static object GetAutogenJobRuntime(
+        TeacherDraftsAutogenJobService service,
+        string jobId)
+    {
+        var jobsField = typeof(TeacherDraftsAutogenJobService).GetField(
+            "_jobs",
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.NonPublic);
+        var jobs = jobsField?.GetValue(service);
+        Assert.NotNull(jobs);
+        var tryGetValue = jobs.GetType().GetMethod(
+            "TryGetValue",
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.Public);
+        Assert.NotNull(tryGetValue);
+        var arguments = new object?[] { jobId, null };
+        Assert.True(Assert.IsType<bool>(tryGetValue.Invoke(jobs, arguments)));
+        return Assert.IsAssignableFrom<object>(arguments[1]);
+    }
+
+    private static void AttachAutogenJobRuntimeClaim(
+        object runtime,
+        string ownerInstanceId,
+        int attempt,
+        DateTime leaseExpiresAtUtc)
+    {
+        var method = runtime.GetType().GetMethod(
+            "AttachDurableClaim",
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.Public);
+        Assert.NotNull(method);
+        method.Invoke(runtime, new object[] { ownerInstanceId, attempt, leaseExpiresAtUtc });
+    }
+
+    private static void MarkAutogenJobRuntimeSucceeded(object runtime, AutoGenJobRequest request)
+    {
+        var result = new AutoGenResult(0, 0, new List<string>());
+        var report = new AutoGenRunReport(
+            DateTimeOffset.UtcNow,
+            request.FromDate,
+            request.ToDate,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            new List<AutoGenGapSummaryItem>(),
+            new List<AutoGenPreflightItem>(),
+            new List<AutoGenRunReportGroupItem>(),
+            new List<AutoGenRunReportModuleItem>(),
+            new List<string>());
+        var method = runtime.GetType().GetMethod(
+            "MarkSucceeded",
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.Public);
+        Assert.NotNull(method);
+        method.Invoke(runtime, new object[] { result, report });
+    }
+
+    private static async Task<bool> InvokeTryPersistOwnedSnapshotAsync(
+        TeacherDraftsAutogenJobService service,
+        object runtime)
+    {
+        var method = typeof(TeacherDraftsAutogenJobService).GetMethod(
+            "TryPersistOwnedSnapshotAsync",
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.NonPublic);
+        Assert.NotNull(method);
+        var invocation = Assert.IsAssignableFrom<Task>(method.Invoke(service, new[] { runtime, "test" }));
+        await invocation;
+        var resultProperty = invocation.GetType().GetProperty("Result");
+        return Assert.IsType<bool>(resultProperty?.GetValue(invocation));
+    }
+
+    private static Task InvokeMaintainLeaseAsync(
+        TeacherDraftsAutogenJobService service,
+        object runtime,
+        CancellationToken cancellationToken)
+    {
+        var method = typeof(TeacherDraftsAutogenJobService).GetMethod(
+            "MaintainLeaseAsync",
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.NonPublic);
+        Assert.NotNull(method);
+        return Assert.IsAssignableFrom<Task>(method.Invoke(service, new object[] { runtime, cancellationToken }));
+    }
+
+    private static Task InvokeRenewAutogenJobLeaseAsync(
+        TeacherDraftsAutogenJobService service,
+        object runtime)
+    {
+        var method = typeof(TeacherDraftsAutogenJobService).GetMethod(
+            "RenewLeaseAndReadCancellationAsync",
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.NonPublic);
+        Assert.NotNull(method);
+        return Assert.IsAssignableFrom<Task>(method.Invoke(
+            service,
+            new object[] { runtime, CancellationToken.None }));
+    }
+
+    private static void AddSqliteExclusiveExecutionMarker(
+        TeacherDraftsAutogenJobService service,
+        string jobId)
+    {
+        var field = typeof(TeacherDraftsAutogenJobService).GetField(
+            "_sqliteExclusiveExecutions",
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.NonPublic);
+        var executions = Assert.IsType<System.Collections.Concurrent.ConcurrentDictionary<string, byte>>(
+            field?.GetValue(service));
+        executions[jobId] = 0;
+    }
+
+    private static void AddAutogenJobRuntime(
+        TeacherDraftsAutogenJobService service,
+        string jobId,
+        object runtime)
+    {
+        var field = typeof(TeacherDraftsAutogenJobService).GetField(
+            "_jobs",
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.NonPublic);
+        var jobs = field?.GetValue(service);
+        Assert.NotNull(jobs);
+        var tryAdd = jobs.GetType().GetMethods(ReflectionBindingFlags.Instance | ReflectionBindingFlags.Public)
+            .Single(method => method.Name == "TryAdd" && method.GetParameters().Length == 2);
+        Assert.True(Assert.IsType<bool>(tryAdd.Invoke(jobs, new[] { jobId, runtime })));
+    }
+
+    private static async Task<bool> InvokeEnterSqliteExclusiveExecutionLeaseAsync(
+        TeacherDraftsAutogenJobService service,
+        AppDbContext db,
+        object runtime)
+    {
+        var method = typeof(TeacherDraftsAutogenJobService).GetMethod(
+            "EnterSqliteExclusiveExecutionLeaseAsync",
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.NonPublic);
+        Assert.NotNull(method);
+        var invocation = Assert.IsAssignableFrom<Task>(method.Invoke(
+            service,
+            new object[] { db, runtime, CancellationToken.None }));
+        await invocation;
+        var resultProperty = invocation.GetType().GetProperty("Result");
+        return Assert.IsType<bool>(resultProperty?.GetValue(invocation));
+    }
+
+    private static Task InvokeCommitExecutionTransactionAsync(IDbContextTransaction transaction)
+    {
+        var method = typeof(TeacherDraftsAutogenJobService).GetMethod(
+            "CommitExecutionTransactionAsync",
+            ReflectionBindingFlags.Static | ReflectionBindingFlags.NonPublic);
+        Assert.NotNull(method);
+        return Assert.IsAssignableFrom<Task>(method.Invoke(null, new object[] { transaction }));
+    }
+
+    private static Task InvokeEnsureAutogenCommitFenceAsync(
+        TeacherDraftsAutogenJobService service,
+        AppDbContext db,
+        object runtime)
+    {
+        var method = typeof(TeacherDraftsAutogenJobService).GetMethod(
+            "EnsureCommitFenceAsync",
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.NonPublic);
+        Assert.NotNull(method);
+        return Assert.IsAssignableFrom<Task>(method.Invoke(
+            service,
+            new object[] { db, runtime, CancellationToken.None }));
+    }
+
+    private static Task InvokePersistTerminalSnapshotAsync(
+        TeacherDraftsAutogenJobService service,
+        object runtime,
+        AutoGenJobRequest request)
+    {
+        var result = new AutoGenResult(0, 0, new List<string>());
+        var report = CreateEmptyAutoGenRunReport(request);
+        var method = typeof(TeacherDraftsAutogenJobService).GetMethod(
+            "PersistTerminalSnapshotWithRetryAsync",
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.NonPublic);
+        Assert.NotNull(method);
+        return Assert.IsAssignableFrom<Task>(method.Invoke(
+            service,
+            new object[] { runtime, "test", result, report }));
+    }
+
+    private static AutoGenRunReport CreateEmptyAutoGenRunReport(AutoGenJobRequest request)
+        => new(
+            DateTimeOffset.UtcNow,
+            request.FromDate,
+            request.ToDate,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            new List<AutoGenGapSummaryItem>(),
+            new List<AutoGenPreflightItem>(),
+            new List<AutoGenRunReportGroupItem>(),
+            new List<AutoGenRunReportModuleItem>(),
+            new List<string>());
+
     private static Task InvokeRunAsync(TeacherDraftsAutogenJobService service, object runtime)
     {
         var method = typeof(TeacherDraftsAutogenJobService)
@@ -1914,6 +3246,125 @@ public sealed class ProductionGuardrailTests
             CreateScopeCallCount++;
             throw new InvalidOperationException("Цей тест не повинен створювати фоновий scope.");
         }
+    }
+
+    private sealed class DelayedRecoveryScopeFactory(
+        IServiceScopeFactory inner,
+        TimeSpan outageDuration) : IServiceScopeFactory
+    {
+        private readonly System.Diagnostics.Stopwatch _timer = System.Diagnostics.Stopwatch.StartNew();
+
+        public IServiceScope CreateScope()
+            => _timer.Elapsed < outageDuration
+                ? throw new InvalidOperationException("Тестове сховище стану тимчасово недоступне.")
+                : inner.CreateScope();
+    }
+
+    private sealed class TestHostApplicationLifetime : IHostApplicationLifetime
+    {
+        private readonly CancellationTokenSource _started = new();
+        private readonly CancellationTokenSource _stopping = new();
+        private readonly CancellationTokenSource _stopped = new();
+
+        public CancellationToken ApplicationStarted => _started.Token;
+        public CancellationToken ApplicationStopping => _stopping.Token;
+        public CancellationToken ApplicationStopped => _stopped.Token;
+        public bool StopRequested => _stopping.IsCancellationRequested;
+
+        public void StopApplication()
+            => _stopping.Cancel();
+    }
+
+    private sealed class TestLogger<T> : ILogger<T>
+    {
+        private readonly List<TestLogEntry> _entries = new();
+        private readonly object _sync = new();
+
+        public IReadOnlyList<TestLogEntry> Entries
+        {
+            get
+            {
+                lock (_sync)
+                {
+                    return _entries.ToList();
+                }
+            }
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull
+            => null;
+
+        public bool IsEnabled(LogLevel logLevel)
+            => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            lock (_sync)
+            {
+                _entries.Add(new TestLogEntry(logLevel, formatter(state, exception), exception));
+            }
+        }
+    }
+
+    private sealed record TestLogEntry(LogLevel Level, string Message, Exception? Exception);
+
+    private sealed class RecordingDbContextTransaction(Action onCommit) : IDbContextTransaction
+    {
+        public Guid TransactionId { get; } = Guid.NewGuid();
+        public bool SupportsSavepoints => false;
+        public bool CommitCalled { get; private set; }
+        public CancellationToken CommitCancellationToken { get; private set; }
+
+        public void Commit()
+        {
+            CommitCalled = true;
+            onCommit();
+        }
+
+        public Task CommitAsync(CancellationToken cancellationToken = default)
+        {
+            CommitCalled = true;
+            CommitCancellationToken = cancellationToken;
+            onCommit();
+            return Task.CompletedTask;
+        }
+
+        public void Rollback()
+        {
+        }
+
+        public Task RollbackAsync(CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
+        public void CreateSavepoint(string name)
+            => throw new NotSupportedException();
+
+        public Task CreateSavepointAsync(string name, CancellationToken cancellationToken = default)
+            => Task.FromException(new NotSupportedException());
+
+        public void RollbackToSavepoint(string name)
+            => throw new NotSupportedException();
+
+        public Task RollbackToSavepointAsync(string name, CancellationToken cancellationToken = default)
+            => Task.FromException(new NotSupportedException());
+
+        public void ReleaseSavepoint(string name)
+            => throw new NotSupportedException();
+
+        public Task ReleaseSavepointAsync(string name, CancellationToken cancellationToken = default)
+            => Task.FromException(new NotSupportedException());
+
+        public void Dispose()
+        {
+        }
+
+        public ValueTask DisposeAsync()
+            => ValueTask.CompletedTask;
     }
 
     private sealed class BlockingScopeFactory : IServiceScopeFactory
@@ -1953,6 +3404,66 @@ public sealed class ProductionGuardrailTests
     {
         public IServiceScope CreateScope()
             => throw new OperationCanceledException("Тестове переривання без запиту користувача.");
+    }
+
+    private static async Task<AtomicAutogenScenario> SeedAtomicAutogenScenarioAsync(AppDbContext db)
+    {
+        var course = new Course { Name = "Курс атомарної автогенерації", DurationWeeks = 52 };
+        var group = new Group { Name = "AT-1", StudentsCount = 20, Course = course };
+        var module = new Module { Code = "ATM", Title = "Атомарний модуль", Credits = 1, Course = course };
+        var lessonType = new LessonTypeRef
+        {
+            Code = "ATOMIC_SELF",
+            Name = "Самостійна робота для атомарного тесту",
+            IsActive = true,
+            RequiresRoom = false,
+            RequiresTeacher = false,
+            BlocksRoom = false,
+            BlocksTeacher = false,
+            CountInPlan = true,
+            CountInLoad = false
+        };
+        var date = new DateOnly(2026, 5, 4);
+        var teacher = new Teacher { FullName = "Викладач атомарного тесту" };
+        var building = new Building { Name = "Корпус атомарного тесту" };
+        var room = new Room
+        {
+            Name = "АТ-101",
+            Capacity = 30,
+            Building = building
+        };
+        db.AddRange(course, group, module, lessonType, teacher, room);
+        await db.SaveChangesAsync();
+        db.TeacherModules.Add(new TeacherModule
+        {
+            TeacherId = teacher.Id,
+            ModuleId = module.Id
+        });
+        db.TimeSlots.Add(new TimeSlot
+        {
+            CourseId = course.Id,
+            DayOfWeek = date.DayOfWeek,
+            Start = new TimeOnly(8, 0),
+            End = new TimeOnly(9, 0),
+            SortOrder = 1,
+            IsActive = true
+        });
+        await db.SaveChangesAsync();
+
+        var ids = new SeedIds(course.Id, group.Id, module.Id, lessonType.Id);
+        return new AtomicAutogenScenario(
+            ids,
+            date,
+            new DraftAutoGenRequest(
+                WeekStart: date,
+                ClearExisting: true,
+                CourseId: course.Id,
+                GroupIds: new List<int> { group.Id },
+                Days: WeekPreset.MonFri,
+                ModuleHours: new Dictionary<int, int> { [module.Id] = 1 },
+                AllowIncompleteDrafts: true,
+                RangeStartDate: date,
+                RangeEndDate: date));
     }
 
     private static async Task SeedDestructiveDependencyGraphAsync(TestDatabase fixture, SeedIds ids)
@@ -2073,6 +3584,62 @@ public sealed class ProductionGuardrailTests
         int SecondRoomId,
         int TeacherId,
         DateOnly Date);
+
+    private sealed record AtomicAutogenScenario(
+        SeedIds Ids,
+        DateOnly Date,
+        DraftAutoGenRequest Request);
+
+    private sealed class SharedAutogenJobDatabase : IAsyncDisposable
+    {
+        private readonly SqliteConnection _keeperConnection;
+
+        private SharedAutogenJobDatabase(
+            SqliteConnection keeperConnection,
+            DbContextOptions<AppDbContext> options)
+        {
+            _keeperConnection = keeperConnection;
+            Options = options;
+        }
+
+        public DbContextOptions<AppDbContext> Options { get; }
+
+        public static async Task<SharedAutogenJobDatabase> CreateAsync()
+        {
+            var databaseName = $"autogen-jobs-{Guid.NewGuid():N}";
+            var connectionString = $"Data Source={databaseName};Mode=Memory;Cache=Shared;Default Timeout=5";
+            var keeperConnection = new SqliteConnection(connectionString);
+            await keeperConnection.OpenAsync();
+            var options = new DbContextOptionsBuilder<AppDbContext>()
+                .UseSqlite(connectionString)
+                .Options;
+            await using var db = new AppDbContext(options);
+            await db.Database.EnsureCreatedAsync();
+            db.Courses.Add(new Course
+            {
+                Id = 1,
+                Name = "Курс фонової автогенерації",
+                DurationWeeks = 52,
+                AcademicPeriodStartDate = new DateOnly(2026, 1, 1)
+            });
+            await db.SaveChangesAsync();
+            return new SharedAutogenJobDatabase(keeperConnection, options);
+        }
+
+        public AppDbContext CreateContext()
+            => new(Options);
+
+        public ServiceProvider CreateProvider()
+        {
+            var services = new ServiceCollection();
+            services.AddScoped(_ => new AppDbContext(Options));
+            services.AddScoped<TeacherDraftsAutogenService>();
+            return services.BuildServiceProvider();
+        }
+
+        public async ValueTask DisposeAsync()
+            => await _keeperConnection.DisposeAsync();
+    }
 
     private sealed class TestDatabase : IAsyncDisposable
     {

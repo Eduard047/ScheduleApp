@@ -962,17 +962,55 @@ public sealed class TeacherDraftsController : ControllerBase
                 title: "Черга автогенерації заповнена",
                 detail: ex.Message);
         }
+        catch (AutoGenJobConflictException ex)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status409Conflict,
+                title: "Конфлікт ідентифікатора автогенерації",
+                detail: ex.Message);
+        }
+        catch (AutoGenJobPersistenceException ex)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status503ServiceUnavailable,
+                title: "Сховище стану автогенерації недоступне",
+                detail: ex.Message);
+        }
     }
     [HttpGet("autogen/jobs/{jobId}")]
     public ActionResult<AutoGenJobStatus> GetAutoGenJob(string jobId)
-        => _autogenJobService.Get(jobId) is { } status
-            ? Ok(status)
-            : NotFound(new { message = "Задачу автогенерації не знайдено." });
+    {
+        try
+        {
+            return _autogenJobService.Get(jobId) is { } status
+                ? Ok(status)
+                : NotFound(new { message = "Завдання автогенерації не знайдено." });
+        }
+        catch (AutoGenJobPersistenceException ex)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status503ServiceUnavailable,
+                title: "Сховище стану автогенерації недоступне",
+                detail: ex.Message);
+        }
+    }
     [HttpPost("autogen/jobs/{jobId}/cancel")]
     public ActionResult<AutoGenJobStatus> CancelAutoGenJob(string jobId)
-        => _autogenJobService.Cancel(jobId) is { } status
-            ? Ok(status)
-            : NotFound(new { message = "Задачу автогенерації не знайдено." });
+    {
+        try
+        {
+            return _autogenJobService.Cancel(jobId) is { } status
+                ? Ok(status)
+                : NotFound(new { message = "Завдання автогенерації не знайдено." });
+        }
+        catch (AutoGenJobPersistenceException ex)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status503ServiceUnavailable,
+                title: "Сховище стану автогенерації недоступне",
+                detail: ex.Message);
+        }
+    }
     [HttpPost("approve-week")]
     // Позначає чернетки викладача за тиждень як затверджені.
     public async Task<IActionResult> ApproveWeek([FromBody] ApproveWeekRequest r)

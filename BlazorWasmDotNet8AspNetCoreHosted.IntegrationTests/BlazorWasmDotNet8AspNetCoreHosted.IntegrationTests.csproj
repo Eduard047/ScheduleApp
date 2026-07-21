@@ -42,6 +42,7 @@
     <Compile Include="AutoGenGapReasonClassifierTests.cs" />
     <Compile Include="AutogenLecturePackingTests.cs" />
     <Compile Include="AutogenQualityMatrixTests.cs" />
+    <Compile Include="DeterministicResidualOptimizerOracleTests.cs" />
     <Compile Include="DeterministicResourceMatcherTests.cs" />
     <Compile Include="LogicalEventRotationPlannerTests.cs" />
     <Compile Include="ProductionGuardrailTests.cs" />

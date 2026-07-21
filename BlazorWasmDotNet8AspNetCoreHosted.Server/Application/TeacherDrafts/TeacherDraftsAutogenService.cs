@@ -11,6 +11,7 @@ using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 
@@ -407,6 +408,25 @@ public sealed class TeacherDraftsAutogenService
     }
     // Створює чернетки на основі правил і доступних даних для заданого тижня.
     public async Task<ActionResult<AutoGenResult>> DraftAutoGen(DraftAutoGenRequest r, CancellationToken cancellationToken = default)
+        => await DraftAutoGenCore(r, useAmbientTransaction: false, cancellationToken);
+
+    internal async Task<ActionResult<AutoGenResult>> DraftAutoGenInAmbientTransaction(
+        DraftAutoGenRequest r,
+        CancellationToken cancellationToken = default)
+    {
+        if (_db.Database.CurrentTransaction is null)
+        {
+            throw new InvalidOperationException(
+                "Фонову автогенерацію не можна виконувати без активної зовнішньої транзакції.");
+        }
+
+        return await DraftAutoGenCore(r, useAmbientTransaction: true, cancellationToken);
+    }
+
+    private async Task<ActionResult<AutoGenResult>> DraftAutoGenCore(
+        DraftAutoGenRequest r,
+        bool useAmbientTransaction,
+        CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         // ЕТАП 1: збираємо типи занять і готуємо довідники правил.
@@ -632,11 +652,18 @@ public sealed class TeacherDraftsAutogenService
             }
         }
         await GenerationLock.WaitAsync(cancellationToken);
+        IDbContextTransaction? ownedTransaction = null;
         try
         {
-        await using var tx = await _db.Database.BeginTransactionAsync(
-            IsolationLevel.Serializable,
-            cancellationToken);
+        if (!useAmbientTransaction)
+        {
+            ownedTransaction = await _db.Database.BeginTransactionAsync(
+                IsolationLevel.Serializable,
+                cancellationToken);
+        }
+        var transaction = ownedTransaction ?? _db.Database.CurrentTransaction
+            ?? throw new InvalidOperationException(
+                "Активну транзакцію автогенерації втрачено до початку запису чернеток.");
         // За потреби очищаємо існуючі незаблоковані чернетки тижня.
         if (r.ClearExisting && !softFill)
         {
@@ -674,7 +701,10 @@ public sealed class TeacherDraftsAutogenService
                 }
                 if (rows.Any(x => x.Status != DraftStatus.Draft || x.IsLocked))
                 {
-                    await tx.RollbackAsync(cancellationToken);
+                    if (ownedTransaction is not null)
+                    {
+                        await transaction.RollbackAsync(cancellationToken);
+                    }
                     return Conflict(new
                     {
                         message = "Автогенерація не може частково очистити логічне заняття зі схваленими або заблокованими рядками. Повторно схваліть чи розблокуйте весь пакет перед очищенням.",
@@ -829,7 +859,9 @@ public sealed class TeacherDraftsAutogenService
                         && !nonOccupyingMarkerTypeIds.Contains(x.LessonTypeId)
                         && x.Date >= historyStart
                         && x.Date < planningWeekEndExclusive
-                        && courseIds.Contains(x.Group.CourseId))
+                        && courseIds.Contains(x.Group.CourseId)
+                        && (x.Group.Course.AcademicPeriodStartDate == null
+                            || x.Date >= x.Group.Course.AcademicPeriodStartDate.Value))
             .Select(x => new BusySlot(
                 x.GroupId,
                 x.TeacherId,
@@ -850,7 +882,9 @@ public sealed class TeacherDraftsAutogenService
                         && !nonOccupyingMarkerTypeIds.Contains(x.LessonTypeId)
                         && x.Date >= historyStart
                         && x.Date < planningWeekEndExclusive
-                        && courseIds.Contains(x.Group.CourseId))
+                        && courseIds.Contains(x.Group.CourseId)
+                        && (x.Group.Course.AcademicPeriodStartDate == null
+                            || x.Date >= x.Group.Course.AcademicPeriodStartDate.Value))
             .Select(x => new BusySlot(
                 x.GroupId,
                 x.TeacherId,
@@ -1258,7 +1292,9 @@ public sealed class TeacherDraftsAutogenService
             .Include(si => si.Group)
             .Where(si => si.TeacherId != null
                          && !excludedTypeIds.Contains(si.LessonTypeId)
-                         && courseIds.Contains(si.Group.CourseId))
+                         && courseIds.Contains(si.Group.CourseId)
+                         && (si.Group.Course.AcademicPeriodStartDate == null
+                             || si.Date >= si.Group.Course.AcademicPeriodStartDate.Value))
             .GroupBy(si => new { si.TeacherId, si.Group.CourseId })
             .Select(g => new { TeacherId = g.Key.TeacherId!.Value, g.Key.CourseId, C = g.Count() })
             .ToListAsync(cancellationToken);
@@ -1267,7 +1303,9 @@ public sealed class TeacherDraftsAutogenService
             .Include(di => di.Group)
             .Where(di => di.TeacherId != null
                          && !excludedTypeIds.Contains(di.LessonTypeId)
-                         && courseIds.Contains(di.Group.CourseId))
+                         && courseIds.Contains(di.Group.CourseId)
+                         && (di.Group.Course.AcademicPeriodStartDate == null
+                             || di.Date >= di.Group.Course.AcademicPeriodStartDate.Value))
             .GroupBy(di => new { di.TeacherId, di.Group.CourseId })
             .Select(g => new { TeacherId = g.Key.TeacherId!.Value, g.Key.CourseId, C = g.Count() })
             .ToListAsync(cancellationToken);
@@ -1360,74 +1398,194 @@ public sealed class TeacherDraftsAutogenService
                 kvp => kvp.Value
                     .Where(t => t.SelfStudyBySupervisor)
                     .Sum(t => Math.Max(0, t.SelfStudyHours)));
-        // Самостійні заняття, вже призначені у чернетках.
-        var selfStudyAssignmentsDraft = await _db.TeacherDraftItems
-            .Where(di => di.IsSelfStudy
-                         && !excludedTypeIds.Contains(di.LessonTypeId)
-                         && di.Date < planningWeekEndExclusive
-                         && courseIds.Contains(di.Group.CourseId)
-                         && (di.ModuleTopicId == null || flaggedSelfStudyTopicIds.Contains(di.ModuleTopicId.Value)))
-            .Select(di => new { di.GroupId, di.ModuleId })
+        // Завантажуємо рядки навчального прогресу лише в межах поточного навчального періоду курсу.
+        var draftUsageRows = await _db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => !excludedTypeIds.Contains(item.LessonTypeId)
+                           && item.Date < planningWeekEndExclusive
+                           && courseIds.Contains(item.Group.CourseId)
+                           && (item.Group.Course.AcademicPeriodStartDate == null
+                               || item.Date >= item.Group.Course.AcademicPeriodStartDate.Value))
+            .Select(item => new LogicalEventUsageRow(
+                item.GroupId,
+                item.ModuleId,
+                item.LessonTypeId,
+                item.ModuleTopicId,
+                item.TeacherId,
+                item.RoomId,
+                item.IsSelfStudy,
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                item.BatchKey))
             .ToListAsync(cancellationToken);
-        // Самостійні заняття, вже опубліковані у розкладі.
-        var selfStudyAssignmentsSchedule = await _db.ScheduleItems
-            .Where(si => si.IsSelfStudy
-                         && !excludedTypeIds.Contains(si.LessonTypeId)
-                         && si.Date < planningWeekEndExclusive
-                         && courseIds.Contains(si.Group.CourseId)
-                         && (si.ModuleTopicId == null || flaggedSelfStudyTopicIds.Contains(si.ModuleTopicId.Value)))
-            .Select(si => new { si.GroupId, si.ModuleId })
+        var scheduleUsageRows = await _db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => !excludedTypeIds.Contains(item.LessonTypeId)
+                           && item.Date < planningWeekEndExclusive
+                           && courseIds.Contains(item.Group.CourseId)
+                           && (item.Group.Course.AcademicPeriodStartDate == null
+                               || item.Date >= item.Group.Course.AcademicPeriodStartDate.Value))
+            .Select(item => new LogicalEventUsageRow(
+                item.GroupId,
+                item.ModuleId,
+                item.LessonTypeId,
+                item.ModuleTopicId,
+                item.TeacherId,
+                item.RoomId,
+                item.IsSelfStudy,
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                item.BatchKey))
             .ToListAsync(cancellationToken);
-        // Самостійні заняття по конкретних темах (чернетки).
-        var selfStudyTopicAssignmentsDraft = await _db.TeacherDraftItems
-            .Where(di => di.IsSelfStudy
-                         && !excludedTypeIds.Contains(di.LessonTypeId)
-                         && di.ModuleTopicId != null
-                         && di.Date < planningWeekEndExclusive
-                         && flaggedSelfStudyTopicIds.Contains(di.ModuleTopicId!.Value)
-                         && courseIds.Contains(di.Group.CourseId))
-            .GroupBy(di => new { di.GroupId, di.ModuleId, TopicId = di.ModuleTopicId!.Value })
-            .Select(g => new { g.Key.GroupId, g.Key.ModuleId, g.Key.TopicId, C = g.Count() })
-            .ToListAsync(cancellationToken);
-        // Самостійні заняття по конкретних темах (розклад).
-        var selfStudyTopicAssignmentsSchedule = await _db.ScheduleItems
-            .Where(si => si.IsSelfStudy
-                         && !excludedTypeIds.Contains(si.LessonTypeId)
-                         && si.ModuleTopicId != null
-                         && si.Date < planningWeekEndExclusive
-                         && flaggedSelfStudyTopicIds.Contains(si.ModuleTopicId!.Value)
-                         && courseIds.Contains(si.Group.CourseId))
-            .GroupBy(si => new { si.GroupId, si.ModuleId, TopicId = si.ModuleTopicId!.Value })
-            .Select(g => new { g.Key.GroupId, g.Key.ModuleId, g.Key.TopicId, C = g.Count() })
-            .ToListAsync(cancellationToken);
+        // Схлопуємо рядки співвикладачів до одного логічного заняття; для старих даних зберігаємо попередню евристику.
+        List<LogicalEventUsageRow> CollapseCurriculumUsageRows(IEnumerable<LogicalEventUsageRow> source)
+        {
+            var rows = source.ToList();
+            var result = new List<LogicalEventUsageRow>(rows.Count);
+            LogicalEventUsageRow SelectRepresentative(IEnumerable<LogicalEventUsageRow> eventRows)
+                => eventRows
+                    .OrderBy(row => row.ModuleTopicId is null ? 1 : 0)
+                    .ThenBy(row => row.ModuleTopicId)
+                    .ThenBy(row => row.TeacherId)
+                    .ThenBy(row => row.RoomId)
+                    .First();
+
+            foreach (var logicalEvent in rows
+                         .Where(row => !string.IsNullOrWhiteSpace(row.BatchKey))
+                         .GroupBy(row => new
+                         {
+                             row.BatchKey,
+                             row.Date,
+                             row.StartTime,
+                             row.EndTime,
+                             row.GroupId,
+                             row.ModuleId,
+                             row.LessonTypeId
+                         }))
+            {
+                result.Add(SelectRepresentative(logicalEvent));
+            }
+
+            foreach (var legacyEvent in rows
+                         .Where(row => string.IsNullOrWhiteSpace(row.BatchKey))
+                         .GroupBy(row => new
+                         {
+                             row.Date,
+                             row.StartTime,
+                             row.EndTime,
+                             row.GroupId,
+                             row.ModuleId,
+                             row.LessonTypeId,
+                             row.RoomId,
+                             row.IsSelfStudy
+                         }))
+            {
+                var eventRows = legacyEvent.ToList();
+                var isLogicalEvent = eventRows.Count > 1
+                                     && eventRows
+                                         .Select(row => (row.ModuleTopicId, row.TeacherId))
+                                         .Distinct()
+                                         .Skip(1)
+                                         .Any();
+                if (isLogicalEvent)
+                {
+                    result.Add(SelectRepresentative(eventRows));
+                }
+                else
+                {
+                    result.AddRange(eventRows);
+                }
+            }
+
+            return result;
+        }
+        List<LogicalEventUsageRow> CollapseCurriculumTopicUsageRows(IEnumerable<LogicalEventUsageRow> source)
+        {
+            var rows = source
+                .Where(row => row.ModuleTopicId is not null)
+                .ToList();
+            var result = new List<LogicalEventUsageRow>(rows.Count);
+
+            foreach (var logicalTopic in rows
+                         .Where(row => !string.IsNullOrWhiteSpace(row.BatchKey))
+                         .GroupBy(row => new
+                         {
+                             row.BatchKey,
+                             row.Date,
+                             row.StartTime,
+                             row.EndTime,
+                             row.GroupId,
+                             row.ModuleId,
+                             row.LessonTypeId,
+                             row.ModuleTopicId
+                         }))
+            {
+                result.Add(logicalTopic
+                    .OrderBy(row => row.TeacherId)
+                    .ThenBy(row => row.RoomId)
+                    .First());
+            }
+
+            foreach (var legacyEvent in rows
+                         .Where(row => string.IsNullOrWhiteSpace(row.BatchKey))
+                         .GroupBy(row => new
+                         {
+                             row.Date,
+                             row.StartTime,
+                             row.EndTime,
+                             row.GroupId,
+                             row.ModuleId,
+                             row.LessonTypeId,
+                             row.RoomId,
+                             row.IsSelfStudy
+                         }))
+            {
+                var eventRows = legacyEvent.ToList();
+                var isLogicalEvent = eventRows.Count > 1
+                                     && eventRows
+                                         .Select(row => (row.ModuleTopicId, row.TeacherId))
+                                         .Distinct()
+                                         .Skip(1)
+                                         .Any();
+                if (!isLogicalEvent)
+                {
+                    result.AddRange(eventRows);
+                    continue;
+                }
+
+                result.AddRange(eventRows
+                    .GroupBy(row => row.ModuleTopicId)
+                    .Select(topicRows => topicRows
+                        .OrderBy(row => row.TeacherId)
+                        .ThenBy(row => row.RoomId)
+                        .First()));
+            }
+
+            return result;
+        }
+        var logicalSelfStudyUsageRows = CollapseCurriculumUsageRows(draftUsageRows.Where(row =>
+                row.IsSelfStudy
+                && (row.ModuleTopicId == null || flaggedSelfStudyTopicIds.Contains(row.ModuleTopicId.Value))))
+            .Concat(CollapseCurriculumUsageRows(scheduleUsageRows.Where(row =>
+                row.IsSelfStudy
+                && (row.ModuleTopicId == null || flaggedSelfStudyTopicIds.Contains(row.ModuleTopicId.Value)))))
+            .ToList();
+        var logicalTopicUsageRows = CollapseCurriculumTopicUsageRows(draftUsageRows)
+            .Concat(CollapseCurriculumTopicUsageRows(scheduleUsageRows))
+            .ToList();
         // Зведений лічильник самостійних занять по модулю/групі.
-        var selfStudyAssignments = selfStudyAssignmentsDraft
-            .Concat(selfStudyAssignmentsSchedule)
-            .GroupBy(x => (x.GroupId, x.ModuleId))
-            .ToDictionary(g => g.Key, g => g.Count());
+        var selfStudyAssignments = logicalSelfStudyUsageRows
+            .GroupBy(row => (row.GroupId, row.ModuleId))
+            .ToDictionary(group => group.Key, group => group.Count());
         // Зведений лічильник самостійних занять по темі.
-        var selfStudyTopicAssignments = selfStudyTopicAssignmentsDraft
-            .Concat(selfStudyTopicAssignmentsSchedule)
-            .GroupBy(x => (x.GroupId, x.ModuleId, x.TopicId))
-            .ToDictionary(g => g.Key, g => g.Sum(x => x.C));
-        // Призначені теми по групі/модулю (чернетки).
-        var topicAssignmentsDraft = await _db.TeacherDraftItems
-            .Where(di => di.ModuleTopicId != null
-                         && !excludedTypeIds.Contains(di.LessonTypeId)
-                         && di.Date < planningWeekEndExclusive
-                         && courseIds.Contains(di.Group.CourseId)
-                         && allowedTopicIds.Contains(di.ModuleTopicId!.Value))
-            .Select(di => new { di.GroupId, di.ModuleId, TopicId = di.ModuleTopicId!.Value })
-            .ToListAsync(cancellationToken);
-        // Призначені теми по групі/модулю (розклад).
-        var topicAssignmentsSchedule = await _db.ScheduleItems
-            .Where(si => si.ModuleTopicId != null
-                         && !excludedTypeIds.Contains(si.LessonTypeId)
-                         && si.Date < planningWeekEndExclusive
-                         && courseIds.Contains(si.Group.CourseId)
-                         && allowedTopicIds.Contains(si.ModuleTopicId!.Value))
-            .Select(si => new { si.GroupId, si.ModuleId, TopicId = si.ModuleTopicId!.Value })
-            .ToListAsync(cancellationToken);
+        var selfStudyTopicAssignments = logicalTopicUsageRows
+            .Where(row => row.IsSelfStudy
+                          && row.ModuleTopicId is int topicId
+                          && flaggedSelfStudyTopicIds.Contains(topicId))
+            .GroupBy(row => (row.GroupId, row.ModuleId, TopicId: row.ModuleTopicId!.Value))
+            .ToDictionary(group => group.Key, group => group.Count());
         // Сховище використаних тем по групі/модулю.
         var topicAssignments = new Dictionary<(int GroupId, int ModuleId), Dictionary<int, int>>();
         // Збільшує лічильник використаної теми.
@@ -1442,9 +1600,10 @@ public sealed class TeacherDraftsAutogenService
             assigned.TryGetValue(topicId, out var usedCount);
             assigned[topicId] = usedCount + 1;
         }
-        foreach (var entry in topicAssignmentsDraft.Concat(topicAssignmentsSchedule))
+        foreach (var entry in logicalTopicUsageRows.Where(row => row.ModuleTopicId is int topicId
+                                                                  && allowedTopicIds.Contains(topicId)))
         {
-            SeedTopicAssignment(entry.GroupId, entry.ModuleId, entry.TopicId);
+            SeedTopicAssignment(entry.GroupId, entry.ModuleId, entry.ModuleTopicId!.Value);
         }
         // Ліміт використання теми у розкладі.
         int GetTopicUsageLimit(ModuleTopic topic)
@@ -2326,42 +2485,6 @@ public sealed class TeacherDraftsAutogenService
             .Where(g => courseIds.Contains(g.CourseId))
             .GroupBy(g => g.CourseId)
             .ToDictionaryAsync(g => g.Key, g => g.OrderBy(x => x.Id).ToList(), cancellationToken);
-        var draftUsageRows = await _db.TeacherDraftItems
-            .AsNoTracking()
-            .Where(item => !excludedTypeIds.Contains(item.LessonTypeId)
-                           && item.Date < planningWeekEndExclusive
-                           && courseIds.Contains(item.Group.CourseId))
-            .Select(item => new LogicalEventUsageRow(
-                item.GroupId,
-                item.ModuleId,
-                item.LessonTypeId,
-                item.ModuleTopicId,
-                item.TeacherId,
-                item.RoomId,
-                item.IsSelfStudy,
-                item.Date,
-                item.StartTime,
-                item.EndTime,
-                item.BatchKey))
-            .ToListAsync(cancellationToken);
-        var scheduleUsageRows = await _db.ScheduleItems
-            .AsNoTracking()
-            .Where(item => !excludedTypeIds.Contains(item.LessonTypeId)
-                           && item.Date < planningWeekEndExclusive
-                           && courseIds.Contains(item.Group.CourseId))
-            .Select(item => new LogicalEventUsageRow(
-                item.GroupId,
-                item.ModuleId,
-                item.LessonTypeId,
-                item.ModuleTopicId,
-                item.TeacherId,
-                item.RoomId,
-                item.IsSelfStudy,
-                item.Date,
-                item.StartTime,
-                item.EndTime,
-                item.BatchKey))
-            .ToListAsync(cancellationToken);
         void SubtractLogicalEventDuplicates(
             Dictionary<(int GroupId, int ModuleId), int> fact,
             IEnumerable<LogicalEventUsageRow> rows,
@@ -2426,7 +2549,9 @@ public sealed class TeacherDraftsAutogenService
         var factByGroupModule = await _db.TeacherDraftItems
             .Where(si => !excludedTypeIds.Contains(si.LessonTypeId)
                          && si.Date < planningWeekEndExclusive
-                         && courseIds.Contains(si.Group.CourseId))
+                         && courseIds.Contains(si.Group.CourseId)
+                         && (si.Group.Course.AcademicPeriodStartDate == null
+                             || si.Date >= si.Group.Course.AcademicPeriodStartDate.Value))
             .GroupBy(si => new { si.GroupId, si.ModuleId })
             .Select(g => new { g.Key.GroupId, g.Key.ModuleId, C = g.Count() })
             .ToListAsync(cancellationToken);
@@ -2436,7 +2561,9 @@ public sealed class TeacherDraftsAutogenService
         var scheduleByGroupModule = await _db.ScheduleItems
             .Where(si => !excludedTypeIds.Contains(si.LessonTypeId)
                          && si.Date < planningWeekEndExclusive
-                         && courseIds.Contains(si.Group.CourseId))
+                         && courseIds.Contains(si.Group.CourseId)
+                         && (si.Group.Course.AcademicPeriodStartDate == null
+                             || si.Date >= si.Group.Course.AcademicPeriodStartDate.Value))
             .GroupBy(si => new { si.GroupId, si.ModuleId })
             .Select(g => new { g.Key.GroupId, g.Key.ModuleId, C = g.Count() })
             .ToListAsync(cancellationToken);
@@ -2459,7 +2586,9 @@ public sealed class TeacherDraftsAutogenService
             .Where(si => !excludedTypeIds.Contains(si.LessonTypeId)
                          && si.Date >= rangeStartDate
                          && si.Date < rangeEndDateExclusive
-                         && courseIds.Contains(si.Group.CourseId))
+                         && courseIds.Contains(si.Group.CourseId)
+                         && (si.Group.Course.AcademicPeriodStartDate == null
+                             || si.Date >= si.Group.Course.AcademicPeriodStartDate.Value))
             .GroupBy(si => new { si.GroupId, si.ModuleId })
             .Select(g => new { g.Key.GroupId, g.Key.ModuleId, C = g.Count() })
             .ToListAsync(cancellationToken);
@@ -2468,7 +2597,9 @@ public sealed class TeacherDraftsAutogenService
             .Where(si => !excludedTypeIds.Contains(si.LessonTypeId)
                          && si.Date >= rangeStartDate
                          && si.Date < rangeEndDateExclusive
-                         && courseIds.Contains(si.Group.CourseId))
+                         && courseIds.Contains(si.Group.CourseId)
+                         && (si.Group.Course.AcademicPeriodStartDate == null
+                             || si.Date >= si.Group.Course.AcademicPeriodStartDate.Value))
             .GroupBy(si => new { si.GroupId, si.ModuleId })
             .Select(g => new { g.Key.GroupId, g.Key.ModuleId, C = g.Count() })
             .ToListAsync(cancellationToken);
@@ -13880,6 +14011,7 @@ public sealed class TeacherDraftsAutogenService
 
             foreach (var draft in changedDraftsForValidation)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var groupLabel = selectedGroupsById.TryGetValue(draft.GroupId, out var group)
                     ? group.Name
                     : $"#{draft.GroupId}";
@@ -13939,57 +14071,73 @@ public sealed class TeacherDraftsAutogenService
                 }
             }
 
-            for (var i = 0; i < changedDraftsForValidation.Count; i++)
+            foreach (var dayDrafts in changedDraftsForValidation
+                         .GroupBy(draft => draft.Date)
+                         .Select(group => group
+                             .OrderBy(draft => draft.StartTime)
+                             .ThenBy(draft => draft.EndTime)
+                             .ThenBy(draft => draft.GroupId)
+                             .ToList()))
             {
-                var left = changedDraftsForValidation[i];
-                for (var j = i + 1; j < changedDraftsForValidation.Count; j++)
+                cancellationToken.ThrowIfCancellationRequested();
+                for (var i = 0; i < dayDrafts.Count; i++)
                 {
-                    var right = changedDraftsForValidation[j];
-                    if (left.Date != right.Date || !Overlaps(left.StartTime, left.EndTime, right.StartTime, right.EndTime))
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var left = dayDrafts[i];
+                    for (var j = i + 1; j < dayDrafts.Count; j++)
                     {
-                        continue;
-                    }
-                    var label = $"{left.Date:yyyy-MM-dd} {left.StartTime:HH\\:mm}-{left.EndTime:HH\\:mm}";
-                    if (left.GroupId == right.GroupId)
-                    {
-                        errors.Add($"Фінальна перевірка: група #{left.GroupId} має перетин чернеток у слоті {label} "
-                                   + $"(чернетки #{left.Id}/модуль #{left.ModuleId}/тема #{left.ModuleTopicId} і "
-                                   + $"#{right.Id}/модуль #{right.ModuleId}/тема #{right.ModuleTopicId}).");
-                    }
-                    var sameShareableOccurrence = SameShareableOccurrence(
-                        left.GroupId,
-                        left.ModuleId,
-                        left.LessonTypeId,
-                        left.ModuleTopicId,
-                        left.TeacherId,
-                        left.RoomId,
-                        left.Date,
-                        left.StartTime,
-                        left.EndTime,
-                        right.GroupId,
-                        right.ModuleId,
-                        right.LessonTypeId,
-                        right.ModuleTopicId,
-                        right.TeacherId,
-                        right.RoomId,
-                        right.Date,
-                        right.StartTime,
-                        right.EndTime);
-                    if (left.TeacherId is int leftTeacher
-                        && right.TeacherId == leftTeacher
-                        && BlocksTeacher(left.LessonTypeId)
-                        && BlocksTeacher(right.LessonTypeId)
-                        && !sameShareableOccurrence)
-                    {
-                        errors.Add($"Фінальна перевірка: викладач #{leftTeacher} має перетин чернеток у слоті {label}.");
-                    }
-                    if (left.RoomId is int leftRoom
-                        && right.RoomId == leftRoom
-                        && BlocksRoom(left.LessonTypeId)
-                        && BlocksRoom(right.LessonTypeId)
-                        && !sameShareableOccurrence)
-                    {
-                        errors.Add($"Фінальна перевірка: аудиторія #{leftRoom} має перетин чернеток у слоті {label}.");
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var right = dayDrafts[j];
+                        if (right.StartTime >= left.EndTime)
+                        {
+                            break;
+                        }
+                        if (!Overlaps(left.StartTime, left.EndTime, right.StartTime, right.EndTime))
+                        {
+                            continue;
+                        }
+                        var label = $"{left.Date:yyyy-MM-dd} {left.StartTime:HH\\:mm}-{left.EndTime:HH\\:mm}";
+                        if (left.GroupId == right.GroupId)
+                        {
+                            errors.Add($"Фінальна перевірка: група #{left.GroupId} має перетин чернеток у слоті {label} "
+                                       + $"(чернетки #{left.Id}/модуль #{left.ModuleId}/тема #{left.ModuleTopicId} і "
+                                       + $"#{right.Id}/модуль #{right.ModuleId}/тема #{right.ModuleTopicId}).");
+                        }
+                        var sameShareableOccurrence = SameShareableOccurrence(
+                            left.GroupId,
+                            left.ModuleId,
+                            left.LessonTypeId,
+                            left.ModuleTopicId,
+                            left.TeacherId,
+                            left.RoomId,
+                            left.Date,
+                            left.StartTime,
+                            left.EndTime,
+                            right.GroupId,
+                            right.ModuleId,
+                            right.LessonTypeId,
+                            right.ModuleTopicId,
+                            right.TeacherId,
+                            right.RoomId,
+                            right.Date,
+                            right.StartTime,
+                            right.EndTime);
+                        if (left.TeacherId is int leftTeacher
+                            && right.TeacherId == leftTeacher
+                            && BlocksTeacher(left.LessonTypeId)
+                            && BlocksTeacher(right.LessonTypeId)
+                            && !sameShareableOccurrence)
+                        {
+                            errors.Add($"Фінальна перевірка: викладач #{leftTeacher} має перетин чернеток у слоті {label}.");
+                        }
+                        if (left.RoomId is int leftRoom
+                            && right.RoomId == leftRoom
+                            && BlocksRoom(left.LessonTypeId)
+                            && BlocksRoom(right.LessonTypeId)
+                            && !sameShareableOccurrence)
+                        {
+                            errors.Add($"Фінальна перевірка: аудиторія #{leftRoom} має перетин чернеток у слоті {label}.");
+                        }
                     }
                 }
             }
@@ -14015,14 +14163,32 @@ public sealed class TeacherDraftsAutogenService
                                 || (d.RoomId != null && roomIdsForValidation.Contains(d.RoomId.Value))))
                 .Select(d => new { d.Date, d.StartTime, d.EndTime, d.GroupId, d.ModuleId, d.ModuleTopicId, d.TeacherId, d.RoomId, d.LessonTypeId })
             .ToListAsync(cancellationToken);
+            var existingPlacementsByDate = existingDrafts
+                .Concat(existingSchedule)
+                .GroupBy(item => item.Date)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group
+                        .OrderBy(item => item.StartTime)
+                        .ThenBy(item => item.EndTime)
+                        .ToList());
 
             foreach (var draft in changedDraftsForValidation)
             {
-                foreach (var existing in existingDrafts.Concat(existingSchedule))
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!existingPlacementsByDate.TryGetValue(draft.Date, out var existingPlacements))
                 {
+                    continue;
+                }
+                foreach (var existing in existingPlacements)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (existing.StartTime >= draft.EndTime)
+                    {
+                        break;
+                    }
                     if (!OccupiesSlot(existing.LessonTypeId)
-                        || draft.Date != existing.Date
-                        || !Overlaps(draft.StartTime, draft.EndTime, existing.StartTime, existing.EndTime))
+                        || existing.EndTime <= draft.StartTime)
                     {
                         continue;
                     }
@@ -14167,17 +14333,31 @@ public sealed class TeacherDraftsAutogenService
         if (r.PreflightOnly)
         {
             warnings.Add("Пробну генерацію завершено без збереження чернеток.");
-            await tx.RollbackAsync(cancellationToken);
+            if (ownedTransaction is not null)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+            }
+            else
+            {
+                await _db.SaveChangesAsync(cancellationToken);
+            }
             return Ok(new AutoGenResult(0, skipped, warnings, gapDetails, BuildAutoGenGapSummary(gapDetails), preflightItems));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
         await _db.SaveChangesAsync(cancellationToken);
-        await tx.CommitAsync(cancellationToken);
+        if (ownedTransaction is not null)
+        {
+            await transaction.CommitAsync(cancellationToken);
+        }
         return Ok(new AutoGenResult(created, skipped, warnings, gapDetails, BuildAutoGenGapSummary(gapDetails), preflightItems));
         }
         finally
         {
+            if (ownedTransaction is not null)
+            {
+                await ownedTransaction.DisposeAsync();
+            }
             GenerationLock.Release();
         }
     }

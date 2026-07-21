@@ -109,6 +109,26 @@ else
                     </button>
                 </div>
             </div>
+            @if (SelectedAutoGenCourse is { } selectedAutoGenCourse)
+            {
+                if (selectedAutoGenCourse.AcademicPeriodStartDate is not DateOnly academicPeriodStartDate)
+                {
+                    <div class="alert alert-warning mt-3 mb-0" role="alert">
+                        <strong>Автогенерацію заблоковано.</strong>
+                        Для курсу «@selectedAutoGenCourse.Name» не вказано початок поточного навчального періоду.
+                        <a class="alert-link" href="/admin/courses">Налаштувати курс</a>.
+                    </div>
+                }
+                else if (_generationFromDate < academicPeriodStartDate)
+                {
+                    <div class="alert alert-warning mt-3 mb-0" role="alert">
+                        <strong>Автогенерацію заблоковано.</strong>
+                        Обрана дата початку генерації передує початку навчального періоду
+                        (@academicPeriodStartDate.ToString("dd.MM.yyyy")) для курсу «@selectedAutoGenCourse.Name».
+                        Змініть діапазон або <a class="alert-link" href="/admin/courses">налаштуйте курс</a>.
+                    </div>
+                }
+            }
             @if (_autoGenProgress is not null)
             {
                 var progress = _autoGenProgress;
@@ -907,8 +927,16 @@ else
     private bool IsBreak(int lessonTypeId) => lessonTypeId == breakTypeId;
     private bool IsCanceled(int lessonTypeId) => lessonTypeId == canceledTypeId;
     private bool IsServiceLessonType(int lessonTypeId) => IsBreak(lessonTypeId) || IsCanceled(lessonTypeId);
+    private LookupDto? SelectedAutoGenCourse
+        => meta is not null && _selectedCourseId is int courseId
+            ? meta.Courses.FirstOrDefault(course => course.Id == courseId)
+            : null;
+    private bool IsAcademicPeriodReadyForAutoGen
+        => SelectedAutoGenCourse?.AcademicPeriodStartDate is DateOnly academicPeriodStartDate
+           && _generationFromDate >= academicPeriodStartDate;
     private bool CanAutoGen
         => _selectedCourseId is int
+           && IsAcademicPeriodReadyForAutoGen
            && _moduleWeekRows.Any(row => row.Selected && row.Hours > 0)
            && _courseGroupRows.Any(row => row.Selected);
     private bool IsAutoGenBusy => _autoGenActionStarting || _autoGenProgress is not null;

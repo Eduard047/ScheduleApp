@@ -20,7 +20,7 @@
     <div class="col-md-6">
         <div class="d-flex justify-content-between align-items-center mb-2 gap-2">
             <button class="btn btn-primary" @onclick="New">+ Додати курс</button>
-            <AdminSearchBox @bind-Value="filter" Style="max-width:280px;" Placeholder="Id / назва / тижні" />
+            <AdminSearchBox @bind-Value="filter" Style="max-width:280px;" Placeholder="Id / назва / тижні / період" />
         </div>
         <table class="table table-sm table-striped align-middle">
             <thead>
@@ -28,6 +28,7 @@
                     <SortableHeader Field="@nameof(CourseEditDto.Id)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Id</SortableHeader>
                     <SortableHeader Field="@nameof(CourseEditDto.Name)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Назва</SortableHeader>
                     <SortableHeader Field="@nameof(CourseEditDto.DurationWeeks)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Тривалість (тижнів)</SortableHeader>
+                    <SortableHeader Field="@nameof(CourseEditDto.AcademicPeriodStartDate)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Початок навчального періоду</SortableHeader>
                     <th style="width:220px;"></th>
                 </tr>
             </thead>
@@ -38,6 +39,7 @@
                         <td>@c.Id</td>
                         <td>@c.Name</td>
                         <td>@c.DurationWeeks</td>
+                        <td>@(c.AcademicPeriodStartDate?.ToString("yyyy-MM-dd") ?? "—")</td>
                         <td class="text-end text-nowrap">
                             <button class="btn btn-sm btn-outline-secondary me-2" @onclick="() => Edit(c)">Редагувати</button>
                             <button class="btn btn-sm btn-outline-danger" @onclick="() => Delete(c.Id!.Value)">Видалити</button>
@@ -63,6 +65,17 @@
                     <div class="mb-3">
                         <label class="form-label">Тривалість (тижнів)</label>
                         <InputNumber class="form-control" @bind-Value="model.DurationWeeks" />
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Початок навчального періоду</label>
+                        <InputDate class="form-control"
+                                   min="2000-01-01"
+                                   max="2100-12-31"
+                                   required
+                                   @bind-Value="model.AcademicPeriodStartDate" />
+                        <div class="form-text">
+                            Поле потрібне для автогенерації. Заняття до цієї дати не витрачають години плану й теми поточного періоду.
+                        </div>
                     </div>
                 </div>
                 <div class="card-footer d-flex gap-2">
@@ -93,7 +106,8 @@
         return seq.Where(c =>
             (c.Id?.ToString().Contains(f, StringComparison.OrdinalIgnoreCase) ?? false) ||
             (!string.IsNullOrEmpty(c.Name) && c.Name.Contains(f, StringComparison.OrdinalIgnoreCase)) ||
-            c.DurationWeeks.ToString().Contains(f, StringComparison.OrdinalIgnoreCase));
+            c.DurationWeeks.ToString().Contains(f, StringComparison.OrdinalIgnoreCase) ||
+            (c.AcademicPeriodStartDate?.ToString("yyyy-MM-dd").Contains(f, StringComparison.OrdinalIgnoreCase) ?? false));
     }
     // Сортує курси за вибраним полем.
     private IEnumerable<CourseEditDto> ApplySort(IEnumerable<CourseEditDto> seq)
@@ -104,6 +118,8 @@
             (nameof(CourseEditDto.Id), false) => seq.OrderByDescending(c => c.Id ?? 0),
             (nameof(CourseEditDto.DurationWeeks), true) => seq.OrderBy(c => c.DurationWeeks),
             (nameof(CourseEditDto.DurationWeeks), false) => seq.OrderByDescending(c => c.DurationWeeks),
+            (nameof(CourseEditDto.AcademicPeriodStartDate), true) => seq.OrderBy(c => c.AcademicPeriodStartDate),
+            (nameof(CourseEditDto.AcademicPeriodStartDate), false) => seq.OrderByDescending(c => c.AcademicPeriodStartDate),
             (nameof(CourseEditDto.Name), false) => seq.OrderByDescending(c => c.Name),
             _ => seq.OrderBy(c => c.Name)
         };
@@ -123,7 +139,7 @@
         items = await Api.GetCourses();
         if (!items.Any())
         {
-            model = new CourseEditDto(null, "", 16);
+            model = new CourseEditDto(null, "", 16, null);
             formTitle = "Новий курс";
         }
         StateHasChanged();
@@ -132,14 +148,14 @@
     private void New()
     {
         error = ok = null;
-        model = new CourseEditDto(null, "", 16);
+        model = new CourseEditDto(null, "", 16, null);
         formTitle = "Новий курс";
     }
     // Заповнює форму для редагування курсу.
     private void Edit(CourseEditDto c)
     {
         error = ok = null;
-        model = new CourseEditDto(c.Id, c.Name, c.DurationWeeks);
+        model = new CourseEditDto(c.Id, c.Name, c.DurationWeeks, c.AcademicPeriodStartDate);
         formTitle = $"Редагування: {c.Name}";
     }
     // Зберігає курс через API.

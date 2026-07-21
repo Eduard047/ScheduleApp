@@ -24,6 +24,7 @@ public class Course
     public int Id { get; set; }
     public string Name { get; set; } = default!;
     public int DurationWeeks { get; set; }
+    public DateOnly? AcademicPeriodStartDate { get; set; }
     public ICollection<Group> Groups { get; set; } = new List<Group>();
     public ICollection<Module> Modules { get; set; } = new List<Module>();
     public ICollection<ModuleCourse> ModuleCourses { get; set; } = new List<ModuleCourse>();
@@ -318,6 +319,11 @@ public class AutoGenJobRun
 {
     public int Id { get; set; }
     public string JobId { get; set; } = default!;
+    public string RequestHash { get; set; } = string.Empty;
+    public string? OwnerInstanceId { get; set; }
+    public int Attempt { get; set; }
+    public DateTime? LeaseExpiresAtUtc { get; set; }
+    public long Version { get; set; }
     public int Kind { get; set; }
     public int State { get; set; }
     public string Title { get; set; } = default!;

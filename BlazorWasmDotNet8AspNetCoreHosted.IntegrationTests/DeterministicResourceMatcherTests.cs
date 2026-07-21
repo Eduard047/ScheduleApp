@@ -416,6 +416,68 @@ public sealed class DeterministicResidualOptimizerTests
     }
 
     [Fact]
+    public void Optimize_preserves_legacy_lexicographic_tie_break()
+    {
+        var candidates = new[]
+        {
+            new ResidualPlacementCandidate(21, 20, 200, 0),
+            new ResidualPlacementCandidate(10, 10, 100, 0),
+            new ResidualPlacementCandidate(20, 20, 100, 0),
+            new ResidualPlacementCandidate(11, 10, 200, 0)
+        };
+        var capacities = new Dictionary<int, int>
+        {
+            [100] = 1,
+            [200] = 1
+        };
+
+        var result = DeterministicResidualOptimizer.Optimize(
+            candidates,
+            capacities,
+            2,
+            100,
+            TimeSpan.FromSeconds(5));
+
+        Assert.False(result.SearchLimitReached);
+        Assert.Equal(new[] { 10, 21 }, result.Placements.Select(placement => placement.CandidateId));
+    }
+
+    [Fact]
+    public void Optimize_solves_dense_matrix_with_polynomial_node_budget()
+    {
+        const int gapCount = 20;
+        const int resourceCount = 20;
+        var candidates = Enumerable
+            .Range(0, gapCount)
+            .SelectMany(gapIndex => Enumerable
+                .Range(0, resourceCount)
+                .Select(resourceIndex => new ResidualPlacementCandidate(
+                    gapIndex * resourceCount + resourceIndex + 1,
+                    gapIndex + 1,
+                    resourceIndex + 101,
+                    gapIndex == resourceIndex ? 0 : 1)))
+            .ToArray();
+        var capacities = Enumerable
+            .Range(0, resourceCount)
+            .ToDictionary(resourceIndex => resourceIndex + 101, _ => 1);
+
+        var result = DeterministicResidualOptimizer.Optimize(
+            candidates,
+            capacities,
+            gapCount,
+            1_000,
+            TimeSpan.FromSeconds(5));
+
+        Assert.False(result.SearchLimitReached);
+        Assert.Equal(gapCount, result.FilledGapCount);
+        Assert.Equal(0, result.TotalCost);
+        Assert.Equal(
+            Enumerable.Range(0, gapCount).Select(index => index * resourceCount + index + 1),
+            result.Placements.Select(placement => placement.CandidateId));
+        Assert.InRange(result.VisitedNodes, 1, 1_000);
+    }
+
+    [Fact]
     public void Optimize_reports_node_limit_and_keeps_deterministic_warm_start()
     {
         var candidates = new[]
@@ -448,6 +510,87 @@ public sealed class DeterministicResidualOptimizerTests
         Assert.False(first.EmergencyLimitReached);
         Assert.Equal(2, first.FilledGapCount);
         Assert.Equal(first.Placements, second.Placements);
+    }
+
+    [Fact]
+    public void Optimize_applies_proven_shortest_path_when_later_expansion_reaches_node_limit()
+    {
+        var candidates = new[]
+        {
+            new ResidualPlacementCandidate(1, 10, 100, 100),
+            new ResidualPlacementCandidate(2, 20, 100, 0),
+            new ResidualPlacementCandidate(3, 20, 200, 0)
+        };
+        var capacities = new Dictionary<int, int>
+        {
+            [100] = 1,
+            [200] = 1
+        };
+
+        var result = DeterministicResidualOptimizer.Optimize(
+            candidates,
+            capacities,
+            1,
+            4,
+            TimeSpan.FromSeconds(5));
+
+        Assert.True(result.NodeLimitReached);
+        Assert.False(result.EmergencyLimitReached);
+        Assert.Equal(0, result.TotalCost);
+        Assert.Equal(new[] { 2 }, result.Placements.Select(placement => placement.CandidateId));
+    }
+
+    [Fact]
+    public void Optimize_reports_total_cost_as_long_without_overflow()
+    {
+        var candidates = new[]
+        {
+            new ResidualPlacementCandidate(1, 10, 100, int.MaxValue),
+            new ResidualPlacementCandidate(2, 20, 200, int.MaxValue)
+        };
+        var capacities = new Dictionary<int, int>
+        {
+            [100] = 1,
+            [200] = 1
+        };
+
+        var result = DeterministicResidualOptimizer.Optimize(
+            candidates,
+            capacities,
+            2,
+            100,
+            TimeSpan.FromSeconds(5));
+
+        Assert.False(result.SearchLimitReached);
+        Assert.Equal(2L * int.MaxValue, result.TotalCost);
+    }
+
+    [Fact]
+    public void Optimize_stops_composite_cost_construction_on_emergency_timeout()
+    {
+        const int candidateCount = 128;
+        var candidates = Enumerable.Range(1, candidateCount)
+            .Select(index => new ResidualPlacementCandidate(index, index, 100, 0))
+            .ToArray();
+        var capacities = new Dictionary<int, int>
+        {
+            [100] = candidateCount
+        };
+        var budget = new DeterministicSearchBudget(
+            10_000,
+            TimeSpan.FromSeconds(3),
+            new AdvancingTimeProvider());
+
+        var result = DeterministicResidualOptimizer.Optimize(
+            candidates,
+            capacities,
+            candidateCount,
+            budget);
+
+        Assert.True(result.EmergencyLimitReached);
+        Assert.False(result.NodeLimitReached);
+        Assert.Equal(0, result.VisitedNodes);
+        Assert.Equal(candidateCount, result.FilledGapCount);
     }
 
     [Fact]
@@ -610,6 +753,20 @@ public sealed class DeterministicResidualOptimizerTests
         public void Advance(TimeSpan value)
         {
             _timestamp += value.Ticks;
+        }
+    }
+
+    private sealed class AdvancingTimeProvider : TimeProvider
+    {
+        private long _timestamp;
+
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
+        public override long GetTimestamp()
+        {
+            var current = _timestamp;
+            _timestamp += TimeSpan.TicksPerSecond;
+            return current;
         }
     }
 }

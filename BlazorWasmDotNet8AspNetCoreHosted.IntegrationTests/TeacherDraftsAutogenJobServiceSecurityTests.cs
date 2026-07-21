@@ -1,6 +1,10 @@
 using System.Reflection;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -11,31 +15,66 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
     [Fact]
     public async Task StopAsync_cancels_and_awaits_running_job_before_returning()
     {
-        using var scopeFactory = new ShutdownBlockingScopeFactory();
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        await using (var db = new AppDbContext(options))
+        {
+            await db.Database.EnsureCreatedAsync();
+            db.Courses.Add(new Course
+            {
+                Id = 1,
+                Name = "Курс перевірки зупинки",
+                DurationWeeks = 52,
+                AcademicPeriodStartDate = new DateOnly(2026, 1, 1)
+            });
+            await db.SaveChangesAsync();
+        }
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(options));
+        await using var provider = services.BuildServiceProvider();
         var service = new TeacherDraftsAutogenJobService(
-            scopeFactory,
+            provider.GetRequiredService<IServiceScopeFactory>(),
             new CapturingLogger<TeacherDraftsAutogenJobService>());
+        var executionGate = await HoldGateAsync(service, "_executionGate");
         var started = service.Start(CreateValidRequest());
+        var persistenceGate = await HoldGateAsync(service, "_persistenceGate");
         Task? stopTask = null;
 
         try
         {
-            Assert.True(scopeFactory.WaitUntilJobIsBlocked(TimeSpan.FromSeconds(2)));
             stopTask = service.StopAsync(CancellationToken.None);
             await Task.Delay(50);
             Assert.False(stopTask.IsCompleted);
         }
         finally
         {
-            scopeFactory.ReleaseJob();
+            persistenceGate.Release();
         }
 
         Assert.NotNull(stopTask);
-        await stopTask.WaitAsync(TimeSpan.FromSeconds(2));
+        await stopTask.WaitAsync(TimeSpan.FromSeconds(5));
+        executionGate.Release();
         var status = service.Get(started.JobId);
         Assert.NotNull(status);
         Assert.Equal(AutoGenJobState.Canceled, status.State);
         Assert.True(status.CancellationRequested);
+        Assert.DoesNotContain("користувач", status.CurrentStage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Initial_persistence_failure_does_not_queue_or_expose_a_local_job()
+    {
+        var service = new TeacherDraftsAutogenJobService(
+            new ThrowingScopeFactory(() => new InvalidOperationException("Сховище недоступне.")),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+
+        Assert.Throws<AutoGenJobPersistenceException>(() => service.Start(CreateValidRequest()));
+
+        Assert.Equal(0, GetPrivateCollectionCount(service, "_jobs"));
+        Assert.Equal(0, GetPrivateCollectionCount(service, "_runningTasks"));
     }
 
     [Fact]
@@ -174,43 +213,34 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
         return Assert.IsType<AutoGenJobStatus>(method.Invoke(runtime, null));
     }
 
+    private static async Task<SemaphoreSlim> HoldGateAsync(
+        TeacherDraftsAutogenJobService service,
+        string fieldName)
+    {
+        var field = typeof(TeacherDraftsAutogenJobService).GetField(
+            fieldName,
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var gate = Assert.IsType<SemaphoreSlim>(field?.GetValue(service));
+        await gate.WaitAsync();
+        return gate;
+    }
+
+    private static int GetPrivateCollectionCount(
+        TeacherDraftsAutogenJobService service,
+        string fieldName)
+    {
+        var field = typeof(TeacherDraftsAutogenJobService).GetField(
+            fieldName,
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var collection = field?.GetValue(service);
+        var count = collection?.GetType().GetProperty("Count", BindingFlags.Instance | BindingFlags.Public);
+        return Assert.IsType<int>(count?.GetValue(collection));
+    }
+
     private sealed class ThrowingScopeFactory(Func<Exception> exceptionFactory) : IServiceScopeFactory
     {
         public IServiceScope CreateScope()
             => throw exceptionFactory();
-    }
-
-    private sealed class ShutdownBlockingScopeFactory : IServiceScopeFactory, IDisposable
-    {
-        private readonly ManualResetEventSlim _jobBlocked = new(false);
-        private readonly ManualResetEventSlim _releaseJob = new(false);
-        private int _createScopeCount;
-
-        public IServiceScope CreateScope()
-        {
-            var call = Interlocked.Increment(ref _createScopeCount);
-            if (call != 3)
-            {
-                throw new InvalidOperationException("Тестове сховище стану недоступне.");
-            }
-
-            _jobBlocked.Set();
-            _releaseJob.Wait(TimeSpan.FromSeconds(5));
-            throw new OperationCanceledException("Тестове переривання фонового завдання.");
-        }
-
-        public bool WaitUntilJobIsBlocked(TimeSpan timeout)
-            => _jobBlocked.Wait(timeout);
-
-        public void ReleaseJob()
-            => _releaseJob.Set();
-
-        public void Dispose()
-        {
-            _releaseJob.Set();
-            _jobBlocked.Dispose();
-            _releaseJob.Dispose();
-        }
     }
 
     private sealed class CapturingLogger<T> : ILogger<T>

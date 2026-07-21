@@ -13,7 +13,12 @@ public class MetaController(AppDbContext db) : ControllerBase
     // Повертає довідкові дані для клієнта, зокрема календар на тиждень.
     public async Task<MetaResponseDto> Get([FromQuery] DateOnly? weekStart)
     {
-        var courses = await db.Courses.AsNoTracking().Select(x => new LookupDto(x.Id, x.Name)).ToListAsync();
+        var courses = await db.Courses.AsNoTracking()
+            .Select(x => new LookupDto(x.Id, x.Name)
+            {
+                AcademicPeriodStartDate = x.AcademicPeriodStartDate
+            })
+            .ToListAsync();
         var groups = await db.Groups.AsNoTracking()
             .Select(x => new LookupDto(x.Id, x.Name) { CourseId = x.CourseId })
             .ToListAsync();

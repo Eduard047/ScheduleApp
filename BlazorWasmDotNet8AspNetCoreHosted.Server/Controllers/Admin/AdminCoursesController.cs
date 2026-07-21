@@ -14,12 +14,15 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Admin;
 // Контролер адміністратора для курсів
 public class AdminCoursesController(AppDbContext db) : ControllerBase
 {
+    private static readonly DateOnly EarliestAcademicPeriodStartDate = new(2000, 1, 1);
+    private static readonly DateOnly LatestAcademicPeriodStartDate = new(2100, 12, 31);
+
     [HttpGet]
     // Повертає список курсів.
     public async Task<IReadOnlyList<CourseEditDto>> List()
         => await db.Courses.AsNoTracking()
             .OrderBy(c => c.Id)
-            .Select(c => new CourseEditDto(c.Id, c.Name, c.DurationWeeks))
+            .Select(c => new CourseEditDto(c.Id, c.Name, c.DurationWeeks, c.AcademicPeriodStartDate))
             .ToListAsync();
     [HttpPost("upsert")]
     // Створює або оновлює курс.
@@ -30,18 +33,36 @@ public class AdminCoursesController(AppDbContext db) : ControllerBase
             return BadRequest(new { message = "Назва є обовʼязковою" });
         if (dto.DurationWeeks is < 1 or > 520)
             return BadRequest(new { message = "Тривалість курсу має бути від 1 до 520 тижнів." });
+        if (dto.AcademicPeriodStartDate is not DateOnly academicPeriodStartDate)
+        {
+            return BadRequest(new { message = "Початок поточного навчального періоду є обов'язковим." });
+        }
+        if (academicPeriodStartDate < EarliestAcademicPeriodStartDate
+            || academicPeriodStartDate > LatestAcademicPeriodStartDate)
+        {
+            return BadRequest(new
+            {
+                message = "Початок навчального періоду має бути в межах від 2000-01-01 до 2100-12-31."
+            });
+        }
         if (dto.Id is int id && id > 0)
         {
             var c = await db.Courses.FindAsync(id);
             if (c is null) return NotFound(new { message = "Курс не знайдено." });
             c.Name = name;
             c.DurationWeeks = dto.DurationWeeks;
+            c.AcademicPeriodStartDate = dto.AcademicPeriodStartDate;
             await db.SaveChangesAsync();
             return Ok(c.Id);
         }
         else
         {
-            var c = new Course { Name = name, DurationWeeks = dto.DurationWeeks };
+            var c = new Course
+            {
+                Name = name,
+                DurationWeeks = dto.DurationWeeks,
+                AcademicPeriodStartDate = dto.AcademicPeriodStartDate
+            };
             db.Courses.Add(c);
             await db.SaveChangesAsync();
             return Ok(c.Id);
