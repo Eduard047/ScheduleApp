@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
+using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 
@@ -73,6 +74,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         // Зберігаємо явну нижню межу поточного навчального періоду без обов'язкового значення.
         b.Entity<Course>(e =>
         {
+            e.Property(x => x.Name).HasMaxLength(CourseEditDto.NameMaxLength).IsRequired();
             e.Property(x => x.AcademicPeriodStartDate).HasColumnType("date");
         });
         // Забороняємо каскадне видалення курсу при видаленні групи.

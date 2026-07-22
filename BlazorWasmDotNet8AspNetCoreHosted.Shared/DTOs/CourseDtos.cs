@@ -4,6 +4,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 // DTO для редагування даних курсу.
 public record class CourseEditDto
 {
+    public const int NameMaxLength = 256;
+
     public CourseEditDto() { }
     public CourseEditDto(int? id, string name, int durationWeeks, DateOnly? academicPeriodStartDate = null)
     {

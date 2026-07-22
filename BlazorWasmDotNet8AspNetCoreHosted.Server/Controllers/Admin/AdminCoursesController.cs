@@ -31,6 +31,13 @@ public class AdminCoursesController(AppDbContext db) : ControllerBase
         var name = dto.Name?.Trim() ?? string.Empty;
         if (string.IsNullOrWhiteSpace(name))
             return BadRequest(new { message = "Назва є обовʼязковою" });
+        if (name.Length > CourseEditDto.NameMaxLength)
+        {
+            return BadRequest(new
+            {
+                message = $"Назва курсу не може перевищувати {CourseEditDto.NameMaxLength} символів."
+            });
+        }
         if (dto.DurationWeeks is < 1 or > 520)
             return BadRequest(new { message = "Тривалість курсу має бути від 1 до 520 тижнів." });
         if (dto.AcademicPeriodStartDate is not DateOnly academicPeriodStartDate)

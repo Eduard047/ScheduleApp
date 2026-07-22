@@ -53,6 +53,43 @@ public sealed class TeacherDraftsAutogenServiceRegressionTests
     }
 
     [Fact]
+    public async Task Course_upsert_accepts_name_at_maximum_length()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var name = new string('К', CourseEditDto.NameMaxLength);
+
+        var action = await new AdminCoursesController(fixture.Db).Upsert(new CourseEditDto(
+            id: null,
+            name,
+            durationWeeks: 52,
+            academicPeriodStartDate: new DateOnly(2026, 9, 1)));
+
+        Assert.IsType<OkObjectResult>(action.Result);
+        var persisted = await fixture.Db.Courses.AsNoTracking().SingleAsync();
+        Assert.Equal(CourseEditDto.NameMaxLength, persisted.Name.Length);
+        Assert.Equal(
+            CourseEditDto.NameMaxLength,
+            fixture.Db.Model.FindEntityType(typeof(Course))?.FindProperty(nameof(Course.Name))?.GetMaxLength());
+    }
+
+    [Fact]
+    public async Task Course_upsert_rejects_name_over_maximum_length()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var name = new string('К', CourseEditDto.NameMaxLength + 1);
+
+        var action = await new AdminCoursesController(fixture.Db).Upsert(new CourseEditDto(
+            id: null,
+            name,
+            durationWeeks: 52,
+            academicPeriodStartDate: new DateOnly(2026, 9, 1)));
+
+        var badRequest = Assert.IsType<BadRequestObjectResult>(action.Result);
+        Assert.Contains(CourseEditDto.NameMaxLength.ToString(), badRequest.Value?.ToString(), StringComparison.Ordinal);
+        Assert.Empty(await fixture.Db.Courses.AsNoTracking().ToListAsync());
+    }
+
+    [Fact]
     public async Task Course_upsert_without_academic_period_does_not_clear_existing_value()
     {
         await using var fixture = await TestDatabase.CreateAsync();
