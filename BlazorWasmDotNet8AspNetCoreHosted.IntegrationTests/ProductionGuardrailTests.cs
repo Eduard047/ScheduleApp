@@ -1565,6 +1565,113 @@ public sealed class ProductionGuardrailTests
             item.GroupId == scenario.Ids.GroupId && item.Date == scenario.Date));
     }
 
+    [Fact]
+    public async Task Autogen_preview_job_persists_plan_but_keeps_draft_scope_unchanged()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var scenario = await SeedAtomicAutogenScenarioAsync(fixture.Db);
+        var course = await fixture.Db.Courses.SingleAsync(item => item.Id == scenario.Ids.CourseId);
+        course.AcademicPeriodStartDate = scenario.Date;
+        await fixture.Db.SaveChangesAsync();
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(fixture.Options));
+        services.AddScoped<TeacherDraftsAutogenService>();
+        services.AddScoped<TeacherDraftsAutogenPlanService>();
+        await using var provider = services.BuildServiceProvider();
+        var jobService = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
+        var request = new AutoGenJobRequest(
+            AutoGenJobKind.Generate,
+            scenario.Date,
+            scenario.Date,
+            scenario.Ids.CourseId,
+            new List<int> { scenario.Ids.GroupId },
+            new Dictionary<int, int> { [scenario.Ids.ModuleId] = 1 },
+            WeekPreset.MonFri,
+            true,
+            false,
+            false,
+            AllowIncompleteDrafts: true,
+            ClientJobId: Guid.NewGuid().ToString("N"),
+            PreviewOnly: true);
+
+        var started = jobService.Start(request);
+        AutoGenJobStatus? status = started.Status;
+        for (var attempt = 0; attempt < 200 && status?.State is AutoGenJobState.Queued or AutoGenJobState.Running; attempt++)
+        {
+            await Task.Delay(25);
+            status = jobService.Get(started.JobId);
+        }
+
+        Assert.NotNull(status);
+        Assert.Equal(AutoGenJobState.Succeeded, status.State);
+        Assert.Equal(1, status.Created);
+        Assert.NotNull(status.Plan);
+        Assert.Equal(AutoGenPlanState.Ready, status.Plan.State);
+        Assert.Equal(1, status.Plan.AddCount);
+        await jobService.StopAsync(CancellationToken.None);
+        await using var verification = new AppDbContext(fixture.Options);
+        Assert.Empty(await verification.TeacherDraftItems.AsNoTracking().ToListAsync());
+        var plan = await verification.AutoGenDraftPlans
+            .AsNoTracking()
+            .Include(item => item.Mutations)
+            .SingleAsync(item => item.PlanId == started.JobId);
+        Assert.Equal(1, plan.AddCount);
+        Assert.Single(plan.Mutations);
+        Assert.Equal((int)AutoGenPlanOperation.Add, plan.Mutations.Single().Operation);
+    }
+
+    [Theory]
+    [InlineData(AutoGenJobState.Canceled)]
+    [InlineData(AutoGenJobState.Failed)]
+    public async Task Autogen_preview_terminal_failure_after_plan_attachment_does_not_persist_ready_plan(
+        AutoGenJobState terminalState)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var request = CreateValidAutoGenJobRequest() with
+        {
+            ClientJobId = Guid.NewGuid().ToString("N"),
+            PreviewOnly = true
+        };
+        await SeedAutogenAcademicPeriodAsync(fixture.Db, request.CourseId, request.FromDate);
+        var run = CreatePersistedAutogenJob(
+            request.ClientJobId!,
+            request,
+            AutoGenJobState.Running,
+            DateTime.UtcNow.AddMinutes(5));
+        fixture.Db.AutoGenJobRuns.Add(run);
+        await fixture.Db.SaveChangesAsync();
+
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(fixture.Options));
+        await using var provider = services.BuildServiceProvider();
+        var service = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
+        var runtime = CreateAutogenJobRuntime(request);
+        AttachAutogenJobRuntimeClaim(
+            runtime,
+            run.OwnerInstanceId!,
+            run.Attempt,
+            run.LeaseExpiresAtUtc!.Value);
+        AttachAutogenJobRuntimePlan(runtime, request);
+
+        Assert.NotNull(GetAutogenJobRuntimePlanPayload(runtime));
+        Assert.Equal(AutoGenPlanState.Ready, GetAutogenJobRuntimeStatus(runtime).Plan?.State);
+
+        MarkAutogenJobRuntimeTerminal(runtime, request, terminalState);
+
+        var terminalStatus = GetAutogenJobRuntimeStatus(runtime);
+        Assert.Equal(terminalState, terminalStatus.State);
+        Assert.Null(terminalStatus.Plan);
+        Assert.Null(GetAutogenJobRuntimePlanPayload(runtime));
+        Assert.True(await InvokeTryPersistOwnedSnapshotAsync(service, runtime));
+
+        await using var verification = new AppDbContext(fixture.Options);
+        Assert.Empty(await verification.AutoGenDraftPlans.AsNoTracking().ToListAsync());
+        var persistedRun = await verification.AutoGenJobRuns
+            .AsNoTracking()
+            .SingleAsync(item => item.JobId == request.ClientJobId);
+        Assert.Equal((int)terminalState, persistedRun.State);
+    }
+
     [Theory]
     [InlineData(AutoGenJobState.Queued)]
     [InlineData(AutoGenJobState.Running)]
@@ -1624,7 +1731,8 @@ public sealed class ProductionGuardrailTests
         var request = CreateValidAutoGenJobRequest() with
         {
             FromDate = new DateOnly(2026, 5, 2),
-            ToDate = new DateOnly(2026, 5, 1)
+            ToDate = new DateOnly(2026, 5, 1),
+            PreviewOnly = true
         };
 
         var action = controller.StartAutoGenJob(request);
@@ -1632,6 +1740,21 @@ public sealed class ProductionGuardrailTests
         var response = Assert.IsType<ObjectResult>(action.Result);
         Assert.Equal(400, response.StatusCode);
         Assert.IsType<ProblemDetails>(response.Value);
+    }
+
+    [Fact]
+    public void Autogen_job_controller_rejects_direct_generate_commit()
+    {
+        var service = CreateAutogenJobService(new RejectingScopeFactory());
+        var controller = CreateTeacherDraftsController(service);
+        var request = CreateValidAutoGenJobRequest() with { PreviewOnly = false };
+
+        var action = controller.StartAutoGenJob(request);
+
+        var response = Assert.IsType<ObjectResult>(action.Result);
+        Assert.Equal(400, response.StatusCode);
+        var problem = Assert.IsType<ProblemDetails>(response.Value);
+        Assert.Contains("поперед", problem.Title, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -1655,7 +1778,7 @@ public sealed class ProductionGuardrailTests
     public async Task Autogen_job_controller_returns_too_many_requests_when_capacity_is_exhausted()
     {
         await using var fixture = await TestDatabase.CreateAsync();
-        var request = CreateValidAutoGenJobRequest();
+        var request = CreateValidAutoGenJobRequest() with { PreviewOnly = true };
         await SeedAutogenAcademicPeriodAsync(fixture.Db, request.CourseId, request.FromDate);
         fixture.Db.AutoGenJobRuns.AddRange(Enumerable.Range(0, 8).Select(_ =>
             CreatePersistedAutogenJob(
@@ -1784,7 +1907,11 @@ public sealed class ProductionGuardrailTests
         var service = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
         var executionGate = await HoldAutogenJobServiceGateAsync(service, "_executionGate");
         var clientJobId = Guid.NewGuid().ToString("N");
-        var request = CreateValidAutoGenJobRequest() with { ClientJobId = clientJobId };
+        var request = CreateValidAutoGenJobRequest() with
+        {
+            ClientJobId = clientJobId,
+            PreviewOnly = true
+        };
 
         try
         {
@@ -1809,7 +1936,11 @@ public sealed class ProductionGuardrailTests
     {
         await using var fixture = await TestDatabase.CreateAsync();
         var clientJobId = Guid.NewGuid().ToString("N");
-        var request = CreateValidAutoGenJobRequest() with { ClientJobId = clientJobId };
+        var request = CreateValidAutoGenJobRequest() with
+        {
+            ClientJobId = clientJobId,
+            PreviewOnly = true
+        };
         fixture.Db.AutoGenJobRuns.Add(new AutoGenJobRun
         {
             JobId = clientJobId,
@@ -1855,7 +1986,11 @@ public sealed class ProductionGuardrailTests
         var firstExecutionGate = await HoldAutogenJobServiceGateAsync(firstService, "_executionGate");
         var secondExecutionGate = await HoldAutogenJobServiceGateAsync(secondService, "_executionGate");
         var clientJobId = Guid.NewGuid().ToString("N");
-        var request = CreateValidAutoGenJobRequest() with { ClientJobId = clientJobId };
+        var request = CreateValidAutoGenJobRequest() with
+        {
+            ClientJobId = clientJobId,
+            PreviewOnly = true
+        };
 
         try
         {
@@ -1901,7 +2036,11 @@ public sealed class ProductionGuardrailTests
         var ownerExecutionGate = await HoldAutogenJobServiceGateAsync(ownerService, "_executionGate");
         var contenderExecutionGate = await HoldAutogenJobServiceGateAsync(contenderService, "_executionGate");
         var clientJobId = Guid.NewGuid().ToString("N");
-        var request = CreateValidAutoGenJobRequest() with { ClientJobId = clientJobId };
+        var request = CreateValidAutoGenJobRequest() with
+        {
+            ClientJobId = clientJobId,
+            PreviewOnly = true
+        };
 
         try
         {
@@ -2519,7 +2658,7 @@ public sealed class ProductionGuardrailTests
     {
         var service = CreateAutogenJobService(new RejectingScopeFactory());
         var controller = CreateTeacherDraftsController(service);
-        var request = CreateValidAutoGenJobRequest();
+        var request = CreateValidAutoGenJobRequest() with { PreviewOnly = true };
 
         var start = Assert.IsType<ObjectResult>(controller.StartAutoGenJob(request).Result);
         var get = Assert.IsType<ObjectResult>(controller.GetAutoGenJob("missing-job").Result);
@@ -3047,6 +3186,79 @@ public sealed class ProductionGuardrailTests
             ReflectionBindingFlags.Instance | ReflectionBindingFlags.Public);
         Assert.NotNull(method);
         method.Invoke(runtime, new object[] { ownerInstanceId, attempt, leaseExpiresAtUtc });
+    }
+
+    private static void AttachAutogenJobRuntimePlan(object runtime, AutoGenJobRequest request)
+    {
+        var planType = typeof(TeacherDraftsAutogenPlanService).Assembly.GetType(
+            "BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts.AutoGenDraftPlanPayload");
+        var mutationType = typeof(TeacherDraftsAutogenPlanService).Assembly.GetType(
+            "BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts.AutoGenDraftPlanMutationPayload");
+        Assert.NotNull(planType);
+        Assert.NotNull(mutationType);
+        var mutations = Array.CreateInstance(mutationType, 0);
+        var nowUtc = DateTime.UtcNow;
+        var plan = Activator.CreateInstance(
+            planType,
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.Public | ReflectionBindingFlags.NonPublic,
+            binder: null,
+            args: new object[]
+            {
+                request.ClientJobId!,
+                request.CourseId,
+                request.FromDate,
+                request.ToDate,
+                request.Days,
+                request.AllowIncompleteDrafts,
+                request.GroupIds,
+                Guid.NewGuid(),
+                "test-input-fingerprint",
+                nowUtc,
+                nowUtc.AddHours(24),
+                mutations
+            },
+            culture: null);
+        Assert.NotNull(plan);
+        var method = runtime.GetType().GetMethod(
+            "AttachPlan",
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.Public);
+        Assert.NotNull(method);
+        method.Invoke(runtime, new[] { plan });
+    }
+
+    private static object? GetAutogenJobRuntimePlanPayload(object runtime)
+    {
+        var property = runtime.GetType().GetProperty(
+            "PlanPayload",
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.Public);
+        Assert.NotNull(property);
+        return property.GetValue(runtime);
+    }
+
+    private static void MarkAutogenJobRuntimeTerminal(
+        object runtime,
+        AutoGenJobRequest request,
+        AutoGenJobState terminalState)
+    {
+        var result = new AutoGenResult(0, 0, new List<string>());
+        var report = CreateEmptyAutoGenRunReport(request);
+        if (terminalState == AutoGenJobState.Canceled)
+        {
+            RequestAutogenJobRuntimeCancellation(runtime);
+            var canceled = runtime.GetType().GetMethod(
+                "MarkCanceled",
+                ReflectionBindingFlags.Instance | ReflectionBindingFlags.Public);
+            Assert.NotNull(canceled);
+            canceled.Invoke(runtime, new object[] { result, report });
+            return;
+        }
+
+        Assert.Equal(AutoGenJobState.Failed, terminalState);
+        var failed = runtime.GetType().GetMethod(
+            "MarkFailed",
+            ReflectionBindingFlags.Instance | ReflectionBindingFlags.Public);
+        Assert.NotNull(failed);
+        failed.Invoke(runtime, new object[] { "Тестова помилка після формування плану.", result, report });
     }
 
     private static void MarkAutogenJobRuntimeSucceeded(object runtime, AutoGenJobRequest request)

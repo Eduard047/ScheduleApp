@@ -42,6 +42,8 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     public DbSet<TeacherDraftItem> TeacherDraftItems => Set<TeacherDraftItem>();
     public DbSet<TimeSlot> TimeSlots => Set<TimeSlot>();
     public DbSet<AutoGenJobRun> AutoGenJobRuns => Set<AutoGenJobRun>();
+    public DbSet<AutoGenDraftPlan> AutoGenDraftPlans => Set<AutoGenDraftPlan>();
+    public DbSet<AutoGenDraftPlanMutation> AutoGenDraftPlanMutations => Set<AutoGenDraftPlanMutation>();
     // Налаштовує зв'язки, обмеження та індекси для сутностей.
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -278,10 +280,12 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             e.HasOne(x => x.ModuleTopic).WithMany().HasForeignKey(x => x.ModuleTopicId).OnDelete(DeleteBehavior.SetNull);
             e.Property(x => x.Status).HasConversion<int>();
             e.Property(x => x.BatchKey).HasMaxLength(64);
+            e.Property(x => x.GenerationJobId).HasMaxLength(64);
             e.Property(x => x.IsSelfStudy).HasDefaultValue(false);
             e.HasIndex(x => new { x.Date, x.GroupId });
             e.HasIndex(x => new { x.Date, x.TeacherId });
             e.HasIndex(x => new { x.Date, x.RoomId });
+            e.HasIndex(x => x.GenerationJobId);
         });
         // Зберігаємо перебіг автогенерації окремо від чернеток, щоб статус можна було переглянути після перезапуску.
         b.Entity<AutoGenJobRun>(e =>
@@ -305,6 +309,43 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             e.HasIndex(x => new { x.State, x.LeaseExpiresAtUtc });
             e.HasIndex(x => x.CreatedAtUtc);
             e.HasIndex(x => x.UpdatedAtUtc);
+        });
+        // Зберігаємо попередній план окремо від робочих чернеток, щоб перегляд не впливав на розклад.
+        b.Entity<AutoGenDraftPlan>(e =>
+        {
+            e.HasKey(x => x.Id);
+            e.Property(x => x.PlanId).HasMaxLength(64).IsRequired();
+            e.Property(x => x.Version).IsConcurrencyToken();
+            e.Property(x => x.GroupIdsJson).HasColumnType("longtext").IsRequired();
+            e.Property(x => x.BeforeScopeRevision).HasColumnType("char(36)");
+            e.Property(x => x.InputFingerprint).HasMaxLength(64).IsRequired();
+            e.Property(x => x.AppliedScopeRevision).HasColumnType("char(36)");
+            e.HasOne(x => x.AutoGenJobRun)
+                .WithMany()
+                .HasForeignKey(x => x.AutoGenJobRunId)
+                .OnDelete(DeleteBehavior.Cascade);
+            e.HasOne(x => x.Course)
+                .WithMany()
+                .HasForeignKey(x => x.CourseId)
+                .OnDelete(DeleteBehavior.Cascade);
+            e.HasIndex(x => x.PlanId).IsUnique();
+            e.HasIndex(x => x.AutoGenJobRunId).IsUnique();
+            e.HasIndex(x => new { x.State, x.ExpiresAtUtc });
+        });
+        // Зберігаємо точні знімки до та після кожної зміни для безпечного застосування й відкоту.
+        b.Entity<AutoGenDraftPlanMutation>(e =>
+        {
+            e.HasKey(x => x.Id);
+            e.Property(x => x.BeforeRevision).HasColumnType("char(36)");
+            e.Property(x => x.AppliedRevision).HasColumnType("char(36)");
+            e.Property(x => x.BeforeJson).HasColumnType("longtext");
+            e.Property(x => x.AfterJson).HasColumnType("longtext");
+            e.HasOne(x => x.Plan)
+                .WithMany(x => x.Mutations)
+                .HasForeignKey(x => x.AutoGenDraftPlanId)
+                .OnDelete(DeleteBehavior.Cascade);
+            e.HasIndex(x => new { x.AutoGenDraftPlanId, x.Ordinal }).IsUnique();
+            e.HasIndex(x => x.AppliedDraftId);
         });
         // Забезпечуємо роботу з тематичним наповненням модулів.
         b.Entity<ModuleTopic>(e =>

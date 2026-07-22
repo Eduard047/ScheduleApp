@@ -312,6 +312,7 @@ public class TeacherDraftItem
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
     public bool IsLocked { get; set; }   
     public bool IsSelfStudy { get; set; } = false;
+    public string? GenerationJobId { get; set; }
 }
 
 // Збережений стан запуску автогенерації для відновлення статусу після перезапуску сервера.
@@ -353,4 +354,49 @@ public class AutoGenJobRun
     public string? ResultJson { get; set; }
     public string? ReportJson { get; set; }
     public DateTime UpdatedAtUtc { get; set; }
+}
+
+// Збережений план змін автогенерації, який можна окремо переглянути, застосувати або відкотити.
+public class AutoGenDraftPlan
+{
+    public int Id { get; set; }
+    public string PlanId { get; set; } = default!;
+    public int AutoGenJobRunId { get; set; }
+    public AutoGenJobRun AutoGenJobRun { get; set; } = default!;
+    public int State { get; set; }
+    public long Version { get; set; }
+    public int CourseId { get; set; }
+    public Course Course { get; set; } = default!;
+    public DateOnly RangeStartDate { get; set; }
+    public DateOnly RangeEndDate { get; set; }
+    public int Days { get; set; }
+    public bool AllowIncompleteDrafts { get; set; }
+    public string GroupIdsJson { get; set; } = default!;
+    public Guid BeforeScopeRevision { get; set; }
+    public string InputFingerprint { get; set; } = default!;
+    public Guid? AppliedScopeRevision { get; set; }
+    public int AddCount { get; set; }
+    public int UpdateCount { get; set; }
+    public int DeleteCount { get; set; }
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime ExpiresAtUtc { get; set; }
+    public DateTime? AppliedAtUtc { get; set; }
+    public DateTime? RolledBackAtUtc { get; set; }
+    public ICollection<AutoGenDraftPlanMutation> Mutations { get; set; } = new List<AutoGenDraftPlanMutation>();
+}
+
+// Одна атомарна зміна чернетки всередині збереженого плану автогенерації.
+public class AutoGenDraftPlanMutation
+{
+    public long Id { get; set; }
+    public int AutoGenDraftPlanId { get; set; }
+    public AutoGenDraftPlan Plan { get; set; } = default!;
+    public int Ordinal { get; set; }
+    public int Operation { get; set; }
+    public int? SourceDraftId { get; set; }
+    public int? AppliedDraftId { get; set; }
+    public Guid? BeforeRevision { get; set; }
+    public Guid? AppliedRevision { get; set; }
+    public string? BeforeJson { get; set; }
+    public string? AfterJson { get; set; }
 }

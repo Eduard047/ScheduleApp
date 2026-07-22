@@ -40,6 +40,7 @@
   <ItemGroup>
     <Compile Include="AdminControllerGuardrailTests.cs" />
     <Compile Include="AutoGenGapReasonClassifierTests.cs" />
+    <Compile Include="AutoGenWarningClassifierTests.cs" />
     <Compile Include="AutogenLecturePackingTests.cs" />
     <Compile Include="AutogenQualityMatrixTests.cs" />
     <Compile Include="DeterministicResidualOptimizerOracleTests.cs" />

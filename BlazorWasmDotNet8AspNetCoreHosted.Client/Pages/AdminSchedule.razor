@@ -101,6 +101,12 @@ else
                     <button class="btn btn-outline-secondary" @onclick="FillWeekDrafts" disabled="@(!CanAutoGen || IsAutoGenBusy)">
                         Заповнити порожні слоти
                     </button>
+                    @if (_latestRollbackableAutoGenPlan?.CanRollback == true)
+                    {
+                        <button class="btn btn-outline-warning" @onclick="RollbackLatestAutoGenPlanAsync" disabled="@IsAutoGenBusy">
+                            Відкотити останнє застосування
+                        </button>
+                    }
                     <button class="btn btn-outline-danger" @onclick="ClearWeekForCurrent" disabled="@IsAutoGenBusy">
                         Очистити тиждень (чернетки, обраний курс)
                     </button>
@@ -444,12 +450,14 @@ else
             <div class="alert @AutoGenOutcomeAlertCssClass mt-3">
                 <div class="d-flex flex-column gap-2">
                     @{
-                        var warningsTotal = okWarnings.Count;
+                        var warningsTotal = _latestWarningDetails.Count;
+                        var actionableWarningsTotal = _latestWarningDetails.Count(detail =>
+                            !string.Equals(detail.Severity, AutoGenWarningSeverities.Info, StringComparison.OrdinalIgnoreCase));
                         var gapSummary = _latestGapSummary;
                         var preflightItems = _latestPreflight;
                         var report = _latestAutoGenReport;
                         var actionItems = BuildAutoGenActionItems(gapSummary, preflightItems, _latestGapDetails);
-                        var outcome = BuildAutoGenOutcomeSummary(ok, report, gapSummary, preflightItems, _latestGapDetails, warningsTotal, actionItems);
+                        var outcome = BuildAutoGenOutcomeSummary(ok, report, gapSummary, preflightItems, _latestGapDetails, actionableWarningsTotal, actionItems);
                         var gapRows = _latestGapDetails
                             .OrderBy(gap => gap.Date)
                             .ThenBy(gap => gap.GroupName, StringComparer.Ordinal)
@@ -500,10 +508,49 @@ else
                     {
                         <div>@ok</div>
                     }
+                    @if (_latestAutoGenPlan is { } latestPlan)
+                    {
+                        <div class="small border rounded-2 bg-light p-2">
+                            <div class="fw-semibold">План змін: @GetAutoGenPlanStateLabel(latestPlan.State)</div>
+                            <div class="d-flex flex-wrap gap-3 mt-1">
+                                <span>Додано: <strong>@latestPlan.AddCount</strong></span>
+                                <span>Змінено: <strong>@latestPlan.UpdateCount</strong></span>
+                                <span>Видалено: <strong>@latestPlan.DeleteCount</strong></span>
+                            </div>
+                            @if (latestPlan.DeleteCount > 0)
+                            {
+                                <div class="text-danger mt-2">
+                                    Видалення охоплює всі незаблоковані чернетки вибраних груп у діапазоні, зокрема модулі поза поточним списком.
+                                </div>
+                            }
+                            @if (_latestAutoGenPlanChanges.Count > 0)
+                            {
+                                var shownPlanChanges = _latestAutoGenPlanChanges
+                                    .OrderBy(change => GetAutoGenPlanOperationOrder(change.Operation))
+                                    .ThenBy(change => change.Before?.Date ?? change.After?.Date)
+                                    .ThenBy(change => change.Before?.TimeStart ?? change.After?.TimeStart, StringComparer.Ordinal)
+                                    .Take(50)
+                                    .ToList();
+                                <details class="mt-2">
+                                    <summary>Переглянути заняття у плані (@_latestAutoGenPlanChanges.Count)</summary>
+                                    <ul class="mb-0 mt-2">
+                                        @foreach (var planChange in shownPlanChanges)
+                                        {
+                                            <li>@BuildAutoGenPlanChangeLabel(planChange)</li>
+                                        }
+                                    </ul>
+                                    @if (shownPlanChanges.Count < _latestAutoGenPlanChanges.Count)
+                                    {
+                                        <div class="text-muted mt-1">Показано 50 із @_latestAutoGenPlanChanges.Count змін.</div>
+                                    }
+                                </details>
+                            }
+                        </div>
+                    }
                     @if (hasAutoGenIssues)
                     {
                         <div class="autogen-next-steps small">
-                            <div class="fw-semibold">Що перевірити</div>
+                            <div class="fw-semibold">@(actionableWarningsTotal > 0 || actionItems.Count > 0 || gapRows.Count > 0 ? "Що перевірити" : "Деталі результату")</div>
                             @if (actionItems.Count > 0)
                             {
                                 <ol class="autogen-action-list mb-0">
@@ -515,7 +562,11 @@ else
                             }
                             else
                             {
-                                <div>Автогенерація залишила проблемні місця. Почніть з групи, модуля та часу в таблиці нижче.</div>
+                                <div>
+                                    @(actionableWarningsTotal > 0
+                                        ? "Автогенерація залишила проблемні місця. Почніть з групи, модуля та часу в таблиці нижче."
+                                        : "Сервер додав інформаційні повідомлення про виконану операцію.")
+                                </div>
                             }
                             @if (gapRows.Count > 0)
                             {
@@ -570,21 +621,49 @@ else
                             @if (okWarningsExpanded)
                             {
                                 <ul class="mb-0 mt-1 small">
-                            @foreach (var warn in okWarnings)
+                            @foreach (var warningDetail in OrderWarningDetails(_latestWarningDetails))
                             {
-                                var detail = ParseWarning(warn);
+                                var parsedWarning = ParseWarning(warningDetail.Message);
                                 <li class="warning-item">
-                                    <div class="warning-main">@detail.Message</div>
-                                    @if (!string.IsNullOrWhiteSpace(detail.Reason))
+                                    <div class="d-flex flex-wrap align-items-center gap-2">
+                                        <span class="badge @GetWarningSeverityBadgeClass(warningDetail.Severity)">@GetWarningSeverityLabel(warningDetail.Severity)</span>
+                                        <span class="badge text-bg-light">@warningDetail.Category / @warningDetail.Code</span>
+                                    </div>
+                                    <div class="warning-main mt-1">@parsedWarning.Message</div>
+                                    @if (!string.IsNullOrWhiteSpace(parsedWarning.Reason))
                                     {
-                                        <div class="warning-reason">Причина: @detail.Reason</div>
+                                        <div class="warning-reason">Причина: @parsedWarning.Reason</div>
                                         <div class="warning-consequence">Наслідок: слот потрібно заповнити вручну або перерозподілити години.</div>
+                                    }
+                                    @if (warningDetail.Context is { Count: > 0 })
+                                    {
+                                        <details class="mt-1">
+                                            <summary>Контекст</summary>
+                                            <dl class="row mb-0 mt-1">
+                                                @foreach (var contextItem in warningDetail.Context.OrderBy(item => item.Key, StringComparer.Ordinal))
+                                                {
+                                                    <dt class="col-sm-4">@contextItem.Key</dt>
+                                                    <dd class="col-sm-8">@contextItem.Value</dd>
+                                                }
+                                            </dl>
+                                        </details>
                                     }
                                 </li>
                             }
                                 </ul>
                             }
                         }
+                    }
+                    @if (_latestAutoGenPlan?.CanApply == true)
+                    {
+                        <div class="border rounded-2 bg-white p-2">
+                            <div class="small mb-2">
+                                Перегляньте зміни та всі попередження вище. Застосування виконується окремою атомарною дією.
+                            </div>
+                            <button class="btn btn-success" @onclick="ApplyLatestAutoGenPlanAsync" disabled="@IsAutoGenBusy">
+                                Застосувати перевірений план
+                            </button>
+                        </div>
                     }
                 </div>
             </div>
@@ -828,11 +907,16 @@ else
     private string? ok;
     private string? error;
     private List<string> okWarnings = new();
+    private List<AutoGenWarningDetail> _latestWarningDetails = new();
     private bool okWarningsExpanded;
     private List<AutoGenGapDetail> _latestGapDetails = new();
     private List<AutoGenGapSummaryItem> _latestGapSummary = new();
     private List<AutoGenPreflightItem> _latestPreflight = new();
     private AutoGenRunReport? _latestAutoGenReport;
+    private AutoGenPlanSummaryDto? _latestAutoGenPlan;
+    private AutoGenPlanSummaryDto? _latestRollbackableAutoGenPlan;
+    private List<AutoGenPlanChangeDto> _latestAutoGenPlanChanges = new();
+    private PreparedAutoGenPlanLogContext? _preparedAutoGenPlanLogContext;
     private AutoGenProgressState? _autoGenProgress;
     private bool _autoGenActionStarting;
     private readonly CancellationTokenSource _componentLifetimeCts = new();
@@ -922,6 +1006,7 @@ else
         await LoadWeek();
         await RestorePersistedAutoGenStatusAsync();
         await RestoreActiveAutoGenJobAsync();
+        await RestoreLatestRollbackableAutoGenPlanAsync();
     }
     private string CurrentWeekKey => GetMonday(_selectedDate).ToString("yyyy-MM-dd");
     private bool IsBreak(int lessonTypeId) => lessonTypeId == breakTypeId;
@@ -941,13 +1026,15 @@ else
            && _courseGroupRows.Any(row => row.Selected);
     private bool IsAutoGenBusy => _autoGenActionStarting || _autoGenProgress is not null;
     private string AutoGenOutcomeAlertCssClass
-        => okWarnings.Any(IsAutoGenFailureWarning)
+        => _latestWarningDetails.Any(detail =>
+            string.Equals(detail.Severity, AutoGenWarningSeverities.Error, StringComparison.OrdinalIgnoreCase))
             ? "alert-danger"
             : HasAutoGenOutcomeIssues
                 ? "alert-warning"
                 : "alert-success";
     private bool HasAutoGenOutcomeIssues
-        => okWarnings.Count > 0
+        => _latestWarningDetails.Any(detail =>
+               !string.Equals(detail.Severity, AutoGenWarningSeverities.Info, StringComparison.OrdinalIgnoreCase))
            || _latestGapDetails.Count > 0
            || _latestPreflight.Any(item => item.Count > 0)
            || (_latestAutoGenReport?.GapCount ?? 0) > 0
@@ -975,6 +1062,7 @@ else
         BuildCourseGroupRows();
         await RestorePersistedAutoGenConfigAsync(restoreCourseSelection: false);
         await PersistAutoGenConfigAsync();
+        await RestoreLatestRollbackableAutoGenPlanAsync();
     }
     // Формує список модулів та годин для поточного курсу.
     private void BuildModuleWeekRows()
@@ -1230,11 +1318,15 @@ else
     {
         ok = error = null;
         okWarnings = new();
+        _latestWarningDetails = new();
         okWarningsExpanded = false;
         _latestGapDetails = new();
         _latestGapSummary = new();
         _latestPreflight = new();
         _latestAutoGenReport = null;
+        _latestAutoGenPlan = null;
+        _latestAutoGenPlanChanges = new();
+        _preparedAutoGenPlanLogContext = null;
         if (clearPersisted)
         {
             await RemovePersistedAutoGenStatusAsync();
@@ -1639,6 +1731,9 @@ else
         IEnumerable<AutoGenGapSummaryItem>? gapSummary = null,
         IEnumerable<AutoGenPreflightItem>? preflight = null,
         AutoGenRunReport? report = null,
+        IEnumerable<AutoGenWarningDetail>? warningDetails = null,
+        AutoGenPlanSummaryDto? plan = null,
+        IEnumerable<AutoGenPlanChangeDto>? planChanges = null,
         bool persist = true)
     {
         ok = message;
@@ -1650,8 +1745,21 @@ else
             : gapSummary?.ToList() ?? new List<AutoGenGapSummaryItem>();
         _latestPreflight = MergePreflight(preflight);
         _latestAutoGenReport = report;
+        _latestAutoGenPlan = plan;
+        _latestAutoGenPlanChanges = planChanges?.ToList() ?? new();
+        if (plan?.CanRollback == true)
+        {
+            _latestRollbackableAutoGenPlan = plan;
+        }
+        else if (plan is not null
+                 && string.Equals(_latestRollbackableAutoGenPlan?.PlanId, plan.PlanId, StringComparison.Ordinal)
+                 && plan.State is AutoGenPlanState.RolledBack or AutoGenPlanState.Expired)
+        {
+            _latestRollbackableAutoGenPlan = null;
+        }
         okWarnings = BuildSlotGapWarnings(warnings, _latestGapDetails);
-        okWarningsExpanded = false;
+        _latestWarningDetails = MergeWarningDetails(warningDetails, okWarnings);
+        okWarningsExpanded = plan?.CanApply == true && _latestWarningDetails.Count > 0;
         if (persist)
         {
             await PersistAutoGenStatusAsync();
@@ -1701,10 +1809,6 @@ else
                 continue;
             }
             var normalized = warning.Trim();
-            if (!IsVisibleAutoGenWarning(normalized))
-            {
-                continue;
-            }
             if (seen.Add(normalized))
             {
                 result.Add(normalized);
@@ -1712,6 +1816,64 @@ else
         }
         return result;
     }
+    // Об'єднує структуровані попередження сервера з локальними деталями незаповнених слотів.
+    private static List<AutoGenWarningDetail> MergeWarningDetails(
+        IEnumerable<AutoGenWarningDetail>? warningDetails,
+        IEnumerable<string> visibleWarnings)
+    {
+        var result = new List<AutoGenWarningDetail>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        if (warningDetails is not null)
+        {
+            foreach (var detail in warningDetails)
+            {
+                if (string.IsNullOrWhiteSpace(detail.Message))
+                {
+                    continue;
+                }
+                var normalized = detail with { Message = detail.Message.Trim() };
+                if (seen.Add(normalized.Message))
+                {
+                    result.Add(normalized);
+                }
+            }
+        }
+        foreach (var detail in AutoGenWarningClassifier.ClassifyMany(visibleWarnings))
+        {
+            if (seen.Add(detail.Message))
+            {
+                result.Add(detail);
+            }
+        }
+        return result;
+    }
+    private static IEnumerable<AutoGenWarningDetail> OrderWarningDetails(IEnumerable<AutoGenWarningDetail> warnings)
+        => warnings
+            .OrderBy(detail => GetWarningSeverityOrder(detail.Severity))
+            .ThenBy(detail => detail.Category, StringComparer.Ordinal)
+            .ThenBy(detail => detail.Code, StringComparer.Ordinal)
+            .ThenBy(detail => detail.Message, StringComparer.Ordinal);
+    private static int GetWarningSeverityOrder(string severity)
+        => severity.ToLowerInvariant() switch
+        {
+            AutoGenWarningSeverities.Error => 0,
+            AutoGenWarningSeverities.Warning => 1,
+            _ => 2
+        };
+    private static string GetWarningSeverityLabel(string severity)
+        => severity.ToLowerInvariant() switch
+        {
+            AutoGenWarningSeverities.Error => "Помилка",
+            AutoGenWarningSeverities.Info => "Інформація",
+            _ => "Попередження"
+        };
+    private static string GetWarningSeverityBadgeClass(string severity)
+        => severity.ToLowerInvariant() switch
+        {
+            AutoGenWarningSeverities.Error => "text-bg-danger",
+            AutoGenWarningSeverities.Info => "text-bg-info",
+            _ => "text-bg-warning"
+        };
     private static List<string> BuildAutoGenActionItems(
         IReadOnlyList<AutoGenGapSummaryItem> gapSummary,
         IReadOnlyList<AutoGenPreflightItem> preflight,
@@ -2020,20 +2182,6 @@ else
     }
     private static bool IsSlotGapWarning(string warning)
         => warning.Contains("не заповнила слот", StringComparison.OrdinalIgnoreCase);
-    private static bool IsAutoGenRepairSuggestion(string warning)
-        => warning.StartsWith("Рекомендація автогенерації:", StringComparison.OrdinalIgnoreCase);
-    private static bool IsAutoGenPreflightWarning(string warning)
-        => warning.StartsWith("Попередня перевірка ресурсів", StringComparison.OrdinalIgnoreCase);
-    private static bool IsVisibleAutoGenWarning(string warning)
-        => IsSlotGapWarning(warning)
-           || IsAutoGenRepairSuggestion(warning)
-           || IsAutoGenPreflightWarning(warning)
-           || IsAutoGenJobStateWarning(warning);
-    private static bool IsAutoGenJobStateWarning(string warning)
-        => warning.StartsWith("Операцію скасовано", StringComparison.OrdinalIgnoreCase)
-           || IsAutoGenFailureWarning(warning);
-    private static bool IsAutoGenFailureWarning(string warning)
-        => warning.StartsWith("Помилка автогенерації:", StringComparison.OrdinalIgnoreCase);
     // Рахує випадки, коли слот не заповнено через правило суцільного блоку модуля.
     private int CountContiguousModuleBlockWarnings()
     {
@@ -2278,7 +2426,9 @@ else
     private async Task ShowRestoredAutoGenResultAsync(AutoGenJobStatus status)
     {
         var result = BuildAutoGenJobResult(status);
-        var summary = status.State switch
+        var summary = status.Plan?.State == AutoGenPlanState.Ready
+            ? $"Відновлено готовий план «{status.Title}»: додати {status.Plan.AddCount}, змінити {status.Plan.UpdateCount}, видалити {status.Plan.DeleteCount}. Чернетки ще не змінено."
+            : status.State switch
         {
             AutoGenJobState.Succeeded => $"Відновлену задачу «{status.Title}» завершено: створено {result.Created}, пропущено {result.Skipped}.",
             AutoGenJobState.Canceled => $"Відновлену задачу «{status.Title}» скасовано: створено {result.Created}.",
@@ -2291,6 +2441,8 @@ else
             result.GapSummary,
             result.Preflight,
             status.Report,
+            result.WarningDetails,
+            status.Plan,
             persist: false);
         if (status.Kind != AutoGenJobKind.Preflight)
         {
@@ -2319,7 +2471,10 @@ else
             GapDetails: new List<AutoGenGapDetail>(_latestGapDetails),
             GapSummary: new List<AutoGenGapSummaryItem>(_latestGapSummary),
             Preflight: new List<AutoGenPreflightItem>(_latestPreflight),
-            Report: _latestAutoGenReport
+            Report: _latestAutoGenReport,
+            WarningDetails: new List<AutoGenWarningDetail>(_latestWarningDetails),
+            Plan: _latestAutoGenPlan,
+            PlanLogContext: _preparedAutoGenPlanLogContext
         );
     }
     // Відновлює останній статус автогенерації з storage.
@@ -2328,7 +2483,55 @@ else
         var statuses = await LoadPersistedAutoGenStatusesAsync();
         if (!statuses.TryGetValue(CurrentWeekKey, out var payload))
             return;
-        await SetOkMessageAsync(payload.Message, payload.Warnings, payload.GapDetails, payload.GapSummary, payload.Preflight, payload.Report, persist: false);
+        var plan = payload.Plan;
+        IReadOnlyList<AutoGenPlanChangeDto>? planChanges = null;
+        if (plan is not null)
+        {
+            try
+            {
+                var refreshedPlan = await Drafts.GetAutogenPlan(plan.PlanId);
+                plan = refreshedPlan.Summary;
+                planChanges = refreshedPlan.Changes;
+            }
+            catch (ApiErrorException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Conflict)
+            {
+                plan = null;
+            }
+        }
+        _preparedAutoGenPlanLogContext = plan?.CanApply == true
+            && string.Equals(payload.PlanLogContext?.PlanId, plan.PlanId, StringComparison.Ordinal)
+                ? payload.PlanLogContext
+                : null;
+        await SetOkMessageAsync(
+            payload.Message,
+            payload.Warnings,
+            payload.GapDetails,
+            payload.GapSummary,
+            payload.Preflight,
+            payload.Report,
+            payload.WarningDetails,
+            plan,
+            planChanges,
+            persist: false);
+    }
+    // Відновлює останній доступний відкіт із серверної історії незалежно від поточного повідомлення сторінки.
+    private async Task RestoreLatestRollbackableAutoGenPlanAsync()
+    {
+        try
+        {
+            var details = await Drafts.GetLatestRollbackableAutogenPlan(_selectedCourseId);
+            _latestRollbackableAutoGenPlan = details?.Summary.CanRollback == true
+                ? details.Summary
+                : null;
+        }
+        catch (ApiErrorException)
+        {
+            _latestRollbackableAutoGenPlan = null;
+        }
+        catch (HttpRequestException)
+        {
+            // Тимчасова помилка мережі не повинна приховувати вже відомий доступний відкіт.
+        }
     }
     // Зберігає налаштування автогенерації для тижня.
     private async Task PersistAutoGenConfigAsync()
@@ -2608,7 +2811,8 @@ else
         Dictionary<int, int> moduleHours,
         bool clearExisting,
         bool softFill,
-        bool preflightOnly = false)
+        bool preflightOnly = false,
+        bool previewOnly = false)
     {
         var (fromDate, toDate) = GetNormalizedGenerationDateRange();
         var weekStarts = BuildGenerationWeekStarts();
@@ -2632,12 +2836,17 @@ else
             GroupRoomPreferences: groupRoomPreferences.Count > 0 ? groupRoomPreferences.ToList() : null,
             SoftOptions: BuildRecommendedSoftOptions(softFill),
             PreferredFirstMaxSlotOrderOverride: BuildRecommendedPreferredFirstLimitOverride(),
-            Title: preflightOnly
+            Title: previewOnly
+                ? softFill
+                    ? "Попередній план заповнення порожніх слотів"
+                    : "Попередній план автогенерації"
+                : preflightOnly
                 ? "Перевірка ресурсів"
                 : softFill
                     ? "Заповнення порожніх слотів"
                     : "Автогенерація у чернетки",
-            ClientJobId: clientJobId
+            ClientJobId: clientJobId,
+            PreviewOnly: previewOnly
         );
         await PersistActiveAutoGenJobIdAsync(clientJobId);
         AutoGenJobStatus status;
@@ -2671,6 +2880,38 @@ else
         status = await WaitForAutoGenJobTerminalAsync(status);
         await RemoveActiveAutoGenJobIdAsync(status.JobId);
         return (BuildAutoGenJobResult(status), fromDate, toDate, weekStarts.Count, status);
+    }
+    // Створює точний план без змін у БД, щоб користувач окремо переглянув деталі та попередження.
+    private async Task<(AutoGenResult Result, DateOnly RangeStartDate, DateOnly RangeEndDate, int WeekCount, AutoGenJobStatus FinalStatus, AutoGenPlanSummaryDto? Plan, IReadOnlyList<AutoGenPlanChangeDto> Changes)> PrepareAutoGenPreviewForRangeAsync(
+        int courseId,
+        IReadOnlyList<int> groupIds,
+        IReadOnlyList<GroupRoomPreferenceDto> groupRoomPreferences,
+        Dictionary<int, int> moduleHours,
+        bool clearExisting,
+        bool softFill)
+    {
+        var (previewResult, rangeStartDate, rangeEndDate, weekCount, previewStatus) = await RunAutoGenForRangeAsync(
+            courseId,
+            groupIds,
+            groupRoomPreferences,
+            moduleHours,
+            clearExisting,
+            softFill,
+            previewOnly: true);
+        if (previewStatus.State != AutoGenJobState.Succeeded)
+        {
+            return (previewResult, rangeStartDate, rangeEndDate, weekCount, previewStatus, previewStatus.Plan, Array.Empty<AutoGenPlanChangeDto>());
+        }
+
+        var plan = await Drafts.GetAutogenPlan(previewStatus.JobId);
+        return (
+            plan.Result,
+            rangeStartDate,
+            rangeEndDate,
+            weekCount,
+            previewStatus with { Plan = plan.Summary },
+            plan.Summary,
+            plan.Changes);
     }
     // Опитує сервер до термінального стану задачі, зберігаючи можливість відновлення після тимчасових збоїв.
     private async Task<AutoGenJobStatus> WaitForAutoGenJobTerminalAsync(AutoGenJobStatus status)
@@ -2727,7 +2968,10 @@ else
                     .ToList()
             };
         }
-        return result;
+        return result with
+        {
+            WarningDetails = MergeWarningDetails(result.WarningDetails, result.Warnings)
+        };
     }
     // Визначає тимчасові помилки опитування, після яких серверна задача може ще працювати.
     private static bool IsTransientAutoGenPollFailure(Exception exception)
@@ -2768,8 +3012,8 @@ else
             }
             var groupRoomPreferences = BuildSelectedGroupRoomPreferences(selectedGroupIds);
             await PersistAutoGenConfigAsync();
-            await StartAutoGenProgressAsync("Автогенерація у чернетки", AutoGenProgressKind.Generate);
-            var (res, rangeStartDate, rangeEndDate, weekCount, finalStatus) = await RunAutoGenForRangeAsync(
+            await StartAutoGenProgressAsync("Готуємо план автогенерації", AutoGenProgressKind.Generate);
+            var (res, rangeStartDate, rangeEndDate, _, finalStatus, plan, planChanges) = await PrepareAutoGenPreviewForRangeAsync(
                 courseId,
                 selectedGroupIds,
                 groupRoomPreferences,
@@ -2777,33 +3021,29 @@ else
                 clearExisting: true,
                 softFill: false);
             var courseName = meta?.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
-            var rangeWeekStart = GetMonday(rangeStartDate);
-            var isSingleFullWeek = weekCount == 1
-                && rangeStartDate == rangeWeekStart
-                && rangeEndDate == rangeWeekStart.AddDays(6);
-            var summary = isSingleFullWeek
-                ? $"Автогенерація тижня у чернетки (курс: {courseName}, груп: {selectedGroupIds.Count}): створено {res.Created}."
-                : $"Автогенерація діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): створено {res.Created}.";
-            summary = finalStatus.State switch
-            {
-                AutoGenJobState.Canceled => $"Автогенерацію скасовано для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: створено {res.Created}.",
-                AutoGenJobState.Failed => $"Автогенерація завершилась з помилками для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: створено {res.Created}.",
-                _ => summary
-            };
-            await SetOkMessageAsync(summary, res.Warnings, res.GapDetails, res.GapSummary, res.Preflight, finalStatus.Report);
-            await UpdateAutoGenProgressMessageAsync("Оновлюємо таблицю після автогенерації...");
-            await LoadWeek();
-            await LogAutoGenAsync(
-                summary,
-                res,
-                rangeStartDate,
-                rangeEndDate,
-                courseId,
-                courseName,
-                moduleHours,
-                softFill: false,
-                finalState: finalStatus.State,
-                jobError: finalStatus.Error);
+            var previewSummary = finalStatus.State == AutoGenJobState.Succeeded
+                ? $"Попередній план автогенерації {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} для курсу {courseName} готовий. Перегляньте всі зміни та попередження, після чого застосуйте план окремою кнопкою. Чернетки ще не змінено."
+                : $"Попередній план автогенерації {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} не підготовлено повністю. Чернетки не змінено.";
+            _preparedAutoGenPlanLogContext = plan?.CanApply == true
+                ? new PreparedAutoGenPlanLogContext(
+                    plan.PlanId,
+                    rangeStartDate,
+                    rangeEndDate,
+                    courseId,
+                    courseName,
+                    new Dictionary<int, int>(moduleHours),
+                    false)
+                : null;
+            await SetOkMessageAsync(
+                previewSummary,
+                res.Warnings,
+                res.GapDetails,
+                res.GapSummary,
+                res.Preflight,
+                finalStatus.Report,
+                res.WarningDetails,
+                plan,
+                planChanges);
         }
         catch (OperationCanceledException) when (_componentLifetimeCts.IsCancellationRequested)
         {
@@ -2874,7 +3114,7 @@ else
                 AutoGenJobState.Failed => $"Перевірка ресурсів завершилась з помилками для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: порожніх слотів {gapCount}, ресурсних дефіцитів {deficitCount}.",
                 _ => summary
             };
-            await SetOkMessageAsync(summary, res.Warnings, res.GapDetails, res.GapSummary, res.Preflight, finalStatus.Report);
+            await SetOkMessageAsync(summary, res.Warnings, res.GapDetails, res.GapSummary, res.Preflight, finalStatus.Report, res.WarningDetails);
         }
         catch (OperationCanceledException) when (_componentLifetimeCts.IsCancellationRequested)
         {
@@ -2924,8 +3164,8 @@ else
             }
             var groupRoomPreferences = BuildSelectedGroupRoomPreferences(selectedGroupIds);
             await PersistAutoGenConfigAsync();
-            await StartAutoGenProgressAsync("Заповнення порожніх слотів", AutoGenProgressKind.Fill);
-            var (res, rangeStartDate, rangeEndDate, weekCount, finalStatus) = await RunAutoGenForRangeAsync(
+            await StartAutoGenProgressAsync("Готуємо план заповнення порожніх слотів", AutoGenProgressKind.Fill);
+            var (res, rangeStartDate, rangeEndDate, _, finalStatus, plan, planChanges) = await PrepareAutoGenPreviewForRangeAsync(
                 courseId,
                 selectedGroupIds,
                 groupRoomPreferences,
@@ -2933,33 +3173,29 @@ else
                 clearExisting: false,
                 softFill: true);
             var courseName = meta?.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
-            var rangeWeekStart = GetMonday(rangeStartDate);
-            var isSingleFullWeek = weekCount == 1
-                && rangeStartDate == rangeWeekStart
-                && rangeEndDate == rangeWeekStart.AddDays(6);
-            var summary = isSingleFullWeek
-                ? $"Заповнення порожніх слотів тижня (курс: {courseName}, груп: {selectedGroupIds.Count}): створено {res.Created}."
-                : $"Заповнення порожніх слотів у діапазоні {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): створено {res.Created}.";
-            summary = finalStatus.State switch
-            {
-                AutoGenJobState.Canceled => $"Дозаповнення скасовано для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: створено {res.Created}.",
-                AutoGenJobState.Failed => $"Дозаповнення завершилось з помилками для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: створено {res.Created}.",
-                _ => summary
-            };
-            await SetOkMessageAsync(summary, res.Warnings, res.GapDetails, res.GapSummary, res.Preflight, finalStatus.Report);
-            await UpdateAutoGenProgressMessageAsync("Оновлюємо таблицю після дозаповнення...");
-            await LoadWeek();
-            await LogAutoGenAsync(
-                summary,
-                res,
-                rangeStartDate,
-                rangeEndDate,
-                courseId,
-                courseName,
-                moduleHours,
-                softFill: true,
-                finalState: finalStatus.State,
-                jobError: finalStatus.Error);
+            var previewSummary = finalStatus.State == AutoGenJobState.Succeeded
+                ? $"Попередній план дозаповнення {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} для курсу {courseName} готовий. Перегляньте всі зміни та попередження, після чого застосуйте план окремою кнопкою. Чернетки ще не змінено."
+                : $"Попередній план дозаповнення {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} не підготовлено повністю. Чернетки не змінено.";
+            _preparedAutoGenPlanLogContext = plan?.CanApply == true
+                ? new PreparedAutoGenPlanLogContext(
+                    plan.PlanId,
+                    rangeStartDate,
+                    rangeEndDate,
+                    courseId,
+                    courseName,
+                    new Dictionary<int, int>(moduleHours),
+                    true)
+                : null;
+            await SetOkMessageAsync(
+                previewSummary,
+                res.Warnings,
+                res.GapDetails,
+                res.GapSummary,
+                res.Preflight,
+                finalStatus.Report,
+                res.WarningDetails,
+                plan,
+                planChanges);
         }
         catch (OperationCanceledException) when (_componentLifetimeCts.IsCancellationRequested)
         {
@@ -2976,6 +3212,178 @@ else
         {
             EndAutoGenAction();
         }
+    }
+    // Застосовує раніше підготовлений план, якщо його вихідний стан досі актуальний.
+    private async Task ApplyLatestAutoGenPlanAsync()
+    {
+        var plan = _latestAutoGenPlan;
+        if (plan?.CanApply != true || !TryBeginAutoGenAction())
+        {
+            return;
+        }
+        try
+        {
+            error = null;
+            var confirmed = await JS.InvokeAsync<bool>(
+                "confirm",
+                $"Застосувати готовий план?\n\nДодати: {plan.AddCount}\nЗмінити: {plan.UpdateCount}\nВидалити: {plan.DeleteCount}\n\nСервер відхилить план, якщо чернетки після перегляду змінилися.");
+            if (!confirmed)
+            {
+                return;
+            }
+
+            await StartAutoGenProgressAsync("Застосовуємо готовий план", AutoGenProgressKind.Generate);
+            var applied = await Drafts.ApplyAutogenPlan(
+                plan.PlanId,
+                new AutoGenPlanActionRequest(plan.Version));
+            var report = _latestAutoGenReport is null
+                ? null
+                : _latestAutoGenReport with
+                {
+                    Created = applied.Result.Created,
+                    Skipped = applied.Result.Skipped,
+                    WarningCount = applied.Result.Warnings.Count,
+                    GapCount = applied.Result.GapDetails?.Count ?? 0,
+                    DeficitCount = applied.Result.Preflight?.Sum(item => item.Count) ?? 0
+                };
+            var logContext = string.Equals(
+                _preparedAutoGenPlanLogContext?.PlanId,
+                plan.PlanId,
+                StringComparison.Ordinal)
+                    ? _preparedAutoGenPlanLogContext
+                    : null;
+            _preparedAutoGenPlanLogContext = null;
+            var summary = $"Готовий план застосовано: додано {applied.Summary.AddCount}, змінено {applied.Summary.UpdateCount}, видалено {applied.Summary.DeleteCount}.";
+            await SetOkMessageAsync(
+                summary,
+                applied.Result.Warnings,
+                applied.Result.GapDetails,
+                applied.Result.GapSummary,
+                applied.Result.Preflight,
+                report,
+                applied.Result.WarningDetails,
+                applied.Summary,
+                applied.Changes);
+            await UpdateAutoGenProgressMessageAsync("Оновлюємо таблицю після застосування...");
+            await LoadWeek();
+            if (logContext is not null)
+            {
+                await LogAutoGenAsync(
+                    summary,
+                    applied.Result,
+                    logContext.RangeStartDate,
+                    logContext.RangeEndDate,
+                    logContext.CourseId,
+                    logContext.CourseName,
+                    logContext.ModuleHours,
+                    logContext.SoftFill,
+                    AutoGenJobState.Succeeded,
+                    jobError: null);
+            }
+        }
+        catch (ApiErrorException ex)
+        {
+            await HandleApiError(ex);
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+        }
+        finally
+        {
+            EndAutoGenAction();
+        }
+    }
+    // Відкочує лише незмінений результат останнього застосованого плану.
+    private async Task RollbackLatestAutoGenPlanAsync()
+    {
+        var plan = _latestRollbackableAutoGenPlan;
+        if (plan?.CanRollback != true || !TryBeginAutoGenAction())
+        {
+            return;
+        }
+        try
+        {
+            error = null;
+            var confirmed = await JS.InvokeAsync<bool>(
+                "confirm",
+                $"Відкотити застосований план?\n\nБуде прибрано доданих: {plan.AddCount}\nВідновлено видалених: {plan.DeleteCount}\nПовернуто змінених: {plan.UpdateCount}\n\nВідкат спрацює лише якщо чернетки після застосування ніхто не редагував.");
+            if (!confirmed)
+            {
+                return;
+            }
+
+            await StartAutoGenProgressAsync("Відкочуємо застосований план", AutoGenProgressKind.Generate);
+            var rolledBack = await Drafts.RollbackAutogenPlan(
+                plan.PlanId,
+                new AutoGenPlanActionRequest(plan.Version));
+            var summary = $"План автогенерації відкочено: прибрано доданих {rolledBack.Summary.AddCount}, відновлено видалених {rolledBack.Summary.DeleteCount}, повернуто змінених {rolledBack.Summary.UpdateCount}.";
+            await SetOkMessageAsync(
+                summary,
+                rolledBack.Result.Warnings,
+                rolledBack.Result.GapDetails,
+                rolledBack.Result.GapSummary,
+                rolledBack.Result.Preflight,
+                warningDetails: rolledBack.Result.WarningDetails,
+                plan: rolledBack.Summary,
+                planChanges: rolledBack.Changes);
+            await UpdateAutoGenProgressMessageAsync("Оновлюємо таблицю після відкоту...");
+            await LoadWeek();
+        }
+        catch (ApiErrorException ex)
+        {
+            await HandleApiError(ex);
+            await RestoreLatestRollbackableAutoGenPlanAsync();
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+        }
+        finally
+        {
+            EndAutoGenAction();
+        }
+    }
+    private static string GetAutoGenPlanStateLabel(AutoGenPlanState state)
+        => state switch
+        {
+            AutoGenPlanState.Ready => "готовий до застосування",
+            AutoGenPlanState.Applied => "застосований",
+            AutoGenPlanState.RolledBack => "відкочений",
+            AutoGenPlanState.Expired => "прострочений",
+            _ => "відсутній"
+        };
+    private static int GetAutoGenPlanOperationOrder(AutoGenPlanOperation operation)
+        => operation switch
+        {
+            AutoGenPlanOperation.Delete => 0,
+            AutoGenPlanOperation.Update => 1,
+            _ => 2
+        };
+    private static string BuildAutoGenPlanChangeLabel(AutoGenPlanChangeDto change)
+    {
+        var draft = change.Operation == AutoGenPlanOperation.Delete ? change.Before : change.After;
+        if (draft is null)
+        {
+            return "Некоректна зміна без даних заняття.";
+        }
+        var action = change.Operation switch
+        {
+            AutoGenPlanOperation.Delete => "Видалити",
+            AutoGenPlanOperation.Update => "Змінити",
+            _ => "Додати"
+        };
+        var resources = new List<string>();
+        if (!string.IsNullOrWhiteSpace(draft.TeacherName))
+        {
+            resources.Add($"викладач: {draft.TeacherName}");
+        }
+        if (!string.IsNullOrWhiteSpace(draft.RoomName))
+        {
+            resources.Add($"аудиторія: {draft.RoomName}");
+        }
+        var resourceSuffix = resources.Count == 0 ? string.Empty : $", {string.Join(", ", resources)}";
+        return $"{action}: {draft.Date:dd.MM.yyyy} {draft.TimeStart}–{draft.TimeEnd}, {draft.GroupName}, {draft.ModuleName}{resourceSuffix}";
     }
     // Очищає чернетки за обраний тиждень.
     private async Task ClearWeekForCurrent()
@@ -3741,7 +4149,18 @@ else
         List<AutoGenGapDetail> GapDetails,
         List<AutoGenGapSummaryItem>? GapSummary = null,
         List<AutoGenPreflightItem>? Preflight = null,
-        AutoGenRunReport? Report = null);
+        AutoGenRunReport? Report = null,
+        List<AutoGenWarningDetail>? WarningDetails = null,
+        AutoGenPlanSummaryDto? Plan = null,
+        PreparedAutoGenPlanLogContext? PlanLogContext = null);
+    private sealed record PreparedAutoGenPlanLogContext(
+        string PlanId,
+        DateOnly RangeStartDate,
+        DateOnly RangeEndDate,
+        int CourseId,
+        string CourseName,
+        Dictionary<int, int> ModuleHours,
+        bool SoftFill);
     private sealed class AutoGenProgressState
     {
         public string? JobId { get; set; }

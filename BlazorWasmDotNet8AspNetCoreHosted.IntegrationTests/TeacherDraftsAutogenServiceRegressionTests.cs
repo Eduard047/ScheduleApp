@@ -329,6 +329,531 @@ public sealed class TeacherDraftsAutogenServiceRegressionTests
         Assert.Equal(thirdTopic.Id, generated.ModuleTopicId);
     }
 
+    [Fact]
+    public async Task Full_generator_creates_complete_lesson_without_teacher_module_when_type_does_not_require_teacher()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var date = new DateOnly(2026, 9, 7);
+        var course = new Course
+        {
+            Name = "Курс без викладача",
+            DurationWeeks = 18,
+            AcademicPeriodStartDate = date
+        };
+        var group = new Group { Name = "БВ-1", StudentsCount = 20, Course = course };
+        var lessonType = new LessonTypeRef
+        {
+            Code = "UNTUTORED",
+            Name = "Заняття без викладача",
+            IsActive = true,
+            RequiresTeacher = false,
+            RequiresRoom = false,
+            BlocksTeacher = false,
+            BlocksRoom = false,
+            CountInPlan = true,
+            CountInLoad = false
+        };
+        var module = new Module
+        {
+            Code = "БВ",
+            Title = "Модуль без викладача",
+            Credits = 1,
+            Course = course
+        };
+        var topic = new ModuleTopic
+        {
+            Module = module,
+            Order = 1,
+            TopicCode = "БВ-1",
+            LessonType = lessonType,
+            TotalHours = 1,
+            AuditoriumHours = 1
+        };
+        fixture.Db.AddRange(
+            course,
+            group,
+            lessonType,
+            module,
+            topic,
+            new TimeSlot
+            {
+                Course = course,
+                DayOfWeek = date.DayOfWeek,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0),
+                SortOrder = 1,
+                IsActive = true
+            });
+        await fixture.Db.SaveChangesAsync();
+
+        var result = await RunAlgorithmScenarioAsync(
+            fixture.Db,
+            date,
+            date,
+            course.Id,
+            group.Id,
+            module.Id,
+            hours: 1);
+
+        Assert.Equal(1, result.Created);
+        var draft = await fixture.Db.TeacherDraftItems.AsNoTracking().SingleAsync();
+        Assert.Null(draft.TeacherId);
+        Assert.Null(draft.RoomId);
+        Assert.Null(draft.ValidationWarnings);
+        Assert.Empty(await fixture.Db.TeacherModules.AsNoTracking().ToListAsync());
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public async Task Full_generator_allows_resource_overlap_when_either_lesson_type_does_not_block(
+        bool existingBlocksResources,
+        bool generatedBlocksResources)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var date = new DateOnly(2026, 9, 7);
+        var course = new Course
+        {
+            Name = "Курс симетричної зайнятості",
+            DurationWeeks = 18,
+            AcademicPeriodStartDate = date
+        };
+        var targetGroup = new Group { Name = "СЗ-1", StudentsCount = 20, Course = course };
+        var occupiedGroup = new Group { Name = "СЗ-2", StudentsCount = 20, Course = course };
+        var existingType = CreateResourceLessonType("EXISTING", existingBlocksResources);
+        var targetType = CreateResourceLessonType("TARGET", generatedBlocksResources);
+        var existingModule = new Module
+        {
+            Code = "СЗ-Н",
+            Title = "Наявний модуль",
+            Credits = 1,
+            Course = course
+        };
+        var targetModule = new Module
+        {
+            Code = "СЗ-Ц",
+            Title = "Цільовий модуль",
+            Credits = 1,
+            Course = course
+        };
+        var teacher = new Teacher { FullName = "Викладач симетричної зайнятості" };
+        var building = new Building { Name = "Корпус симетричної зайнятості" };
+        var room = new Room
+        {
+            Name = "СЗ-101",
+            Capacity = 40,
+            Building = building
+        };
+        var start = new TimeOnly(8, 0);
+        var end = new TimeOnly(9, 0);
+        fixture.Db.AddRange(
+            course,
+            targetGroup,
+            occupiedGroup,
+            existingType,
+            targetType,
+            existingModule,
+            targetModule,
+            teacher,
+            building,
+            room);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.AddRange(
+            new ModuleTopic
+            {
+                ModuleId = targetModule.Id,
+                Order = 1,
+                TopicCode = "СЗ-1",
+                LessonTypeId = targetType.Id,
+                TotalHours = 1,
+                AuditoriumHours = 1
+            },
+            new TeacherModule { TeacherId = teacher.Id, ModuleId = targetModule.Id },
+            new ModuleRoom { ModuleId = targetModule.Id, RoomId = room.Id },
+            new TeacherWorkingHour
+            {
+                TeacherId = teacher.Id,
+                DayOfWeek = date.DayOfWeek,
+                Start = start,
+                End = end
+            },
+            new TimeSlot
+            {
+                CourseId = course.Id,
+                DayOfWeek = date.DayOfWeek,
+                Start = start,
+                End = end,
+                SortOrder = 1,
+                IsActive = true
+            },
+            new ScheduleItem
+            {
+                Date = date,
+                DayOfWeek = date.DayOfWeek,
+                StartTime = start,
+                EndTime = end,
+                GroupId = occupiedGroup.Id,
+                ModuleId = existingModule.Id,
+                LessonTypeId = existingType.Id,
+                TeacherId = teacher.Id,
+                RoomId = room.Id
+            });
+        await fixture.Db.SaveChangesAsync();
+
+        var result = await RunAlgorithmScenarioAsync(
+            fixture.Db,
+            date,
+            date,
+            course.Id,
+            targetGroup.Id,
+            targetModule.Id,
+            hours: 1);
+
+        Assert.Equal(1, result.Created);
+        var generated = await fixture.Db.TeacherDraftItems.AsNoTracking().SingleAsync();
+        Assert.Equal(teacher.Id, generated.TeacherId);
+        Assert.Equal(room.Id, generated.RoomId);
+        Assert.Equal(start, generated.StartTime);
+    }
+
+    [Fact]
+    public async Task Full_generator_balances_dynamic_logical_teacher_load_and_ignores_non_load_types()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var firstDate = new DateOnly(2026, 9, 7);
+        var secondDate = firstDate.AddDays(1);
+        var course = new Course
+        {
+            Name = "Курс динамічного навантаження",
+            DurationWeeks = 18,
+            AcademicPeriodStartDate = firstDate.AddDays(-30)
+        };
+        var targetGroup = new Group { Name = "ДН-1", StudentsCount = 20, Course = course };
+        var sharedGroupA = new Group { Name = "ДН-2", StudentsCount = 20, Course = course };
+        var sharedGroupB = new Group { Name = "ДН-3", StudentsCount = 20, Course = course };
+        var targetType = CreateResourceLessonType("PRACTICE", blocksResources: true);
+        var sharedLoadType = CreateResourceLessonType("LECTURE", blocksResources: true);
+        var ignoredLoadType = CreateResourceLessonType("IGNORED", blocksResources: true);
+        ignoredLoadType.CountInLoad = false;
+        var targetModule = new Module
+        {
+            Code = "ДН-Ц",
+            Title = "Цільовий модуль навантаження",
+            Credits = 1,
+            Course = course
+        };
+        var sharedModule = new Module
+        {
+            Code = "ДН-Л",
+            Title = "Спільна лекція",
+            Credits = 1,
+            Course = course
+        };
+        var ignoredModule = new Module
+        {
+            Code = "ДН-І",
+            Title = "Невраховані заняття",
+            Credits = 1,
+            Course = course
+        };
+        var firstTeacher = new Teacher { FullName = "Перший викладач навантаження" };
+        var secondTeacher = new Teacher { FullName = "Другий викладач навантаження" };
+        var building = new Building { Name = "Корпус навантаження" };
+        var room = new Room { Name = "ДН-101", Capacity = 80, Building = building };
+        fixture.Db.AddRange(
+            course,
+            targetGroup,
+            sharedGroupA,
+            sharedGroupB,
+            targetType,
+            sharedLoadType,
+            ignoredLoadType,
+            targetModule,
+            sharedModule,
+            ignoredModule,
+            firstTeacher,
+            secondTeacher,
+            building,
+            room);
+        await fixture.Db.SaveChangesAsync();
+        var targetTopic = new ModuleTopic
+        {
+            ModuleId = targetModule.Id,
+            Order = 1,
+            TopicCode = "ДН-1",
+            LessonTypeId = targetType.Id,
+            TotalHours = 2,
+            AuditoriumHours = 2
+        };
+        var sharedTopic = new ModuleTopic
+        {
+            ModuleId = sharedModule.Id,
+            Order = 1,
+            TopicCode = "ДН-Л1",
+            LessonTypeId = sharedLoadType.Id,
+            TotalHours = 1,
+            AuditoriumHours = 1
+        };
+        fixture.Db.AddRange(targetTopic, sharedTopic);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.AddRange(
+            new TeacherModule { TeacherId = firstTeacher.Id, ModuleId = targetModule.Id },
+            new TeacherModule { TeacherId = secondTeacher.Id, ModuleId = targetModule.Id },
+            new ModuleRoom { ModuleId = targetModule.Id, RoomId = room.Id },
+            new TimeSlot
+            {
+                CourseId = course.Id,
+                DayOfWeek = firstDate.DayOfWeek,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0),
+                SortOrder = 1,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                CourseId = course.Id,
+                DayOfWeek = secondDate.DayOfWeek,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0),
+                SortOrder = 1,
+                IsActive = true
+            });
+        foreach (var teacher in new[] { firstTeacher, secondTeacher })
+        {
+            fixture.Db.TeacherWorkingHours.AddRange(
+                new TeacherWorkingHour
+                {
+                    TeacherId = teacher.Id,
+                    DayOfWeek = firstDate.DayOfWeek,
+                    Start = new TimeOnly(8, 0),
+                    End = new TimeOnly(9, 0)
+                },
+                new TeacherWorkingHour
+                {
+                    TeacherId = teacher.Id,
+                    DayOfWeek = secondDate.DayOfWeek,
+                    Start = new TimeOnly(8, 0),
+                    End = new TimeOnly(9, 0)
+                });
+        }
+        var sharedDate = firstDate.AddDays(-7);
+        fixture.Db.ScheduleItems.AddRange(
+            CreateScheduleItem(sharedDate, sharedGroupA, sharedModule, sharedLoadType, firstTeacher, room, sharedTopic.Id),
+            CreateScheduleItem(sharedDate, sharedGroupB, sharedModule, sharedLoadType, firstTeacher, room, sharedTopic.Id));
+        for (var index = 1; index <= 3; index++)
+        {
+            fixture.Db.ScheduleItems.Add(CreateScheduleItem(
+                firstDate.AddDays(-7 - index),
+                targetGroup,
+                ignoredModule,
+                ignoredLoadType,
+                secondTeacher,
+                room,
+                moduleTopicId: null));
+        }
+        await fixture.Db.SaveChangesAsync();
+
+        var result = await RunAlgorithmScenarioAsync(
+            fixture.Db,
+            firstDate,
+            secondDate,
+            course.Id,
+            targetGroup.Id,
+            targetModule.Id,
+            hours: 2,
+            teacherLoadPenaltyWeight: 100);
+
+        Assert.Equal(2, result.Created);
+        var generatedTeachers = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .OrderBy(item => item.Date)
+            .Select(item => item.TeacherId)
+            .ToListAsync();
+        Assert.Equal(new int?[] { secondTeacher.Id, firstTeacher.Id }, generatedTeachers);
+    }
+
+    [Fact]
+    public async Task Full_generator_includes_future_academic_period_events_in_teacher_load()
+    {
+        await AssertFutureTeacherLoadScenarioAsync(durationWeeks: 18, futureEventShouldCount: true);
+    }
+
+    [Fact]
+    public async Task Full_generator_excludes_events_after_academic_period_from_teacher_load()
+    {
+        await AssertFutureTeacherLoadScenarioAsync(durationWeeks: 3, futureEventShouldCount: false);
+    }
+
+    private static async Task AssertFutureTeacherLoadScenarioAsync(int durationWeeks, bool futureEventShouldCount)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var date = new DateOnly(2026, 9, 7);
+        var course = new Course
+        {
+            Name = "Курс майбутнього навантаження",
+            DurationWeeks = durationWeeks,
+            AcademicPeriodStartDate = date.AddDays(-7)
+        };
+        var targetGroup = new Group { Name = "МН-1", StudentsCount = 20, Course = course };
+        var futureGroup = new Group { Name = "МН-2", StudentsCount = 20, Course = course };
+        var lessonType = CreateResourceLessonType("FUTURE-LOAD", blocksResources: true);
+        var targetModule = new Module
+        {
+            Code = "МН-Ц",
+            Title = "Цільовий модуль майбутнього навантаження",
+            Credits = 1,
+            Course = course
+        };
+        var futureModule = new Module
+        {
+            Code = "МН-М",
+            Title = "Майбутній модуль навантаження",
+            Credits = 1,
+            Course = course
+        };
+        var firstTeacher = new Teacher { FullName = "Викладач із майбутнім навантаженням" };
+        var secondTeacher = new Teacher { FullName = "Викладач без майбутнього навантаження" };
+        var building = new Building { Name = "Корпус майбутнього навантаження" };
+        var room = new Room { Name = "МН-101", Capacity = 40, Building = building };
+        fixture.Db.AddRange(
+            course,
+            targetGroup,
+            futureGroup,
+            lessonType,
+            targetModule,
+            futureModule,
+            firstTeacher,
+            secondTeacher,
+            building,
+            room);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.AddRange(
+            new ModuleTopic
+            {
+                ModuleId = targetModule.Id,
+                Order = 1,
+                TopicCode = "МН-1",
+                LessonTypeId = lessonType.Id,
+                TotalHours = 1,
+                AuditoriumHours = 1
+            },
+            new TeacherModule { TeacherId = firstTeacher.Id, ModuleId = targetModule.Id },
+            new TeacherModule { TeacherId = secondTeacher.Id, ModuleId = targetModule.Id },
+            new ModuleRoom { ModuleId = targetModule.Id, RoomId = room.Id },
+            new TimeSlot
+            {
+                CourseId = course.Id,
+                DayOfWeek = date.DayOfWeek,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0),
+                SortOrder = 1,
+                IsActive = true
+            },
+            new TeacherWorkingHour
+            {
+                TeacherId = firstTeacher.Id,
+                DayOfWeek = date.DayOfWeek,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0)
+            },
+            new TeacherWorkingHour
+            {
+                TeacherId = secondTeacher.Id,
+                DayOfWeek = date.DayOfWeek,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0)
+            },
+            CreateScheduleItem(
+                date.AddDays(14),
+                futureGroup,
+                futureModule,
+                lessonType,
+                firstTeacher,
+                room,
+                moduleTopicId: null));
+        await fixture.Db.SaveChangesAsync();
+
+        var result = await RunAlgorithmScenarioAsync(
+            fixture.Db,
+            date,
+            date,
+            course.Id,
+            targetGroup.Id,
+            targetModule.Id,
+            hours: 1,
+            teacherLoadPenaltyWeight: 100);
+
+        Assert.Equal(1, result.Created);
+        var generated = await fixture.Db.TeacherDraftItems.AsNoTracking().SingleAsync();
+        var expectedTeacherId = futureEventShouldCount ? secondTeacher.Id : firstTeacher.Id;
+        Assert.Equal(expectedTeacherId, generated.TeacherId);
+    }
+
+    private static LessonTypeRef CreateResourceLessonType(string code, bool blocksResources)
+        => new()
+        {
+            Code = code,
+            Name = $"Тип {code}",
+            IsActive = true,
+            RequiresTeacher = true,
+            RequiresRoom = true,
+            BlocksTeacher = blocksResources,
+            BlocksRoom = blocksResources,
+            CountInPlan = true,
+            CountInLoad = true
+        };
+
+    private static ScheduleItem CreateScheduleItem(
+        DateOnly date,
+        Group group,
+        Module module,
+        LessonTypeRef lessonType,
+        Teacher teacher,
+        Room room,
+        int? moduleTopicId)
+        => new()
+        {
+            Date = date,
+            DayOfWeek = date.DayOfWeek,
+            StartTime = new TimeOnly(8, 0),
+            EndTime = new TimeOnly(9, 0),
+            GroupId = group.Id,
+            ModuleId = module.Id,
+            LessonTypeId = lessonType.Id,
+            TeacherId = teacher.Id,
+            RoomId = room.Id,
+            ModuleTopicId = moduleTopicId
+        };
+
+    private static async Task<AutoGenResult> RunAlgorithmScenarioAsync(
+        AppDbContext db,
+        DateOnly rangeStart,
+        DateOnly rangeEnd,
+        int courseId,
+        int groupId,
+        int moduleId,
+        int hours,
+        double? teacherLoadPenaltyWeight = null)
+    {
+        var action = await new TeacherDraftsAutogenService(db).DraftAutoGen(
+            new DraftAutoGenRequest(
+                WeekStart: rangeStart,
+                ClearExisting: false,
+                CourseId: courseId,
+                GroupIds: new List<int> { groupId },
+                Days: WeekPreset.MonFri,
+                ModuleHours: new Dictionary<int, int> { [moduleId] = hours },
+                SoftFill: false,
+                AllowIncompleteDrafts: false,
+                RangeStartDate: rangeStart,
+                RangeEndDate: rangeEnd,
+                SoftOptions: new DraftAutoGenSoftOptions(
+                    RecentRepeatWindowDays: 0,
+                    TeacherLoadPenaltyWeight: teacherLoadPenaltyWeight)));
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        return Assert.IsType<AutoGenResult>(ok.Value);
+    }
+
     private static DraftAutoGenRequest BuildCurriculumProgressRequest(CurriculumProgressSeed data)
         => new(
             WeekStart: data.GenerationDate,

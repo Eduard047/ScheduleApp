@@ -84,13 +84,22 @@ public record AutoGenPreflightItem(
     List<string> Examples
 );
 
+public record AutoGenWarningDetail(
+    string Code,
+    string Severity,
+    string Category,
+    string Message,
+    Dictionary<string, string>? Context = null
+);
+
 public record AutoGenResult(
     int Created,
     int Skipped,
     List<string> Warnings,
     List<AutoGenGapDetail>? GapDetails = null,
     List<AutoGenGapSummaryItem>? GapSummary = null,
-    List<AutoGenPreflightItem>? Preflight = null
+    List<AutoGenPreflightItem>? Preflight = null,
+    List<AutoGenWarningDetail>? WarningDetails = null
 );
 
 public enum AutoGenJobKind
@@ -125,8 +134,79 @@ public record AutoGenJobRequest(
     AutoGenSoftOptionsDto? SoftOptions = null,
     int? PreferredFirstMaxSlotOrderOverride = null,
     string? Title = null,
-    string? ClientJobId = null
+    string? ClientJobId = null,
+    bool PreviewOnly = false
 );
+
+public enum AutoGenPlanState
+{
+    None = 0,
+    Ready = 1,
+    Applied = 2,
+    RolledBack = 3,
+    Expired = 4
+}
+
+public enum AutoGenPlanOperation
+{
+    Add = 0,
+    Update = 1,
+    Delete = 2
+}
+
+public record AutoGenPlanSummaryDto(
+    string PlanId,
+    AutoGenPlanState State,
+    long Version,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset ExpiresAt,
+    DateTimeOffset? AppliedAt,
+    DateTimeOffset? RolledBackAt,
+    int AddCount,
+    int UpdateCount,
+    int DeleteCount,
+    bool CanApply,
+    bool CanRollback
+);
+
+public record AutoGenPlanDraftDto(
+    int? DraftId,
+    DateOnly Date,
+    string TimeStart,
+    string TimeEnd,
+    int GroupId,
+    string GroupName,
+    int ModuleId,
+    string ModuleName,
+    int LessonTypeId,
+    string LessonTypeName,
+    int? ModuleTopicId,
+    string? TopicCode,
+    int? TeacherId,
+    string? TeacherName,
+    int? RoomId,
+    string? RoomName,
+    bool IsSelfStudy,
+    bool IsLocked,
+    DraftStatusDto Status,
+    string? BatchKey,
+    string? Warnings
+);
+
+public record AutoGenPlanChangeDto(
+    int Ordinal,
+    AutoGenPlanOperation Operation,
+    AutoGenPlanDraftDto? Before,
+    AutoGenPlanDraftDto? After
+);
+
+public record AutoGenPlanDetailsDto(
+    AutoGenPlanSummaryDto Summary,
+    List<AutoGenPlanChangeDto> Changes,
+    AutoGenResult Result
+);
+
+public record AutoGenPlanActionRequest(long ExpectedVersion);
 
 public record AutoGenJobStartResult(
     string JobId,
@@ -191,5 +271,6 @@ public record AutoGenJobStatus(
     string? LastCompletedMessage = null,
     AutoGenResult? Result = null,
     AutoGenRunReport? Report = null,
-    string? Error = null
+    string? Error = null,
+    AutoGenPlanSummaryDto? Plan = null
 );

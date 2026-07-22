@@ -11,6 +11,7 @@ internal static class TeacherDraftsAutogenReportBuilder
         IEnumerable<AutoGenGapDetail> gapDetails,
         IEnumerable<AutoGenPreflightItem> preflight)
     {
+        var warningDetails = AutoGenWarningClassifier.ClassifyMany(warnings);
         var gaps = gapDetails
             .Select(AutoGenGapReasonClassifier.EnsureStructured)
             .ToList();
@@ -18,10 +19,11 @@ internal static class TeacherDraftsAutogenReportBuilder
         return new AutoGenResult(
             created,
             skipped,
-            warnings.Where(warning => !string.IsNullOrWhiteSpace(warning)).Distinct(StringComparer.Ordinal).ToList(),
+            warningDetails.Select(detail => detail.Message).ToList(),
             gaps,
             BuildGapSummary(gaps),
-            preflightItems);
+            preflightItems,
+            warningDetails);
     }
 
     public static AutoGenRunReport BuildReport(DateOnly fromDate, DateOnly toDate, int totalWeeks, AutoGenResult result)

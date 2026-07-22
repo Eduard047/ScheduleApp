@@ -51,6 +51,7 @@ builder.Services.AddScoped<AggregatesService>();
 builder.Services.AddScoped<TeacherDraftsQueryService>();
 builder.Services.AddScoped<TeacherDraftsExportService>();
 builder.Services.AddScoped<TeacherDraftsAutogenService>();
+builder.Services.AddScoped<TeacherDraftsAutogenPlanService>();
 builder.Services.AddSingleton<TeacherDraftsAutogenJobService>();
 builder.Services.AddHostedService<TeacherDraftsAutogenJobService>(services =>
     services.GetRequiredService<TeacherDraftsAutogenJobService>());

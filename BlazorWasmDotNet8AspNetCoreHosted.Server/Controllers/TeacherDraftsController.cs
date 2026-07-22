@@ -944,6 +944,13 @@ public sealed class TeacherDraftsController : ControllerBase
     [HttpPost("autogen/jobs")]
     public ActionResult<AutoGenJobStartResult> StartAutoGenJob([FromBody] AutoGenJobRequest r)
     {
+        if (r.Kind is AutoGenJobKind.Generate or AutoGenJobKind.Fill && !r.PreviewOnly)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status400BadRequest,
+                title: "Потрібен попередній перегляд автогенерації",
+                detail: "Генерацію та дозаповнення можна виконати лише через попередній план із подальшим окремим застосуванням.");
+        }
         try
         {
             return Ok(_autogenJobService.Start(r));
@@ -1008,6 +1015,92 @@ public sealed class TeacherDraftsController : ControllerBase
             return Problem(
                 statusCode: StatusCodes.Status503ServiceUnavailable,
                 title: "Сховище стану автогенерації недоступне",
+                detail: ex.Message);
+        }
+    }
+    [HttpGet("autogen/jobs/{jobId}/plan")]
+    public async Task<ActionResult<AutoGenPlanDetailsDto>> GetAutoGenPlan(
+        string jobId,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return Ok(await _autogenJobService.GetPlanAsync(jobId, cancellationToken));
+        }
+        catch (AutoGenPlanNotFoundException ex)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status404NotFound,
+                title: "План автогенерації не знайдено",
+                detail: ex.Message);
+        }
+        catch (AutoGenPlanPersistenceException ex)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status503ServiceUnavailable,
+                title: "Не вдалося прочитати план автогенерації",
+                detail: ex.Message);
+        }
+    }
+    [HttpGet("autogen/plans/latest-rollbackable")]
+    public async Task<ActionResult<AutoGenPlanDetailsDto>> GetLatestRollbackableAutoGenPlan(
+        [FromQuery] int? courseId,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var plan = await _autogenJobService.GetLatestRollbackablePlanAsync(courseId, cancellationToken);
+            return plan is null ? NoContent() : Ok(plan);
+        }
+        catch (AutoGenPlanPersistenceException ex)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status503ServiceUnavailable,
+                title: "Не вдалося знайти доступний відкіт автогенерації",
+                detail: ex.Message);
+        }
+    }
+    [HttpPost("autogen/jobs/{jobId}/apply")]
+    public async Task<ActionResult<AutoGenPlanDetailsDto>> ApplyAutoGenPlan(
+        string jobId,
+        [FromBody] AutoGenPlanActionRequest request,
+        CancellationToken cancellationToken)
+        => await ExecuteAutoGenPlanActionAsync(
+            () => _autogenJobService.ApplyPlanAsync(jobId, request, cancellationToken));
+    [HttpPost("autogen/jobs/{jobId}/rollback")]
+    public async Task<ActionResult<AutoGenPlanDetailsDto>> RollbackAutoGenPlan(
+        string jobId,
+        [FromBody] AutoGenPlanActionRequest request,
+        CancellationToken cancellationToken)
+        => await ExecuteAutoGenPlanActionAsync(
+            () => _autogenJobService.RollbackPlanAsync(jobId, request, cancellationToken));
+
+    private async Task<ActionResult<AutoGenPlanDetailsDto>> ExecuteAutoGenPlanActionAsync(
+        Func<Task<AutoGenPlanDetailsDto>> action)
+    {
+        try
+        {
+            return Ok(await action());
+        }
+        catch (AutoGenPlanNotFoundException ex)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status404NotFound,
+                title: "План автогенерації не знайдено",
+                detail: ex.Message);
+        }
+        catch (AutoGenPlanConflictException ex)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status409Conflict,
+                title: "План автогенерації застарів або конфліктує з поточними даними",
+                detail: ex.Message);
+        }
+        catch (AutoGenPlanPersistenceException ex)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status503ServiceUnavailable,
+                title: "Сховище плану автогенерації недоступне",
                 detail: ex.Message);
         }
     }

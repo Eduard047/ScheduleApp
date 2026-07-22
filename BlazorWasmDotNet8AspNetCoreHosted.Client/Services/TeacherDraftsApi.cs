@@ -1,6 +1,7 @@
 using System.Net.Http.Json;
 using BlazorWasmDotNet8AspNetCoreHosted.Client.Services;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
+using System.Net;
 
 // API-клієнт для роботи з викладацькими чернетками
 public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
@@ -53,6 +54,45 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
         var res = await http.PostAsync($"api/teacher-drafts/autogen/jobs/{Uri.EscapeDataString(jobId)}/cancel", content: null);
         await res.EnsureSuccessWithDetailsAsync();
         return (await res.Content.ReadFromJsonAsync<AutoGenJobStatus>())!;
+    }
+    public async Task<AutoGenPlanDetailsDto> GetAutogenPlan(string jobId)
+    {
+        var res = await http.GetAsync($"api/teacher-drafts/autogen/jobs/{Uri.EscapeDataString(jobId)}/plan");
+        await res.EnsureSuccessWithDetailsAsync();
+        return await res.Content.ReadFromJsonAsync<AutoGenPlanDetailsDto>()
+               ?? throw new InvalidOperationException("Сервер не повернув попередній план автогенерації.");
+    }
+    public async Task<AutoGenPlanDetailsDto> ApplyAutogenPlan(string jobId, AutoGenPlanActionRequest request)
+    {
+        var res = await http.PostAsJsonAsync(
+            $"api/teacher-drafts/autogen/jobs/{Uri.EscapeDataString(jobId)}/apply",
+            request);
+        await res.EnsureSuccessWithDetailsAsync();
+        return await res.Content.ReadFromJsonAsync<AutoGenPlanDetailsDto>()
+               ?? throw new InvalidOperationException("Сервер не повернув результат застосування плану автогенерації.");
+    }
+    public async Task<AutoGenPlanDetailsDto> RollbackAutogenPlan(string jobId, AutoGenPlanActionRequest request)
+    {
+        var res = await http.PostAsJsonAsync(
+            $"api/teacher-drafts/autogen/jobs/{Uri.EscapeDataString(jobId)}/rollback",
+            request);
+        await res.EnsureSuccessWithDetailsAsync();
+        return await res.Content.ReadFromJsonAsync<AutoGenPlanDetailsDto>()
+               ?? throw new InvalidOperationException("Сервер не повернув результат відкоту плану автогенерації.");
+    }
+    public async Task<AutoGenPlanDetailsDto?> GetLatestRollbackableAutogenPlan(int? courseId)
+    {
+        var url = ApiClientHelpers.WithQuery(
+            "api/teacher-drafts/autogen/plans/latest-rollbackable",
+            ("courseId", courseId?.ToString()));
+        var res = await http.GetAsync(url);
+        if (res.StatusCode is HttpStatusCode.NoContent or HttpStatusCode.NotFound)
+        {
+            return null;
+        }
+        await res.EnsureSuccessWithDetailsAsync();
+        return await res.Content.ReadFromJsonAsync<AutoGenPlanDetailsDto>()
+               ?? throw new InvalidOperationException("Сервер не повернув доступний план для відкоту автогенерації.");
     }
     // Виконує попередню перевірку ресурсів без запису чернеток.
     public async Task<AutoGenResult> AutogenPreflightWeek(AutoGenRequest req)

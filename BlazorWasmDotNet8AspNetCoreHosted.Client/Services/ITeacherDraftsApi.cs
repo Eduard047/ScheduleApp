@@ -24,6 +24,10 @@ public interface ITeacherDraftsApi
     Task<AutoGenJobStartResult> StartAutogenJob(AutoGenJobRequest req);
     Task<AutoGenJobStatus> GetAutogenJob(string jobId);
     Task<AutoGenJobStatus> CancelAutogenJob(string jobId);
+    Task<AutoGenPlanDetailsDto> GetAutogenPlan(string jobId);
+    Task<AutoGenPlanDetailsDto> ApplyAutogenPlan(string jobId, AutoGenPlanActionRequest request);
+    Task<AutoGenPlanDetailsDto> RollbackAutogenPlan(string jobId, AutoGenPlanActionRequest request);
+    Task<AutoGenPlanDetailsDto?> GetLatestRollbackableAutogenPlan(int? courseId);
     // Очищає чернетки тижня.
     Task<int> ClearWeek(ClearWeekRequest req);
     // Автогенерація на місяць.

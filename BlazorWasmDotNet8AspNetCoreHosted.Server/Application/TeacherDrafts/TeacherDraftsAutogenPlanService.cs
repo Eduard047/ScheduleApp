@@ -1,0 +1,1091 @@
+using System.Data;
+using System.Text.Json;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
+using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
+using Microsoft.EntityFrameworkCore;
+
+namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
+
+public sealed class AutoGenPlanNotFoundException(string message) : Exception(message);
+
+public sealed class AutoGenPlanConflictException(string message) : Exception(message);
+
+public sealed class AutoGenPlanPersistenceException(string message, Exception? innerException = null)
+    : Exception(message, innerException);
+
+internal sealed record AutoGenDraftSnapshot(
+    int Id,
+    Guid Revision,
+    DateOnly Date,
+    DayOfWeek DayOfWeek,
+    TimeOnly StartTime,
+    TimeOnly EndTime,
+    int LessonTypeId,
+    string LessonTypeName,
+    int GroupId,
+    string GroupName,
+    int ModuleId,
+    string ModuleName,
+    int? ModuleTopicId,
+    string? TopicCode,
+    int? TeacherId,
+    string? TeacherName,
+    int? RoomId,
+    string? RoomName,
+    DraftStatus Status,
+    int? PublishedItemId,
+    string? BatchKey,
+    string? ValidationWarnings,
+    DateTime CreatedAt,
+    DateTime UpdatedAt,
+    bool IsLocked,
+    bool IsSelfStudy,
+    string? GenerationJobId);
+
+internal sealed record AutoGenDraftPlanMutationPayload(
+    int Ordinal,
+    AutoGenPlanOperation Operation,
+    AutoGenDraftSnapshot? Before,
+    AutoGenDraftSnapshot? After);
+
+internal sealed record AutoGenDraftPlanPayload(
+    string PlanId,
+    int CourseId,
+    DateOnly RangeStartDate,
+    DateOnly RangeEndDate,
+    WeekPreset Days,
+    bool AllowIncompleteDrafts,
+    IReadOnlyList<int> GroupIds,
+    Guid BeforeScopeRevision,
+    string InputFingerprint,
+    DateTime CreatedAtUtc,
+    DateTime ExpiresAtUtc,
+    IReadOnlyList<AutoGenDraftPlanMutationPayload> Mutations)
+{
+    public int AddCount => Mutations.Count(item => item.Operation == AutoGenPlanOperation.Add);
+    public int UpdateCount => Mutations.Count(item => item.Operation == AutoGenPlanOperation.Update);
+    public int DeleteCount => Mutations.Count(item => item.Operation == AutoGenPlanOperation.Delete);
+
+    public AutoGenPlanSummaryDto ToSummary()
+        => new(
+            PlanId,
+            AutoGenPlanState.Ready,
+            1,
+            new DateTimeOffset(DateTime.SpecifyKind(CreatedAtUtc, DateTimeKind.Utc)),
+            new DateTimeOffset(DateTime.SpecifyKind(ExpiresAtUtc, DateTimeKind.Utc)),
+            null,
+            null,
+            AddCount,
+            UpdateCount,
+            DeleteCount,
+            true,
+            false);
+}
+
+public sealed class TeacherDraftsAutogenPlanService
+{
+    private static readonly TimeSpan PreviewLifetime = TimeSpan.FromHours(24);
+    private static readonly TimeSpan RollbackLifetime = TimeSpan.FromDays(7);
+    private static readonly TimeSpan PlanRetention = TimeSpan.FromDays(30);
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        WriteIndented = false
+    };
+
+    private readonly AppDbContext _db;
+
+    public TeacherDraftsAutogenPlanService(AppDbContext db)
+        => _db = db;
+
+    public Task<string> CaptureInputFingerprintAsync(
+        AutoGenJobRequest request,
+        CancellationToken cancellationToken = default)
+        => TeacherDraftsAutogenInputFingerprint.CaptureAsync(_db, request, cancellationToken);
+
+    internal async Task<List<AutoGenDraftSnapshot>> CaptureScopeAsync(
+        AutoGenJobRequest request,
+        CancellationToken cancellationToken)
+    {
+        var groupIds = request.GroupIds.Distinct().ToList();
+        return await _db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => item.Date >= request.FromDate
+                           && item.Date <= request.ToDate
+                           && groupIds.Contains(item.GroupId))
+            .OrderBy(item => item.Id)
+            .Select(item => new AutoGenDraftSnapshot(
+                item.Id,
+                item.Revision,
+                item.Date,
+                item.DayOfWeek,
+                item.StartTime,
+                item.EndTime,
+                item.LessonTypeId,
+                item.LessonType.Name,
+                item.GroupId,
+                item.Group.Name,
+                item.ModuleId,
+                item.Module.Title,
+                item.ModuleTopicId,
+                item.ModuleTopic != null ? item.ModuleTopic.TopicCode : null,
+                item.TeacherId,
+                item.Teacher != null ? item.Teacher.FullName : null,
+                item.RoomId,
+                item.Room != null ? item.Room.Name : null,
+                item.Status,
+                item.PublishedItemId,
+                item.BatchKey,
+                item.ValidationWarnings,
+                item.CreatedAt,
+                item.UpdatedAt,
+                item.IsLocked,
+                item.IsSelfStudy,
+                item.GenerationJobId))
+            .ToListAsync(cancellationToken);
+    }
+
+    internal static AutoGenDraftPlanPayload BuildPayload(
+        string planId,
+        AutoGenJobRequest request,
+        IReadOnlyCollection<AutoGenDraftSnapshot> before,
+        IReadOnlyCollection<AutoGenDraftSnapshot> after,
+        string inputFingerprint)
+    {
+        var beforeById = before.ToDictionary(item => item.Id);
+        var afterById = after.ToDictionary(item => item.Id);
+        var unordered = new List<(AutoGenPlanOperation Operation, AutoGenDraftSnapshot? Before, AutoGenDraftSnapshot? After)>();
+
+        foreach (var previous in before.OrderBy(item => item.Id))
+        {
+            if (!afterById.TryGetValue(previous.Id, out var current))
+            {
+                unordered.Add((AutoGenPlanOperation.Delete, previous, null));
+                continue;
+            }
+
+            if (!HasSameMutableContent(previous, current))
+            {
+                unordered.Add((AutoGenPlanOperation.Update, previous, current));
+            }
+        }
+
+        foreach (var current in after
+                     .Where(item => !beforeById.ContainsKey(item.Id))
+                     .OrderBy(item => item.Date)
+                     .ThenBy(item => item.StartTime)
+                     .ThenBy(item => item.GroupId)
+                     .ThenBy(item => item.ModuleId)
+                     .ThenBy(item => item.Id))
+        {
+            unordered.Add((AutoGenPlanOperation.Add, null, current with { Id = 0, Revision = Guid.Empty }));
+        }
+
+        var mutations = unordered
+            .OrderBy(item => item.Operation)
+            .ThenBy(item => item.Before?.Date ?? item.After!.Date)
+            .ThenBy(item => item.Before?.StartTime ?? item.After!.StartTime)
+            .ThenBy(item => item.Before?.GroupId ?? item.After!.GroupId)
+            .ThenBy(item => item.Before?.Id ?? int.MaxValue)
+            .Select((item, index) => new AutoGenDraftPlanMutationPayload(
+                index + 1,
+                item.Operation,
+                item.Before,
+                item.After))
+            .ToList();
+        var now = DateTime.UtcNow;
+        return new AutoGenDraftPlanPayload(
+            planId,
+            request.CourseId,
+            request.FromDate,
+            request.ToDate,
+            request.Days,
+            request.AllowIncompleteDrafts,
+            request.GroupIds.Distinct().OrderBy(id => id).ToList(),
+            BuildScopeRevision(before),
+            inputFingerprint,
+            now,
+            now.Add(PreviewLifetime),
+            mutations);
+    }
+
+    internal static async Task AddReadyPlanAsync(
+        AppDbContext db,
+        AutoGenJobRun run,
+        AutoGenDraftPlanPayload payload,
+        CancellationToken cancellationToken)
+    {
+        await CleanupExpiredPlansAsync(db, cancellationToken);
+        if (await db.AutoGenDraftPlans.AnyAsync(item => item.AutoGenJobRunId == run.Id, cancellationToken))
+        {
+            return;
+        }
+
+        var plan = new AutoGenDraftPlan
+        {
+            PlanId = payload.PlanId,
+            AutoGenJobRun = run,
+            State = (int)AutoGenPlanState.Ready,
+            Version = 1,
+            CourseId = payload.CourseId,
+            RangeStartDate = payload.RangeStartDate,
+            RangeEndDate = payload.RangeEndDate,
+            Days = (int)payload.Days,
+            AllowIncompleteDrafts = payload.AllowIncompleteDrafts,
+            GroupIdsJson = JsonSerializer.Serialize(payload.GroupIds, JsonOptions),
+            BeforeScopeRevision = payload.BeforeScopeRevision,
+            InputFingerprint = payload.InputFingerprint,
+            AddCount = payload.AddCount,
+            UpdateCount = payload.UpdateCount,
+            DeleteCount = payload.DeleteCount,
+            CreatedAtUtc = payload.CreatedAtUtc,
+            ExpiresAtUtc = payload.ExpiresAtUtc
+        };
+        foreach (var mutation in payload.Mutations)
+        {
+            plan.Mutations.Add(new AutoGenDraftPlanMutation
+            {
+                Ordinal = mutation.Ordinal,
+                Operation = (int)mutation.Operation,
+                SourceDraftId = mutation.Before?.Id,
+                BeforeRevision = mutation.Before?.Revision,
+                BeforeJson = SerializeSnapshot(mutation.Before),
+                AfterJson = SerializeSnapshot(mutation.After)
+            });
+        }
+        db.AutoGenDraftPlans.Add(plan);
+    }
+
+    public async Task<AutoGenPlanDetailsDto> GetDetailsAsync(
+        string planId,
+        CancellationToken cancellationToken = default)
+    {
+        await CleanupExpiredPlansAsync(_db, cancellationToken);
+        var plan = await LoadPlanAsync(planId, tracking: false, cancellationToken);
+        return BuildDetails(plan, DateTime.UtcNow);
+    }
+
+    public async Task<AutoGenPlanDetailsDto?> GetLatestRollbackableAsync(
+        int? courseId,
+        CancellationToken cancellationToken = default)
+    {
+        await CleanupExpiredPlansAsync(_db, cancellationToken);
+        var nowUtc = DateTime.UtcNow;
+        var query = _db.AutoGenDraftPlans
+            .AsNoTracking()
+            .Include(item => item.AutoGenJobRun)
+            .Include(item => item.Mutations)
+            .Where(item => item.State == (int)AutoGenPlanState.Applied
+                           && item.ExpiresAtUtc > nowUtc);
+        if (courseId is > 0)
+        {
+            query = query.Where(item => item.CourseId == courseId.Value);
+        }
+        var plan = await query
+            .OrderByDescending(item => item.AppliedAtUtc)
+            .ThenByDescending(item => item.Id)
+            .FirstOrDefaultAsync(cancellationToken);
+        return plan is null ? null : BuildDetails(plan, nowUtc);
+    }
+
+    public async Task<AutoGenPlanDetailsDto> ApplyAsync(
+        string planId,
+        AutoGenPlanActionRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        await using var transaction = await _db.Database.BeginTransactionAsync(
+            IsolationLevel.Serializable,
+            cancellationToken);
+        try
+        {
+            await CleanupExpiredPlansAsync(_db, cancellationToken);
+            var plan = await LoadPlanAsync(planId, tracking: true, cancellationToken);
+            var state = EffectiveState(plan, DateTime.UtcNow);
+            if (state == AutoGenPlanState.Applied)
+            {
+                await transaction.CommitAsync(cancellationToken);
+                return BuildDetails(plan, DateTime.UtcNow);
+            }
+            if (state != AutoGenPlanState.Ready)
+            {
+                throw new AutoGenPlanConflictException(
+                    state == AutoGenPlanState.Expired
+                        ? "Термін дії попереднього плану автогенерації минув. Створіть новий попередній перегляд."
+                        : "Цей план автогенерації вже не можна застосувати.");
+            }
+            EnsureExpectedVersion(plan, request.ExpectedVersion);
+            await EnsureInputFingerprintIsCurrentAsync(plan, cancellationToken);
+
+            var groupIds = DeserializeGroupIds(plan);
+            var scopeRows = await LoadTrackedScopeRowsAsync(plan, groupIds, cancellationToken);
+            EnsureScopeRevision(plan.BeforeScopeRevision, scopeRows, "Чернетки змінилися після попереднього перегляду");
+            var scopeById = scopeRows.ToDictionary(item => item.Id);
+            var payloads = ReadMutationPayloads(plan);
+            EnsureBeforeRowsAreCurrent(payloads, scopeById);
+            var pending = payloads
+                .Where(item => item.Operation is AutoGenPlanOperation.Add or AutoGenPlanOperation.Update)
+                .Select(item => ToPendingDraft(item.After
+                    ?? throw CorruptPlan("План застосування не містить нового стану чернетки.")))
+                .ToList();
+            var excludedIds = payloads
+                .Where(item => item.Operation is AutoGenPlanOperation.Update or AutoGenPlanOperation.Delete)
+                .Select(item => item.Before!.Id)
+                .ToList();
+            await ValidateReferencesAndHardRulesAsync(plan, groupIds, payloads.Select(item => item.After).OfType<AutoGenDraftSnapshot>(), pending, excludedIds, cancellationToken);
+
+            var appliedEntities = new Dictionary<long, TeacherDraftItem>();
+            foreach (var payload in payloads)
+            {
+                switch (payload.Operation)
+                {
+                    case AutoGenPlanOperation.Add:
+                    {
+                        var entity = new TeacherDraftItem();
+                        ApplySnapshot(entity, payload.After!, plan.PlanId, isNew: true);
+                        _db.TeacherDraftItems.Add(entity);
+                        appliedEntities[payload.Entity.Id] = entity;
+                        break;
+                    }
+                    case AutoGenPlanOperation.Update:
+                    {
+                        var entity = scopeById[payload.Before!.Id];
+                        ApplySnapshot(entity, payload.After!, plan.PlanId, isNew: false);
+                        appliedEntities[payload.Entity.Id] = entity;
+                        break;
+                    }
+                    case AutoGenPlanOperation.Delete:
+                        _db.TeacherDraftItems.Remove(scopeById[payload.Before!.Id]);
+                        break;
+                    default:
+                        throw CorruptPlan("План містить невідому операцію з чернеткою.");
+                }
+            }
+
+            await _db.SaveChangesAsync(cancellationToken);
+            foreach (var payload in payloads)
+            {
+                if (!appliedEntities.TryGetValue(payload.Entity.Id, out var entity))
+                {
+                    payload.Entity.AppliedDraftId = null;
+                    payload.Entity.AppliedRevision = null;
+                    continue;
+                }
+                payload.Entity.AppliedDraftId = entity.Id;
+                payload.Entity.AppliedRevision = entity.Revision;
+            }
+
+            var appliedScope = await LoadScopeRevisionRowsAsync(plan, groupIds, cancellationToken);
+            plan.AppliedScopeRevision = BuildScopeRevision(appliedScope);
+            plan.State = (int)AutoGenPlanState.Applied;
+            plan.AppliedAtUtc = DateTime.UtcNow;
+            plan.ExpiresAtUtc = plan.AppliedAtUtc.Value.Add(RollbackLifetime);
+            plan.Version++;
+            UpdatePersistedJobPlanStatus(plan);
+            await _db.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(CancellationToken.None);
+            return BuildDetails(plan, DateTime.UtcNow);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            await transaction.RollbackAsync(CancellationToken.None);
+            throw new AutoGenPlanConflictException(
+                "План або чернетки були змінені паралельно. Оновіть попередній перегляд і повторіть дію.");
+        }
+        catch (DbUpdateException)
+        {
+            await transaction.RollbackAsync(CancellationToken.None);
+            throw new AutoGenPlanConflictException(
+                "Під час застосування дані змінилися або один із довідників став недоступним. План не застосовано.");
+        }
+        catch
+        {
+            await transaction.RollbackAsync(CancellationToken.None);
+            throw;
+        }
+    }
+
+    public async Task<AutoGenPlanDetailsDto> RollbackAsync(
+        string planId,
+        AutoGenPlanActionRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        await using var transaction = await _db.Database.BeginTransactionAsync(
+            IsolationLevel.Serializable,
+            cancellationToken);
+        try
+        {
+            await CleanupExpiredPlansAsync(_db, cancellationToken);
+            var plan = await LoadPlanAsync(planId, tracking: true, cancellationToken);
+            var state = EffectiveState(plan, DateTime.UtcNow);
+            if (state == AutoGenPlanState.RolledBack)
+            {
+                await transaction.CommitAsync(cancellationToken);
+                return BuildDetails(plan, DateTime.UtcNow);
+            }
+            if (state != AutoGenPlanState.Applied)
+            {
+                throw new AutoGenPlanConflictException(
+                    state == AutoGenPlanState.Expired
+                        ? "Термін безпечного відкоту автогенерації минув."
+                        : "Відкотити можна лише застосований план автогенерації.");
+            }
+            EnsureExpectedVersion(plan, request.ExpectedVersion);
+            if (plan.AppliedScopeRevision is not Guid appliedScopeRevision)
+            {
+                throw CorruptPlan("Застосований план не містить контрольної версії чернеток.");
+            }
+
+            var groupIds = DeserializeGroupIds(plan);
+            var scopeRows = await LoadTrackedScopeRowsAsync(plan, groupIds, cancellationToken);
+            EnsureScopeRevision(appliedScopeRevision, scopeRows, "Чернетки змінилися після застосування плану");
+            var scopeById = scopeRows.ToDictionary(item => item.Id);
+            var payloads = ReadMutationPayloads(plan);
+            EnsureAppliedRowsAreCurrent(plan.PlanId, payloads, scopeById);
+            var restoredSnapshots = payloads
+                .Where(item => item.Operation is AutoGenPlanOperation.Update or AutoGenPlanOperation.Delete)
+                .Select(item => item.Before
+                    ?? throw CorruptPlan("План відкоту не містить попереднього стану чернетки."))
+                .ToList();
+            var pending = restoredSnapshots.Select(ToPendingDraft).ToList();
+            var excludedIds = payloads
+                .Where(item => item.Operation is AutoGenPlanOperation.Add or AutoGenPlanOperation.Update)
+                .Select(item => item.Entity.AppliedDraftId!.Value)
+                .ToList();
+            await ValidateReferencesAndHardRulesAsync(plan, groupIds, restoredSnapshots, pending, excludedIds, cancellationToken);
+
+            foreach (var payload in payloads)
+            {
+                switch (payload.Operation)
+                {
+                    case AutoGenPlanOperation.Add:
+                        _db.TeacherDraftItems.Remove(scopeById[payload.Entity.AppliedDraftId!.Value]);
+                        break;
+                    case AutoGenPlanOperation.Update:
+                    {
+                        var entity = scopeById[payload.Entity.AppliedDraftId!.Value];
+                        ApplySnapshot(entity, payload.Before!, payload.Before!.GenerationJobId, isNew: false);
+                        break;
+                    }
+                    case AutoGenPlanOperation.Delete:
+                    {
+                        var entity = new TeacherDraftItem { Id = payload.Before!.Id };
+                        ApplySnapshot(entity, payload.Before, payload.Before.GenerationJobId, isNew: true);
+                        entity.CreatedAt = payload.Before.CreatedAt;
+                        _db.TeacherDraftItems.Add(entity);
+                        break;
+                    }
+                    default:
+                        throw CorruptPlan("План містить невідому операцію відкоту.");
+                }
+            }
+
+            await _db.SaveChangesAsync(cancellationToken);
+            plan.State = (int)AutoGenPlanState.RolledBack;
+            plan.RolledBackAtUtc = DateTime.UtcNow;
+            plan.Version++;
+            UpdatePersistedJobPlanStatus(plan);
+            await _db.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(CancellationToken.None);
+            return BuildDetails(plan, DateTime.UtcNow);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            await transaction.RollbackAsync(CancellationToken.None);
+            throw new AutoGenPlanConflictException(
+                "План або чернетки були змінені паралельно. Автоматичний відкіт не виконано.");
+        }
+        catch (DbUpdateException)
+        {
+            await transaction.RollbackAsync(CancellationToken.None);
+            throw new AutoGenPlanConflictException(
+                "Під час відкоту дані змінилися або один із довідників став недоступним. Автоматичний відкіт не виконано.");
+        }
+        catch
+        {
+            await transaction.RollbackAsync(CancellationToken.None);
+            throw;
+        }
+    }
+
+    private async Task<AutoGenDraftPlan> LoadPlanAsync(
+        string planId,
+        bool tracking,
+        CancellationToken cancellationToken)
+    {
+        var normalized = planId?.Trim();
+        if (string.IsNullOrWhiteSpace(normalized) || normalized.Length > 64)
+        {
+            throw new AutoGenPlanNotFoundException("План автогенерації не знайдено.");
+        }
+
+        IQueryable<AutoGenDraftPlan> query = _db.AutoGenDraftPlans
+            .Include(item => item.AutoGenJobRun)
+            .Include(item => item.Mutations);
+        if (!tracking)
+        {
+            query = query.AsNoTracking();
+        }
+        return await query.SingleOrDefaultAsync(item => item.PlanId == normalized, cancellationToken)
+               ?? throw new AutoGenPlanNotFoundException("План автогенерації не знайдено.");
+    }
+
+    private async Task<List<TeacherDraftItem>> LoadTrackedScopeRowsAsync(
+        AutoGenDraftPlan plan,
+        IReadOnlyCollection<int> groupIds,
+        CancellationToken cancellationToken)
+        => await _db.TeacherDraftItems
+            .Where(item => item.Date >= plan.RangeStartDate
+                           && item.Date <= plan.RangeEndDate
+                           && groupIds.Contains(item.GroupId))
+            .OrderBy(item => item.Id)
+            .ToListAsync(cancellationToken);
+
+    private async Task<List<KeyValuePair<int, Guid>>> LoadScopeRevisionRowsAsync(
+        AutoGenDraftPlan plan,
+        IReadOnlyCollection<int> groupIds,
+        CancellationToken cancellationToken)
+        => await _db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => item.Date >= plan.RangeStartDate
+                           && item.Date <= plan.RangeEndDate
+                           && groupIds.Contains(item.GroupId))
+            .OrderBy(item => item.Id)
+            .Select(item => new KeyValuePair<int, Guid>(item.Id, item.Revision))
+            .ToListAsync(cancellationToken);
+
+    private async Task ValidateReferencesAndHardRulesAsync(
+        AutoGenDraftPlan plan,
+        IReadOnlyCollection<int> groupIds,
+        IEnumerable<AutoGenDraftSnapshot> snapshots,
+        IReadOnlyCollection<TeacherDraftsAutogenPendingDraft> pending,
+        IReadOnlyCollection<int> excludedIds,
+        CancellationToken cancellationToken)
+    {
+        var rows = snapshots.ToList();
+        await ValidateReferencesAsync(plan, groupIds, rows, cancellationToken);
+        var result = await new TeacherDraftsAutogenHardRuleValidator(_db).ValidateAsync(
+            new TeacherDraftsAutogenHardRuleValidationRequest(
+                plan.CourseId,
+                groupIds,
+                plan.RangeStartDate,
+                plan.RangeEndDate,
+                (WeekPreset)plan.Days,
+                plan.AllowIncompleteDrafts,
+                PendingDrafts: pending,
+                ExcludedDraftIds: excludedIds),
+            cancellationToken);
+        if (!result.HasViolations)
+        {
+            return;
+        }
+        var shown = result.Violations.Take(10).ToList();
+        var suffix = result.Violations.Count > shown.Count
+            ? $" Ще порушень: {result.Violations.Count - shown.Count}."
+            : string.Empty;
+        throw new AutoGenPlanConflictException(
+            $"План більше не відповідає жорстким правилам: {string.Join(" | ", shown)}.{suffix}");
+    }
+
+    private async Task ValidateReferencesAsync(
+        AutoGenDraftPlan plan,
+        IReadOnlyCollection<int> groupIds,
+        IReadOnlyCollection<AutoGenDraftSnapshot> rows,
+        CancellationToken cancellationToken)
+    {
+        var existingGroups = await _db.Groups.AsNoTracking()
+            .Where(item => groupIds.Contains(item.Id) && item.CourseId == plan.CourseId)
+            .Select(item => item.Id)
+            .ToListAsync(cancellationToken);
+        if (existingGroups.Count != groupIds.Distinct().Count())
+        {
+            throw new AutoGenPlanConflictException("Склад груп або їхня належність до курсу змінилися після попереднього перегляду.");
+        }
+
+        static List<int> Missing(IEnumerable<int> expected, IEnumerable<int> existing)
+        {
+            var actual = existing.ToHashSet();
+            return expected.Distinct().Where(id => !actual.Contains(id)).OrderBy(id => id).ToList();
+        }
+
+        var moduleIds = rows.Select(item => item.ModuleId).Distinct().ToList();
+        var existingModules = await _db.Modules.AsNoTracking()
+            .Where(item => moduleIds.Contains(item.Id)
+                           && (item.CourseId == plan.CourseId || item.ModuleCourses.Any(link => link.CourseId == plan.CourseId)))
+            .Select(item => item.Id)
+            .ToListAsync(cancellationToken);
+        var lessonTypeIds = rows.Select(item => item.LessonTypeId).Distinct().ToList();
+        var existingLessonTypes = await _db.LessonTypes.AsNoTracking()
+            .Where(item => lessonTypeIds.Contains(item.Id))
+            .Select(item => item.Id)
+            .ToListAsync(cancellationToken);
+        var teacherIds = rows.Where(item => item.TeacherId is not null).Select(item => item.TeacherId!.Value).Distinct().ToList();
+        var existingTeachers = await _db.Teachers.AsNoTracking()
+            .Where(item => teacherIds.Contains(item.Id))
+            .Select(item => item.Id)
+            .ToListAsync(cancellationToken);
+        var roomIds = rows.Where(item => item.RoomId is not null).Select(item => item.RoomId!.Value).Distinct().ToList();
+        var existingRooms = await _db.Rooms.AsNoTracking()
+            .Where(item => roomIds.Contains(item.Id))
+            .Select(item => item.Id)
+            .ToListAsync(cancellationToken);
+        var topicIds = rows.Where(item => item.ModuleTopicId is not null).Select(item => item.ModuleTopicId!.Value).Distinct().ToList();
+        var topicMap = await _db.ModuleTopics.AsNoTracking()
+            .Where(item => topicIds.Contains(item.Id))
+            .Select(item => new { item.Id, item.ModuleId, item.LessonTypeId })
+            .ToDictionaryAsync(item => item.Id, cancellationToken);
+
+        var missingMessages = new List<string>();
+        AddMissing("модулі", Missing(moduleIds, existingModules));
+        AddMissing("типи занять", Missing(lessonTypeIds, existingLessonTypes));
+        AddMissing("викладачі", Missing(teacherIds, existingTeachers));
+        AddMissing("аудиторії", Missing(roomIds, existingRooms));
+        AddMissing("теми", Missing(topicIds, topicMap.Keys));
+        foreach (var row in rows.Where(item => item.ModuleTopicId is not null))
+        {
+            if (topicMap.TryGetValue(row.ModuleTopicId!.Value, out var topic)
+                && (topic.ModuleId != row.ModuleId || topic.LessonTypeId != row.LessonTypeId))
+            {
+                missingMessages.Add($"тема #{topic.Id} більше не відповідає модулю або типу заняття");
+            }
+        }
+        if (missingMessages.Count > 0)
+        {
+            throw new AutoGenPlanConflictException(
+                $"Довідники змінилися після попереднього перегляду: {string.Join("; ", missingMessages)}.");
+        }
+        return;
+
+        void AddMissing(string title, IReadOnlyCollection<int> ids)
+        {
+            if (ids.Count > 0)
+            {
+                missingMessages.Add($"{title}: {string.Join(", ", ids)}");
+            }
+        }
+    }
+
+    private static IReadOnlyList<int> DeserializeGroupIds(AutoGenDraftPlan plan)
+    {
+        try
+        {
+            var ids = JsonSerializer.Deserialize<List<int>>(plan.GroupIdsJson, JsonOptions)?
+                .Where(id => id > 0)
+                .Distinct()
+                .OrderBy(id => id)
+                .ToList();
+            return ids is { Count: > 0 }
+                ? ids
+                : throw CorruptPlan("План не містить груп для застосування.");
+        }
+        catch (JsonException ex)
+        {
+            throw new AutoGenPlanPersistenceException("Не вдалося прочитати склад груп збереженого плану.", ex);
+        }
+    }
+
+    private static List<ResolvedMutation> ReadMutationPayloads(AutoGenDraftPlan plan)
+        => plan.Mutations
+            .OrderBy(item => item.Ordinal)
+            .Select(item =>
+            {
+                if (!Enum.IsDefined(typeof(AutoGenPlanOperation), item.Operation))
+                {
+                    throw CorruptPlan("План містить невідомий тип зміни.");
+                }
+                return new ResolvedMutation(
+                    item,
+                    (AutoGenPlanOperation)item.Operation,
+                    DeserializeSnapshot(item.BeforeJson),
+                    DeserializeSnapshot(item.AfterJson));
+            })
+            .ToList();
+
+    private static void EnsureBeforeRowsAreCurrent(
+        IReadOnlyCollection<ResolvedMutation> payloads,
+        IReadOnlyDictionary<int, TeacherDraftItem> scopeById)
+    {
+        foreach (var payload in payloads.Where(item => item.Operation is AutoGenPlanOperation.Update or AutoGenPlanOperation.Delete))
+        {
+            var before = payload.Before ?? throw CorruptPlan("План не містить попереднього стану чернетки.");
+            if (!scopeById.TryGetValue(before.Id, out var current)
+                || current.Revision != before.Revision
+                || current.Status != DraftStatus.Draft
+                || current.IsLocked)
+            {
+                throw new AutoGenPlanConflictException(
+                    $"Чернетка #{before.Id} змінилася, була заблокована або схвалена після попереднього перегляду.");
+            }
+        }
+    }
+
+    private static void EnsureAppliedRowsAreCurrent(
+        string planId,
+        IReadOnlyCollection<ResolvedMutation> payloads,
+        IReadOnlyDictionary<int, TeacherDraftItem> scopeById)
+    {
+        foreach (var payload in payloads)
+        {
+            if (payload.Operation == AutoGenPlanOperation.Delete)
+            {
+                if (payload.Entity.SourceDraftId is int sourceId && scopeById.ContainsKey(sourceId))
+                {
+                    throw new AutoGenPlanConflictException(
+                        $"Видалена планом чернетка #{sourceId} знову з'явилася. Автоматичний відкіт зупинено.");
+                }
+                continue;
+            }
+            if (payload.Entity.AppliedDraftId is not int appliedId
+                || payload.Entity.AppliedRevision is not Guid appliedRevision
+                || !scopeById.TryGetValue(appliedId, out var current)
+                || current.Revision != appliedRevision
+                || !string.Equals(current.GenerationJobId, planId, StringComparison.Ordinal))
+            {
+                throw new AutoGenPlanConflictException(
+                    $"Результат плану для чернетки #{payload.Entity.AppliedDraftId?.ToString() ?? "?"} уже змінено вручну. Автоматичний відкіт зупинено.");
+            }
+        }
+    }
+
+    private static void EnsureExpectedVersion(AutoGenDraftPlan plan, long expectedVersion)
+    {
+        if (expectedVersion <= 0 || plan.Version != expectedVersion)
+        {
+            throw new AutoGenPlanConflictException(
+                $"Версія плану застаріла. Поточна версія: {plan.Version}. Оновіть попередній перегляд.");
+        }
+    }
+
+    private async Task EnsureInputFingerprintIsCurrentAsync(
+        AutoGenDraftPlan plan,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(plan.InputFingerprint) || plan.InputFingerprint.Length != 64)
+        {
+            throw CorruptPlan("Збережений план не містить контрольного відбитка вхідних даних.");
+        }
+        var request = ReadPlanRequest(plan);
+        var current = await CaptureInputFingerprintAsync(request, cancellationToken);
+        if (!string.Equals(current, plan.InputFingerprint, StringComparison.Ordinal))
+        {
+            throw new AutoGenPlanConflictException(
+                "Налаштування, довідники або зайнятість розкладу змінилися після попереднього перегляду. Створіть новий план автогенерації.");
+        }
+    }
+
+    internal static Task<int> CleanupExpiredPlansAsync(
+        AppDbContext db,
+        CancellationToken cancellationToken = default)
+    {
+        var cutoffUtc = DateTime.UtcNow.Subtract(PlanRetention);
+        return db.AutoGenDraftPlans
+            .Where(item => item.ExpiresAtUtc < cutoffUtc)
+            .ExecuteDeleteAsync(cancellationToken);
+    }
+
+    private static void EnsureScopeRevision(
+        Guid expected,
+        IEnumerable<TeacherDraftItem> rows,
+        string message)
+    {
+        var actual = LogicalRevisionToken.Combine(rows.Select(item =>
+            new KeyValuePair<int, Guid>(item.Id, item.Revision)));
+        if (actual != expected)
+        {
+            throw new AutoGenPlanConflictException($"{message}. План не застосовано.");
+        }
+    }
+
+    private static Guid BuildScopeRevision(IEnumerable<AutoGenDraftSnapshot> rows)
+        => LogicalRevisionToken.Combine(rows.Select(item =>
+            new KeyValuePair<int, Guid>(item.Id, item.Revision)));
+
+    private static Guid BuildScopeRevision(IEnumerable<KeyValuePair<int, Guid>> rows)
+        => LogicalRevisionToken.Combine(rows);
+
+    private static bool HasSameMutableContent(AutoGenDraftSnapshot left, AutoGenDraftSnapshot right)
+        => left.Date == right.Date
+           && left.DayOfWeek == right.DayOfWeek
+           && left.StartTime == right.StartTime
+           && left.EndTime == right.EndTime
+           && left.LessonTypeId == right.LessonTypeId
+           && left.GroupId == right.GroupId
+           && left.ModuleId == right.ModuleId
+           && left.ModuleTopicId == right.ModuleTopicId
+           && left.TeacherId == right.TeacherId
+           && left.RoomId == right.RoomId
+           && left.Status == right.Status
+           && left.PublishedItemId == right.PublishedItemId
+           && string.Equals(left.BatchKey, right.BatchKey, StringComparison.Ordinal)
+           && string.Equals(left.ValidationWarnings, right.ValidationWarnings, StringComparison.Ordinal)
+           && left.IsLocked == right.IsLocked
+           && left.IsSelfStudy == right.IsSelfStudy
+           && string.Equals(left.GenerationJobId, right.GenerationJobId, StringComparison.Ordinal);
+
+    private static void ApplySnapshot(
+        TeacherDraftItem entity,
+        AutoGenDraftSnapshot snapshot,
+        string? generationJobId,
+        bool isNew)
+    {
+        entity.Date = snapshot.Date;
+        entity.DayOfWeek = snapshot.DayOfWeek;
+        entity.StartTime = snapshot.StartTime;
+        entity.EndTime = snapshot.EndTime;
+        entity.LessonTypeId = snapshot.LessonTypeId;
+        entity.GroupId = snapshot.GroupId;
+        entity.ModuleId = snapshot.ModuleId;
+        entity.ModuleTopicId = snapshot.ModuleTopicId;
+        entity.TeacherId = snapshot.TeacherId;
+        entity.RoomId = snapshot.RoomId;
+        entity.Status = snapshot.Status;
+        entity.PublishedItemId = snapshot.PublishedItemId;
+        entity.BatchKey = snapshot.BatchKey;
+        entity.ValidationWarnings = snapshot.ValidationWarnings;
+        entity.CreatedAt = isNew ? DateTime.UtcNow : snapshot.CreatedAt;
+        entity.UpdatedAt = DateTime.UtcNow;
+        entity.IsLocked = snapshot.IsLocked;
+        entity.IsSelfStudy = snapshot.IsSelfStudy;
+        entity.GenerationJobId = generationJobId;
+        if (isNew)
+        {
+            entity.Revision = Guid.NewGuid();
+        }
+    }
+
+    private static TeacherDraftsAutogenPendingDraft ToPendingDraft(AutoGenDraftSnapshot item)
+        => new(
+            item.Date,
+            item.StartTime,
+            item.EndTime,
+            item.GroupId,
+            item.ModuleId,
+            item.LessonTypeId,
+            item.ModuleTopicId,
+            item.TeacherId,
+            item.RoomId,
+            item.IsSelfStudy,
+            item.BatchKey);
+
+    private static string? SerializeSnapshot(AutoGenDraftSnapshot? snapshot)
+        => snapshot is null ? null : JsonSerializer.Serialize(snapshot, JsonOptions);
+
+    private static AutoGenDraftSnapshot? DeserializeSnapshot(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return null;
+        }
+        try
+        {
+            return JsonSerializer.Deserialize<AutoGenDraftSnapshot>(json, JsonOptions)
+                   ?? throw CorruptPlan("Знімок чернетки у плані порожній.");
+        }
+        catch (JsonException ex)
+        {
+            throw new AutoGenPlanPersistenceException("Не вдалося прочитати знімок чернетки зі збереженого плану.", ex);
+        }
+    }
+
+    private static AutoGenPlanState EffectiveState(AutoGenDraftPlan plan, DateTime nowUtc)
+    {
+        var state = Enum.IsDefined(typeof(AutoGenPlanState), plan.State)
+            ? (AutoGenPlanState)plan.State
+            : AutoGenPlanState.Expired;
+        return state is AutoGenPlanState.Ready or AutoGenPlanState.Applied
+               && plan.ExpiresAtUtc <= nowUtc
+            ? AutoGenPlanState.Expired
+            : state;
+    }
+
+    private static AutoGenPlanDetailsDto BuildDetails(AutoGenDraftPlan plan, DateTime nowUtc)
+    {
+        var state = EffectiveState(plan, nowUtc);
+        var summary = BuildSummary(plan, state);
+        var changes = ReadMutationPayloads(plan)
+            .Select(item => new AutoGenPlanChangeDto(
+                item.Entity.Ordinal,
+                item.Operation,
+                ToDraftDto(item.Before, item.Operation == AutoGenPlanOperation.Add ? null : item.Entity.SourceDraftId),
+                ToDraftDto(item.After, item.Entity.AppliedDraftId)))
+            .ToList();
+        var result = AdjustResultForState(
+            TryDeserializeResult(plan.AutoGenJobRun.ResultJson)
+            ?? new AutoGenResult(0, 0, new List<string>()),
+            state);
+        return new AutoGenPlanDetailsDto(summary, changes, result);
+    }
+
+    private static AutoGenResult AdjustResultForState(AutoGenResult result, AutoGenPlanState state)
+    {
+        if (state == AutoGenPlanState.Ready)
+        {
+            return result;
+        }
+        var warnings = result.Warnings
+            .Where(message => !IsReadyPlanInstruction(message))
+            .ToList();
+        var warningDetails = result.WarningDetails?
+            .Where(detail => !IsReadyPlanInstruction(detail.Message))
+            .ToList();
+        return result with
+        {
+            Warnings = warnings,
+            WarningDetails = warningDetails
+        };
+    }
+
+    private static bool IsReadyPlanInstruction(string? message)
+        => !string.IsNullOrWhiteSpace(message)
+           && (message.Contains(
+                   "Сформовано попередній план без зміни робочих чернеток",
+                   StringComparison.OrdinalIgnoreCase)
+               || message.Contains(
+                   "Застосуйте його окремою дією після перегляду",
+                   StringComparison.OrdinalIgnoreCase));
+
+    private static AutoGenJobRequest ReadPlanRequest(AutoGenDraftPlan plan)
+    {
+        AutoGenJobRequest? request;
+        try
+        {
+            request = JsonSerializer.Deserialize<AutoGenJobRequest>(
+                plan.AutoGenJobRun.RequestJson,
+                JsonOptions);
+        }
+        catch (JsonException ex)
+        {
+            throw new AutoGenPlanPersistenceException(
+                "Не вдалося прочитати запит автогенерації для збереженого плану.",
+                ex);
+        }
+
+        if (request is null)
+        {
+            throw CorruptPlan("Збережений план не містить запиту автогенерації.");
+        }
+
+        var requestGroupIds = (request.GroupIds ?? [])
+            .Where(id => id > 0)
+            .Distinct()
+            .OrderBy(id => id)
+            .ToList();
+        var planGroupIds = DeserializeGroupIds(plan);
+        if (!request.PreviewOnly
+            || request.CourseId != plan.CourseId
+            || request.FromDate != plan.RangeStartDate
+            || request.ToDate != plan.RangeEndDate
+            || request.Days != (WeekPreset)plan.Days
+            || request.AllowIncompleteDrafts != plan.AllowIncompleteDrafts
+            || !requestGroupIds.SequenceEqual(planGroupIds))
+        {
+            throw CorruptPlan("Область збереженого плану не відповідає початковому запиту автогенерації.");
+        }
+
+        return request;
+    }
+
+    private static AutoGenPlanSummaryDto BuildSummary(AutoGenDraftPlan plan, AutoGenPlanState? forcedState = null)
+    {
+        var state = forcedState ?? EffectiveState(plan, DateTime.UtcNow);
+        return new AutoGenPlanSummaryDto(
+            plan.PlanId,
+            state,
+            plan.Version,
+            ToOffset(plan.CreatedAtUtc),
+            ToOffset(plan.ExpiresAtUtc),
+            ToOffset(plan.AppliedAtUtc),
+            ToOffset(plan.RolledBackAtUtc),
+            plan.AddCount,
+            plan.UpdateCount,
+            plan.DeleteCount,
+            state == AutoGenPlanState.Ready,
+            state == AutoGenPlanState.Applied);
+    }
+
+    private static AutoGenPlanDraftDto? ToDraftDto(AutoGenDraftSnapshot? item, int? effectiveId)
+        => item is null
+            ? null
+            : new AutoGenPlanDraftDto(
+                effectiveId,
+                item.Date,
+                item.StartTime.ToString("HH\\:mm"),
+                item.EndTime.ToString("HH\\:mm"),
+                item.GroupId,
+                item.GroupName,
+                item.ModuleId,
+                item.ModuleName,
+                item.LessonTypeId,
+                item.LessonTypeName,
+                item.ModuleTopicId,
+                item.TopicCode,
+                item.TeacherId,
+                item.TeacherName,
+                item.RoomId,
+                item.RoomName,
+                item.IsSelfStudy,
+                item.IsLocked,
+                (DraftStatusDto)item.Status,
+                item.BatchKey,
+                item.ValidationWarnings);
+
+    private static AutoGenResult? TryDeserializeResult(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return null;
+        }
+        try
+        {
+            return JsonSerializer.Deserialize<AutoGenResult>(json, JsonOptions);
+        }
+        catch (JsonException ex)
+        {
+            throw new AutoGenPlanPersistenceException("Не вдалося прочитати результат автогенерації для плану.", ex);
+        }
+    }
+
+    private static void UpdatePersistedJobPlanStatus(AutoGenDraftPlan plan)
+    {
+        AutoGenJobStatus? status;
+        try
+        {
+            status = JsonSerializer.Deserialize<AutoGenJobStatus>(plan.AutoGenJobRun.StatusJson, JsonOptions);
+        }
+        catch (JsonException ex)
+        {
+            throw new AutoGenPlanPersistenceException("Не вдалося оновити стан завдання після зміни плану.", ex);
+        }
+        if (status is null)
+        {
+            throw new AutoGenPlanPersistenceException("Збережений стан завдання автогенерації порожній.");
+        }
+        var planState = EffectiveState(plan, DateTime.UtcNow);
+        var adjustedResult = status.Result is null
+            ? null
+            : AdjustResultForState(status.Result, planState);
+        plan.AutoGenJobRun.StatusJson = JsonSerializer.Serialize(
+            status with
+            {
+                Plan = BuildSummary(plan, planState),
+                Result = adjustedResult,
+                WarningCount = adjustedResult?.Warnings.Count ?? status.WarningCount
+            },
+            JsonOptions);
+        plan.AutoGenJobRun.UpdatedAtUtc = DateTime.UtcNow;
+    }
+
+    private static DateTimeOffset ToOffset(DateTime value)
+        => new(DateTime.SpecifyKind(value, DateTimeKind.Utc));
+
+    private static DateTimeOffset? ToOffset(DateTime? value)
+        => value is DateTime resolved ? ToOffset(resolved) : null;
+
+    private static AutoGenPlanPersistenceException CorruptPlan(string message)
+        => new(message);
+
+    private sealed record ResolvedMutation(
+        AutoGenDraftPlanMutation Entity,
+        AutoGenPlanOperation Operation,
+        AutoGenDraftSnapshot? Before,
+        AutoGenDraftSnapshot? After);
+}

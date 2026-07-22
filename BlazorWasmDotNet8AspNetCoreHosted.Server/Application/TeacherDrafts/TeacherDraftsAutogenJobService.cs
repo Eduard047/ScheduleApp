@@ -236,6 +236,78 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         return persistedStatus;
     }
 
+    public async Task<AutoGenPlanDetailsDto> GetPlanAsync(
+        string jobId,
+        CancellationToken cancellationToken = default)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
+        var details = await plans.GetDetailsAsync(jobId, cancellationToken);
+        UpdateLocalPlanSummary(jobId, details.Summary);
+        return details;
+    }
+
+    public async Task<AutoGenPlanDetailsDto?> GetLatestRollbackablePlanAsync(
+        int? courseId,
+        CancellationToken cancellationToken = default)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
+        return await plans.GetLatestRollbackableAsync(courseId, cancellationToken);
+    }
+
+    public async Task<AutoGenPlanDetailsDto> ApplyPlanAsync(
+        string jobId,
+        AutoGenPlanActionRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        await _executionGate.WaitAsync(cancellationToken);
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
+            await using var globalExecutionLock = await AcquireGlobalExecutionLockAsync(db, cancellationToken);
+            var details = await plans.ApplyAsync(jobId, request, cancellationToken);
+            UpdateLocalPlanSummary(jobId, details.Summary);
+            return details;
+        }
+        finally
+        {
+            _executionGate.Release();
+        }
+    }
+
+    public async Task<AutoGenPlanDetailsDto> RollbackPlanAsync(
+        string jobId,
+        AutoGenPlanActionRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        await _executionGate.WaitAsync(cancellationToken);
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
+            await using var globalExecutionLock = await AcquireGlobalExecutionLockAsync(db, cancellationToken);
+            var details = await plans.RollbackAsync(jobId, request, cancellationToken);
+            UpdateLocalPlanSummary(jobId, details.Summary);
+            return details;
+        }
+        finally
+        {
+            _executionGate.Release();
+        }
+    }
+
+    private void UpdateLocalPlanSummary(string jobId, AutoGenPlanSummaryDto summary)
+    {
+        if (_jobs.TryGetValue(jobId, out var job))
+        {
+            job.UpdatePlanSummary(summary);
+        }
+    }
+
     private void ThrowIfStopping()
     {
         if (Volatile.Read(ref _stopping) != 0)
@@ -688,7 +760,22 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                 db.AutoGenJobRuns.Add(run);
             }
             ApplyJobRun(run, status, job.Request);
+            var legacyPlan = status.State == AutoGenJobState.Succeeded
+                ? job.PlanPayload
+                : null;
+            if (legacyPlan is not null)
+            {
+                await TeacherDraftsAutogenPlanService.AddReadyPlanAsync(
+                    db,
+                    run,
+                    legacyPlan,
+                    CancellationToken.None);
+            }
             await db.SaveChangesAsync(CancellationToken.None);
+            if (legacyPlan is not null)
+            {
+                job.ReleasePersistedPlanPayload();
+            }
             return true;
         }
         catch (Exception ex)
@@ -740,6 +827,17 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                 }
 
                 ApplyJobRun(run, status, job.Request);
+                var plan = status.State == AutoGenJobState.Succeeded
+                    ? job.PlanPayload
+                    : null;
+                if (plan is not null)
+                {
+                    await TeacherDraftsAutogenPlanService.AddReadyPlanAsync(
+                        db,
+                        run,
+                        plan,
+                        CancellationToken.None);
+                }
                 run.UpdatedAtUtc = now;
                 run.RequestHash = job.RequestHash;
                 run.OwnerInstanceId = job.OwnerInstanceId;
@@ -751,6 +849,10 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                 try
                 {
                     await db.SaveChangesAsync(CancellationToken.None);
+                    if (plan is not null)
+                    {
+                        job.ReleasePersistedPlanPayload();
+                    }
                     return true;
                 }
                 catch (DbUpdateConcurrencyException) when (retry < 2)
@@ -1060,6 +1162,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             request.ClearExisting,
             request.SoftFill,
             request.PreflightOnly,
+            request.PreviewOnly,
             request.AllowIncompleteDrafts,
             GroupRoomPreferences = request.GroupRoomPreferences?
                 .Select(preference => new
@@ -1360,10 +1463,12 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         var clearExisting = request.ClearExisting;
         var softFill = request.SoftFill;
         var preflightOnly = request.PreflightOnly;
+        var previewOnly = request.PreviewOnly;
         if (request.Kind == AutoGenJobKind.Preflight)
         {
             clearExisting = false;
             preflightOnly = true;
+            previewOnly = false;
         }
         else if (request.Kind == AutoGenJobKind.Fill)
         {
@@ -1398,6 +1503,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             ClearExisting = clearExisting,
             SoftFill = softFill,
             PreflightOnly = preflightOnly,
+            PreviewOnly = previewOnly,
             Title = title,
             ClientJobId = clientJobId
         };
@@ -1421,6 +1527,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         var failed = false;
         var executionRolledBack = false;
         var executionCommitted = false;
+        AutoGenDraftPlanPayload? planPayload = null;
         var weekStarts = BuildWeekStarts(job.Request.FromDate, job.Request.ToDate);
         var ownsExecutionGate = false;
         using var heartbeatStop = new CancellationTokenSource();
@@ -1460,6 +1567,13 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                     try
                     {
                         await ValidateAcademicPeriodAsync(executionDb, job.Request, job.Token);
+                        var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
+                        var previewInputFingerprint = job.Request.PreviewOnly
+                            ? await plans.CaptureInputFingerprintAsync(job.Request, job.Token)
+                            : null;
+                        var beforePreviewScope = job.Request.PreviewOnly
+                            ? await plans.CaptureScopeAsync(job.Request, job.Token)
+                            : null;
                         foreach (var runRange in runRanges)
                         {
                             job.Token.ThrowIfCancellationRequested();
@@ -1507,11 +1621,31 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                         }
 
                         job.Token.ThrowIfCancellationRequested();
-                        if (failed || job.Request.PreflightOnly)
+                        if (!failed && job.Request.PreviewOnly)
+                        {
+                            var afterPreviewScope = await plans.CaptureScopeAsync(job.Request, job.Token);
+                            planPayload = TeacherDraftsAutogenPlanService.BuildPayload(
+                                job.JobId,
+                                job.Request,
+                                beforePreviewScope!,
+                                afterPreviewScope,
+                                previewInputFingerprint
+                                ?? throw new InvalidOperationException("Контрольний відбиток попереднього плану не сформовано."));
+                        }
+                        if (failed || job.Request.PreflightOnly || job.Request.PreviewOnly)
                         {
                             await executionTransaction.RollbackAsync(CancellationToken.None);
                             transactionFinalized = true;
-                            MarkExecutionRolledBack();
+                            if (job.Request.PreviewOnly && !failed)
+                            {
+                                job.AttachPlan(planPayload
+                                    ?? throw new InvalidOperationException("Попередній план автогенерації не сформовано."));
+                                warnings.Add("Сформовано попередній план без зміни робочих чернеток. Застосуйте його окремою дією після перегляду.");
+                            }
+                            else
+                            {
+                                MarkExecutionRolledBack();
+                            }
                         }
                         else
                         {
@@ -1992,6 +2126,8 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         private string? _lastCompletedMessage;
         private AutoGenResult? _result;
         private AutoGenRunReport? _report;
+        private AutoGenDraftPlanPayload? _planPayload;
+        private AutoGenPlanSummaryDto? _planSummary;
         private string? _error;
         private AutoGenJobCancellationReason _cancellationReason;
 
@@ -2011,6 +2147,16 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         public int Attempt { get; private set; }
         public DateTime? LeaseExpiresAtUtc { get; private set; }
         public bool IsDurable => OwnerInstanceId is not null && Attempt > 0;
+        public AutoGenDraftPlanPayload? PlanPayload
+        {
+            get
+            {
+                lock (_sync)
+                {
+                    return _planPayload;
+                }
+            }
+        }
         public CancellationToken Token => _cts.Token;
         public AutoGenJobCancellationReason CancellationReason
         {
@@ -2028,6 +2174,31 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             OwnerInstanceId = ownerInstanceId;
             Attempt = attempt;
             LeaseExpiresAtUtc = leaseExpiresAtUtc;
+        }
+
+        public void AttachPlan(AutoGenDraftPlanPayload payload)
+        {
+            lock (_sync)
+            {
+                _planPayload = payload;
+                _planSummary = payload.ToSummary();
+            }
+        }
+
+        public void UpdatePlanSummary(AutoGenPlanSummaryDto summary)
+        {
+            lock (_sync)
+            {
+                _planSummary = summary;
+            }
+        }
+
+        public void ReleasePersistedPlanPayload()
+        {
+            lock (_sync)
+            {
+                _planPayload = null;
+            }
         }
 
         public void RequestCancellation()
@@ -2115,6 +2286,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                 _state = AutoGenJobState.Failed;
                 _completedAt = DateTimeOffset.UtcNow;
                 _error = error;
+                DiscardUnpersistedPlan();
                 ApplyFinalResult(result, report);
                 _currentStage = "Завершено з помилками.";
             }
@@ -2126,6 +2298,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             {
                 _state = AutoGenJobState.Canceled;
                 _completedAt = DateTimeOffset.UtcNow;
+                DiscardUnpersistedPlan();
                 ApplyFinalResult(result, report);
                 _currentStage = _cancellationReason == AutoGenJobCancellationReason.HostStopping
                     ? "Скасовано під час завершення роботи сервера."
@@ -2164,7 +2337,8 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                     _lastCompletedMessage,
                     _result,
                     _report,
-                    _error);
+                    _error,
+                    _planSummary);
             }
         }
 
@@ -2177,6 +2351,12 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             _warningCount = result.Warnings.Count;
             _gapCount = result.GapDetails?.Count ?? 0;
             _deficitCount = result.Preflight?.Sum(item => item.Count) ?? 0;
+        }
+
+        private void DiscardUnpersistedPlan()
+        {
+            _planPayload = null;
+            _planSummary = null;
         }
 
         private int CalculatePercent()
