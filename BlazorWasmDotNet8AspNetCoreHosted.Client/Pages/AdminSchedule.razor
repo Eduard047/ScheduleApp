@@ -101,6 +101,12 @@ else
                     <button class="btn btn-outline-secondary" @onclick="FillWeekDrafts" disabled="@(!CanAutoGen || IsAutoGenBusy)">
                         Дозаповнити відсутні пари
                     </button>
+                    <button class="btn btn-outline-secondary"
+                            @onclick="RestoreLastAutoGenInputAsync"
+                            disabled="@(_lastAutoGenInput is null || IsAutoGenBusy)"
+                            title="@GetLastAutoGenInputButtonTitle()">
+                        Повернути останнє заповнення
+                    </button>
                     @if (_latestRollbackableAutoGenPlan?.CanRollback == true)
                     {
                         <button class="btn btn-autogen-rollback" @onclick="RollbackLatestAutoGenPlanAsync" disabled="@IsAutoGenBusy">
@@ -940,11 +946,13 @@ else
     private CancellationTokenSource? _autoGenProgressTimerCts;
     private string? _currentAutoGenJobId;
     private bool _autoGenCancelRequested;
+    private LastAutoGenInputState? _lastAutoGenInput;
     private const string AutoGenStatusStorageKey = "adminSchedule.autoGenStatus.v1";
     private const string AutoGenStatusLocalStorageKey = "adminSchedule.autoGenStatus.local.v1";
     private const string ActiveAutoGenJobStorageKey = "adminSchedule.activeAutoGenJob.v1";
     private const string AutoGenConfigStorageKey = "adminSchedule.autoGenConfig.v1";
     private const string AutoGenConfigLocalStorageKey = "adminSchedule.autoGenConfig.local.v1";
+    private const string LastAutoGenInputStorageKey = "adminSchedule.lastAutoGenInput.v1";
     private const int LogLessonLimit = 300;
     private const string LogActionAutogen = "autogen-week";
     private const string LogActionFill = "fill-week";
@@ -1010,6 +1018,7 @@ else
         _generationFromDate = selectedWeekStart;
         _generationToDate = selectedWeekStart;
         await LoadRoomCatalogAsync();
+        await LoadLastAutoGenInputAsync();
         await RestorePersistedAutoGenConfigAsync(restoreCourseSelection: true);
         if (_selectedCourseId is null && meta.Courses.Count == 1)
         {
@@ -2833,6 +2842,121 @@ else
         {
         }
     }
+    // Завантажує останній використаний набір полів автогенерації.
+    private async Task LoadLastAutoGenInputAsync()
+    {
+        try
+        {
+            var stored = await ReadStorageAsync(LastAutoGenInputStorageKey, useLocal: true);
+            if (!string.IsNullOrWhiteSpace(stored))
+            {
+                _lastAutoGenInput = JsonSerializer.Deserialize<LastAutoGenInputState>(stored, AutoGenStatusJsonOptions);
+            }
+        }
+        catch (JSException)
+        {
+            _lastAutoGenInput = null;
+        }
+        catch (JsonException)
+        {
+            _lastAutoGenInput = null;
+        }
+    }
+    // Запам'ятовує повний набір полів перед запуском дії автогенерації.
+    private async Task PersistLastAutoGenInputAsync()
+    {
+        if (_selectedCourseId is not int courseId)
+        {
+            return;
+        }
+        var state = new LastAutoGenInputState(
+            SelectedDate: _selectedDate,
+            GenerationFromDate: _generationFromDate,
+            GenerationToDate: _generationToDate,
+            DaysPreset: _daysPreset,
+            CourseId: courseId,
+            Modules: _moduleWeekRows
+                .Where(row => row.Selected || row.Hours > 0)
+                .GroupBy(row => row.ModuleId)
+                .ToDictionary(
+                    group => group.Key,
+                    group =>
+                    {
+                        var row = group.First();
+                        return new PersistedModuleSelection(row.Selected, row.Hours);
+                    }),
+            SelectedGroupIds: GetSelectedGroupIds(),
+            GroupRoomSelections: _courseGroupRows
+                .Where(row => row.Selected && HasManualGroupRoomPreference(row))
+                .ToDictionary(
+                    row => row.GroupId,
+                    row => new PersistedGroupRoomSelection(
+                        row.PreferredBuildingId,
+                        row.PreferredRoomIds.Distinct().ToList())),
+            UseRecommendedProfile: _useRecommendedAutoGenProfile,
+            AllowIncompleteDrafts: _allowIncompleteDrafts,
+            SavedAt: DateTimeOffset.Now);
+        try
+        {
+            var json = JsonSerializer.Serialize(state, AutoGenStatusJsonOptions);
+            await SetStorageAsync(LastAutoGenInputStorageKey, json, useLocal: true);
+            _lastAutoGenInput = state;
+        }
+        catch (JSException)
+        {
+        }
+    }
+    // Повертає останній використаний набір і пропускає видалені довідникові значення.
+    private async Task RestoreLastAutoGenInputAsync()
+    {
+        if (IsAutoGenBusy || meta is null || _lastAutoGenInput is not { } state)
+        {
+            return;
+        }
+        if (!meta.Courses.Any(course => course.Id == state.CourseId))
+        {
+            error = "Курс з останнього заповнення більше недоступний.";
+            return;
+        }
+        _selectedDate = state.SelectedDate;
+        _generationFromDate = state.GenerationFromDate;
+        _generationToDate = state.GenerationToDate;
+        _daysPreset = Enum.IsDefined(state.DaysPreset) ? state.DaysPreset : WeekPreset.MonFri;
+        _selectedCourseId = state.CourseId;
+        BuildModuleWeekRows();
+        BuildCourseGroupRows();
+        var modules = state.Modules ?? new Dictionary<int, PersistedModuleSelection>();
+        foreach (var row in _moduleWeekRows)
+        {
+            row.Selected = false;
+            row.Hours = 0;
+            if (modules.TryGetValue(row.ModuleId, out var module))
+            {
+                row.Selected = module.Selected;
+                row.Hours = Math.Max(0, module.Hours);
+            }
+        }
+        var selectedGroupIds = (state.SelectedGroupIds ?? new List<int>())
+            .Where(groupId => groupId > 0)
+            .ToHashSet();
+        foreach (var row in _courseGroupRows)
+        {
+            row.Selected = selectedGroupIds.Contains(row.GroupId);
+        }
+        ApplyPersistedGroupRoomSelections(state.GroupRoomSelections);
+        _useRecommendedAutoGenProfile = state.UseRecommendedProfile;
+        _allowIncompleteDrafts = state.AllowIncompleteDrafts;
+        await ResetStatusAsync(clearPersisted: false);
+        await PersistAutoGenConfigAsync();
+        await LoadWeek();
+        await RestoreLatestRollbackableAutoGenPlanAsync();
+        ok = $"Останнє заповнення від {state.SavedAt.ToLocalTime():dd.MM.yyyy HH:mm} відновлено.";
+        error = null;
+    }
+    private string GetLastAutoGenInputButtonTitle()
+        => _lastAutoGenInput is null
+            ? "Кнопка стане доступною після першого запуску автогенерації, перевірки ресурсів або дозаповнення."
+            : $"Збережено {_lastAutoGenInput.SavedAt.ToLocalTime():dd.MM.yyyy HH:mm}";
     // Запускає автогенерацію послідовно для кожного тижня в обраному діапазоні.
     // Формує запит ручних пріоритетів корпусів і аудиторій для вибраних груп.
     private List<GroupRoomPreferenceDto> BuildSelectedGroupRoomPreferences(IReadOnlyCollection<int>? groupIds = null)
@@ -3064,6 +3188,7 @@ else
             }
             var groupRoomPreferences = BuildSelectedGroupRoomPreferences(selectedGroupIds);
             await PersistAutoGenConfigAsync();
+            await PersistLastAutoGenInputAsync();
             await StartAutoGenProgressAsync("Готуємо план автогенерації", AutoGenProgressKind.Generate);
             var (res, rangeStartDate, rangeEndDate, _, finalStatus, plan, planChanges) = await PrepareAutoGenPreviewForRangeAsync(
                 courseId,
@@ -3145,6 +3270,7 @@ else
             }
             var groupRoomPreferences = BuildSelectedGroupRoomPreferences(selectedGroupIds);
             await PersistAutoGenConfigAsync();
+            await PersistLastAutoGenInputAsync();
             await StartAutoGenProgressAsync("Перевірка ресурсів", AutoGenProgressKind.Preflight);
             var (res, rangeStartDate, rangeEndDate, _, finalStatus) = await RunAutoGenForRangeAsync(
                 courseId,
@@ -3216,6 +3342,7 @@ else
             }
             var groupRoomPreferences = BuildSelectedGroupRoomPreferences(selectedGroupIds);
             await PersistAutoGenConfigAsync();
+            await PersistLastAutoGenInputAsync();
             await StartAutoGenProgressAsync("Готуємо план дозаповнення відсутніх пар", AutoGenProgressKind.Fill);
             var (res, rangeStartDate, rangeEndDate, _, finalStatus, plan, planChanges) = await PrepareAutoGenPreviewForRangeAsync(
                 courseId,
@@ -4170,6 +4297,19 @@ else
     private sealed record PersistedGroupRoomSelection(
         int? PreferredBuildingId,
         List<int> PreferredRoomIds
+    );
+    private sealed record LastAutoGenInputState(
+        DateOnly SelectedDate,
+        DateOnly GenerationFromDate,
+        DateOnly GenerationToDate,
+        WeekPreset DaysPreset,
+        int CourseId,
+        Dictionary<int, PersistedModuleSelection>? Modules,
+        List<int>? SelectedGroupIds,
+        Dictionary<int, PersistedGroupRoomSelection>? GroupRoomSelections,
+        bool UseRecommendedProfile,
+        bool AllowIncompleteDrafts,
+        DateTimeOffset SavedAt
     );
     private sealed class ConflictDetails
     {
