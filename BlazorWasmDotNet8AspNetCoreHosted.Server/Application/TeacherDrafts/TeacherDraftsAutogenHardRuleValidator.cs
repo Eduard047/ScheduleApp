@@ -688,7 +688,8 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
     {
         var violations = new List<string>();
         foreach (var moduleDay in placements
-                     .Where(row => !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(row.LessonTypeCode))
+                     .Where(row => !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(row.LessonTypeCode)
+                                   && !CanShareAcrossGroups(row))
                      .GroupBy(row => new { row.Date, row.ModuleId }))
         {
             foreach (var start in moduleDay.Select(row => row.Start).Distinct().OrderBy(value => value))

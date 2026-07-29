@@ -994,7 +994,7 @@ public sealed class AutogenLecturePackingTests
             },
             RangeStartDate: new DateOnly(2026, 4, 27),
             RangeEndDate: new DateOnly(2026, 4, 27),
-            SoftOptions: new DraftAutoGenSoftOptions(MaxParallelGroupsPerModuleInSlot: 7));
+            SoftOptions: new DraftAutoGenSoftOptions(MaxParallelGroupsPerModuleInSlot: 4));
 
         var service = new TeacherDraftsAutogenService(db);
         var action = await service.DraftAutoGen(request);
@@ -1107,7 +1107,7 @@ public sealed class AutogenLecturePackingTests
     }
 
     [Fact]
-    public async Task Draft_autogen_splits_twenty_one_l3_groups_between_large_rooms_without_singletons()
+    public async Task Draft_autogen_packs_twenty_one_l3_groups_into_two_capacity_bounded_streams()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
         await connection.OpenAsync();
@@ -1165,8 +1165,8 @@ public sealed class AutogenLecturePackingTests
 
         Assert.Equal(data.GroupIds.Count, result.Created);
         Assert.Equal(data.GroupIds.Count, drafts.Select(item => item.GroupId).Distinct().Count());
-        Assert.InRange(clusters.Count, 6, 7);
-        Assert.All(clusters, cluster => Assert.InRange(cluster.GroupCount, 2, 4));
+        Assert.Equal(2, clusters.Count);
+        Assert.Equal(new[] { 16, 5 }, clusters.Select(cluster => cluster.GroupCount));
         Assert.All(clusters, cluster => Assert.True(
             cluster.Students <= cluster.RoomCapacity,
             $"Потік на {cluster.GroupCount} груп має {cluster.Students} слухачів, але аудиторія вміщує лише {cluster.RoomCapacity}."));

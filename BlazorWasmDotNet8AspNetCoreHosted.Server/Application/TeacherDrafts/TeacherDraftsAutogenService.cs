@@ -2083,7 +2083,17 @@ public sealed class TeacherDraftsAutogenService
             int lessonTypeId,
             bool isSelfStudyPlacement,
             bool bypassSoftModuleParallelLimit = false)
-            => maxParallelGroupsPerModuleInSlot;
+        {
+            if (CanShareAcrossGroups(lessonTypeId)
+                && selectedGroupsByCourse.TryGetValue(courseId, out var sameCourseGroups))
+            {
+                // Один спільний лекційний потік є однією подією, тому кількість
+                // його груп обмежує аудиторія, а не ліміт паралельних непотокових занять.
+                return Math.Max(maxParallelGroupsPerModuleInSlot, sameCourseGroups.Count);
+            }
+
+            return maxParallelGroupsPerModuleInSlot;
+        }
         int EligibleTeacherCountForPlacement(
             int moduleId,
             ModuleTopic? topic,
@@ -3685,7 +3695,10 @@ public sealed class TeacherDraftsAutogenService
             {
                 return CacheDecision(false);
             }
-            if (pendingGroups.Count > maxParallelGroupsPerModuleInSlot)
+            if (pendingGroups.Count > SlotGroupLimitForPlacement(
+                    courseIdCheck,
+                    topic.LessonTypeId,
+                    isSelfStudyPlacement: false))
             {
                 // Коли всі групи не можуть законно ввійти в один слот, не чекаємо
                 // на повний потік і дозволяємо генератору будувати підпотоки.
@@ -3840,13 +3853,19 @@ public sealed class TeacherDraftsAutogenService
 
         List<int> ApplyParallelModuleLimitToSharedPack(
             IReadOnlyList<int> candidateGroupIds,
+            int courseId,
             int moduleId,
+            int lessonTypeId,
             DateOnly date,
             TimeOnly start,
             TimeOnly end)
         {
             var groupsAlreadyInSlot = CountGroupsWithModuleInSlot(moduleId, date, start, end);
-            var available = Math.Max(0, maxParallelGroupsPerModuleInSlot - groupsAlreadyInSlot);
+            var slotGroupLimit = SlotGroupLimitForPlacement(
+                courseId,
+                lessonTypeId,
+                isSelfStudyPlacement: false);
+            var available = Math.Max(0, slotGroupLimit - groupsAlreadyInSlot);
             var take = Math.Min(candidateGroupIds.Count, available);
             if (candidateGroupIds.Count > take
                 && candidateGroupIds.Count - take == 1
@@ -3911,7 +3930,9 @@ public sealed class TeacherDraftsAutogenService
             }
             return ApplyParallelModuleLimitToSharedPack(
                 result,
+                courseGroups[0].CourseId,
                 moduleId,
+                topic.LessonTypeId,
                 date,
                 slot.Start,
                 slot.End);
@@ -4304,7 +4325,9 @@ public sealed class TeacherDraftsAutogenService
             }
             return ApplyParallelModuleLimitToSharedPack(
                 result,
+                courseGroups[0].CourseId,
                 moduleId,
+                topic.LessonTypeId,
                 date,
                 slot.Start,
                 slot.End);
@@ -4575,7 +4598,10 @@ public sealed class TeacherDraftsAutogenService
                     return false;
                 }
                 var completionPackSize = Math.Min(
-                    maxParallelGroupsPerModuleInSlot,
+                    SlotGroupLimitForPlacement(
+                        courseIdValue,
+                        topic.LessonTypeId,
+                        isSelfStudyPlacement: false),
                     remainingGroups.Count);
                 if (remainingGroups.Count > completionPackSize
                     && remainingGroups.Count - completionPackSize == 1
@@ -4625,7 +4651,10 @@ public sealed class TeacherDraftsAutogenService
                                 moduleId,
                                 completionDate,
                                 completionSlot.Start,
-                                completionSlot.End) + completionGroupIds.Count > maxParallelGroupsPerModuleInSlot)
+                                completionSlot.End) + completionGroupIds.Count > SlotGroupLimitForPlacement(
+                                    courseIdValue,
+                                    topic.LessonTypeId,
+                                    isSelfStudyPlacement: false))
                         {
                             continue;
                         }
@@ -6435,7 +6464,7 @@ public sealed class TeacherDraftsAutogenService
                 var remainingCapacity = Math.Max(0, room.Capacity - sharedStudents);
                 var remainingGroupSlots = Math.Max(
                     0,
-                    maxParallelGroupsPerModuleInSlot - totalSharedGroupCount);
+                    sameCourseGroups.Count - totalSharedGroupCount);
                 return Math.Min(remainingGroupSlots, remainingCapacity / averageGroupSize);
             }
             // Додає дефіцитний пріоритет до аудиторій:
@@ -6671,7 +6700,9 @@ public sealed class TeacherDraftsAutogenService
                 }
                 return CacheGroups(ApplyParallelModuleLimitToSharedPack(
                     sharedGroupIds,
+                    grp.CourseId,
                     moduleId,
+                    lessonTypeId,
                     date,
                     start,
                     end));
@@ -8148,7 +8179,10 @@ public sealed class TeacherDraftsAutogenService
                                     continue;
                                 }
                                 var groupsWithModuleInSlot = CountGroupsWithModuleInSlot(moduleId, date, s, e);
-                                if (groupsWithModuleInSlot + newSharedGroupIds.Count > maxParallelGroupsPerModuleInSlot)
+                                if (groupsWithModuleInSlot + newSharedGroupIds.Count > SlotGroupLimitForPlacement(
+                                        grp.CourseId,
+                                        ltypeId,
+                                        isSelfStudyPlacement))
                                 {
                                     continue;
                                 }
