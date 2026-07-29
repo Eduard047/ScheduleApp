@@ -48,10 +48,30 @@
         background: #fff8d8;
         color: #3d2b00;
     }
+    .autogen-result-alert.alert-danger {
+        border-color: #e11d48;
+        background: #fff1f2;
+        color: #4c0519;
+    }
     .autogen-warning-badge {
         border: 1px solid #d6a31a;
         background: #fff1b8;
         color: #3d2b00;
+    }
+    .autogen-warning-badge--error {
+        border-color: #be123c;
+        background: #be123c;
+        color: #fff;
+    }
+    .autogen-warning-badge--info {
+        border-color: #0e7490;
+        background: #cffafe;
+        color: #164e63;
+    }
+    .autogen-warning-meta-badge {
+        border: 1px solid #94a3b8;
+        background: #f8fafc;
+        color: #1e293b;
     }
     .warning-item {
         padding: .25rem 0;

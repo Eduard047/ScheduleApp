@@ -650,7 +650,7 @@ else
                                 <li class="warning-item">
                                     <div class="d-flex flex-wrap align-items-center gap-2">
                                         <span class="badge @GetWarningSeverityBadgeClass(warningDetail.Severity)">@GetWarningSeverityLabel(warningDetail.Severity)</span>
-                                        <span class="badge text-bg-light">@warningDetail.Category / @warningDetail.Code</span>
+                                        <span class="badge autogen-warning-meta-badge">@warningDetail.Category / @warningDetail.Code</span>
                                     </div>
                                     <div class="warning-main mt-1">@parsedWarning.Message</div>
                                     @if (!string.IsNullOrWhiteSpace(parsedWarning.Reason))
@@ -1017,8 +1017,11 @@ else
         var selectedWeekStart = GetMonday(_selectedDate);
         _generationFromDate = selectedWeekStart;
         _generationToDate = selectedWeekStart;
-        await LoadRoomCatalogAsync();
-        await LoadLastAutoGenInputAsync();
+        // Мережевий довідник аудиторій і локальні налаштування незалежні,
+        // тому завантажуємо їх паралельно, скорочуючи старт сторінки.
+        var roomCatalogTask = LoadRoomCatalogAsync();
+        var lastAutoGenInputTask = LoadLastAutoGenInputAsync();
+        await Task.WhenAll(roomCatalogTask, lastAutoGenInputTask);
         await RestorePersistedAutoGenConfigAsync(restoreCourseSelection: true);
         if (_selectedCourseId is null && meta.Courses.Count == 1)
         {
@@ -1541,6 +1544,7 @@ else
         }
         var now = DateTimeOffset.Now;
         var totalWeeks = Math.Max(1, status.TotalWeeks);
+        var previousCompletedSteps = _autoGenProgress?.CompletedSteps ?? 0;
         var currentStepNumber = status.CurrentWeekNumber > 0
             ? status.CurrentWeekNumber
             : Math.Min(totalWeeks, Math.Max(1, status.CompletedWeeks + 1));
@@ -1558,6 +1562,10 @@ else
                 CurrentStepStartedAt = now,
                 LastUpdatedAt = now
             };
+        }
+        if (status.StartedAt is DateTimeOffset serverStartedAt)
+        {
+            _autoGenProgress.StartedAt = serverStartedAt.ToLocalTime();
         }
         var currentWeekChanged = status.CurrentWeekStartDate is not null
             && _autoGenProgress.CurrentWeekStartDate != status.CurrentWeekStartDate;
@@ -1587,6 +1595,19 @@ else
         _autoGenProgress.DeficitCount = status.DeficitCount;
         _autoGenProgress.Percent = Math.Clamp(status.Percent, 0, 100);
         _autoGenProgress.CancellationRequested = status.CancellationRequested || _autoGenCancelRequested;
+        if (_autoGenProgress.CompletedSteps > 0
+            && (_autoGenProgress.CompletedSteps > previousCompletedSteps
+                || _autoGenProgress.AverageCompletedStepSeconds is null))
+        {
+            var completedDurationEnd = currentWeekChanged
+                ? _autoGenProgress.CurrentStepStartedAt
+                : now;
+            var measuredSeconds = Math.Max(
+                1,
+                (completedDurationEnd - _autoGenProgress.StartedAt).TotalSeconds);
+            _autoGenProgress.AverageCompletedStepSeconds =
+                measuredSeconds / _autoGenProgress.CompletedSteps;
+        }
         if (status.Report is not null)
         {
             _latestAutoGenReport = status.Report;
@@ -1630,6 +1651,7 @@ else
         {
             return;
         }
+        var previousCompletedSteps = _autoGenProgress.CompletedSteps;
         _autoGenProgress.CompletedSteps = Math.Max(_autoGenProgress.CompletedSteps, weekIndex + 1);
         _autoGenProgress.Created += result.Created;
         _autoGenProgress.WarningCount += result.Warnings.Count;
@@ -1640,6 +1662,14 @@ else
         _autoGenProgress.CurrentMessage = _autoGenProgress.CompletedSteps >= _autoGenProgress.TotalSteps
             ? "Завершення операції..."
             : "Підготовка наступного тижня...";
+        if (_autoGenProgress.CompletedSteps > previousCompletedSteps)
+        {
+            var measuredSeconds = Math.Max(
+                1,
+                (_autoGenProgress.LastUpdatedAt - _autoGenProgress.StartedAt).TotalSeconds);
+            _autoGenProgress.AverageCompletedStepSeconds =
+                measuredSeconds / _autoGenProgress.CompletedSteps;
+        }
         await InvokeAsync(StateHasChanged);
     }
     // Показує фінальний технічний крок після генерації.
@@ -1740,22 +1770,39 @@ else
         };
     private static string GetAutoGenRemainingLabel(AutoGenProgressState progress)
     {
-        var elapsed = GetAutoGenElapsed(progress);
-        if (elapsed < TimeSpan.FromSeconds(1))
-        {
-            return "рахуємо...";
-        }
-        var ratio = GetAutoGenProgressRatio(progress);
-        if (ratio >= 1)
+        if (progress.CompletedSteps >= progress.TotalSteps)
         {
             return "0 с";
         }
-        if (ratio <= 0.01)
+        if (progress.CompletedSteps <= 0
+            || progress.AverageCompletedStepSeconds is not double averageStepSeconds
+            || averageStepSeconds <= 0)
         {
             return "рахуємо...";
         }
-        var estimatedTotalSeconds = elapsed.TotalSeconds / ratio;
-        var remaining = TimeSpan.FromSeconds(Math.Max(0, estimatedTotalSeconds - elapsed.TotalSeconds));
+
+        var remainingSteps = Math.Max(0, progress.TotalSteps - progress.CompletedSteps);
+        var currentStepIsRunning = progress.CurrentStepNumber > progress.CompletedSteps
+                                   && remainingSteps > 0;
+        var futureFullSteps = currentStepIsRunning
+            ? Math.Max(0, remainingSteps - 1)
+            : remainingSteps;
+        var remainingSeconds = futureFullSteps * averageStepSeconds;
+        if (currentStepIsRunning)
+        {
+            var currentStepElapsedSeconds = Math.Max(
+                0,
+                (progress.LastUpdatedAt - progress.CurrentStepStartedAt).TotalSeconds);
+            // Якщо поточний крок уже довший за середній, не показуємо хибний нуль:
+            // оцінка адаптується до фактичної тривалості цього кроку.
+            var estimatedCurrentStepSeconds = Math.Max(
+                averageStepSeconds,
+                currentStepElapsedSeconds * 1.15);
+            remainingSeconds += Math.Max(
+                1,
+                estimatedCurrentStepSeconds - currentStepElapsedSeconds);
+        }
+        var remaining = TimeSpan.FromSeconds(Math.Max(0, remainingSeconds));
         return $"приблизно {FormatDuration(remaining)}";
     }
     private static string FormatDuration(TimeSpan duration)
@@ -1926,8 +1973,8 @@ else
     private static string GetWarningSeverityBadgeClass(string severity)
         => severity.ToLowerInvariant() switch
         {
-            AutoGenWarningSeverities.Error => "text-bg-danger",
-            AutoGenWarningSeverities.Info => "text-bg-info",
+            AutoGenWarningSeverities.Error => "autogen-warning-badge autogen-warning-badge--error",
+            AutoGenWarningSeverities.Info => "autogen-warning-badge autogen-warning-badge--info",
             _ => "autogen-warning-badge"
         };
     private static List<string> BuildAutoGenActionItems(
@@ -4370,6 +4417,7 @@ else
         public DateTimeOffset StartedAt { get; set; } = DateTimeOffset.Now;
         public DateTimeOffset CurrentStepStartedAt { get; set; } = DateTimeOffset.Now;
         public DateTimeOffset LastUpdatedAt { get; set; } = DateTimeOffset.Now;
+        public double? AverageCompletedStepSeconds { get; set; }
         public string CurrentMessage { get; set; } = string.Empty;
         public string? LastCompletedMessage { get; set; }
         public int Percent { get; set; } = -1;

@@ -20,6 +20,8 @@ builder.Services.AddProblemDetails(options =>
         context.ProblemDetails.Extensions["traceId"] = context.HttpContext.TraceIdentifier;
 });
 builder.Services.AddHealthChecks();
+// Стискаємо JSON, WebAssembly та статичні ресурси під час передавання через HTTPS.
+builder.Services.AddResponseCompression(options => options.EnableForHttps = true);
 
 var trustedProxyAddresses = builder.Configuration
     .GetSection("ReverseProxy:KnownProxies")
@@ -82,6 +84,7 @@ app.UseWhen(
     context => !context.Request.Path.StartsWithSegments("/health"),
     branch => branch.UseHttpsRedirection());
 
+app.UseResponseCompression();
 app.UseBlazorFrameworkFiles();
 app.UseStaticFiles();
 

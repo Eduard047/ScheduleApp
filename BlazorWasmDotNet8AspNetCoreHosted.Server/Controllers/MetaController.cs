@@ -68,7 +68,7 @@ public class MetaController(AppDbContext db) : ControllerBase
                 RequiresRoom = x.RequiresRoom,
                 CssKey = x.CssKey
             }).ToListAsync();
-        var lunches = await db.LunchConfigs
+        var lunches = await db.LunchConfigs.AsNoTracking()
             .Select(x => new LunchConfigDto(x.CourseId, x.Start.ToString("HH:mm"), x.End.ToString("HH:mm")))
             .ToListAsync();
         var cal = new List<CalendarExceptionDto>();
