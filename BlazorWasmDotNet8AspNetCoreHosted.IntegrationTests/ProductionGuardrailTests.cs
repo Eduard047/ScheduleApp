@@ -560,7 +560,7 @@ public sealed class ProductionGuardrailTests
     [Theory]
     [InlineData("CANCELED")]
     [InlineData("RESCHEDULED")]
-    public async Task Draft_autogen_reports_gap_hidden_only_by_non_occupying_marker(string markerCode)
+    public async Task Draft_autogen_fills_slot_with_non_occupying_marker(string markerCode)
     {
         await using var fixture = await TestDatabase.CreateAsync();
         var ids = await fixture.SeedMinimalScheduleModelAsync();
@@ -608,15 +608,23 @@ public sealed class ProductionGuardrailTests
                 CourseId: ids.CourseId,
                 GroupIds: new List<int> { ids.GroupId },
                 Days: WeekPreset.MonFri,
+                ModuleHours: new Dictionary<int, int> { [ids.ModuleId] = 1 },
                 RangeStartDate: date,
                 RangeEndDate: date));
 
         var ok = Assert.IsType<OkObjectResult>(action.Result);
         var result = Assert.IsType<AutoGenResult>(ok.Value);
-        Assert.Equal(0, result.Created);
-        var gap = Assert.Single(result.GapDetails ?? new List<AutoGenGapDetail>());
-        Assert.Equal(new TimeOnly(8, 0), gap.Start);
-        Assert.Equal(new TimeOnly(9, 0), gap.End);
+        Assert.Equal(1, result.Created);
+        Assert.Empty(result.GapDetails ?? new List<AutoGenGapDetail>());
+
+        var generated = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .SingleAsync(item => item.GroupId == ids.GroupId
+                                 && item.ModuleId == ids.ModuleId
+                                 && item.Date == date);
+        Assert.Equal(ids.LessonTypeId, generated.LessonTypeId);
+        Assert.Equal(new TimeOnly(8, 0), generated.StartTime);
+        Assert.Equal(new TimeOnly(9, 0), generated.EndTime);
     }
 
     [Theory]

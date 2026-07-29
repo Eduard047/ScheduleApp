@@ -19,6 +19,17 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 public sealed class TeacherDraftsAutogenService
 {
     private static readonly SemaphoreSlim GenerationLock = new(1, 1);
+    private static readonly (
+        bool AllowRepeatPreviousDay,
+        bool AllowExtraSameDay,
+        bool Relaxed,
+        bool BypassDistinctLimit)[] ExhaustiveGapFillStages =
+    [
+        (false, false, false, false),
+        (false, true, false, false),
+        (true, true, true, false),
+        (true, true, true, true)
+    ];
 
     // Контекст БД для читання довідників та запису чернеток.
     private readonly AppDbContext _db;
@@ -161,6 +172,29 @@ public sealed class TeacherDraftsAutogenService
         int MaxNodes,
         bool EmergencyTimeLimitReached,
         string[] Scopes);
+    private sealed record AutogenTrialSnapshot(
+        HashSet<TeacherDraftItem> CreatedDrafts,
+        IReadOnlyDictionary<TeacherDraftItem, MovableDraftTrialState> MovableDrafts,
+        IReadOnlyCollection<BusySlot> BusySlots,
+        IReadOnlyCollection<BusySlot> TopicOrderSlots,
+        int WarningCount,
+        int GapDetailCount,
+        HashSet<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End)> GapWarnings,
+        Dictionary<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End), HashSet<string>> SlotFailureReasons,
+        IReadOnlyDictionary<(int GroupId, DateOnly Date), SearchLimitDiagnosticsState> SearchLimitDiagnostics,
+        HashSet<int> AttemptedModules,
+        HashSet<(int GroupId, int ModuleId)> ExhaustedTopics,
+        HashSet<(int GroupId, int ModuleId, int TopicId)> OverflowTopics,
+        HashSet<int> MissingModules,
+        int CreatedCount,
+        int SkippedCount,
+        int IncompleteDraftCount,
+        int IncompleteMissingTeacherCount,
+        int IncompleteMissingRoomCount,
+        int IncompleteMissingBothCount,
+        int EmergencySingletonCount,
+        int? LastPrimaryModuleId,
+        int LessonTypeIndex);
     // Уніфіковані відповіді для API.
     private static ActionResult<AutoGenResult> Ok(AutoGenResult value) => new OkObjectResult(value);
     private static ActionResult<AutoGenResult> BadRequest(object value) => new BadRequestObjectResult(value);
@@ -9166,57 +9200,10 @@ public sealed class TeacherDraftsAutogenService
 
                                 if (residualPlan.Placements.Count > 0)
                                 {
-                                    var residualCreatedSnapshot = allCreatedDrafts.ToHashSet();
-                                    var residualMovableDraftSnapshot = movableDrafts
-                                        .Distinct()
-                                        .ToDictionary(draft => draft, CaptureMovableDraftTrialState);
-                                    var residualBusySnapshot = busy.ToList();
-                                    var residualTopicOrderSnapshot = topicOrderSlots.ToList();
-                                    var residualWarningsCount = warnings.Count;
-                                    var residualGapDetailsCount = gapDetails.Count;
-                                    var residualGapWarnings = CopyGapWarnings();
-                                    var residualSlotFailureReasons = CopySlotFailureReasons();
-                                    var residualSearchLimitDiagnostics = CopySearchLimitDiagnostics();
-                                    var residualAttemptedModules = modulesAttemptedToday.ToHashSet();
-                                    var residualTopicsExhaustedNotified = topicsExhaustedNotified.ToHashSet();
-                                    var residualOverflowTopicNotified = overflowTopicNotified.ToHashSet();
-                                    var residualMissingModulesNotified = missingModulesNotified.ToHashSet();
-                                    var residualCreatedCount = created;
-                                    var residualSkippedCount = skipped;
-                                    var residualIncompleteDrafts = incompleteDraftsCreated;
-                                    var residualIncompleteMissingTeacher = incompleteMissingTeacherCount;
-                                    var residualIncompleteMissingRoom = incompleteMissingRoomCount;
-                                    var residualIncompleteMissingBoth = incompleteMissingBothCount;
-                                    var residualEmergencySingleton = emergencySingletonSharedLecturesCreated;
-                                    var residualLastPrimary = lastPrimaryModuleId;
-                                    var residualLessonTypeIndex = ltIndex;
+                                    var residualSnapshot = CaptureTrialState();
 
                                     void RollbackResidualPlan()
-                                    {
-                                        RestoreTrialState(
-                                            residualCreatedSnapshot,
-                                            residualMovableDraftSnapshot,
-                                            residualBusySnapshot,
-                                            residualTopicOrderSnapshot,
-                                            residualWarningsCount,
-                                            residualGapDetailsCount,
-                                            residualGapWarnings,
-                                            residualSlotFailureReasons,
-                                            residualSearchLimitDiagnostics,
-                                            residualAttemptedModules,
-                                            residualTopicsExhaustedNotified,
-                                            residualOverflowTopicNotified,
-                                            residualMissingModulesNotified,
-                                            residualCreatedCount,
-                                            residualSkippedCount,
-                                            residualIncompleteDrafts,
-                                            residualIncompleteMissingTeacher,
-                                            residualIncompleteMissingRoom,
-                                            residualIncompleteMissingBoth,
-                                            residualEmergencySingleton,
-                                            residualLastPrimary,
-                                            residualLessonTypeIndex);
-                                    }
+                                        => RestoreTrialState(residualSnapshot);
 
                                     var planApplication = await DeterministicResidualOptimizer.TryApplyPlanAtomicallyAsync(
                                         residualPlan.Placements,
@@ -9280,26 +9267,19 @@ public sealed class TeacherDraftsAutogenService
                         cancellationToken.ThrowIfCancellationRequested();
                         progress = false;
                         pass++;
-                        var placed = await TryFillGapStageAsync(
-                                         allowRepeatPreviousDay: false,
-                                         allowExtraSameDay: false,
-                                         relaxed: false,
-                                         bypassDistinctLimit: false)
-                                     || await TryFillGapStageAsync(
-                                         allowRepeatPreviousDay: false,
-                                         allowExtraSameDay: true,
-                                         relaxed: false,
-                                         bypassDistinctLimit: false)
-                                     || await TryFillGapStageAsync(
-                                         allowRepeatPreviousDay: true,
-                                         allowExtraSameDay: true,
-                                         relaxed: true,
-                                         bypassDistinctLimit: false)
-                                     || await TryFillGapStageAsync(
-                                         allowRepeatPreviousDay: true,
-                                         allowExtraSameDay: true,
-                                         relaxed: true,
-                                         bypassDistinctLimit: true);
+                        var placed = false;
+                        foreach (var stage in ExhaustiveGapFillStages)
+                        {
+                            placed = await TryFillGapStageAsync(
+                                stage.AllowRepeatPreviousDay,
+                                stage.AllowExtraSameDay,
+                                stage.Relaxed,
+                                stage.BypassDistinctLimit);
+                            if (placed)
+                            {
+                                break;
+                            }
+                        }
                         if (placed)
                         {
                             progress = true;
@@ -11115,30 +11095,7 @@ public sealed class TeacherDraftsAutogenService
                         foreach (var gap in gaps)
                         {
                             var gapCountBefore = CountGlobalWorkingGaps();
-                            var repairCreatedSnapshot = allCreatedDrafts.ToHashSet();
-                            var repairMovableDraftSnapshot = movableDrafts
-                                .Distinct()
-                                .ToDictionary(draft => draft, CaptureMovableDraftTrialState);
-                            var repairBusySnapshot = busy.ToList();
-                            var repairTopicOrderSnapshot = topicOrderSlots.ToList();
-                            var repairWarningsCount = warnings.Count;
-                            var repairGapDetailsCount = gapDetails.Count;
-                            var repairGapWarnings = CopyGapWarnings();
-                            var repairSlotFailureReasons = CopySlotFailureReasons();
-                            var repairSearchLimitDiagnostics = CopySearchLimitDiagnostics();
-                            var repairAttemptedModules = modulesAttemptedToday.ToHashSet();
-                            var repairTopicsExhaustedNotified = topicsExhaustedNotified.ToHashSet();
-                            var repairOverflowTopicNotified = overflowTopicNotified.ToHashSet();
-                            var repairMissingModulesNotified = missingModulesNotified.ToHashSet();
-                            var repairCreatedCount = created;
-                            var repairSkippedCount = skipped;
-                            var repairIncompleteDrafts = incompleteDraftsCreated;
-                            var repairIncompleteMissingTeacher = incompleteMissingTeacherCount;
-                            var repairIncompleteMissingRoom = incompleteMissingRoomCount;
-                            var repairIncompleteMissingBoth = incompleteMissingBothCount;
-                            var repairEmergencySingleton = emergencySingletonSharedLecturesCreated;
-                            var repairLastPrimary = lastPrimaryModuleId;
-                            var repairLessonTypeIndex = ltIndex;
+                            var repairSnapshot = CaptureTrialState();
                             var repairPerDayCount = perDayCount.ToDictionary(entry => entry.Key, entry => entry.Value);
                             var repairRangeFactMap = rangeFactMap.ToDictionary(entry => entry.Key, entry => entry.Value);
                             var repairRemaining = remainingByGroupModule.ToDictionary(entry => entry.Key, entry => entry.Value);
@@ -11242,29 +11199,7 @@ public sealed class TeacherDraftsAutogenService
 
                             if (!improvedThisCycle)
                             {
-                                RestoreTrialState(
-                                    repairCreatedSnapshot,
-                                    repairMovableDraftSnapshot,
-                                    repairBusySnapshot,
-                                    repairTopicOrderSnapshot,
-                                    repairWarningsCount,
-                                    repairGapDetailsCount,
-                                    repairGapWarnings,
-                                    repairSlotFailureReasons,
-                                    repairSearchLimitDiagnostics,
-                                    repairAttemptedModules,
-                                    repairTopicsExhaustedNotified,
-                                    repairOverflowTopicNotified,
-                                    repairMissingModulesNotified,
-                                    repairCreatedCount,
-                                    repairSkippedCount,
-                                    repairIncompleteDrafts,
-                                    repairIncompleteMissingTeacher,
-                                    repairIncompleteMissingRoom,
-                                    repairIncompleteMissingBoth,
-                                    repairEmergencySingleton,
-                                    repairLastPrimary,
-                                    repairLessonTypeIndex);
+                                RestoreTrialState(repairSnapshot);
 
                                 perDayCount.Clear();
                                 foreach (var entry in repairPerDayCount)
@@ -11442,6 +11377,33 @@ public sealed class TeacherDraftsAutogenService
                 Dictionary<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End), HashSet<string>> CopySlotFailureReasons()
                     => slotFailureReasons.ToDictionary(entry => entry.Key, entry => entry.Value.ToHashSet());
 
+                AutogenTrialSnapshot CaptureTrialState()
+                    => new(
+                        allCreatedDrafts.ToHashSet(),
+                        movableDrafts
+                            .Distinct()
+                            .ToDictionary(draft => draft, CaptureMovableDraftTrialState),
+                        busy.ToList(),
+                        topicOrderSlots.ToList(),
+                        warnings.Count,
+                        gapDetails.Count,
+                        CopyGapWarnings(),
+                        CopySlotFailureReasons(),
+                        CopySearchLimitDiagnostics(),
+                        modulesAttemptedToday.ToHashSet(),
+                        topicsExhaustedNotified.ToHashSet(),
+                        overflowTopicNotified.ToHashSet(),
+                        missingModulesNotified.ToHashSet(),
+                        created,
+                        skipped,
+                        incompleteDraftsCreated,
+                        incompleteMissingTeacherCount,
+                        incompleteMissingRoomCount,
+                        incompleteMissingBothCount,
+                        emergencySingletonSharedLecturesCreated,
+                        lastPrimaryModuleId,
+                        ltIndex);
+
                 int CountModuleTransitionsForDay()
                 {
                     var dayModules = BusyForGroupDate(grp.Id, date)
@@ -11496,90 +11458,68 @@ public sealed class TeacherDraftsAutogenService
                            - transitions * 40;
                 }
 
-                void RestoreTrialState(
-                    HashSet<TeacherDraftItem> createdSnapshot,
-                    IReadOnlyDictionary<TeacherDraftItem, MovableDraftTrialState> movableDraftSnapshot,
-                    IReadOnlyCollection<BusySlot> busySnapshot,
-                    IReadOnlyCollection<BusySlot> topicOrderSnapshot,
-                    int warningsCount,
-                    int gapDetailsCount,
-                    HashSet<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End)> gapWarningSnapshot,
-                    Dictionary<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End), HashSet<string>> slotFailureSnapshot,
-                    IReadOnlyDictionary<(int GroupId, DateOnly Date), SearchLimitDiagnosticsState> searchLimitSnapshot,
-                    HashSet<int> attemptedModulesSnapshot,
-                    HashSet<(int GroupId, int ModuleId)> topicsExhaustedSnapshot,
-                    HashSet<(int GroupId, int ModuleId, int TopicId)> overflowTopicSnapshot,
-                    HashSet<int> missingModulesSnapshot,
-                    int createdSnapshotCount,
-                    int skippedSnapshotCount,
-                    int incompleteDraftsSnapshot,
-                    int incompleteMissingTeacherSnapshot,
-                    int incompleteMissingRoomSnapshot,
-                    int incompleteMissingBothSnapshot,
-                    int emergencySingletonSnapshot,
-                    int? lastPrimarySnapshot,
-                    int lessonTypeIndexSnapshot)
+                void RestoreTrialState(AutogenTrialSnapshot snapshot)
                 {
                     foreach (var item in allCreatedDrafts
-                                 .Where(item => !createdSnapshot.Contains(item) && !item.IsLocked)
+                                 .Where(item => !snapshot.CreatedDrafts.Contains(item) && !item.IsLocked)
                                  .ToList())
                     {
                         UndoCreatedDraft(item);
                     }
-                    foreach (var (draft, draftSnapshot) in movableDraftSnapshot)
+                    foreach (var (draft, draftSnapshot) in snapshot.MovableDrafts)
                     {
                         RestoreMovableDraftTrialState(draft, draftSnapshot);
                     }
-                    RestoreBusyState(busySnapshot, topicOrderSnapshot);
+                    RestoreBusyState(snapshot.BusySlots, snapshot.TopicOrderSlots);
 
-                    while (warnings.Count > warningsCount)
+                    while (warnings.Count > snapshot.WarningCount)
                     {
                         warnings.RemoveAt(warnings.Count - 1);
                     }
-                    while (gapDetails.Count > gapDetailsCount)
+                    while (gapDetails.Count > snapshot.GapDetailCount)
                     {
                         gapDetails.RemoveAt(gapDetails.Count - 1);
                     }
                     gapWarnings.Clear();
-                    foreach (var warningKey in gapWarningSnapshot)
+                    foreach (var warningKey in snapshot.GapWarnings)
                     {
                         gapWarnings.Add(warningKey);
                     }
                     slotFailureReasons.Clear();
-                    foreach (var entry in slotFailureSnapshot)
+                    foreach (var entry in snapshot.SlotFailureReasons)
                     {
                         slotFailureReasons[entry.Key] = entry.Value.ToHashSet();
                     }
-                    RestoreSearchLimitDiagnostics(searchLimitSnapshot);
+                    RestoreSearchLimitDiagnostics(snapshot.SearchLimitDiagnostics);
                     modulesAttemptedToday.Clear();
-                    foreach (var moduleId in attemptedModulesSnapshot)
+                    foreach (var moduleId in snapshot.AttemptedModules)
                     {
                         modulesAttemptedToday.Add(moduleId);
                     }
                     topicsExhaustedNotified.Clear();
-                    foreach (var notificationKey in topicsExhaustedSnapshot)
+                    foreach (var notificationKey in snapshot.ExhaustedTopics)
                     {
                         topicsExhaustedNotified.Add(notificationKey);
                     }
                     overflowTopicNotified.Clear();
-                    foreach (var notificationKey in overflowTopicSnapshot)
+                    foreach (var notificationKey in snapshot.OverflowTopics)
                     {
                         overflowTopicNotified.Add(notificationKey);
                     }
                     missingModulesNotified.Clear();
-                    foreach (var moduleId in missingModulesSnapshot)
+                    foreach (var moduleId in snapshot.MissingModules)
                     {
                         missingModulesNotified.Add(moduleId);
                     }
-                    created = createdSnapshotCount;
-                    skipped = skippedSnapshotCount;
-                    incompleteDraftsCreated = incompleteDraftsSnapshot;
-                    incompleteMissingTeacherCount = incompleteMissingTeacherSnapshot;
-                    incompleteMissingRoomCount = incompleteMissingRoomSnapshot;
-                    incompleteMissingBothCount = incompleteMissingBothSnapshot;
-                    emergencySingletonSharedLecturesCreated = emergencySingletonSnapshot;
-                    lastPrimaryModuleId = lastPrimarySnapshot;
-                    ltIndex = lessonTypeIndexSnapshot;
+                    created = snapshot.CreatedCount;
+                    skipped = snapshot.SkippedCount;
+                    incompleteDraftsCreated = snapshot.IncompleteDraftCount;
+                    incompleteMissingTeacherCount = snapshot.IncompleteMissingTeacherCount;
+                    incompleteMissingRoomCount = snapshot.IncompleteMissingRoomCount;
+                    incompleteMissingBothCount = snapshot.IncompleteMissingBothCount;
+                    emergencySingletonSharedLecturesCreated = snapshot.EmergencySingletonCount;
+                    lastPrimaryModuleId = snapshot.LastPrimaryModuleId;
+                    ltIndex = snapshot.LessonTypeIndex;
                     RestoreFirstMainMarker();
                     InvalidateGapResourceCaches();
                 }
@@ -11769,30 +11709,7 @@ public sealed class TeacherDraftsAutogenService
                     }
                 }
 
-                var trialCreatedSnapshot = allCreatedDrafts.ToHashSet();
-                var trialMovableDraftSnapshot = movableDrafts
-                    .Distinct()
-                    .ToDictionary(draft => draft, CaptureMovableDraftTrialState);
-                var trialBusySnapshot = busy.ToList();
-                var trialTopicOrderSnapshot = topicOrderSlots.ToList();
-                var trialWarningsCount = warnings.Count;
-                var trialGapDetailsCount = gapDetails.Count;
-                var trialGapWarnings = CopyGapWarnings();
-                var trialSlotFailureReasons = CopySlotFailureReasons();
-                var trialSearchLimitDiagnostics = CopySearchLimitDiagnostics();
-                var trialAttemptedModules = modulesAttemptedToday.ToHashSet();
-                var trialTopicsExhaustedNotified = topicsExhaustedNotified.ToHashSet();
-                var trialOverflowTopicNotified = overflowTopicNotified.ToHashSet();
-                var trialMissingModulesNotified = missingModulesNotified.ToHashSet();
-                var trialCreatedCount = created;
-                var trialSkippedCount = skipped;
-                var trialIncompleteDrafts = incompleteDraftsCreated;
-                var trialIncompleteMissingTeacher = incompleteMissingTeacherCount;
-                var trialIncompleteMissingRoom = incompleteMissingRoomCount;
-                var trialIncompleteMissingBoth = incompleteMissingBothCount;
-                var trialEmergencySingleton = emergencySingletonSharedLecturesCreated;
-                var trialLastPrimary = lastPrimaryModuleId;
-                var trialLessonTypeIndex = ltIndex;
+                var trialSnapshot = CaptureTrialState();
 
                 var enableDayRollbackOptimizer = softFill || hasModuleHourOverrides;
                 var passModes = enableDayRollbackOptimizer
@@ -11826,29 +11743,7 @@ public sealed class TeacherDraftsAutogenService
                         bestFilledSlots = filledSlots;
                         bestRemainingNeed = remainingNeed;
                     }
-                    RestoreTrialState(
-                        trialCreatedSnapshot,
-                        trialMovableDraftSnapshot,
-                        trialBusySnapshot,
-                        trialTopicOrderSnapshot,
-                        trialWarningsCount,
-                        trialGapDetailsCount,
-                        trialGapWarnings,
-                        trialSlotFailureReasons,
-                        trialSearchLimitDiagnostics,
-                        trialAttemptedModules,
-                        trialTopicsExhaustedNotified,
-                        trialOverflowTopicNotified,
-                        trialMissingModulesNotified,
-                        trialCreatedCount,
-                        trialSkippedCount,
-                        trialIncompleteDrafts,
-                        trialIncompleteMissingTeacher,
-                        trialIncompleteMissingRoom,
-                        trialIncompleteMissingBoth,
-                        trialEmergencySingleton,
-                        trialLastPrimary,
-                        trialLessonTypeIndex);
+                    RestoreTrialState(trialSnapshot);
                     if (bestGapCount == 0 && bestScore > 0)
                     {
                         break;

@@ -36,6 +36,10 @@ public sealed class AutogenQualityMatrixTests
             MaximumIncompleteCount: 0,
             MinimumScheduledWeekCount: 1,
             MinimumScheduledWeekdayCount: 1,
+            MaximumGroupWindowCount: 0,
+            MaximumTeacherWindowCount: 2,
+            MaximumBuildingTransitionCount: 0,
+            MaximumTeacherLoadSpread: 2,
             MaximumRuntime: TimeSpan.FromSeconds(15),
             ExpectedFingerprint: "851cd5f21477053c937e52527c931af07ff2e23ccaa5fec2058359afc54d263e"),
         new QualityProfile(
@@ -51,6 +55,10 @@ public sealed class AutogenQualityMatrixTests
             MaximumIncompleteCount: 0,
             MinimumScheduledWeekCount: 1,
             MinimumScheduledWeekdayCount: 1,
+            MaximumGroupWindowCount: 0,
+            MaximumTeacherWindowCount: 0,
+            MaximumBuildingTransitionCount: 0,
+            MaximumTeacherLoadSpread: 1,
             MaximumRuntime: TimeSpan.FromSeconds(15),
             ExpectedFingerprint: "d60f4c1430ff1778db8d27c5a78b921744677b7371b3f51f21587e1a35a72399"),
         new QualityProfile(
@@ -66,6 +74,10 @@ public sealed class AutogenQualityMatrixTests
             MaximumIncompleteCount: 0,
             MinimumScheduledWeekCount: 18,
             MinimumScheduledWeekdayCount: 3,
+            MaximumGroupWindowCount: 0,
+            MaximumTeacherWindowCount: 0,
+            MaximumBuildingTransitionCount: 0,
+            MaximumTeacherLoadSpread: 0,
             MaximumRuntime: TimeSpan.FromSeconds(45),
             ExpectedFingerprint: "26ec8a636ac323e39266d026c9646d3d66f0fda9d6ad5b5cf39137bbd08beea5")
     };
@@ -83,6 +95,8 @@ public sealed class AutogenQualityMatrixTests
             $"Профіль={profile.Name}; створено={first.Created}; пропуски={first.GapCount}; " +
             $"дефіцит-попиту={first.MissingDemand}; тижні={first.ScheduledWeekCount}; " +
             $"дні-тижня={first.ScheduledWeekdayCount}; " +
+            $"вікна-груп={first.GroupWindowCount}; вікна-викладачів={first.TeacherWindowCount}; " +
+            $"зміни-корпусів={first.BuildingTransitionCount}; розкид-навантаження={first.TeacherLoadSpread}; " +
             $"порушення={first.HardViolationCount}; незавершені={first.IncompleteCount}; " +
             $"час={first.Runtime.TotalMilliseconds:F0} мс; fingerprint={first.Fingerprint}");
         if (first.GapReasons.Count > 0)
@@ -129,6 +143,22 @@ public sealed class AutogenQualityMatrixTests
             snapshot.ScheduledWeekdayCount >= profile.MinimumScheduledWeekdayCount,
             $"Профіль {profile.Name}: використано {snapshot.ScheduledWeekdayCount} дн. тижня, " +
             $"мінімум {profile.MinimumScheduledWeekdayCount}.");
+        Assert.True(
+            snapshot.GroupWindowCount <= profile.MaximumGroupWindowCount,
+            $"Профіль {profile.Name}: вікон у груп {snapshot.GroupWindowCount}, " +
+            $"бюджет {profile.MaximumGroupWindowCount}.");
+        Assert.True(
+            snapshot.TeacherWindowCount <= profile.MaximumTeacherWindowCount,
+            $"Профіль {profile.Name}: вікон у викладачів {snapshot.TeacherWindowCount}, " +
+            $"бюджет {profile.MaximumTeacherWindowCount}.");
+        Assert.True(
+            snapshot.BuildingTransitionCount <= profile.MaximumBuildingTransitionCount,
+            $"Профіль {profile.Name}: переходів між корпусами {snapshot.BuildingTransitionCount}, " +
+            $"бюджет {profile.MaximumBuildingTransitionCount}.");
+        Assert.True(
+            snapshot.TeacherLoadSpread <= profile.MaximumTeacherLoadSpread,
+            $"Профіль {profile.Name}: розкид навантаження {snapshot.TeacherLoadSpread}, " +
+            $"бюджет {profile.MaximumTeacherLoadSpread}.");
         Assert.True(
             snapshot.Runtime <= profile.MaximumRuntime,
             $"Профіль {profile.Name}: генерація тривала {snapshot.Runtime.TotalMilliseconds:F0} мс, " +
@@ -192,6 +222,7 @@ public sealed class AutogenQualityMatrixTests
                                 && item.IsLocked);
         var coverage = await ReadCoverageAsync(
             database.Db,
+            seed.CourseId,
             seed.GroupIds,
             seed.Request.ModuleHours ?? new Dictionary<int, int>(),
             rangeStart,
@@ -210,6 +241,10 @@ public sealed class AutogenQualityMatrixTests
             incompleteCount,
             coverage.ScheduledWeekCount,
             coverage.ScheduledWeekdayCount,
+            coverage.GroupWindowCount,
+            coverage.TeacherWindowCount,
+            coverage.BuildingTransitionCount,
+            coverage.TeacherLoadSpread,
             stopwatch.Elapsed,
             fingerprint,
             result.GapDetails?.Select(item => item.Reason ?? item.SlotLabel).ToList() ?? [],
@@ -299,6 +334,7 @@ public sealed class AutogenQualityMatrixTests
 
     private static async Task<CoverageSnapshot> ReadCoverageAsync(
         AppDbContext db,
+        int courseId,
         IReadOnlyCollection<int> groupIds,
         IReadOnlyDictionary<int, int> moduleHours,
         DateOnly rangeStart,
@@ -309,8 +345,44 @@ public sealed class AutogenQualityMatrixTests
             .Where(item => groupIds.Contains(item.GroupId)
                            && item.Date >= rangeStart
                            && item.Date <= rangeEnd)
-            .Select(item => new { item.GroupId, item.ModuleId, item.Date })
+            .Select(item => new
+            {
+                item.GroupId,
+                item.ModuleId,
+                item.ModuleTopicId,
+                item.LessonTypeId,
+                item.TeacherId,
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                BuildingId = item.RoomId == null ? null : (int?)item.Room!.BuildingId
+            })
             .ToListAsync();
+        var configuredSlots = await db.TimeSlots
+            .AsNoTracking()
+            .Where(slot => slot.CourseId == courseId
+                           && slot.IsActive
+                           && slot.DayOfWeek != null)
+            .Select(slot => new
+            {
+                slot.DayOfWeek,
+                slot.Start,
+                slot.End,
+                slot.SortOrder
+            })
+            .ToListAsync();
+        var slotIndexByTime = new Dictionary<(DayOfWeek Day, TimeOnly Start, TimeOnly End), int>();
+        foreach (var daySlots in configuredSlots.GroupBy(slot => slot.DayOfWeek))
+        {
+            var index = 0;
+            foreach (var slot in daySlots
+                         .OrderBy(slot => slot.SortOrder)
+                         .ThenBy(slot => slot.Start)
+                         .ThenBy(slot => slot.End))
+            {
+                slotIndexByTime[(slot.DayOfWeek!.Value, slot.Start, slot.End)] = index++;
+            }
+        }
         var actualHours = rows
             .GroupBy(item => (item.GroupId, item.ModuleId))
             .ToDictionary(group => group.Key, group => group.Count());
@@ -331,8 +403,102 @@ public sealed class AutogenQualityMatrixTests
             .Select(item => item.Date.DayOfWeek)
             .Distinct()
             .Count();
+        var groupWindowCount = rows
+            .GroupBy(item => (item.GroupId, item.Date))
+            .Sum(group =>
+            {
+                var indexes = group
+                    .Select(item => slotIndexByTime.TryGetValue(
+                        (item.Date.DayOfWeek, item.StartTime, item.EndTime),
+                        out var index)
+                            ? index
+                            : -1)
+                    .Where(index => index >= 0)
+                    .Distinct()
+                    .OrderBy(index => index)
+                    .ToList();
+                return indexes.Count < 2
+                    ? 0
+                    : indexes[^1] - indexes[0] + 1 - indexes.Count;
+            });
+        var teacherWindowCount = rows
+            .Where(item => item.TeacherId is not null)
+            .GroupBy(item => (TeacherId: item.TeacherId!.Value, item.Date))
+            .Sum(group =>
+            {
+                var indexes = group
+                    .Select(item => slotIndexByTime.TryGetValue(
+                        (item.Date.DayOfWeek, item.StartTime, item.EndTime),
+                        out var index)
+                            ? index
+                            : -1)
+                    .Where(index => index >= 0)
+                    .Distinct()
+                    .OrderBy(index => index)
+                    .ToList();
+                return indexes.Count < 2
+                    ? 0
+                    : indexes[^1] - indexes[0] + 1 - indexes.Count;
+            });
+        var buildingTransitionCount = rows
+            .GroupBy(item => (item.GroupId, item.Date))
+            .Sum(group =>
+            {
+                var buildings = group
+                    .GroupBy(item => (item.StartTime, item.EndTime))
+                    .OrderBy(item => item.Key.StartTime)
+                    .ThenBy(item => item.Key.EndTime)
+                    .Select(item => item
+                        .Select(row => row.BuildingId)
+                        .FirstOrDefault(buildingId => buildingId is not null))
+                    .Where(buildingId => buildingId is not null)
+                    .Select(buildingId => buildingId!.Value)
+                    .ToList();
+                return buildings
+                    .Skip(1)
+                    .Where((buildingId, index) => buildingId != buildings[index])
+                    .Count();
+            });
+        var scheduledModuleIds = rows
+            .Select(item => item.ModuleId)
+            .Distinct()
+            .ToList();
+        var eligibleTeacherIds = await db.TeacherModules
+            .AsNoTracking()
+            .Where(link => scheduledModuleIds.Contains(link.ModuleId))
+            .Select(link => link.TeacherId)
+            .Distinct()
+            .ToListAsync();
+        var teacherLoadById = rows
+            .Where(item => item.TeacherId is not null)
+            .Select(item => new
+            {
+                TeacherId = item.TeacherId!.Value,
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                item.ModuleId,
+                item.ModuleTopicId,
+                item.LessonTypeId
+            })
+            .Distinct()
+            .GroupBy(item => item.TeacherId)
+            .ToDictionary(group => group.Key, group => group.Count());
+        var teacherLoads = eligibleTeacherIds
+            .Select(teacherId => teacherLoadById.GetValueOrDefault(teacherId))
+            .ToList();
+        var teacherLoadSpread = teacherLoads.Count == 0
+            ? 0
+            : teacherLoads.Max() - teacherLoads.Min();
 
-        return new CoverageSnapshot(missingDemand, scheduledWeekCount, scheduledWeekdayCount);
+        return new CoverageSnapshot(
+            missingDemand,
+            scheduledWeekCount,
+            scheduledWeekdayCount,
+            groupWindowCount,
+            teacherWindowCount,
+            buildingTransitionCount,
+            teacherLoadSpread);
     }
 
     private static DateOnly StartOfWeek(DateOnly date)
@@ -354,6 +520,10 @@ public sealed class AutogenQualityMatrixTests
         int MaximumIncompleteCount,
         int MinimumScheduledWeekCount,
         int MinimumScheduledWeekdayCount,
+        int MaximumGroupWindowCount,
+        int MaximumTeacherWindowCount,
+        int MaximumBuildingTransitionCount,
+        int MaximumTeacherLoadSpread,
         TimeSpan MaximumRuntime,
         string ExpectedFingerprint)
     {
@@ -378,6 +548,10 @@ public sealed class AutogenQualityMatrixTests
         int IncompleteCount,
         int ScheduledWeekCount,
         int ScheduledWeekdayCount,
+        int GroupWindowCount,
+        int TeacherWindowCount,
+        int BuildingTransitionCount,
+        int TeacherLoadSpread,
         TimeSpan Runtime,
         string Fingerprint,
         IReadOnlyList<string> GapReasons,
@@ -386,7 +560,11 @@ public sealed class AutogenQualityMatrixTests
     private sealed record CoverageSnapshot(
         int MissingDemand,
         int ScheduledWeekCount,
-        int ScheduledWeekdayCount);
+        int ScheduledWeekdayCount,
+        int GroupWindowCount,
+        int TeacherWindowCount,
+        int BuildingTransitionCount,
+        int TeacherLoadSpread);
 
     private sealed record QualitySeed(
         int CourseId,
