@@ -94,10 +94,10 @@ public sealed class ProductionGuardrailTests
     }
 
     [Theory]
-    [InlineData(false, 0)]
-    [InlineData(true, 1)]
-    public async Task Autogen_MonSat_uses_Saturday_only_with_effective_working_calendar_override(
-        bool addWorkingOverride,
+    [InlineData(false, 1)]
+    [InlineData(true, 0)]
+    public async Task Autogen_MonSat_uses_configured_Saturday_unless_calendar_marks_it_non_working(
+        bool addNonWorkingOverride,
         int expectedCreated)
     {
         await using var fixture = await TestDatabase.CreateAsync();
@@ -127,13 +127,13 @@ public sealed class ProductionGuardrailTests
             SortOrder = 1,
             IsActive = true
         });
-        if (addWorkingOverride)
+        if (addNonWorkingOverride)
         {
             fixture.Db.CalendarExceptions.Add(new CalendarException
             {
                 Date = saturday,
-                IsWorkingDay = true,
-                Name = "Робоча субота групи",
+                IsWorkingDay = false,
+                Name = "Неробоча субота групи",
                 CourseId = ids.CourseId,
                 GroupId = ids.GroupId
             });
@@ -882,10 +882,10 @@ public sealed class ProductionGuardrailTests
     }
 
     [Theory]
-    [InlineData(false, true)]
-    [InlineData(true, false)]
-    public async Task Hard_rule_validator_matches_publish_calendar_semantics_for_Saturday(
-        bool addWorkingOverride,
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    public async Task Hard_rule_validator_accepts_configured_Saturday_unless_calendar_marks_it_non_working(
+        bool addNonWorkingOverride,
         bool expectNonWorkingViolation)
     {
         await using var fixture = await TestDatabase.CreateAsync();
@@ -910,13 +910,13 @@ public sealed class ProductionGuardrailTests
             ModuleId = ids.ModuleId,
             LessonTypeId = ids.LessonTypeId
         });
-        if (addWorkingOverride)
+        if (addNonWorkingOverride)
         {
             fixture.Db.CalendarExceptions.Add(new CalendarException
             {
                 Date = saturday,
-                IsWorkingDay = true,
-                Name = "Робоча субота курсу",
+                IsWorkingDay = false,
+                Name = "Неробоча субота курсу",
                 CourseId = ids.CourseId
             });
         }
@@ -934,7 +934,61 @@ public sealed class ProductionGuardrailTests
         Assert.Equal(
             expectNonWorkingViolation,
             result.Violations.Any(violation =>
-                violation.Contains("неробочий день", StringComparison.OrdinalIgnoreCase)));
+                violation.Contains("неробоч", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    [Fact]
+    public async Task Hard_rule_validator_rejects_more_than_four_groups_of_same_module_at_once()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var ids = await fixture.SeedMinimalScheduleModelAsync();
+        var date = new DateOnly(2026, 5, 4);
+        fixture.Db.TimeSlots.Add(new TimeSlot
+        {
+            CourseId = ids.CourseId,
+            DayOfWeek = DayOfWeek.Monday,
+            Start = new TimeOnly(8, 0),
+            End = new TimeOnly(9, 0),
+            SortOrder = 1,
+            IsActive = true
+        });
+        var extraGroups = Enumerable.Range(2, 4)
+            .Select(index => new Group
+            {
+                Name = $"П-{index}",
+                StudentsCount = 15,
+                CourseId = ids.CourseId
+            })
+            .ToList();
+        fixture.Db.Groups.AddRange(extraGroups);
+        await fixture.Db.SaveChangesAsync();
+        var groupIds = new[] { ids.GroupId }
+            .Concat(extraGroups.Select(group => group.Id))
+            .ToList();
+        fixture.Db.TeacherDraftItems.AddRange(groupIds.Select(groupId => new TeacherDraftItem
+        {
+            Date = date,
+            DayOfWeek = date.DayOfWeek,
+            StartTime = new TimeOnly(8, 0),
+            EndTime = new TimeOnly(9, 0),
+            GroupId = groupId,
+            ModuleId = ids.ModuleId,
+            LessonTypeId = ids.LessonTypeId
+        }));
+        await fixture.Db.SaveChangesAsync();
+
+        var result = await new TeacherDraftsAutogenHardRuleValidator(fixture.Db).ValidateAsync(
+            new TeacherDraftsAutogenHardRuleValidationRequest(
+                ids.CourseId,
+                groupIds,
+                date,
+                date,
+                WeekPreset.MonFri,
+                AllowIncompleteDrafts: true,
+                MaxParallelGroupsPerModuleInSlot: 4));
+
+        Assert.Contains(result.Violations, violation =>
+            violation.Contains("одночасно поставлено для 5 груп", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

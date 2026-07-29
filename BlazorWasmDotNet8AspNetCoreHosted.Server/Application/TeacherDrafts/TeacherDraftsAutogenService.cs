@@ -527,7 +527,7 @@ public sealed class TeacherDraftsAutogenService
             : softFill || isShortManualRange ? 0 : 2;
         var maxParallelGroupsPerModuleInSlot = softOptions?.MaxParallelGroupsPerModuleInSlot is int parallelGroups && parallelGroups > 0
             ? parallelGroups
-            : softFill ? 3 : 2;
+            : 4;
         var preferredFirstPenaltyMultiplier = softOptions?.PreferredFirstPenaltyMultiplier is double preferredFirstMultiplier && preferredFirstMultiplier >= 0
             ? preferredFirstMultiplier
             : 1.0;
@@ -560,8 +560,7 @@ public sealed class TeacherDraftsAutogenService
             var dow = d.ToDateTime(TimeOnly.MinValue).DayOfWeek;
             if (!DayAllowed(dow)) return false;
             var scoped = TeacherDraftsHelpers.ResolveCalendarOverride(calendar, d, grp.CourseId, grp.Id);
-            var isWeekend = dow is DayOfWeek.Saturday or DayOfWeek.Sunday;
-            return scoped ?? !isWeekend;
+            return scoped ?? true;
         }
         // Нормалізуємо фільтри: 0 або null означає "без фільтра".
         int? courseId = (r.CourseId > 0) ? r.CourseId : null;
@@ -589,11 +588,6 @@ public sealed class TeacherDraftsAutogenService
             ?? new Dictionary<int, int>();
         bool hasModuleHourOverrides = moduleHoursByModuleId.Count > 0;
         var initWarnings = new List<string>();
-        if (r.AllowOnDaysOff)
-        {
-            initWarnings.Add(
-                "Параметр дозволу генерації у неробочі дні не обходить календар: для суботи, неділі або іншого неробочого дня додайте явний робочий виняток календаря.");
-        }
         // Без курсу неможливо перевірити валідність модулів.
         if (hasModuleHourOverrides && courseId is null)
         {
@@ -1391,10 +1385,36 @@ public sealed class TeacherDraftsAutogenService
         // Мапи для швидкого доступу до імен та кафедр викладачів.
         var teacherNames = teachersMeta.ToDictionary(x => x.Id, x => x.Name);
         var teacherDepartmentById = teachersMeta.ToDictionary(x => x.Id, x => x.DepartmentId);
-        // Назви кафедр для повідомлень та перевірок.
-        var departmentNames = await _db.Departments
-            .AsNoTracking()
-            .ToDictionaryAsync(d => d.Id, d => string.IsNullOrWhiteSpace(d.Name) ? $"#{d.Id}" : d.Name!, cancellationToken);
+        // Кафедра теми задає пріоритет, але не скасовує явний зв'язок викладача з модулем.
+        // Якщо кафедру теми не вказано, усі викладачі модуля є рівноправними кандидатами.
+        bool IsPreferredTeacherForTopic(int teacherId, ModuleTopic? topic)
+            => topic?.DepartmentId is not int departmentId
+               || departmentId <= 0
+               || teacherDepartmentById.TryGetValue(teacherId, out var teacherDepartmentId)
+               && teacherDepartmentId == departmentId;
+        int TeacherDepartmentPriority(int teacherId, ModuleTopic? topic)
+            => IsPreferredTeacherForTopic(teacherId, topic) ? 0 : 1;
+        bool IsDepartmentFallbackTeacher(int teacherId, ModuleTopic? topic)
+            => topic?.DepartmentId is int departmentId
+               && departmentId > 0
+               && !IsPreferredTeacherForTopic(teacherId, topic);
+        List<int> PreferredOrExplicitTeacherPool(IEnumerable<int> teacherIds, ModuleTopic? topic)
+        {
+            var allCandidates = teacherIds
+                .Distinct()
+                .ToList();
+            if (topic?.DepartmentId is not int departmentId || departmentId <= 0)
+            {
+                return allCandidates;
+            }
+
+            var departmentCandidates = allCandidates
+                .Where(teacherId => IsPreferredTeacherForTopic(teacherId, topic))
+                .ToList();
+            return departmentCandidates.Count > 0
+                ? departmentCandidates
+                : allCandidates;
+        }
         // Робочі години викладачів (обмеження часу).
         var teacherWorkingHours = await _db.TeacherWorkingHours.AsNoTracking()
             .Select(w => new { w.TeacherId, w.DayOfWeek, w.Start, w.End })
@@ -1946,10 +1966,6 @@ public sealed class TeacherDraftsAutogenService
                    && lt.CountInPlan
                    && !excludedTypeIds.Contains(lessonTypeId);
         }
-        int MaxSharedLectureGroupsForCourse(int courseId)
-            => selectedGroupsByCourse.TryGetValue(courseId, out var sameCourseGroups) && sameCourseGroups.Count > 0
-                ? sameCourseGroups.Count
-                : 1;
         // Перевірка, чи тип заняття трактуємо як лекцію для об'єднання груп.
         bool IsLectureType(int lessonTypeId) => lectureTypeIds.Contains(lessonTypeId);
         var preferredFirstTypeIds = types
@@ -1983,29 +1999,23 @@ public sealed class TeacherDraftsAutogenService
             int lessonTypeId,
             bool isSelfStudyPlacement,
             bool bypassSoftModuleParallelLimit = false)
-            => !isSelfStudyPlacement && CanShareAcrossGroups(lessonTypeId)
-                ? MaxSharedLectureGroupsForCourse(courseId)
-                : bypassSoftModuleParallelLimit
-                    ? int.MaxValue
-                    : maxParallelGroupsPerModuleInSlot;
+            => maxParallelGroupsPerModuleInSlot;
         int EligibleTeacherCountForPlacement(
             int moduleId,
             ModuleTopic? topic,
             bool isSelfStudyPlacement)
-            => (isSelfStudyPlacement
+            => PreferredOrExplicitTeacherPool(
+                    isSelfStudyPlacement
                     ? supervisorsForModule
                         .Where(link => link.ModuleId == moduleId)
                         .Select(link => link.TeacherId)
                     : teachersForModule
                         .Where(link => link.ModuleId == moduleId)
-                        .Select(link => link.TeacherId))
-                .Distinct()
-                .Count(teacherId => topic?.DepartmentId is not int departmentId
-                                    || departmentId <= 0
-                                    || teacherDepartmentById.TryGetValue(teacherId, out var teacherDepartmentId)
-                                    && teacherDepartmentId == departmentId);
-        // Навіть аварійний обхід м'якого ліміту не може створювати більше
-        // непотокових занять модуля, ніж є придатних викладачів для теми.
+                        .Select(link => link.TeacherId),
+                    topic)
+                .Count;
+        // Кількість паралельних груп є жорсткою межею навіть для аварійних проходів.
+        // Для непотокових занять додатково враховуємо кількість придатних викладачів.
         int ResourceBoundedSlotGroupLimitForPlacement(
             int courseId,
             int moduleId,
@@ -2477,6 +2487,9 @@ public sealed class TeacherDraftsAutogenService
             }
             return usableTopics.Last();
         }
+        ModuleTopic? SelectPendingOrOverflowTopicForRepair(int groupIdCheck, int moduleIdCheck)
+            => SelectNextTopicInOrder(groupIdCheck, moduleIdCheck)
+               ?? SelectOverflowTopicInOrder(groupIdCheck, moduleIdCheck);
         bool IsOverflowTopicUse(int groupIdCheck, int moduleIdCheck, ModuleTopic topic)
         {
             var limit = GetTopicUsageLimit(topic);
@@ -2771,6 +2784,11 @@ public sealed class TeacherDraftsAutogenService
             rangeEndDateExclusive);
         int CurrentRangeFactFor(int gid, int mid) =>
             rangeFactMap.TryGetValue((gid, mid), out var used) ? used : 0;
+        int CurrentRangeScheduledHoursFor(int gid, int mid) =>
+            CountLogicalBusyEvents(BusyForGroup(gid).Where(slot =>
+                slot.ModuleId == mid
+                && slot.Date >= rangeStartDate
+                && slot.Date < rangeEndDateExclusive));
         void AddCurrentRangeFact(int gid, int mid)
         {
             var key = (gid, mid);
@@ -2906,10 +2924,12 @@ public sealed class TeacherDraftsAutogenService
             remainingByGroupModule.TryGetValue((gid, mid), out var left) ? left : 0;
         int ManualRangeRemainingFor(int gid, int mid) =>
             hasModuleHourOverrides && moduleHoursByModuleId.TryGetValue(mid, out var hours)
-                ? Math.Max(0, hours - CurrentRangeFactFor(gid, mid))
+                ? Math.Max(0, hours - CurrentRangeScheduledHoursFor(gid, mid))
                 : RemainingFor(gid, mid);
         int PlacementRemainingFor(int gid, int mid) =>
-            RemainingFor(gid, mid);
+            hasModuleHourOverrides
+                ? Math.Min(RemainingFor(gid, mid), ManualRangeRemainingFor(gid, mid))
+                : RemainingFor(gid, mid);
         // Доступ до залишків самостійної роботи.
         int SelfStudyRemaining(int gid, int mid) =>
             selfStudyRemainingByGroupModule.TryGetValue((gid, mid), out var left) ? left : 0;
@@ -3095,13 +3115,13 @@ public sealed class TeacherDraftsAutogenService
                     .ToList();
                 var calendarAdvice = closedCandidateDates.Count == 0
                     ? string.Empty
-                    : $" Створіть робочий CalendarException для курсу або групи на {string.Join(", ", closedCandidateDates.Select(entry => $"{entry.Date:yyyy-MM-dd} (до {entry.SlotCount} пар)"))}.";
+                    : $" Зробіть робочим днем для цього курсу або групи: {string.Join(", ", closedCandidateDates.Select(entry => $"{entry.Date:dd.MM.yyyy} — можна додати до {entry.SlotCount} пар"))}.";
                 AddItem(
                     "calendar-capacity",
-                    "Недостатня сумарна календарна місткість",
+                    "Не вистачає вільного часу в розкладі",
                     missingSlots,
-                    $"Для групи {group.Name} сума годин усіх модулів перевищує доступний календар на {missingSlots} пар.{calendarAdvice} Або розширте діапазон чи додайте часові слоти в робочі дні.",
-                    $"{group.Name}: сумарно потрібно {totalRequired}, відкрито {openSlotCount}, бракує {missingSlots}.");
+                    $"Групі {group.Name} потрібно поставити {totalRequired} пар, але у вибраних датах є лише {openSlotCount} вільних місць. Не поміщається {missingSlots} пар.{calendarAdvice} Також можна обрати довший період або додати час до сітки занять у робочі дні.",
+                    $"{group.Name}: потрібно поставити {totalRequired} пар, вільних місць — {openSlotCount}, не поміщається — {missingSlots}.");
             }
 
             foreach (var entry in remainingByGroupModule
@@ -3205,32 +3225,21 @@ public sealed class TeacherDraftsAutogenService
                 }
                 preflightRequiredTeacherHours = Math.Min(required, preflightRequiredTeacherHours);
                 var preflightRequiresTeacher = preflightRequiredTeacherHours > 0;
-                var teacherIds = teachersForModule
-                    .Where(link => link.ModuleId == moduleId)
-                    .Select(link => link.TeacherId)
-                    .Concat(supervisorsForModule
+                var teacherIds = PreferredOrExplicitTeacherPool(
+                    teachersForModule
                         .Where(link => link.ModuleId == moduleId)
-                        .Select(link => link.TeacherId))
-                    .Distinct()
-                    .ToList();
-                if (nextTopic?.DepartmentId is int departmentId && departmentId > 0)
-                {
-                    teacherIds = teacherIds
-                        .Where(teacherId => teacherDepartmentById.TryGetValue(teacherId, out var teacherDepartmentId)
-                                            && teacherDepartmentId == departmentId)
-                        .ToList();
-                }
+                        .Select(link => link.TeacherId)
+                        .Concat(supervisorsForModule
+                            .Where(link => link.ModuleId == moduleId)
+                            .Select(link => link.TeacherId)),
+                    nextTopic);
                 if (preflightRequiresTeacher && teacherIds.Count == 0)
                 {
-                    var departmentHint = nextTopic?.DepartmentId is int topicDepartmentId
-                        && departmentNames.TryGetValue(topicDepartmentId, out var departmentName)
-                        ? $" кафедри <{departmentName}>"
-                        : string.Empty;
                     AddItem(
                         "teacher",
                         "Немає викладачів для модуля",
                         preflightRequiredTeacherHours,
-                        $"Додайте викладача{departmentHint} до модуля <{moduleLabel}>, перевірте кафедру теми або призначте керівника самостійної роботи.",
+                        $"Додайте до модуля <{moduleLabel}> хоча б одного викладача або керівника самостійної роботи. Кафедру викладача можна не вказувати: явний зв'язок із модулем буде використано як резерв.",
                         $"{examplePrefix}: потрібно {preflightRequiredTeacherHours} викладацьких слотів, не знайдено жодного викладача.");
                 }
                 else if (preflightRequiresTeacher)
@@ -3550,6 +3559,12 @@ public sealed class TeacherDraftsAutogenService
             {
                 return false;
             }
+            if (pendingGroups.Count > maxParallelGroupsPerModuleInSlot)
+            {
+                // Коли всі групи не можуть законно ввійти в один слот, не чекаємо
+                // на повний потік і дозволяємо генератору будувати підпотоки.
+                return false;
+            }
 
             var pendingStudents = pendingGroups.Sum(group => group.StudentsCount);
             allowedRoomsByModule.TryGetValue(moduleIdCheck, out var allowedRooms);
@@ -3569,15 +3584,13 @@ public sealed class TeacherDraftsAutogenService
 
             var lessonType = typeById[topic.LessonTypeId];
             var teacherCandidates = lessonType.RequiresTeacher
-                ? teachersForModule
-                    .Where(item => item.ModuleId == moduleIdCheck)
-                    .Select(item => item.TeacherId)
-                    .Distinct()
-                    .Where(teacherId => topic.DepartmentId is not int departmentId
-                                        || departmentId <= 0
-                                        || teacherDepartmentById.TryGetValue(teacherId, out var teacherDepartmentId)
-                                        && teacherDepartmentId == departmentId)
-                    .OrderBy(teacherId => teacherId)
+                ? PreferredOrExplicitTeacherPool(
+                        teachersForModule
+                            .Where(item => item.ModuleId == moduleIdCheck)
+                            .Select(item => item.TeacherId),
+                        topic)
+                    .OrderBy(teacherId => TeacherDepartmentPriority(teacherId, topic))
+                    .ThenBy(teacherId => teacherId)
                     .Select(teacherId => (int?)teacherId)
                     .ToList()
                 : new List<int?> { null };
@@ -3699,6 +3712,27 @@ public sealed class TeacherDraftsAutogenService
             return false;
         }
 
+        List<int> ApplyParallelModuleLimitToSharedPack(
+            IReadOnlyList<int> candidateGroupIds,
+            int moduleId,
+            DateOnly date,
+            TimeOnly start,
+            TimeOnly end)
+        {
+            var groupsAlreadyInSlot = CountGroupsWithModuleInSlot(moduleId, date, start, end);
+            var available = Math.Max(0, maxParallelGroupsPerModuleInSlot - groupsAlreadyInSlot);
+            var take = Math.Min(candidateGroupIds.Count, available);
+            if (candidateGroupIds.Count > take
+                && candidateGroupIds.Count - take == 1
+                && take > 2)
+            {
+                // Не залишаємо одиночний лекційний хвіст, якщо потік можна
+                // детерміновано розділити, наприклад 5 груп як 3 + 2.
+                take--;
+            }
+            return candidateGroupIds.Take(take).ToList();
+        }
+
         List<int> BuildPotentialSharedLectureGroupPack(
             IReadOnlyList<Group> courseGroups,
             int moduleId,
@@ -3748,7 +3782,12 @@ public sealed class TeacherDraftsAutogenService
                 result.Add(group.Id);
                 totalStudents += group.StudentsCount;
             }
-            return result;
+            return ApplyParallelModuleLimitToSharedPack(
+                result,
+                moduleId,
+                date,
+                slot.Start,
+                slot.End);
         }
 
         var futureSharedCheckpointReservations = new List<(
@@ -4090,7 +4129,12 @@ public sealed class TeacherDraftsAutogenService
                 result.Add(group.Id);
                 totalStudents += group.StudentsCount;
             }
-            return result;
+            return ApplyParallelModuleLimitToSharedPack(
+                result,
+                moduleId,
+                date,
+                slot.Start,
+                slot.End);
         }
 
         bool TryPreplaceSharedLectureTopic(int courseIdValue, int moduleId, ModuleTopic topic)
@@ -4117,14 +4161,13 @@ public sealed class TeacherDraftsAutogenService
             }
 
             var teacherIds = lessonType.RequiresTeacher
-                ? teachersForModule
-                    .Where(x => x.ModuleId == moduleId)
-                    .Select(x => x.TeacherId)
-                    .Distinct()
-                    .Where(tid => topic.DepartmentId is not int departmentId
-                                  || departmentId <= 0
-                                  || (teacherDepartmentById.TryGetValue(tid, out var teacherDepartment) && teacherDepartment == departmentId))
-                    .OrderBy(tid => TeacherLoadScore(tid, courseIdValue))
+                ? PreferredOrExplicitTeacherPool(
+                        teachersForModule
+                            .Where(x => x.ModuleId == moduleId)
+                            .Select(x => x.TeacherId),
+                        topic)
+                    .OrderBy(tid => TeacherDepartmentPriority(tid, topic))
+                    .ThenBy(tid => TeacherLoadScore(tid, courseIdValue))
                     .ThenBy(tid => tid)
                     .Cast<int?>()
                     .ToList()
@@ -4353,11 +4396,28 @@ public sealed class TeacherDraftsAutogenService
 
                 var remainingGroups = courseGroups
                     .Where(group => remainingGroupIds.Contains(group.Id))
+                    .OrderBy(group => group.StudentsCount)
+                    .ThenBy(group => group.Id)
                     .ToList();
                 if (remainingGroups.Count != remainingGroupIds.Count)
                 {
                     return false;
                 }
+                var completionPackSize = Math.Min(
+                    maxParallelGroupsPerModuleInSlot,
+                    remainingGroups.Count);
+                if (remainingGroups.Count > completionPackSize
+                    && remainingGroups.Count - completionPackSize == 1
+                    && completionPackSize > 2)
+                {
+                    completionPackSize--;
+                }
+                remainingGroups = remainingGroups
+                    .Take(completionPackSize)
+                    .ToList();
+                var completionGroupIds = remainingGroups
+                    .Select(group => group.Id)
+                    .ToList();
                 var requiredCapacity = remainingGroups.Sum(group => group.StudentsCount);
 
                 foreach (var completionDate in DatesBetween(rangeStartDate, rangeEndDateExclusive))
@@ -4389,7 +4449,12 @@ public sealed class TeacherDraftsAutogenService
                                 completionDate,
                                 completionSlot,
                                 completionSlots,
-                                remainingGroupIds.ToList()))
+                                completionGroupIds)
+                            || CountGroupsWithModuleInSlot(
+                                moduleId,
+                                completionDate,
+                                completionSlot.Start,
+                                completionSlot.End) + completionGroupIds.Count > maxParallelGroupsPerModuleInSlot)
                         {
                             continue;
                         }
@@ -4418,9 +4483,6 @@ public sealed class TeacherDraftsAutogenService
                                                                  && completionSlot.Start == reservedSlot.Start
                                                                  && completionSlot.End == reservedSlot.End;
                                 if (overlapsReservedOccurrence
-                                    && (completionRoom.Id == reservedRoomId
-                                        || completionTeacherId is int completionTeacher
-                                        && reservedTeacherId == completionTeacher)
                                     || HasRoomOverlap(
                                         completionRoom.Id,
                                         topic.LessonTypeId,
@@ -4451,7 +4513,7 @@ public sealed class TeacherDraftsAutogenService
                                         completionDate,
                                         completionSlot.Start,
                                         completionSlot.End,
-                                        remainingGroupIds.ToList(),
+                                        completionGroupIds,
                                         out _))
                                 {
                                     continue;
@@ -4544,10 +4606,6 @@ public sealed class TeacherDraftsAutogenService
                                 ? BuildPotentialSharedLectureGroupPack(courseGroups, moduleId, topic, room, date, slot)
                                 : BuildSharedLectureGroupPack(courseGroups, moduleId, topic, room, date, slot);
                             if (pack.Count < 2)
-                            {
-                                continue;
-                            }
-                            if (reserveFutureCheckpoint && pack.Count != pendingTopicGroups.Count)
                             {
                                 continue;
                             }
@@ -4857,13 +4915,12 @@ public sealed class TeacherDraftsAutogenService
                     }
 
                     var feasibleTeachers = lessonType.RequiresTeacher
-                        ? teacherIds.Where(teacherId =>
-                            (topic?.DepartmentId is not int departmentId
-                             || departmentId <= 0
-                             || teacherDepartmentById.TryGetValue(teacherId, out var teacherDepartmentId)
-                             && teacherDepartmentId == departmentId)
-                            && TeacherFitsWorkingHours(teacherId, placementDate, slot.Start, slot.End)
-                            && !HasTeacherOverlap(teacherId, lessonTypeId, placementDate, slot.Start, slot.End))
+                        ? PreferredOrExplicitTeacherPool(
+                                teacherIds.Where(teacherId =>
+                                TeacherFitsWorkingHours(teacherId, placementDate, slot.Start, slot.End)
+                                && !HasTeacherOverlap(teacherId, lessonTypeId, placementDate, slot.Start, slot.End)),
+                                topic)
+                            .OrderBy(teacherId => TeacherDepartmentPriority(teacherId, topic))
                             .Select(teacherId => (int?)teacherId)
                             .ToList()
                         : new List<int?> { null };
@@ -5482,6 +5539,11 @@ public sealed class TeacherDraftsAutogenService
             // Додає попередження щодо порожнього слоту.
             void WarnGap(DateOnly date, TimeSlot gap)
             {
+                if (!remainingByGroupModule.Any(entry => entry.Key.GroupId == grp.Id && entry.Value > 0))
+                {
+                    // Вільний календарний слот не є помилкою, якщо всі задані години групи вже розміщено.
+                    return;
+                }
                 var label = $"{gap.Start:HH\\:mm}-{gap.End:HH\\:mm}";
                 var key = (grp.Id, date, gap.Start, gap.End);
                 if (gapWarnings.Add(key))
@@ -6026,7 +6088,12 @@ public sealed class TeacherDraftsAutogenService
                     var altRequiresTeacher = !typeById.TryGetValue(altLtId, out var altLessonType)
                                              || altLessonType.RequiresTeacher;
                     var altTeacherCandidates = altTids.Count > 0
-                        ? altTids.Select(teacherId => (int?)teacherId).ToList()
+                        ? PreferredOrExplicitTeacherPool(
+                                altTids.Where(teacherId => TeacherFitsWorkingHours(teacherId, date, start, end)),
+                                altTopic)
+                            .OrderBy(teacherId => TeacherDepartmentPriority(teacherId, altTopic))
+                            .Select(teacherId => (int?)teacherId)
+                            .ToList()
                         : altRequiresTeacher
                             ? new List<int?>()
                             : new List<int?> { null };
@@ -6046,14 +6113,6 @@ public sealed class TeacherDraftsAutogenService
                                 && BlocksTeacherSlot(x.LessonTypeId))
                             && x.StartTime < end && start < x.EndTime);
                         if (peopleBusy) continue;
-                        if (altTopic?.DepartmentId is int altDepId
-                            && altDepId > 0
-                            && (tid is not int teacherForDepartment
-                                || !teacherDepartmentById.TryGetValue(teacherForDepartment, out var teacherDep)
-                                || teacherDep != altDepId))
-                        {
-                            continue;
-                        }
                         var altSlotGroupLimit = SlotGroupLimitForPlacement(grp.CourseId, altLtId, altSelfStudy);
                         if (CountGroupsWithModuleInSlot(altModuleId, date, start, end) >= altSlotGroupLimit) continue;
                         var requiresRoom = (typeById.TryGetValue(altLtId, out var ltMetaAlt) ? ltMetaAlt.RequiresRoom : (bool?)null) ?? true;
@@ -6171,7 +6230,9 @@ public sealed class TeacherDraftsAutogenService
                 }
                 var averageGroupSize = Math.Max(1, (int)Math.Ceiling(sameCourseGroups.Average(x => x.StudentsCount)));
                 var remainingCapacity = Math.Max(0, room.Capacity - sharedStudents);
-                var remainingGroupSlots = Math.Max(0, sameCourseGroups.Count - totalSharedGroupCount);
+                var remainingGroupSlots = Math.Max(
+                    0,
+                    maxParallelGroupsPerModuleInSlot - totalSharedGroupCount);
                 return Math.Min(remainingGroupSlots, remainingCapacity / averageGroupSize);
             }
             // Додає дефіцитний пріоритет до аудиторій:
@@ -6351,7 +6412,12 @@ public sealed class TeacherDraftsAutogenService
                     sharedGroupIds.Add(otherGroup.Id);
                     totalStudents += otherGroup.StudentsCount;
                 }
-                return sharedGroupIds;
+                return ApplyParallelModuleLimitToSharedPack(
+                    sharedGroupIds,
+                    moduleId,
+                    date,
+                    start,
+                    end);
             }
             bool HasFeasiblePendingShareablePartner(int moduleId, ModuleTopic? topic)
             {
@@ -7187,7 +7253,6 @@ public sealed class TeacherDraftsAutogenService
                         preferredFirstWeekBalancePenalty = 34.0 * preferredFirstPenaltyMultiplier;
                         preferredFirstWeekBalanceNote = "Тип з прапорцем \"Бажано першим у тижні\" поставлено раніше тижневого балансу, щоб не лишати порожній слот";
                     }
-                    // Лекційні потоки лімітуємо кількістю вибраних груп курсу, а не фіксованою стелею.
                     if (!isSelfStudyPlacement
                         && topicSelection is not null
                         && CanShareAcrossGroups(ltypeId)
@@ -7199,7 +7264,7 @@ public sealed class TeacherDraftsAutogenService
                             $"Спільну лекційну тему {topicSelection.TopicCode} модуля <{ModuleLabel()}> відкладено, доки всі вибрані групи курсу дійдуть до неї за порядком тем.");
                         continue;
                     }
-                    // На ранніх проходах ліміт розподіляє модуль між слотами, але не має створювати штучний дефіцит.
+                    // Межа паралельних груп однакова для основних і відновлювальних проходів.
                     var preselectedSlotGroupLimit = ResourceBoundedSlotGroupLimitForPlacement(
                         grp.CourseId,
                         moduleId,
@@ -7276,27 +7341,11 @@ public sealed class TeacherDraftsAutogenService
                     }
                     // Для необов'язкового викладача зберігаємо явний зв'язок, а без нього використовуємо null-кандидата.
                     var requiresTeacher = (typeById.TryGetValue(ltypeId, out var ltMetaForFallback) ? ltMetaForFallback.RequiresTeacher : (bool?)null) ?? true;
-                    var mappedTeacherIds = tids;
-                    if (topicSelection?.DepartmentId is int departmentId
-                        && departmentId > 0)
-                    {
-                        mappedTeacherIds = tids
-                            .Where(tid => teacherDepartmentById.TryGetValue(tid, out var depId) && depId == departmentId)
-                            .ToList();
-                        if (requiresTeacher && mappedTeacherIds.Count == 0)
-                        {
-                            var depName = departmentNames.TryGetValue(departmentId, out var dn) ? dn : $"#{departmentId}";
-                            var topicCode = string.IsNullOrWhiteSpace(topicSelection.TopicCode) ? null : topicSelection.TopicCode.Trim();
-                            var reason = topicCode is null
-                                ? $"Для модуля <{ModuleLabel()}> обрано кафедру \"{depName}\", але немає доступних викладачів цієї кафедри."
-                                : $"Для модуля <{ModuleLabel()}> (тема {topicCode}) обрано кафедру \"{depName}\", але немає доступних викладачів цієї кафедри.";
-                            RecordSlotFailureReason(date, sl, reason);
-                            if (!allowIncompleteDrafts)
-                            {
-                                continue;
-                            }
-                        }
-                    }
+                    var mappedTeacherIds = PreferredOrExplicitTeacherPool(
+                            tids.Where(tid => TeacherFitsWorkingHours(tid, date, s, e)),
+                            topicSelection)
+                        .OrderBy(tid => TeacherDepartmentPriority(tid, topicSelection))
+                        .ToList();
                     List<int?> filteredTeacherIds = mappedTeacherIds.Count > 0
                         ? mappedTeacherIds.Select(teacherId => (int?)teacherId).ToList()
                         : requiresTeacher
@@ -7429,25 +7478,23 @@ public sealed class TeacherDraftsAutogenService
 
                             if (eventRequiresTeacher)
                             {
-                                var eventTeacherCandidates = (resourceEvent.IsSelfStudy
+                                var eventTeacherCandidates = PreferredOrExplicitTeacherPool(
+                                        (resourceEvent.IsSelfStudy
                                         ? supervisorsForModule
                                             .Where(link => link.ModuleId == resourceEvent.ModuleId)
                                             .Select(link => link.TeacherId)
                                         : teachersForModule
                                             .Where(link => link.ModuleId == resourceEvent.ModuleId)
                                             .Select(link => link.TeacherId))
-                                    .Distinct()
-                                    .Where(teacherId => eventTopic?.DepartmentId is not int departmentId
-                                                        || departmentId <= 0
-                                                        || teacherDepartmentById.TryGetValue(teacherId, out var teacherDepartmentId)
-                                                        && teacherDepartmentId == departmentId)
-                                    .Where(teacherId => TeacherFitsWorkingHours(teacherId, date, s, e))
-                                    .Where(teacherId => !BlocksTeacherSlot(resourceEvent.LessonTypeId)
-                                                        || !BusyForTeacherDate(teacherId, date).Any(busySlot =>
-                                                            SlotOverlaps(busySlot, date, s, e)
-                                                            && BlocksTeacherSlot(busySlot.LessonTypeId)
-                                                            && !BelongsToRematchableDraft(busySlot)))
-                                    .OrderBy(teacherId => teacherId)
+                                        .Where(teacherId => TeacherFitsWorkingHours(teacherId, date, s, e))
+                                        .Where(teacherId => !BlocksTeacherSlot(resourceEvent.LessonTypeId)
+                                                            || !BusyForTeacherDate(teacherId, date).Any(busySlot =>
+                                                                SlotOverlaps(busySlot, date, s, e)
+                                                                && BlocksTeacherSlot(busySlot.LessonTypeId)
+                                                                && !BelongsToRematchableDraft(busySlot))),
+                                        eventTopic)
+                                    .OrderBy(teacherId => TeacherDepartmentPriority(teacherId, eventTopic))
+                                    .ThenBy(teacherId => teacherId)
                                     .ToList();
                                 if (eventTeacherCandidates.Count == 0)
                                 {
@@ -7791,8 +7838,7 @@ public sealed class TeacherDraftsAutogenService
                                     continue;
                                 }
                                 var groupsWithModuleInSlot = CountGroupsWithModuleInSlot(moduleId, date, s, e);
-                                if (allowJoinExistingSharedLecture
-                                    && groupsWithModuleInSlot + newSharedGroupIds.Count > MaxSharedLectureGroupsForCourse(grp.CourseId))
+                                if (groupsWithModuleInSlot + newSharedGroupIds.Count > maxParallelGroupsPerModuleInSlot)
                                 {
                                     continue;
                                 }
@@ -8689,13 +8735,6 @@ public sealed class TeacherDraftsAutogenService
                     }
                     return lessonTypeId != 0;
                 }
-                // Перевіряє відповідність кафедри теми викладачу.
-                bool TeacherMatchesTopicDepartment(ModuleTopic? topicSelection, int teacherId)
-                {
-                    return topicSelection?.DepartmentId is not int departmentId
-                           || departmentId <= 0
-                           || (teacherDepartmentById.TryGetValue(teacherId, out var teacherDepartment) && teacherDepartment == departmentId);
-                }
                 // Грубо оцінює, скільки викладачів реально доступні для модуля в конкретному порожньому слоті.
                 int CountFeasibleTeacherOptionsForGap(
                     TimeSlot gap,
@@ -8710,18 +8749,17 @@ public sealed class TeacherDraftsAutogenService
                         return 1;
                     }
                     int count = 0;
-                    var teacherIds = (isSelfStudyPlacement
+                    var teacherIds = PreferredOrExplicitTeacherPool(
+                            (isSelfStudyPlacement
                             ? supervisorsForModule.Where(x => x.ModuleId == moduleId).Select(x => x.TeacherId)
                             : teachersForModule.Where(x => x.ModuleId == moduleId).Select(x => x.TeacherId))
-                        .Distinct()
+                            .Where(teacherId => TeacherFitsWorkingHours(teacherId, date, gap.Start, gap.End))
+                            .Where(teacherId => !HasTeacherOverlap(teacherId, lessonTypeId, date, gap.Start, gap.End)),
+                            topicSelection)
                         .OrderBy(id => TeacherLoadPenalty(id))
                         .ThenBy(id => id);
                     foreach (var teacherId in teacherIds)
                     {
-                        if (!TeacherMatchesTopicDepartment(topicSelection, teacherId))
-                        {
-                            continue;
-                        }
                         if (!TeacherFitsWorkingHours(teacherId, date, gap.Start, gap.End))
                         {
                             continue;
@@ -10188,16 +10226,21 @@ public sealed class TeacherDraftsAutogenService
                         var requiresRoom = (typeById.TryGetValue(candidate.LessonTypeId, out typeMeta)
                             ? typeMeta.RequiresRoom
                             : (bool?)null) ?? true;
-                        var teacherCandidates = teachersForModule
-                            .Where(entry => entry.ModuleId == candidate.ModuleId)
-                            .Select(entry => (int?)entry.TeacherId)
-                            .Distinct()
-                            .Where(teacherId => topic.DepartmentId is not int departmentId
-                                                || departmentId <= 0
-                                                || teacherId is int resolvedTeacherId
-                                                && teacherDepartmentById.TryGetValue(resolvedTeacherId, out var teacherDepartmentId)
-                                                && teacherDepartmentId == departmentId)
-                            .OrderBy(teacherId => teacherId == candidate.TeacherId ? 0 : 1)
+                        var teacherCandidates = PreferredOrExplicitTeacherPool(
+                                teachersForModule
+                                    .Where(entry => entry.ModuleId == candidate.ModuleId)
+                                    .Select(entry => entry.TeacherId)
+                                    .Where(teacherId => TeacherFitsWorkingHours(
+                                        teacherId,
+                                        targetDate,
+                                        targetSlot.Start,
+                                        targetSlot.End)),
+                                topic)
+                            .Select(teacherId => (int?)teacherId)
+                            .OrderBy(teacherId => teacherId is int resolvedTeacherId
+                                ? TeacherDepartmentPriority(resolvedTeacherId, topic)
+                                : 0)
+                            .ThenBy(teacherId => teacherId == candidate.TeacherId ? 0 : 1)
                             .ThenBy(teacherId => teacherId is int resolvedTeacherId ? TeacherLoadPenalty(resolvedTeacherId) : 0)
                             .ThenBy(teacherId => teacherId)
                             .ToList();
@@ -10646,20 +10689,25 @@ public sealed class TeacherDraftsAutogenService
                                             : null;
                                         var requiresTeacher = lessonType?.RequiresTeacher ?? true;
                                         var requiresRoom = lessonType?.RequiresRoom ?? true;
-                                        var teacherCandidates = (draft.IsSelfStudy
+                                        var teacherCandidates = PreferredOrExplicitTeacherPool(
+                                                (draft.IsSelfStudy
                                                 ? supervisorsForModule
                                                     .Where(link => link.ModuleId == draft.ModuleId)
-                                                    .Select(link => (int?)link.TeacherId)
+                                                    .Select(link => link.TeacherId)
                                                 : teachersForModule
                                                     .Where(link => link.ModuleId == draft.ModuleId)
-                                                    .Select(link => (int?)link.TeacherId))
-                                            .Distinct()
-                                            .Where(teacherId => teacherId is not int resolvedTeacherId
-                                                                || topic.DepartmentId is not int departmentId
-                                                                || departmentId <= 0
-                                                                || teacherDepartmentById.TryGetValue(resolvedTeacherId, out var teacherDepartmentId)
-                                                                && teacherDepartmentId == departmentId)
-                                            .OrderBy(teacherId => teacherId == draft.TeacherId ? 0 : 1)
+                                                    .Select(link => link.TeacherId))
+                                                .Where(teacherId => TeacherFitsWorkingHours(
+                                                    teacherId,
+                                                    gapDate,
+                                                    targetSlot.Start,
+                                                    targetSlot.End)),
+                                                topic)
+                                            .Select(teacherId => (int?)teacherId)
+                                            .OrderBy(teacherId => teacherId is int resolvedTeacherId
+                                                ? TeacherDepartmentPriority(resolvedTeacherId, topic)
+                                                : 0)
+                                            .ThenBy(teacherId => teacherId == draft.TeacherId ? 0 : 1)
                                             .ThenBy(teacherId => teacherId is int resolvedTeacherId
                                                 ? TeacherLoadPenalty(resolvedTeacherId)
                                                 : 0)
@@ -10883,7 +10931,7 @@ public sealed class TeacherDraftsAutogenService
                             .Select(moduleId => new
                             {
                                 ModuleId = moduleId,
-                                PendingTopic = SelectNextTopicInOrder(grp.Id, moduleId)
+                                PendingTopic = SelectPendingOrOverflowTopicForRepair(grp.Id, moduleId)
                             })
                             .Where(entry => entry.PendingTopic is not null
                                             && !CanShareAcrossGroups(entry.PendingTopic.LessonTypeId))
@@ -10956,7 +11004,7 @@ public sealed class TeacherDraftsAutogenService
                             })
                             .Where(entry => entry.Topic is not null
                                             && (constrainedModuleId is null
-                                                || SelectNextTopicInOrder(grp.Id, constrainedModuleId.Value) is { } pendingTopic
+                                                 || SelectPendingOrOverflowTopicForRepair(grp.Id, constrainedModuleId.Value) is { } pendingTopic
                                                 && entry.Topic.Order <= pendingTopic.Order))
                             .OrderBy(entry => allowEarlierTopLevelBlocker
                                               && CompareSlotPosition(
@@ -11129,7 +11177,7 @@ public sealed class TeacherDraftsAutogenService
                                 .Select(moduleId => new
                                 {
                                     ModuleId = moduleId,
-                                    PendingTopic = SelectNextTopicInOrder(grp.Id, moduleId),
+                                    PendingTopic = SelectPendingOrOverflowTopicForRepair(grp.Id, moduleId),
                                     BlockerCount = movableDrafts.Count(candidate =>
                                         candidate.GroupId == grp.Id
                                         && candidate.ModuleId == moduleId
@@ -13003,31 +13051,29 @@ public sealed class TeacherDraftsAutogenService
                         ? resolvedTopic
                         : null;
                     var teacherCandidates = lessonType.RequiresTeacher
-                        ? (draft.IsSelfStudy
+                        ? PreferredOrExplicitTeacherPool(
+                                (draft.IsSelfStudy
                                 ? supervisorsForModule
                                     .Where(link => link.ModuleId == draft.ModuleId)
                                     .Select(link => link.TeacherId)
                                 : teachersForModule
                                     .Where(link => link.ModuleId == draft.ModuleId)
                                     .Select(link => link.TeacherId))
-                            .Distinct()
-                            .Where(teacherId => topic?.DepartmentId is not int departmentId
-                                                || departmentId <= 0
-                                                || teacherDepartmentById.TryGetValue(teacherId, out var teacherDepartmentId)
-                                                && teacherDepartmentId == departmentId)
-                            .Where(teacherId => TeacherFitsWorkingHours(
-                                teacherId,
-                                date,
-                                draft.StartTime,
-                                draft.EndTime))
-                            .Where(teacherId => !BlocksTeacherSlot(draft.LessonTypeId)
-                                                || !HasTeacherOverlap(
-                                                    teacherId,
-                                                    draft.LessonTypeId,
-                                                    date,
-                                                    draft.StartTime,
-                                                    draft.EndTime))
-                            .OrderBy(teacherId => teacherId == draft.TeacherId ? 0 : 1)
+                                .Where(teacherId => TeacherFitsWorkingHours(
+                                    teacherId,
+                                    date,
+                                    draft.StartTime,
+                                    draft.EndTime))
+                                .Where(teacherId => !BlocksTeacherSlot(draft.LessonTypeId)
+                                                    || !HasTeacherOverlap(
+                                                        teacherId,
+                                                        draft.LessonTypeId,
+                                                        date,
+                                                        draft.StartTime,
+                                                        draft.EndTime)),
+                                topic)
+                            .OrderBy(teacherId => TeacherDepartmentPriority(teacherId, topic))
+                            .ThenBy(teacherId => teacherId == draft.TeacherId ? 0 : 1)
                             .ThenBy(teacherId => TeacherLoadScore(teacherId, group.CourseId) * teacherLoadPenaltyWeight)
                             .ThenBy(teacherId => teacherId)
                             .Select(teacherId => (int?)teacherId)
@@ -13389,12 +13435,7 @@ public sealed class TeacherDraftsAutogenService
                                                     targetSlot.StartTime,
                                                     targetSlot.EndTime))
                             .OrderBy(teacherId => teacherId == draft.TeacherId ? 0 : 1)
-                            .ThenBy(teacherId => topic?.DepartmentId is not int departmentId
-                                                 || departmentId <= 0
-                                                 || teacherDepartmentById.TryGetValue(teacherId, out var teacherDepartmentId)
-                                                 && teacherDepartmentId == departmentId
-                                ? 0
-                                : 1)
+                            .ThenBy(teacherId => TeacherDepartmentPriority(teacherId, topic))
                             .ThenBy(teacherId => TeacherLoadScore(teacherId, draftGroup.CourseId) * teacherLoadPenaltyWeight)
                             .ThenBy(teacherId => teacherId)
                             .ToList();
@@ -13404,10 +13445,7 @@ public sealed class TeacherDraftsAutogenService
                             break;
                         }
                         var preferredTeacherCandidates = allTeacherCandidates
-                            .Where(teacherId => topic?.DepartmentId is not int departmentId
-                                                || departmentId <= 0
-                                                || teacherDepartmentById.TryGetValue(teacherId, out var teacherDepartmentId)
-                                                && teacherDepartmentId == departmentId)
+                            .Where(teacherId => IsPreferredTeacherForTopic(teacherId, topic))
                             .ToList();
                         if (BlocksTeacherSlot(draft.LessonTypeId))
                         {
@@ -13609,15 +13647,6 @@ public sealed class TeacherDraftsAutogenService
                     var previousRoomId = draft.RoomId;
                     if (assignedTeachers.TryGetValue(eventIndex, out var assignedTeacherId))
                     {
-                        if (draft.ModuleTopicId is int fallbackTopicId
-                            && topicById.TryGetValue(fallbackTopicId, out var fallbackTopic)
-                            && fallbackTopic.DepartmentId is int fallbackDepartmentId
-                            && fallbackDepartmentId > 0
-                            && (!teacherDepartmentById.TryGetValue(assignedTeacherId, out var fallbackTeacherDepartmentId)
-                                || fallbackTeacherDepartmentId != fallbackDepartmentId))
-                        {
-                            warnings.Add($"[{draft.Date:yyyy-MM-dd} {draft.StartTime:HH\\:mm}-{draft.EndTime:HH\\:mm}] Для групи {selectedGroupsById[draft.GroupId].Name} використано явний зв'язок викладача з модулем поза кафедрою теми, тому що для кафедрального пулу повне призначення ресурсів неможливе.");
-                        }
                         draft.TeacherId = assignedTeacherId;
                     }
                     if (assignedRooms.TryGetValue(eventIndex, out var assignedRoomId))
@@ -14517,6 +14546,42 @@ public sealed class TeacherDraftsAutogenService
                 .Distinct(StringComparer.Ordinal)
                 .ToList();
         }
+        foreach (var draft in changedDraftsForValidation
+                     .Where(draft => draft.Status == DraftStatus.Draft
+                                     && _db.Entry(draft).State is not EntityState.Deleted and not EntityState.Detached)
+                     .OrderBy(draft => draft.Date)
+                     .ThenBy(draft => draft.StartTime)
+                     .ThenBy(draft => draft.GroupId))
+        {
+            if (draft.TeacherId is not int teacherId
+                || draft.ModuleTopicId is not int topicId
+                || !topicById.TryGetValue(topicId, out var topic)
+                || !IsDepartmentFallbackTeacher(teacherId, topic))
+            {
+                continue;
+            }
+
+            var groupLabel = selectedGroupsById.TryGetValue(draft.GroupId, out var group)
+                ? group.Name
+                : $"#{draft.GroupId}";
+            warnings.Add(
+                $"[{draft.Date:yyyy-MM-dd} {draft.StartTime:HH\\:mm}-{draft.EndTime:HH\\:mm}] Для групи {groupLabel} використано явний зв'язок викладача з модулем поза кафедрою теми, тому що кафедральний викладач не дозволяв скласти повне призначення.");
+        }
+        var normalizedGapDetails = gapDetails
+            .GroupBy(gap => gap.GroupId)
+            .SelectMany(group =>
+            {
+                var missingHours = remainingByGroupModule
+                    .Where(entry => entry.Key.GroupId == group.Key)
+                    .Sum(entry => Math.Max(0, entry.Value));
+                return group
+                    .OrderBy(gap => gap.Date)
+                    .ThenBy(gap => gap.Start)
+                    .Take(missingHours);
+            })
+            .ToList();
+        gapDetails.Clear();
+        gapDetails.AddRange(normalizedGapDetails);
         if (gapDetails.Count > 0)
         {
             var reasonSummary = gapDetails
@@ -14556,6 +14621,21 @@ public sealed class TeacherDraftsAutogenService
                 $"Створено {incompleteDraftsCreated} неповних чернеток: без викладача — {incompleteMissingTeacherCount}, без аудиторії — {incompleteMissingRoomCount}, без обох призначень — {incompleteMissingBothCount}.");
         }
         var finalValidationErrors = await ValidateGeneratedDraftsAsync();
+        if (hasModuleHourOverrides)
+        {
+            foreach (var group in selectedGroupsById.Values.OrderBy(group => group.Id))
+            {
+                foreach (var moduleHours in moduleHoursByModuleId.OrderBy(entry => entry.Key))
+                {
+                    var actualHours = CurrentRangeScheduledHoursFor(group.Id, moduleHours.Key);
+                    if (actualHours > moduleHours.Value)
+                    {
+                        finalValidationErrors.Add(
+                            $"Фінальна перевірка: для групи {group.Name} модуль <{ModuleTitleLabel(moduleHours.Key)}> має {actualHours} пар при заданій межі {moduleHours.Value}.");
+                    }
+                }
+            }
+        }
         var pendingDraftsForSharedValidation = changedDraftsForValidation
             .Select(draft => new TeacherDraftsAutogenPendingDraft(
                 draft.Date,
@@ -14586,7 +14666,8 @@ public sealed class TeacherDraftsAutogenService
                     r.Days,
                     allowIncompleteDrafts,
                     PendingDrafts: coursePendingDrafts,
-                    ExcludedDraftIds: modifiedDraftIdsForValidation),
+                    ExcludedDraftIds: modifiedDraftIdsForValidation,
+                    MaxParallelGroupsPerModuleInSlot: maxParallelGroupsPerModuleInSlot),
                 cancellationToken);
             finalValidationErrors.AddRange(sharedHardRuleValidation.Violations
                 .Select(error => $"Фінальна перевірка: {error}"));

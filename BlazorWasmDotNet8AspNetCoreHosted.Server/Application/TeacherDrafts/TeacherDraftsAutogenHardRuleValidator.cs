@@ -58,10 +58,9 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
                 row.Date,
                 row.CourseId,
                 row.GroupId);
-            var isWeekend = row.Date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday;
-            if (!(calendarOverride ?? !isWeekend))
+            if (calendarOverride == false)
             {
-                violations.Add($"{row.Date:yyyy-MM-dd} {row.GroupName}: заняття створено у неробочий день без явного робочого винятку календаря.");
+                violations.Add($"{row.Date:yyyy-MM-dd} {row.GroupName}: заняття створено у день, який у календарі позначено неробочим.");
             }
 
             if (!request.AllowIncompleteDrafts && !row.IsSelfStudy && row.RequiresTeacher && row.TeacherId is null)
@@ -77,6 +76,10 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
 
         violations.AddRange(await FindTimeSlotViolationsAsync(currentDraftRows, cancellationToken));
         violations.AddRange(await FindTeacherWorkingHourViolationsAsync(currentDraftRows, cancellationToken));
+        if (request.MaxParallelGroupsPerModuleInSlot is int maxParallelGroups && maxParallelGroups > 0)
+        {
+            violations.AddRange(FindParallelModuleSlotViolations(placements, maxParallelGroups));
+        }
         violations.AddRange(FindOverlapViolations(
             "групи",
             placements.GroupBy(row => (Id: row.GroupId, Name: row.GroupName))));
@@ -679,6 +682,37 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
         }
     }
 
+    private static IReadOnlyList<string> FindParallelModuleSlotViolations(
+        IReadOnlyList<PlacementRow> placements,
+        int maxParallelGroups)
+    {
+        var violations = new List<string>();
+        foreach (var moduleDay in placements
+                     .Where(row => !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(row.LessonTypeCode))
+                     .GroupBy(row => new { row.Date, row.ModuleId }))
+        {
+            foreach (var start in moduleDay.Select(row => row.Start).Distinct().OrderBy(value => value))
+            {
+                var activeGroups = moduleDay
+                    .Where(row => row.Start <= start && start < row.End)
+                    .GroupBy(row => row.GroupId)
+                    .Select(group => group.First())
+                    .OrderBy(row => row.GroupName, StringComparer.Ordinal)
+                    .ToList();
+                if (activeGroups.Count <= maxParallelGroups)
+                {
+                    continue;
+                }
+
+                var end = activeGroups.Min(row => row.End);
+                violations.Add(
+                    $"{moduleDay.Key.Date:yyyy-MM-dd} {start:HH\\:mm}-{end:HH\\:mm}: модуль #{moduleDay.Key.ModuleId} одночасно поставлено для {activeGroups.Count} груп ({string.Join(", ", activeGroups.Select(row => row.GroupName))}), дозволено не більше {maxParallelGroups}.");
+            }
+        }
+
+        return violations;
+    }
+
     private static IEnumerable<PlacementRow> CollapseSharedFlowPlacements(IEnumerable<PlacementRow> rows)
     {
         foreach (var row in rows.Where(row => !CanShareAcrossGroups(row)))
@@ -1102,7 +1136,8 @@ public sealed record TeacherDraftsAutogenHardRuleValidationRequest(
     DraftStatus DraftStatus = DraftStatus.Draft,
     IReadOnlyCollection<TeacherDraftsAutogenPendingDraft>? PendingDrafts = null,
     IReadOnlyCollection<int>? ExcludedDraftIds = null,
-    bool IncludeStoredDrafts = true);
+    bool IncludeStoredDrafts = true,
+    int? MaxParallelGroupsPerModuleInSlot = null);
 
 public sealed record TeacherDraftsAutogenPendingDraft(
     DateOnly Date,

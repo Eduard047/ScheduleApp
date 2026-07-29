@@ -127,6 +127,169 @@ public sealed class TeacherDraftsAutogenServiceRegressionTests
         Assert.Empty(firstRun.IncompleteDraftIds);
     }
 
+    [Fact]
+    public async Task Teacher_without_department_is_used_when_topic_department_is_missing()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var generationDate = new DateOnly(2026, 9, 7);
+        var data = await fixture.SeedCurriculumProgressScenarioAsync(
+            generationDate,
+            academicPeriodStartDate: new DateOnly(2026, 9, 1),
+            targetHours: 1,
+            topicHours: 1);
+
+        var action = await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(
+            BuildCurriculumProgressRequest(data));
+
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+        Assert.Equal(1, result.Created);
+        var generated = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .SingleAsync(item => item.Date == generationDate);
+        Assert.Equal(data.TeacherId, generated.TeacherId);
+        Assert.Null(await fixture.Db.Teachers
+            .Where(item => item.Id == data.TeacherId)
+            .Select(item => item.DepartmentId)
+            .SingleAsync());
+        Assert.Null(await fixture.Db.ModuleTopics
+            .Where(item => item.Id == data.TopicId)
+            .Select(item => item.DepartmentId)
+            .SingleAsync());
+    }
+
+    [Fact]
+    public async Task Teacher_without_department_is_used_as_explicit_module_fallback_for_department_topic()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var generationDate = new DateOnly(2026, 9, 7);
+        var data = await fixture.SeedCurriculumProgressScenarioAsync(
+            generationDate,
+            academicPeriodStartDate: new DateOnly(2026, 9, 1),
+            targetHours: 1,
+            topicHours: 1);
+        var department = new Department { Name = "Кафедра теми" };
+        fixture.Db.Departments.Add(department);
+        await fixture.Db.SaveChangesAsync();
+        var topic = await fixture.Db.ModuleTopics.SingleAsync(item => item.Id == data.TopicId);
+        topic.DepartmentId = department.Id;
+        await fixture.Db.SaveChangesAsync();
+
+        var action = await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(
+            BuildCurriculumProgressRequest(data));
+
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+        Assert.Equal(1, result.Created);
+        var generated = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .SingleAsync(item => item.Date == generationDate);
+        Assert.Equal(data.TeacherId, generated.TeacherId);
+        Assert.Contains(
+            result.Warnings,
+            warning => warning.Contains("поза кафедрою теми", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Department_teacher_is_preferred_before_teacher_without_department()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var generationDate = new DateOnly(2026, 9, 7);
+        var data = await fixture.SeedCurriculumProgressScenarioAsync(
+            generationDate,
+            academicPeriodStartDate: new DateOnly(2026, 9, 1),
+            targetHours: 1,
+            topicHours: 1);
+        var department = new Department { Name = "Кафедра теми" };
+        var departmentTeacher = new Teacher
+        {
+            FullName = "Викладач кафедри теми",
+            Department = department
+        };
+        var module = await fixture.Db.Modules.SingleAsync(item => item.Id == data.ModuleId);
+        var topic = await fixture.Db.ModuleTopics.SingleAsync(item => item.Id == data.TopicId);
+        topic.Department = department;
+        fixture.Db.AddRange(
+            departmentTeacher,
+            new TeacherModule
+            {
+                Teacher = departmentTeacher,
+                Module = module
+            },
+            new TeacherWorkingHour
+            {
+                Teacher = departmentTeacher,
+                DayOfWeek = generationDate.DayOfWeek,
+                Start = data.Start,
+                End = data.End
+            });
+        await fixture.Db.SaveChangesAsync();
+
+        var action = await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(
+            BuildCurriculumProgressRequest(data));
+
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+        Assert.Equal(1, result.Created);
+        var generated = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .SingleAsync(item => item.Date == generationDate);
+        Assert.Equal(departmentTeacher.Id, generated.TeacherId);
+        Assert.DoesNotContain(
+            result.Warnings,
+            warning => warning.Contains("поза кафедрою теми", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Teacher_without_department_is_used_when_department_teacher_does_not_work_in_slot()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var generationDate = new DateOnly(2026, 9, 7);
+        var data = await fixture.SeedCurriculumProgressScenarioAsync(
+            generationDate,
+            academicPeriodStartDate: new DateOnly(2026, 9, 1),
+            targetHours: 1,
+            topicHours: 1);
+        var department = new Department { Name = "Кафедра теми" };
+        var unavailableDepartmentTeacher = new Teacher
+        {
+            FullName = "Недоступний викладач кафедри",
+            Department = department
+        };
+        var module = await fixture.Db.Modules.SingleAsync(item => item.Id == data.ModuleId);
+        var topic = await fixture.Db.ModuleTopics.SingleAsync(item => item.Id == data.TopicId);
+        topic.Department = department;
+        fixture.Db.AddRange(
+            unavailableDepartmentTeacher,
+            new TeacherModule
+            {
+                Teacher = unavailableDepartmentTeacher,
+                Module = module
+            },
+            new TeacherWorkingHour
+            {
+                Teacher = unavailableDepartmentTeacher,
+                DayOfWeek = DayOfWeek.Tuesday,
+                Start = data.Start,
+                End = data.End
+            });
+        await fixture.Db.SaveChangesAsync();
+
+        var action = await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(
+            BuildCurriculumProgressRequest(data));
+
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+        Assert.Equal(1, result.Created);
+        var generated = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .SingleAsync(item => item.Date == generationDate);
+        Assert.Equal(data.TeacherId, generated.TeacherId);
+        Assert.Contains(
+            result.Warnings,
+            warning => warning.Contains("поза кафедрою теми", StringComparison.OrdinalIgnoreCase));
+    }
+
     [Theory]
     [InlineData(true, null)]
     [InlineData(false, "protected-sync-batch")]
@@ -984,6 +1147,7 @@ public sealed class TeacherDraftsAutogenServiceRegressionTests
         int ModuleId,
         int TopicId,
         int LessonTypeId,
+        int TeacherId,
         DateOnly GenerationDate,
         TimeOnly Start,
         TimeOnly End);
@@ -1332,6 +1496,7 @@ public sealed class TeacherDraftsAutogenServiceRegressionTests
                 module.Id,
                 topic.Id,
                 lessonType.Id,
+                teacher.Id,
                 generationDate,
                 start,
                 end);

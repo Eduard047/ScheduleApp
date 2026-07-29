@@ -95,15 +95,15 @@ else
                     <button class="btn btn-outline-primary" @onclick="AutoGenDrafts" disabled="@(!CanAutoGen || IsAutoGenBusy)">
                         Автогенерація (у чернетки)
                     </button>
-                    <button class="btn btn-outline-info" @onclick="CheckAutoGenResources" disabled="@(!CanAutoGen || IsAutoGenBusy)">
+                    <button class="btn btn-autogen-check" @onclick="CheckAutoGenResources" disabled="@(!CanAutoGen || IsAutoGenBusy)">
                         Перевірити ресурси
                     </button>
                     <button class="btn btn-outline-secondary" @onclick="FillWeekDrafts" disabled="@(!CanAutoGen || IsAutoGenBusy)">
-                        Заповнити порожні слоти
+                        Дозаповнити відсутні пари
                     </button>
                     @if (_latestRollbackableAutoGenPlan?.CanRollback == true)
                     {
-                        <button class="btn btn-outline-warning" @onclick="RollbackLatestAutoGenPlanAsync" disabled="@IsAutoGenBusy">
+                        <button class="btn btn-autogen-rollback" @onclick="RollbackLatestAutoGenPlanAsync" disabled="@IsAutoGenBusy">
                             Відкотити останнє застосування
                         </button>
                     }
@@ -202,7 +202,7 @@ else
                                 Активний профіль: <strong>@RecommendedAutoGenProfileName</strong>.
                                 Для автогенерації застосовується override ліміту "бажано першим" = @RecommendedPreferredFirstMaxSlotOrderOverride.
                                 Для дозаповнення використовується вікно близьких повторів @RecommendedSoftFillRepeatWindowDays день,
-                                ліміт паралельних груп @RecommendedSoftFillMaxParallelGroupsPerModuleInSlot
+                                не більше @RecommendedSoftFillMaxParallelGroupsPerModuleInSlot груп одного модуля одночасно,
                                 межа різних модулів @RecommendedSoftFillPreferredMaxDistinctModulesPerDay/@RecommendedSoftFillMaxDistinctModulesPerDay
                                 і нульові м'які штрафи за навантаження викладача та зміну корпусу.
                             </span>
@@ -369,15 +369,21 @@ else
                     </div>
                 </div>
                 <div class="mt-3">
-                    <div class="fw-semibold mb-2">Модулі та години на тиждень</div>
+                    @{
+                        var moduleWeekTotals = GetModuleWeekTotals();
+                    }
+                    <div class="fw-semibold">Модулі та пари на тиждень</div>
+                    <div class="small text-muted mb-2">
+                        План задається для однієї групи. Факт рахується за @GetLoadedWeekRangeLabel() для всіх вибраних груп разом.
+                    </div>
                     <div class="table-responsive">
                         <table class="table table-sm align-middle mb-0">
                             <thead>
                                 <tr>
                                     <th style="width: 60px;" class="text-center">✓</th>
                                     <th>Модуль</th>
-                                    <th style="width: 140px;" class="text-center">Годин</th>
-                                    <th style="width: 170px;" class="text-center">Згенеровано</th>
+                                    <th style="width: 140px;" class="text-center">Пар на групу</th>
+                                    <th style="width: 190px;" class="text-center">У розкладі та чернетках</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -428,16 +434,27 @@ else
                             </tbody>
                         </table>
                     </div>
-                    <div class="small text-muted mt-2">
-                        Вкажіть, які модулі мають бути на поточному тижні, і скільки годин потрібно згенерувати для обраних груп курсу.
-                        Колонка «Згенеровано» показує чернетки поточного завантаженого тижня для вибраних груп.
-                    </div>
+                    @if (moduleWeekTotals.Planned > 0)
+                    {
+                        <div class="module-week-total @(moduleWeekTotals.Missing > 0 ? "module-week-total--missing" : "module-week-total--complete")">
+                            <span>Разом за @GetLoadedWeekRangeLabel():</span>
+                            <strong>@moduleWeekTotals.Scheduled із @moduleWeekTotals.Planned пар</strong>
+                            @if (moduleWeekTotals.Missing > 0)
+                            {
+                                <span>Ще не вистачає @moduleWeekTotals.Missing пар.</span>
+                            }
+                            else
+                            {
+                                <span>План виконано.</span>
+                            }
+                        </div>
+                    }
                 </div>
             }
             else
             {
                 <div class="small text-muted mt-2">
-                    Оберіть курс, щоб налаштувати модулі та години для автогенерації в обраному діапазоні.
+                    Оберіть курс, щоб налаштувати модулі та кількість пар для автогенерації в обраному діапазоні.
                 </div>
             }
             <div class="small text-muted mt-2">
@@ -447,7 +464,7 @@ else
         </div>
         @if (!string.IsNullOrWhiteSpace(ok))
         {
-            <div class="alert @AutoGenOutcomeAlertCssClass mt-3">
+            <div class="alert autogen-result-alert @AutoGenOutcomeAlertCssClass mt-3">
                 <div class="d-flex flex-column gap-2">
                     @{
                         var warningsTotal = _latestWarningDetails.Count;
@@ -571,7 +588,7 @@ else
                             @if (gapRows.Count > 0)
                             {
                                 <details class="autogen-detail-panel mt-2">
-                                    <summary>Показати проблемні слоти (@_latestGapDetails.Count)</summary>
+                                    <summary>Показати пари, які не вдалося поставити (@_latestGapDetails.Count)</summary>
                                     <div class="table-responsive mt-2">
                                         <table class="table table-sm align-middle mb-0">
                                             <thead>
@@ -633,7 +650,7 @@ else
                                     @if (!string.IsNullOrWhiteSpace(parsedWarning.Reason))
                                     {
                                         <div class="warning-reason">Причина: @parsedWarning.Reason</div>
-                                        <div class="warning-consequence">Наслідок: слот потрібно заповнити вручну або перерозподілити години.</div>
+                                        <div class="warning-consequence">Наслідок: цю пару потрібно поставити вручну або перерозподілити навчальний час.</div>
                                     }
                                     @if (warningDetail.Context is { Count: > 0 })
                                     {
@@ -1151,7 +1168,7 @@ else
             .Select(group => group.Id)
             .ToHashSet()
            ?? new HashSet<int>();
-    // Рахує, скільки годин модуля вже є у чернетках поточного завантаженого тижня.
+    // Рахує пари модуля в чернетках і опублікованому розкладі поточного завантаженого тижня.
     private (int Generated, int Planned, int Missing, int Over) GetModuleGeneratedHours(ModuleWeekRow row)
     {
         var selectedGroupIds = GetSelectedGroupIds().ToHashSet();
@@ -1164,14 +1181,44 @@ else
         }
         var weekStart = GetMonday(_selectedDate);
         var weekEnd = weekStart.AddDays(6);
-        var generated = tableItems.Count(item =>
-            item.Source == TableItemSource.Draft
-            && item.ModuleId == row.ModuleId
-            && selectedGroupIds.Contains(item.GroupId)
-            && item.Date >= weekStart
-            && item.Date <= weekEnd
-            && !IsServiceLessonType(item.LessonTypeId));
+        var generated = tableItems
+            .Where(item =>
+                item.ModuleId == row.ModuleId
+                && selectedGroupIds.Contains(item.GroupId)
+                && item.Date >= weekStart
+                && item.Date <= weekEnd
+                && !IsServiceLessonType(item.LessonTypeId))
+            .Select(item => (
+                item.Source,
+                item.Date,
+                item.TimeStart,
+                item.TimeEnd,
+                item.GroupId,
+                item.ModuleId,
+                item.LessonTypeId))
+            .Distinct()
+            .Count();
         return (generated, planned, Math.Max(0, planned - generated), Math.Max(0, generated - planned));
+    }
+    // Підсумовує план і фактичну кількість пар усіх вибраних модулів за завантажений тиждень.
+    private (int Scheduled, int Planned, int Missing, int Over) GetModuleWeekTotals()
+    {
+        var total = (Scheduled: 0, Planned: 0, Missing: 0, Over: 0);
+        foreach (var row in _moduleWeekRows.Where(row => row.Selected && row.Hours > 0))
+        {
+            var progress = GetModuleGeneratedHours(row);
+            total.Scheduled += progress.Generated;
+            total.Planned += progress.Planned;
+            total.Missing += progress.Missing;
+            total.Over += progress.Over;
+        }
+        return total;
+    }
+    // Повертає діапазон дат, за яким пораховано факт у таблиці модулів.
+    private string GetLoadedWeekRangeLabel()
+    {
+        var weekStart = GetMonday(_selectedDate);
+        return $"{weekStart:dd.MM.yyyy}–{weekStart.AddDays(6):dd.MM.yyyy}";
     }
     private static string FormatModuleGeneratedHours(int generated, int planned)
         => planned <= 0 ? "—" : $"{generated} / {planned}";
@@ -1615,7 +1662,7 @@ else
         => kind switch
         {
             AutoGenProgressKind.Preflight => "Перевіряємо ресурси",
-            AutoGenProgressKind.Fill => "Заповнюємо порожні слоти",
+            AutoGenProgressKind.Fill => "Дозаповнюємо відсутні пари",
             AutoGenProgressKind.ClearDrafts => "Очищаємо чернетки",
             AutoGenProgressKind.ClearSchedule => "Очищаємо розклад",
             _ => "Генеруємо чернетки"
@@ -1643,7 +1690,7 @@ else
         var deficitCount = result.Preflight?.Sum(item => item.Count) ?? 0;
         if (gapCount > 0)
         {
-            parts.Add($"порожніх слотів {gapCount}");
+            parts.Add($"не вдалося поставити пар: {gapCount}");
         }
         if (deficitCount > 0)
         {
@@ -1872,7 +1919,7 @@ else
         {
             AutoGenWarningSeverities.Error => "text-bg-danger",
             AutoGenWarningSeverities.Info => "text-bg-info",
-            _ => "text-bg-warning"
+            _ => "autogen-warning-badge"
         };
     private static List<string> BuildAutoGenActionItems(
         IReadOnlyList<AutoGenGapSummaryItem> gapSummary,
@@ -1899,15 +1946,15 @@ else
         {
             Add(item.Code switch
             {
-                AutoGenGapReasonCodes.Teacher => $"{item.Count} слотів вперлися у викладачів. Перевірте, чи прив'язані викладачі до цих модулів і чи вільні вони в потрібний час.",
-                AutoGenGapReasonCodes.Room => $"{item.Count} слотів вперлися в аудиторії. Перевірте вільні аудиторії потрібної місткості та дозволені корпуси.",
-                AutoGenGapReasonCodes.Travel => $"{item.Count} слотів не стали через переходи між корпусами. Поставте сусідні пари ближче або збільште перерву.",
-                AutoGenGapReasonCodes.TopicOrder => $"{item.Count} слотів заблокував порядок тем. Перевірте, чи попередні теми вже поставлені і чи не завищено години модуля.",
-                AutoGenGapReasonCodes.ModuleBlock => $"{item.Count} слотів не стали через правило суцільного модуля. Тримайте пари одного модуля поруч або перенесіть зайву пару цього дня.",
-                AutoGenGapReasonCodes.Limit => $"{item.Count} слотів зупинили денні обмеження. Додайте навчальний день/час або зменште кількість годин у вибраному діапазоні.",
-                AutoGenGapReasonCodes.SearchLimit => $"{item.Count} слотів лишилися після досягнення безпечної межі пошуку. Спочатку виправте найвужчі обмеження ресурсів, а потім повторіть генерацію.",
-                AutoGenGapReasonCodes.SharedFlow => $"{item.Count} слотів пов'язані зі спільним потоком. Для груп потоку вирівняйте модуль, тему, викладача й аудиторію.",
-                _ => $"{item.Count} слотів треба перевірити вручну. Почніть з групи, модуля і часу в таблиці нижче."
+                AutoGenGapReasonCodes.Teacher => $"{item.Count} пар не вдалося поставити через викладачів. Перевірте, чи прив'язані викладачі до цих модулів і чи вільні вони в потрібний час.",
+                AutoGenGapReasonCodes.Room => $"{item.Count} пар не вдалося поставити через аудиторії. Перевірте вільні аудиторії потрібної місткості та дозволені корпуси.",
+                AutoGenGapReasonCodes.Travel => $"{item.Count} пар не вдалося поставити через переходи між корпусами. Поставте сусідні пари ближче або збільшіть перерву.",
+                AutoGenGapReasonCodes.TopicOrder => $"{item.Count} пар заблокував порядок тем. Перевірте, чи попередні теми вже поставлені і чи не завищено план модуля.",
+                AutoGenGapReasonCodes.ModuleBlock => $"{item.Count} пар не вдалося поставити через правило суцільного модуля. Тримайте пари одного модуля поруч або перенесіть зайву пару цього дня.",
+                AutoGenGapReasonCodes.Limit => $"{item.Count} пар зупинили денні обмеження. Додайте навчальний день або час чи зменште кількість пар у вибраному діапазоні.",
+                AutoGenGapReasonCodes.SearchLimit => $"{item.Count} пар лишилися після досягнення безпечної межі пошуку. Спочатку виправте найвужчі обмеження ресурсів, а потім повторіть генерацію.",
+                AutoGenGapReasonCodes.SharedFlow => $"{item.Count} пар пов'язані зі спільним потоком. Для груп потоку вирівняйте модуль, тему, викладача й аудиторію.",
+                _ => $"{item.Count} пар треба перевірити вручну. Почніть з групи, модуля і часу в таблиці нижче."
             });
         }
 
@@ -1931,12 +1978,13 @@ else
         var exampleSuffix = string.IsNullOrWhiteSpace(example) ? string.Empty : $" Приклад: {example}";
         return item.Code switch
         {
-            "slot" => $"{item.Count} слотів бракує у сітці груп. Додайте навчальний час або звільніть уже зайняті пари цієї групи.{exampleSuffix}",
-            "teacher" => $"{item.Count} викладацьких слотів бракує. Перевірте прив'язку викладачів до модуля, їх робочі години та зайнятість.{exampleSuffix}",
-            "room" => $"{item.Count} аудиторних слотів бракує. Додайте або звільніть аудиторії потрібної місткості.{exampleSuffix}",
-            "building" => $"{item.Count} слотів заблокували налаштування корпусів. Розширте дозволені корпуси або пріоритетні аудиторії групи.{exampleSuffix}",
-            "travel" => $"{item.Count} слотів відсіяли переходи. Підберіть аудиторії ближче до сусідніх занять або збільшіть перерву.{exampleSuffix}",
-            "topic-order" => $"{item.Count} годин не мають доступних тем. Додайте теми потрібного типу або зменште години модуля.{exampleSuffix}",
+            "calendar-capacity" => $"{item.Count} пар не поміщаються у вибрані дати. У розділі календаря зробіть додатковий день робочим для потрібного курсу або групи. Також можна обрати довший період чи додати час до сітки занять.{exampleSuffix}",
+            "slot" => $"{item.Count} пар бракує у сітці груп. Додайте навчальний час або звільніть уже зайняті пари цієї групи.{exampleSuffix}",
+            "teacher" => $"{item.Count} пар не вдалося поставити через викладачів. Перевірте прив'язку викладачів до модуля, їх робочі години та зайнятість.{exampleSuffix}",
+            "room" => $"{item.Count} пар не вдалося поставити через аудиторії. Додайте або звільніть аудиторії потрібної місткості.{exampleSuffix}",
+            "building" => $"{item.Count} пар заблокували налаштування корпусів. Розширте дозволені корпуси або пріоритетні аудиторії групи.{exampleSuffix}",
+            "travel" => $"{item.Count} пар не вдалося поставити через переходи. Підберіть аудиторії ближче до сусідніх занять або збільшіть перерву.{exampleSuffix}",
+            "topic-order" => $"{item.Count} пар не мають доступних тем. Додайте теми потрібного типу або зменште план модуля.{exampleSuffix}",
             _ => $"{item.Title}: {item.Count}. {item.Recommendation}{exampleSuffix}"
         };
     }
@@ -1978,15 +2026,15 @@ else
     {
         if (gapCount > 0 && deficitCount > 0)
         {
-            return $"Залишилось {gapCount} порожніх слотів і {deficitCount} ресурсних дефіцитів";
+            return $"За останню спробу не вдалося поставити {gapCount} пар; перевірка знайшла {deficitCount} проблем";
         }
         if (gapCount > 0)
         {
-            return $"Залишилось {gapCount} порожніх слотів";
+            return $"За останню спробу не вдалося поставити {gapCount} пар";
         }
         if (deficitCount > 0)
         {
-            return $"Знайдено {deficitCount} ресурсних дефіцитів";
+            return $"Перевірка знайшла {deficitCount} проблем у налаштуваннях";
         }
         if (warningsTotal > 0)
         {
@@ -1994,9 +2042,9 @@ else
         }
         if (report is not null && report.Created > 0)
         {
-            return $"Створено {report.Created} чернеток без порожніх слотів";
+            return $"Створено {report.Created} чернеток, усі запитані пари поставлено";
         }
-        return "Порожніх слотів не залишилось";
+        return "Усі запитані пари вдалося поставити";
     }
 
     private static string BuildAutoGenOutcomeDetail(AutoGenRunReport report)
@@ -2024,8 +2072,12 @@ else
             metrics.Add(new AutoGenOutcomeMetric("Пропущено", report.Skipped.ToString(), "вже існували або були закріплені"));
             metrics.Add(new AutoGenOutcomeMetric("Тижнів", report.TotalWeeks.ToString()));
         }
-        metrics.Add(new AutoGenOutcomeMetric("Порожні слоти", gapCount.ToString(), gapCount > 0 ? "потрібна ручна перевірка" : "не залишились", gapCount > 0));
-        metrics.Add(new AutoGenOutcomeMetric("Дефіцити", deficitCount.ToString(), deficitCount > 0 ? "бракує ресурсу" : "не знайдено", deficitCount > 0));
+        metrics.Add(new AutoGenOutcomeMetric("Не поставлено", gapCount.ToString(), "за останню спробу", gapCount > 0));
+        metrics.Add(new AutoGenOutcomeMetric(
+            "Проблеми в налаштуваннях",
+            deficitCount.ToString(),
+            deficitCount > 0 ? "одна пара може мати кілька причин" : "не знайдено",
+            deficitCount > 0));
         if (warningsTotal > 0)
         {
             metrics.Add(new AutoGenOutcomeMetric("Попередження", warningsTotal.ToString(), "деталі нижче", true));
@@ -2838,12 +2890,12 @@ else
             PreferredFirstMaxSlotOrderOverride: BuildRecommendedPreferredFirstLimitOverride(),
             Title: previewOnly
                 ? softFill
-                    ? "Попередній план заповнення порожніх слотів"
+                    ? "Попередній план дозаповнення відсутніх пар"
                     : "Попередній план автогенерації"
                 : preflightOnly
                 ? "Перевірка ресурсів"
                 : softFill
-                    ? "Заповнення порожніх слотів"
+                    ? "Дозаповнення відсутніх пар"
                     : "Автогенерація у чернетки",
             ClientJobId: clientJobId,
             PreviewOnly: previewOnly
@@ -3106,12 +3158,12 @@ else
             var deficitCount = res.Preflight?.Sum(item => item.Count) ?? 0;
             var gapCount = res.GapDetails?.Count ?? 0;
             var summary = gapCount > 0 || deficitCount > 0
-                ? $"Перевірка ресурсів {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): пробна генерація показала {gapCount} порожніх слотів, ресурсних дефіцитів: {deficitCount}. Чернетки не збережено."
-                : $"Перевірка ресурсів {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): пробна генерація не знайшла порожніх слотів і явних дефіцитів. Чернетки не збережено.";
+                ? $"Перевірка ресурсів {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): не вдалося поставити {gapCount} пар, проблем у налаштуваннях: {deficitCount}. Чернетки не збережено."
+                : $"Перевірка ресурсів {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): усі запитані пари можна поставити, явних проблем у налаштуваннях не знайдено. Чернетки не збережено.";
             summary = finalStatus.State switch
             {
                 AutoGenJobState.Canceled => $"Перевірку ресурсів скасовано для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: перевірено {finalStatus.CompletedWeeks}/{finalStatus.TotalWeeks} тижнів.",
-                AutoGenJobState.Failed => $"Перевірка ресурсів завершилась з помилками для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: порожніх слотів {gapCount}, ресурсних дефіцитів {deficitCount}.",
+                AutoGenJobState.Failed => $"Перевірка ресурсів завершилась з помилками для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: не вдалося поставити {gapCount} пар, проблем у налаштуваннях {deficitCount}.",
                 _ => summary
             };
             await SetOkMessageAsync(summary, res.Warnings, res.GapDetails, res.GapSummary, res.Preflight, finalStatus.Report, res.WarningDetails);
@@ -3132,7 +3184,7 @@ else
             EndAutoGenAction();
         }
     }
-    // Заповнює порожні слоти чернеток на обраному діапазоні.
+    // Дозаповнює відсутні пари в чернетках обраного діапазону.
     private async Task FillWeekDrafts()
     {
         if (!TryBeginAutoGenAction())
@@ -3144,7 +3196,7 @@ else
             await ResetStatusAsync();
             if (_selectedCourseId is not int courseId)
             {
-                error = "Оберіть курс для заповнення порожніх слотів.";
+                error = "Оберіть курс для дозаповнення відсутніх пар.";
                 return;
             }
             var moduleHours = _moduleWeekRows
@@ -3159,12 +3211,12 @@ else
             var selectedGroupIds = GetSelectedGroupIds();
             if (selectedGroupIds.Count == 0)
             {
-                error = "Оберіть хоча б одну групу для заповнення порожніх слотів.";
+                error = "Оберіть хоча б одну групу для дозаповнення відсутніх пар.";
                 return;
             }
             var groupRoomPreferences = BuildSelectedGroupRoomPreferences(selectedGroupIds);
             await PersistAutoGenConfigAsync();
-            await StartAutoGenProgressAsync("Готуємо план заповнення порожніх слотів", AutoGenProgressKind.Fill);
+            await StartAutoGenProgressAsync("Готуємо план дозаповнення відсутніх пар", AutoGenProgressKind.Fill);
             var (res, rangeStartDate, rangeEndDate, _, finalStatus, plan, planChanges) = await PrepareAutoGenPreviewForRangeAsync(
                 courseId,
                 selectedGroupIds,
@@ -3700,7 +3752,7 @@ else
             Id: Guid.NewGuid().ToString("N"),
             Timestamp: DateTimeOffset.Now,
             ActionCode: softFill ? LogActionFill : LogActionAutogen,
-            ActionLabel: softFill ? "Заповнення порожніх слотів" : "Автогенерація (чернетки)",
+            ActionLabel: softFill ? "Дозаповнення відсутніх пар" : "Автогенерація (чернетки)",
             Summary: summary,
             Success: finalState == AutoGenJobState.Succeeded,
             Error: finalState switch

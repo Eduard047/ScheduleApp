@@ -372,10 +372,12 @@ public sealed class AutogenLecturePackingTests
         var result = Assert.IsType<AutoGenResult>(ok.Value);
 
         var capacityItem = Assert.Single(result.Preflight!, item => item.Code == "calendar-capacity");
-        Assert.Equal(3, capacityItem.Count);
-        Assert.Contains("CalendarException", capacityItem.Recommendation, StringComparison.Ordinal);
-        Assert.Contains("2026-05-16", capacityItem.Recommendation, StringComparison.Ordinal);
-        Assert.Equal(5, result.Created);
+        Assert.Equal(2, capacityItem.Count);
+        Assert.Equal("Не вистачає вільного часу в розкладі", capacityItem.Title);
+        Assert.DoesNotContain("Зробіть робочим днем", capacityItem.Recommendation, StringComparison.Ordinal);
+        Assert.Contains("довший період", capacityItem.Recommendation, StringComparison.Ordinal);
+        Assert.DoesNotContain("CalendarException", capacityItem.Recommendation, StringComparison.Ordinal);
+        Assert.Equal(6, result.Created);
         Assert.DoesNotContain(
             result.GapDetails ?? new List<AutoGenGapDetail>(),
             gap => gap.Date == data.RangeEnd);
@@ -384,8 +386,8 @@ public sealed class AutogenLecturePackingTests
             .OrderBy(item => item.Date)
             .Select(item => item.Date)
             .ToListAsync();
-        Assert.Equal(5, persistedDates.Count);
-        Assert.All(persistedDates, date => Assert.True(date < data.RangeEnd));
+        Assert.Equal(6, persistedDates.Count);
+        Assert.Contains(data.RangeEnd, persistedDates);
     }
 
     [Fact]
@@ -401,6 +403,17 @@ public sealed class AutogenLecturePackingTests
         await using var db = new AppDbContext(options);
         await db.Database.EnsureCreatedAsync();
         var data = await SeedTopicOverflowFillScenarioAsync(db);
+        db.TimeSlots.Add(new TimeSlot
+        {
+            Id = 102,
+            CourseId = data.CourseId,
+            DayOfWeek = DayOfWeek.Monday,
+            Start = new TimeOnly(11, 0),
+            End = new TimeOnly(12, 20),
+            SortOrder = 3,
+            IsActive = true
+        });
+        await db.SaveChangesAsync();
 
         var request = new DraftAutoGenRequest(
             WeekStart: data.Date,
@@ -430,6 +443,13 @@ public sealed class AutogenLecturePackingTests
         Assert.All(drafts, item => Assert.Equal(data.TopicId, item.ModuleTopicId));
         Assert.Empty(result.GapDetails ?? new List<AutoGenGapDetail>());
         Assert.Contains(result.Warnings, warning => warning.Contains("повторно використано тему", StringComparison.OrdinalIgnoreCase));
+
+        var refillAction = await service.DraftAutoGen(request with { ClearExisting = false });
+        var refillOk = Assert.IsType<OkObjectResult>(refillAction.Result);
+        var refillResult = Assert.IsType<AutoGenResult>(refillOk.Value);
+        Assert.Equal(0, refillResult.Created);
+        Assert.Equal(2, await db.TeacherDraftItems.CountAsync(item =>
+            item.GroupId == data.GroupId && item.ModuleId == data.ModuleId));
     }
 
     [Fact]
@@ -579,7 +599,7 @@ public sealed class AutogenLecturePackingTests
         db.AddRange(course, module, workType, lectureType, building);
         await db.SaveChangesAsync();
 
-        var groups = Enumerable.Range(1, 7)
+        var groups = Enumerable.Range(1, 4)
             .Select(index => new Group
             {
                 Name = $"CP-{index}",
@@ -587,10 +607,10 @@ public sealed class AutogenLecturePackingTests
                 CourseId = course.Id
             })
             .ToList();
-        var teachers = Enumerable.Range(1, 7)
+        var teachers = Enumerable.Range(1, 4)
             .Select(index => new Teacher { FullName = $"Викладач {index}" })
             .ToList();
-        var rooms = Enumerable.Range(1, 7)
+        var rooms = Enumerable.Range(1, 4)
             .Select(index => new Room
             {
                 Name = $"CP-{index}",
@@ -658,24 +678,30 @@ public sealed class AutogenLecturePackingTests
             .ThenBy(item => item.StartTime)
             .ToListAsync();
 
-        Assert.Equal(21, result.Created);
-        Assert.Equal(21, drafts.Count);
+        Assert.True(
+            result.Created == groups.Count * 3,
+            $"Очікували {groups.Count * 3} створених занять, отримали {result.Created}. Чернетки: {string.Join(" | ", drafts.Select(item => $"{item.GroupId}:{item.StartTime:HH\\:mm} T{item.ModuleTopicId}"))}. Прогалини: {string.Join(" | ", (result.GapDetails ?? new List<AutoGenGapDetail>()).Select(gap => $"{gap.GroupName} {gap.Start:HH\\:mm}: {gap.Reason}"))}. Попередження: {string.Join(" | ", result.Warnings)}");
+        Assert.Equal(groups.Count * 3, drafts.Count);
         Assert.All(drafts.GroupBy(item => item.GroupId), groupDrafts =>
         {
             Assert.Equal(new int?[] { workTopic.Id, workTopic.Id, sharedTopic.Id }, groupDrafts.Select(item => item.ModuleTopicId).ToArray());
         });
         var sharedRows = drafts.Where(item => item.ModuleTopicId == sharedTopic.Id).ToList();
-        Assert.Equal(7, sharedRows.Count);
-        Assert.Single(sharedRows.Select(item => item.RoomId).Distinct());
+        Assert.Equal(groups.Count, sharedRows.Count);
         Assert.All(sharedRows, item => Assert.Equal(rooms[^1].Id, item.RoomId));
-        Assert.Equal(new TimeOnly(11, 0), Assert.Single(sharedRows.Select(item => item.StartTime).Distinct()));
+        var sharedOccurrences = sharedRows
+            .GroupBy(item => new { item.Date, item.StartTime, item.EndTime, item.RoomId, item.TeacherId })
+            .Select(group => group.Select(item => item.GroupId).Distinct().Count())
+            .ToList();
+        Assert.Single(sharedOccurrences);
+        Assert.Equal(groups.Count, sharedOccurrences[0]);
         Assert.Empty(result.GapDetails ?? new List<AutoGenGapDetail>());
         var predecessorRows = drafts.Where(item => item.ModuleTopicId == workTopic.Id).ToList();
         Assert.All(predecessorRows.GroupBy(item => item.StartTime), slotRows =>
         {
-            Assert.Equal(7, slotRows.Count());
-            Assert.Equal(7, slotRows.Select(item => item.TeacherId).Distinct().Count());
-            Assert.Equal(7, slotRows.Select(item => item.RoomId).Distinct().Count());
+            Assert.InRange(slotRows.Count(), 1, 4);
+            Assert.Equal(slotRows.Count(), slotRows.Select(item => item.TeacherId).Distinct().Count());
+            Assert.Equal(slotRows.Count(), slotRows.Select(item => item.RoomId).Distinct().Count());
         });
         Assert.Empty(await TravelInvariantVerifier.FindViolationsAsync(db, course.Id, date, date));
     }
@@ -1139,9 +1165,8 @@ public sealed class AutogenLecturePackingTests
 
         Assert.Equal(data.GroupIds.Count, result.Created);
         Assert.Equal(data.GroupIds.Count, drafts.Select(item => item.GroupId).Distinct().Count());
-        Assert.Equal(2, clusters.Count);
-        Assert.Contains(clusters, cluster => cluster.RoomId == data.BigRoomId && cluster.RoomName == "Актова зала" && cluster.GroupCount == 16 && cluster.Students == 480);
-        Assert.Contains(clusters, cluster => cluster.RoomId == data.SmallRoomId && cluster.RoomName == "5/203" && cluster.GroupCount == 5 && cluster.Students == 150);
+        Assert.InRange(clusters.Count, 6, 7);
+        Assert.All(clusters, cluster => Assert.InRange(cluster.GroupCount, 2, 4));
         Assert.All(clusters, cluster => Assert.True(
             cluster.Students <= cluster.RoomCapacity,
             $"Потік на {cluster.GroupCount} груп має {cluster.Students} слухачів, але аудиторія вміщує лише {cluster.RoomCapacity}."));
@@ -1560,7 +1585,7 @@ public sealed class AutogenLecturePackingTests
     }
 
     [Fact]
-    public async Task Draft_autogen_reports_each_final_empty_slot_once()
+    public async Task Draft_autogen_does_not_report_unused_calendar_capacity_as_gap()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
         await connection.OpenAsync();
@@ -1638,11 +1663,8 @@ public sealed class AutogenLecturePackingTests
             .ToList();
 
         Assert.Equal(reportedGapKeys.Count, reportedGapKeys.Distinct().Count());
-        Assert.True(
-            expectedGapKeys.SetEquals(reportedGapKeys),
-            $"Фінальні порожні слоти мають точно відповідати GapDetails. Очікувалося: {string.Join(" | ", expectedGapKeys)}. Отримано: {string.Join(" | ", reportedGapKeys)}.");
-        Assert.Equal(data.GroupIds.Count, reportedGapKeys.Count);
-        Assert.All(reportedGapKeys, gap => Assert.Equal(data.MiddleSlotStart, gap.Start));
+        Assert.Equal(data.GroupIds.Count, expectedGapKeys.Count);
+        Assert.Empty(reportedGapKeys);
     }
 
     private static async Task<PersistedMoveRepairSeed> SeedPersistedMoveRepairScenarioAsync(AppDbContext db)
@@ -2651,16 +2673,13 @@ public sealed class AutogenLecturePackingTests
                 TeacherId = 2,
                 ModuleId = moduleId
             });
-        db.TimeSlots.Add(new TimeSlot
-        {
-            Id = 1,
-            CourseId = courseId,
-            DayOfWeek = DayOfWeek.Monday,
-            Start = new TimeOnly(8, 0),
-            End = new TimeOnly(9, 20),
-            SortOrder = 1,
-            IsActive = true
-        });
+        db.TimeSlots.AddRange(
+            new TimeSlot { Id = 1, CourseId = courseId, DayOfWeek = DayOfWeek.Monday, Start = new TimeOnly(8, 0), End = new TimeOnly(9, 20), SortOrder = 1, IsActive = true },
+            new TimeSlot { Id = 2, CourseId = courseId, DayOfWeek = DayOfWeek.Monday, Start = new TimeOnly(9, 30), End = new TimeOnly(10, 50), SortOrder = 2, IsActive = true },
+            new TimeSlot { Id = 3, CourseId = courseId, DayOfWeek = DayOfWeek.Monday, Start = new TimeOnly(11, 0), End = new TimeOnly(12, 20), SortOrder = 3, IsActive = true },
+            new TimeSlot { Id = 4, CourseId = courseId, DayOfWeek = DayOfWeek.Monday, Start = new TimeOnly(12, 30), End = new TimeOnly(13, 50), SortOrder = 4, IsActive = true },
+            new TimeSlot { Id = 5, CourseId = courseId, DayOfWeek = DayOfWeek.Monday, Start = new TimeOnly(14, 0), End = new TimeOnly(15, 20), SortOrder = 5, IsActive = true },
+            new TimeSlot { Id = 6, CourseId = courseId, DayOfWeek = DayOfWeek.Monday, Start = new TimeOnly(15, 30), End = new TimeOnly(16, 50), SortOrder = 6, IsActive = true });
 
         var groupIds = Enumerable.Range(9301, 21).ToList();
         foreach (var groupId in groupIds)

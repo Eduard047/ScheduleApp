@@ -118,17 +118,15 @@ public sealed class TeacherDraftsPublishService
         foreach (var candidate in candidates)
         {
             var d = candidate.Draft;
-            var isWeekend = d.Date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday;
             var scoped = TeacherDraftsHelpers.ResolveCalendarOverride(
                 calendar,
                 d.Date,
                 d.Group.CourseId,
                 d.GroupId);
-            var isWorking = scoped ?? !isWeekend;
-            if (!isWorking)
+            if (scoped == false)
             {
                 violations.Add(
-                    $"[{d.Date:yyyy-MM-dd} {d.StartTime:HH\\:mm}-{d.EndTime:HH\\:mm}] Публікацію у неробочий день заборонено без явного робочого винятку календаря.");
+                    $"[{d.Date:yyyy-MM-dd} {d.StartTime:HH\\:mm}-{d.EndTime:HH\\:mm}] Публікацію заборонено: цей день у календарі позначено неробочим.");
             }
             var req = new UpsertScheduleItemRequest(
                 Id: null,

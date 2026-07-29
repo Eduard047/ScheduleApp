@@ -1416,7 +1416,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                 && (maxParallelGroups <= 0 || maxParallelGroups > MaxGroupCount))
             {
                 throw new AutoGenJobValidationException(
-                    $"М'який ліміт паралельних груп має бути від 1 до {MaxGroupCount}.");
+                    $"Межа паралельних груп має бути від 1 до {MaxGroupCount}.");
             }
             if (softOptions.RecentRepeatWindowDays is int repeatWindow
                 && (repeatWindow < 0

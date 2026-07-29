@@ -130,15 +130,15 @@ internal static class TeacherDraftsAutogenReportBuilder
         var exampleSuffix = string.IsNullOrWhiteSpace(example) ? string.Empty : $" Приклад: {example}";
         return item.Code switch
         {
-            AutoGenGapReasonCodes.Teacher => $"{item.Count} слотів вперлися у викладачів. Перевірте прив'язку до модуля, робочі години та зайнятість.{exampleSuffix}",
-            AutoGenGapReasonCodes.Room => $"{item.Count} слотів вперлися в аудиторії. Перевірте місткість, дозволені корпуси та зайнятість у потрібний час.{exampleSuffix}",
-            AutoGenGapReasonCodes.Travel => $"{item.Count} слотів не стали через переходи між корпусами. Поставте сусідні пари ближче або збільшіть перерву.{exampleSuffix}",
-            AutoGenGapReasonCodes.TopicOrder => $"{item.Count} слотів заблокував порядок тем. Перевірте, чи попередні теми вже поставлені перед наступними.{exampleSuffix}",
-            AutoGenGapReasonCodes.ModuleBlock => $"{item.Count} слотів не стали через правило суцільного модуля. Тримайте пари одного модуля поруч у межах дня.{exampleSuffix}",
-            AutoGenGapReasonCodes.Limit => $"{item.Count} слотів зупинили денні або слотні ліміти. Додайте навчальний час або зменште години в цьому діапазоні.{exampleSuffix}",
-            AutoGenGapReasonCodes.SearchLimit => $"{item.Count} слотів лишилися після досягнення безпечної межі пошуку. Перевірте ресурси й повторіть генерацію після виправлення найвужчих обмежень.{exampleSuffix}",
-            AutoGenGapReasonCodes.SharedFlow => $"{item.Count} слотів пов'язані зі спільним потоком. Вирівняйте тему, викладача й аудиторію для груп потоку.{exampleSuffix}",
-            _ => $"{item.Count} слотів треба перевірити вручну за групою, модулем і часом.{exampleSuffix}"
+            AutoGenGapReasonCodes.Teacher => $"{item.Count} пар не вдалося поставити через викладачів. Перевірте прив'язку до модуля, робочі години та зайнятість.{exampleSuffix}",
+            AutoGenGapReasonCodes.Room => $"{item.Count} пар не вдалося поставити через аудиторії. Перевірте місткість, дозволені корпуси та зайнятість у потрібний час.{exampleSuffix}",
+            AutoGenGapReasonCodes.Travel => $"{item.Count} пар не вдалося поставити через переходи між корпусами. Поставте сусідні пари ближче або збільшіть перерву.{exampleSuffix}",
+            AutoGenGapReasonCodes.TopicOrder => $"{item.Count} пар заблокував порядок тем. Перевірте, чи попередні теми вже поставлені перед наступними.{exampleSuffix}",
+            AutoGenGapReasonCodes.ModuleBlock => $"{item.Count} пар не вдалося поставити через правило суцільного модуля. Тримайте пари одного модуля поруч у межах дня.{exampleSuffix}",
+            AutoGenGapReasonCodes.Limit => $"{item.Count} пар зупинили денні обмеження. Додайте навчальний час або зменште кількість пар у цьому діапазоні.{exampleSuffix}",
+            AutoGenGapReasonCodes.SearchLimit => $"{item.Count} пар лишилися після досягнення безпечної межі пошуку. Перевірте ресурси й повторіть генерацію після виправлення найвужчих обмежень.{exampleSuffix}",
+            AutoGenGapReasonCodes.SharedFlow => $"{item.Count} пар пов'язані зі спільним потоком. Вирівняйте тему, викладача й аудиторію для груп потоку.{exampleSuffix}",
+            _ => $"{item.Count} пар треба перевірити вручну за групою, модулем і часом.{exampleSuffix}"
         };
     }
 
@@ -147,12 +147,13 @@ internal static class TeacherDraftsAutogenReportBuilder
         var exampleSuffix = string.IsNullOrWhiteSpace(example) ? string.Empty : $" Приклад: {example}";
         return item.Code switch
         {
-            "slot" => $"{item.Count} слотів бракує у сітці груп. Додайте навчальний час або звільніть уже зайняті пари.{exampleSuffix}",
-            "teacher" => $"{item.Count} викладацьких слотів бракує. Перевірте прив'язку викладачів, робочі години та зайнятість.{exampleSuffix}",
-            "room" => $"{item.Count} аудиторних слотів бракує. Додайте або звільніть аудиторії потрібної місткості.{exampleSuffix}",
-            "building" => $"{item.Count} слотів заблокували налаштування корпусів. Розширте дозволені корпуси або пріоритетні аудиторії групи.{exampleSuffix}",
-            "travel" => $"{item.Count} слотів відсіяли переходи. Підберіть ближчі аудиторії або збільшіть перерву.{exampleSuffix}",
-            "topic-order" => $"{item.Count} годин не мають доступних тем. Додайте теми потрібного типу або зменште години модуля.{exampleSuffix}",
+            "calendar-capacity" => $"{item.Count} пар не поміщаються у вибрані дати. Зробіть додатковий день робочим для потрібного курсу або групи, оберіть довший період чи додайте час до сітки занять.{exampleSuffix}",
+            "slot" => $"{item.Count} пар бракує у сітці груп. Додайте навчальний час або звільніть уже зайняті пари.{exampleSuffix}",
+            "teacher" => $"{item.Count} пар не вдалося поставити через викладачів. Перевірте прив'язку викладачів, робочі години та зайнятість.{exampleSuffix}",
+            "room" => $"{item.Count} пар не вдалося поставити через аудиторії. Додайте або звільніть аудиторії потрібної місткості.{exampleSuffix}",
+            "building" => $"{item.Count} пар заблокували налаштування корпусів. Розширте дозволені корпуси або пріоритетні аудиторії групи.{exampleSuffix}",
+            "travel" => $"{item.Count} пар не вдалося поставити через переходи. Підберіть ближчі аудиторії або збільшіть перерву.{exampleSuffix}",
+            "topic-order" => $"{item.Count} пар не мають доступних тем. Додайте теми потрібного типу або зменште план модуля.{exampleSuffix}",
             _ => $"{item.Title}: {item.Count}. {item.Recommendation}{exampleSuffix}"
         };
     }

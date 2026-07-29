@@ -183,7 +183,7 @@ public sealed class PublishGuardrailTests
     }
 
     [Fact]
-    public async Task PublishWeek_rejects_weekend_without_explicit_working_calendar_exception()
+    public async Task PublishWeek_allows_configured_Saturday_without_calendar_exception()
     {
         await using var fixture = await TestDatabase.CreateAsync();
         var model = await fixture.SeedAsync();
@@ -210,8 +210,49 @@ public sealed class PublishGuardrailTests
         var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null));
 
         var payload = ReadPayload(result);
+        Assert.Equal(1, payload.Created);
+        Assert.Empty(payload.Warnings);
+        Assert.Equal(1, await fixture.Db.ScheduleItems.CountAsync());
+        Assert.Equal(0, await fixture.Db.TeacherDraftItems.CountAsync());
+    }
+
+    [Fact]
+    public async Task PublishWeek_rejects_Saturday_marked_non_working_in_calendar()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedAsync();
+        var saturday = Monday.AddDays(5);
+        fixture.Db.TimeSlots.Add(new TimeSlot
+        {
+            CourseId = model.CourseId,
+            DayOfWeek = DayOfWeek.Saturday,
+            Start = new TimeOnly(8, 0),
+            End = new TimeOnly(9, 0),
+            SortOrder = 1,
+            IsActive = true
+        });
+        var draft = CreateDraft(
+            model,
+            model.IndependentLessonTypeId,
+            new TimeOnly(8, 0),
+            new TimeOnly(9, 0));
+        draft.Date = saturday;
+        draft.DayOfWeek = DayOfWeek.Saturday;
+        fixture.Db.TeacherDraftItems.Add(draft);
+        fixture.Db.CalendarExceptions.Add(new CalendarException
+        {
+            Date = saturday,
+            IsWorkingDay = false,
+            Name = "Неробоча субота",
+            CourseId = model.CourseId
+        });
+        await fixture.Db.SaveChangesAsync();
+
+        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null));
+
+        var payload = ReadPayload(result);
         Assert.Equal(0, payload.Created);
-        Assert.Contains(payload.Warnings, warning => warning.Contains("неробочий день", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(payload.Warnings, warning => warning.Contains("неробочим", StringComparison.OrdinalIgnoreCase));
         Assert.Equal(0, await fixture.Db.ScheduleItems.CountAsync());
         Assert.Equal(1, await fixture.Db.TeacherDraftItems.CountAsync());
     }

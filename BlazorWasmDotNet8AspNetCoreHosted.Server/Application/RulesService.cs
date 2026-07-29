@@ -141,10 +141,9 @@ public sealed class RulesService(AppDbContext db)
             else if (!IsSlotRangeAllowed(start, end, effectiveSlots))
                 errors.Add("Обраний часовий проміжок не входить до дозволених слотів.");
         }
-        bool isWeekend = dayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday;
         var courseId = group?.CourseId;
         var cal = await FindCalendarExceptionAsync(r.Date, courseId, r.GroupId);
-        bool isWorking = cal?.IsWorkingDay ?? !isWeekend;
+        bool isWorking = cal?.IsWorkingDay ?? true;
         if (!isWorking && !r.OverrideNonWorkingDay)
             errors.Add("Заняття потрапляє на неробочий день без явного дозволу.");
         if (requiresRoom && room is not null)
@@ -412,13 +411,12 @@ public sealed class RulesService(AppDbContext db)
             else if (!IsSlotRangeAllowed(start, end, effectiveSlots))
                 AddError("slot-not-allowed", "Недозволений слот", $"Проміжок {r.TimeStart}-{r.TimeEnd} відсутній серед дозволених для курсу {group.Course.Name}.");
         }
-        bool isWeekend = dayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday;
         var courseId = group?.CourseId;
         var cal = await FindCalendarExceptionAsync(r.Date, courseId, r.GroupId);
-        bool isWorking = cal?.IsWorkingDay ?? !isWeekend;
+        bool isWorking = cal?.IsWorkingDay ?? true;
         if (!isWorking && !r.OverrideNonWorkingDay)
         {
-            var reason = cal is not null ? cal.Name : (isWeekend ? "вихідний день" : "неробочий день");
+            var reason = cal?.Name ?? "неробочий день";
             AddWarning("non-working-day", "Заняття у вихідний", $"Дата {r.Date:yyyy-MM-dd} позначена як {reason}. Для публікації потрібно примусове збереження.");
         }
         if (requiresRoom && room is not null)
