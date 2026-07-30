@@ -481,7 +481,7 @@ else
                         var preflightItems = _latestPreflight;
                         var report = _latestAutoGenReport;
                         var actionItems = BuildAutoGenActionItems(gapSummary, preflightItems, _latestGapDetails);
-                        var outcome = BuildAutoGenOutcomeSummary(ok, report, gapSummary, preflightItems, _latestGapDetails, actionableWarningsTotal, actionItems);
+                        var outcome = BuildAutoGenOutcomeSummary(ok, report, _latestAutoGenPlan, gapSummary, preflightItems, _latestGapDetails, actionableWarningsTotal, actionItems);
                         var gapRows = _latestGapDetails
                             .OrderBy(gap => gap.Date)
                             .ThenBy(gap => gap.GroupName, StringComparer.Ordinal)
@@ -924,6 +924,13 @@ else
     private int? _selectedCourseId;
     private readonly List<ModuleWeekRow> _moduleWeekRows = new();
     private readonly List<TableItem> _generationRangeItems = new();
+    private readonly LatestAsyncRequestGuard _generationRangeLoadGuard = new();
+    private readonly LatestAsyncRequestGuard _weekLoadGuard = new();
+    private readonly LatestAsyncRequestGuard _statusRestoreGuard = new();
+    private readonly LatestAsyncRequestGuard _weekSelectionGuard = new();
+    private readonly LatestAsyncRequestGuard _rollbackablePlanLoadGuard = new();
+    private readonly LatestAsyncRequestGuard _autoGenConfigRestoreGuard = new();
+    private readonly LatestAsyncRequestGuard _activeAutoGenRestoreGuard = new();
     private readonly List<CourseGroupRow> _courseGroupRows = new();
     private List<BuildingEditDto> _buildingOptions = new();
     private List<RoomEditDto> _roomOptions = new();
@@ -952,6 +959,7 @@ else
     private const string AutoGenStatusStorageKey = "adminSchedule.autoGenStatus.v1";
     private const string AutoGenStatusLocalStorageKey = "adminSchedule.autoGenStatus.local.v1";
     private const string ActiveAutoGenJobStorageKey = "adminSchedule.activeAutoGenJob.v1";
+    private const string ActiveAutoGenJobContextStorageKey = "adminSchedule.activeAutoGenJob.context.v1";
     private const string AutoGenConfigStorageKey = "adminSchedule.autoGenConfig.v1";
     private const string AutoGenConfigLocalStorageKey = "adminSchedule.autoGenConfig.local.v1";
     private const string LastAutoGenInputStorageKey = "adminSchedule.lastAutoGenInput.v1";
@@ -1039,7 +1047,7 @@ else
         await RestoreActiveAutoGenJobAsync();
         await RestoreLatestRollbackableAutoGenPlanAsync();
     }
-    private string CurrentWeekKey => GetMonday(_selectedDate).ToString("yyyy-MM-dd");
+    private string CurrentWeekKey => AdminScheduleAutoGenState.BuildWeekKey(_selectedDate);
     private bool IsBreak(int lessonTypeId) => lessonTypeId == breakTypeId;
     private bool IsCanceled(int lessonTypeId) => lessonTypeId == canceledTypeId;
     private bool IsServiceLessonType(int lessonTypeId) => IsBreak(lessonTypeId) || IsCanceled(lessonTypeId);
@@ -1089,10 +1097,15 @@ else
     // Реагує на зміну обраного курсу для автогенерації.
     private async Task OnSelectedCourseChanged()
     {
+        _activeAutoGenRestoreGuard.Invalidate();
+        _latestRollbackableAutoGenPlan = null;
+        _rollbackablePlanLoadGuard.Invalidate();
+        await ResetStatusAsync(clearPersisted: false);
         BuildModuleWeekRows();
         BuildCourseGroupRows();
         await RestorePersistedAutoGenConfigAsync(restoreCourseSelection: false);
         await PersistAutoGenConfigAsync();
+        await RestorePersistedAutoGenStatusAsync();
         await RestoreLatestRollbackableAutoGenPlanAsync();
     }
     // Формує список модулів та годин для поточного курсу.
@@ -1376,6 +1389,7 @@ else
     // Скидає статуси повідомлень та, за потреби, збережений стан.
     private async Task ResetStatusAsync(bool clearPersisted = true)
     {
+        _statusRestoreGuard.Invalidate();
         ok = error = null;
         okWarnings = new();
         _latestWarningDetails = new();
@@ -1838,7 +1852,9 @@ else
         IEnumerable<AutoGenWarningDetail>? warningDetails = null,
         AutoGenPlanSummaryDto? plan = null,
         IEnumerable<AutoGenPlanChangeDto>? planChanges = null,
-        bool persist = true)
+        bool persist = true,
+        string? persistenceWeekKey = null,
+        int? persistenceCourseId = null)
     {
         ok = message;
         _latestGapDetails = gapDetails?
@@ -1861,13 +1877,18 @@ else
         {
             _latestRollbackableAutoGenPlan = null;
         }
-        okWarnings = BuildSlotGapWarnings(warnings, _latestGapDetails);
-        _latestWarningDetails = MergeWarningDetails(warningDetails, okWarnings);
+        _latestWarningDetails = AdminScheduleAutoGenState.BuildTechnicalWarningDetails(
+            warnings,
+            warningDetails,
+            _latestGapDetails);
+        okWarnings = _latestWarningDetails
+            .Select(detail => detail.Message)
+            .ToList();
         // Технічні повідомлення завжди починаються у згорнутому стані.
         okWarningsExpanded = false;
         if (persist)
         {
-            await PersistAutoGenStatusAsync();
+            await PersistAutoGenStatusAsync(persistenceWeekKey, persistenceCourseId);
         }
     }
     // Перемикає видимість попереджень після успіху.
@@ -1888,40 +1909,7 @@ else
         var reason = warning[(idx + marker.Length)..].Trim();
         return (string.IsNullOrWhiteSpace(message) ? warning : message, string.IsNullOrWhiteSpace(reason) ? null : reason);
     }
-    private static List<string> BuildSlotGapWarnings(IEnumerable<string>? warnings, IEnumerable<AutoGenGapDetail>? gapDetails)
-    {
-        var result = new List<string>();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        if (gapDetails is not null)
-        {
-            foreach (var gap in gapDetails)
-            {
-                var warning = BuildSlotGapWarning(gap);
-                if (seen.Add(warning))
-                {
-                    result.Add(warning);
-                }
-            }
-        }
-        if (warnings is null)
-        {
-            return result;
-        }
-        foreach (var warning in warnings)
-        {
-            if (string.IsNullOrWhiteSpace(warning))
-            {
-                continue;
-            }
-            var normalized = warning.Trim();
-            if (seen.Add(normalized))
-            {
-                result.Add(normalized);
-            }
-        }
-        return result;
-    }
-    // Об'єднує структуровані попередження сервера з локальними деталями незаповнених слотів.
+    // Об'єднує структуровані попередження сервера з нормалізованими текстовими повідомленнями.
     private static List<AutoGenWarningDetail> MergeWarningDetails(
         IEnumerable<AutoGenWarningDetail>? warningDetails,
         IEnumerable<string> visibleWarnings)
@@ -2049,6 +2037,7 @@ else
     private static AutoGenOutcomeSummary? BuildAutoGenOutcomeSummary(
         string? message,
         AutoGenRunReport? report,
+        AutoGenPlanSummaryDto? plan,
         IReadOnlyList<AutoGenGapSummaryItem> gapSummary,
         IReadOnlyList<AutoGenPreflightItem> preflight,
         IReadOnlyList<AutoGenGapDetail> gapDetails,
@@ -2057,18 +2046,23 @@ else
     {
         var gapCount = report?.GapCount ?? gapDetails.Count;
         var deficitCount = report?.DeficitCount ?? preflight.Sum(item => item.Count);
-        var hasOutcomeData = report is not null || gapCount > 0 || deficitCount > 0 || warningsTotal > 0 || actionItems.Count > 0;
+        var hasOutcomeData = report is not null
+                             || plan is not null
+                             || gapCount > 0
+                             || deficitCount > 0
+                             || warningsTotal > 0
+                             || actionItems.Count > 0;
         if (!hasOutcomeData)
         {
             return null;
         }
 
         var hasIssues = gapCount > 0 || deficitCount > 0 || warningsTotal > 0 || actionItems.Count > 0;
-        var headline = BuildAutoGenOutcomeHeadline(report, gapCount, deficitCount, warningsTotal, gapSummary);
+        var headline = BuildAutoGenOutcomeHeadline(report, plan, gapCount, deficitCount, warningsTotal, gapSummary);
         var detail = report is not null
-            ? BuildAutoGenOutcomeDetail(report)
+            ? BuildAutoGenOutcomeDetail(report, plan)
             : string.IsNullOrWhiteSpace(message) ? "Операцію виконано." : message.Trim();
-        var metrics = BuildAutoGenOutcomeMetrics(report, gapCount, deficitCount, warningsTotal);
+        var metrics = BuildAutoGenOutcomeMetrics(report, plan, gapCount, deficitCount, warningsTotal);
 
         return new AutoGenOutcomeSummary(
             hasIssues ? "autogen-outcome--needs-review" : "autogen-outcome--clean",
@@ -2082,6 +2076,7 @@ else
 
     private static string BuildAutoGenOutcomeHeadline(
         AutoGenRunReport? report,
+        AutoGenPlanSummaryDto? plan,
         int gapCount,
         int deficitCount,
         int warningsTotal,
@@ -2110,6 +2105,10 @@ else
         {
             return $"Є {warningsTotal} попереджень після автогенерації";
         }
+        if (plan is not null)
+        {
+            return $"План підготовлено: {AdminScheduleAutoGenState.BuildPlanChangeSummary(plan)}";
+        }
         if (report is not null && report.Created > 0)
         {
             return $"Створено {report.Created} чернеток, усі запитані пари поставлено";
@@ -2117,10 +2116,14 @@ else
         return "Усі запитані пари вдалося поставити";
     }
 
-    private static string BuildAutoGenOutcomeDetail(AutoGenRunReport report)
+    private static string BuildAutoGenOutcomeDetail(AutoGenRunReport report, AutoGenPlanSummaryDto? plan)
     {
         var range = BuildAutoGenOutcomeRangeText(report.RangeStartDate, report.RangeEndDate);
         var weeksText = report.TotalWeeks == 1 ? "1 тиждень" : $"{report.TotalWeeks} тижнів";
+        if (plan is not null)
+        {
+            return $"Діапазон {range}: {weeksText}; план — {AdminScheduleAutoGenState.BuildPlanChangeSummary(plan)}; пропущено {report.Skipped}.";
+        }
         return $"Діапазон {range}: {weeksText}, створено {report.Created}, пропущено {report.Skipped}.";
     }
 
@@ -2131,12 +2134,24 @@ else
 
     private static List<AutoGenOutcomeMetric> BuildAutoGenOutcomeMetrics(
         AutoGenRunReport? report,
+        AutoGenPlanSummaryDto? plan,
         int gapCount,
         int deficitCount,
         int warningsTotal)
     {
         var metrics = new List<AutoGenOutcomeMetric>();
-        if (report is not null)
+        if (plan is not null)
+        {
+            metrics.Add(new AutoGenOutcomeMetric("Додати", plan.AddCount.ToString()));
+            metrics.Add(new AutoGenOutcomeMetric("Змінити або перемістити", plan.UpdateCount.ToString()));
+            metrics.Add(new AutoGenOutcomeMetric("Видалити", plan.DeleteCount.ToString()));
+            if (report is not null)
+            {
+                metrics.Add(new AutoGenOutcomeMetric("Пропущено", report.Skipped.ToString(), "вже існували або були закріплені"));
+                metrics.Add(new AutoGenOutcomeMetric("Тижнів", report.TotalWeeks.ToString()));
+            }
+        }
+        else if (report is not null)
         {
             metrics.Add(new AutoGenOutcomeMetric("Створено", report.Created.ToString()));
             metrics.Add(new AutoGenOutcomeMetric("Пропущено", report.Skipped.ToString(), "вже існували або були закріплені"));
@@ -2292,16 +2307,6 @@ else
         return normalized.Length <= maxLength ? normalized : normalized[..maxLength] + "...";
     }
 
-    private static string BuildSlotGapWarning(AutoGenGapDetail gap)
-    {
-        var message = $"Автогенерація не заповнила слот {gap.SlotLabel} для групи {gap.GroupName} на {gap.Date:yyyy-MM-dd}.";
-        var reason = string.IsNullOrWhiteSpace(gap.Reason)
-            ? AutoGenGapReasonClassifier.Classify(gap).Title
-            : gap.Reason;
-        return string.IsNullOrWhiteSpace(reason)
-            ? message
-            : $"{message} Причина: {reason}";
-    }
     private static bool IsSlotGapWarning(string warning)
         => warning.Contains("не заповнила слот", StringComparison.OrdinalIgnoreCase);
     // Рахує випадки, коли слот не заповнено через правило суцільного блоку модуля.
@@ -2325,23 +2330,31 @@ else
         return text.Contains(ContiguousModuleBlockReasonMarker, StringComparison.OrdinalIgnoreCase);
     }
     // Зберігає повідомлення про автогенерацію у сховищі.
-    private async Task PersistAutoGenStatusAsync()
+    private async Task PersistAutoGenStatusAsync(
+        string? weekKey = null,
+        int? courseId = null)
     {
-        var entry = BuildPersistedAutoGenStatus();
+        var targetWeekKey = string.IsNullOrWhiteSpace(weekKey)
+            ? CurrentWeekKey
+            : weekKey.Trim();
+        var entry = BuildPersistedAutoGenStatus(courseId);
         if (entry is null)
         {
-            await RemovePersistedAutoGenStatusAsync();
+            await RemovePersistedAutoGenStatusAsync(targetWeekKey);
             return;
         }
         var statuses = await LoadPersistedAutoGenStatusesAsync();
-        statuses[CurrentWeekKey] = entry;
+        statuses[targetWeekKey] = entry;
         await SavePersistedAutoGenStatusesAsync(statuses);
     }
     // Видаляє збережений статус автогенерації.
-    private async Task RemovePersistedAutoGenStatusAsync()
+    private async Task RemovePersistedAutoGenStatusAsync(string? weekKey = null)
     {
+        var targetWeekKey = string.IsNullOrWhiteSpace(weekKey)
+            ? CurrentWeekKey
+            : weekKey.Trim();
         var statuses = await LoadPersistedAutoGenStatusesAsync();
-        if (!statuses.Remove(CurrentWeekKey))
+        if (!statuses.Remove(targetWeekKey))
         {
             return;
         }
@@ -2412,8 +2425,11 @@ else
     // Видаляє ключ зі сховища браузера.
     private ValueTask RemoveStorageAsync(string key, bool useLocal)
         => JS.InvokeVoidAsync(useLocal ? "localStorage.removeItem" : "sessionStorage.removeItem", key);
-    // Зберігає ідентифікатор активної серверної задачі для відновлення після перезавантаження сторінки.
-    private async Task PersistActiveAutoGenJobIdAsync(string jobId)
+    // Зберігає активну задачу разом із курсом, щоб результат не залежав від іншого останнього вводу.
+    private async Task PersistActiveAutoGenJobIdAsync(
+        string jobId,
+        int? courseId = null,
+        DateOnly? rangeStartDate = null)
     {
         if (string.IsNullOrWhiteSpace(jobId))
         {
@@ -2421,7 +2437,19 @@ else
         }
         try
         {
-            await SetStorageAsync(ActiveAutoGenJobStorageKey, jobId.Trim(), useLocal: true);
+            var normalizedJobId = jobId.Trim();
+            await SetStorageAsync(ActiveAutoGenJobStorageKey, normalizedJobId, useLocal: true);
+            if (courseId is int persistedCourseId && rangeStartDate is DateOnly persistedRangeStartDate)
+            {
+                var context = new ActiveAutoGenJobContext(
+                    normalizedJobId,
+                    persistedCourseId,
+                    persistedRangeStartDate);
+                await SetStorageAsync(
+                    ActiveAutoGenJobContextStorageKey,
+                    JsonSerializer.Serialize(context, AutoGenStatusJsonOptions),
+                    useLocal: true);
+            }
         }
         catch (JSException)
         {
@@ -2440,15 +2468,51 @@ else
             return null;
         }
     }
-    // Видаляє активний ідентифікатор, не зачіпаючи новішу задачу з іншої вкладки.
-    private async Task RemoveActiveAutoGenJobIdAsync(string? expectedJobId = null)
+    // Читає контекст лише тієї задачі, ідентифікатор якої щойно підтверджено.
+    private async Task<ActiveAutoGenJobContext?> ReadActiveAutoGenJobContextAsync(string expectedJobId)
     {
         try
         {
+            var stored = await ReadStorageAsync(ActiveAutoGenJobContextStorageKey, useLocal: true);
+            if (string.IsNullOrWhiteSpace(stored))
+            {
+                return null;
+            }
+            var context = JsonSerializer.Deserialize<ActiveAutoGenJobContext>(
+                stored,
+                AutoGenStatusJsonOptions);
+            return context is not null
+                   && string.Equals(context.JobId, expectedJobId, StringComparison.Ordinal)
+                ? context
+                : null;
+        }
+        catch (JSException)
+        {
+            return null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+    // Видаляє активний ідентифікатор, не зачіпаючи новішу задачу з іншої вкладки.
+    private async Task RemoveActiveAutoGenJobIdAsync(string? expectedJobId = null)
+    {
+        if (string.IsNullOrWhiteSpace(expectedJobId))
+        {
+            return;
+        }
+        try
+        {
             var current = (await ReadStorageAsync(ActiveAutoGenJobStorageKey, useLocal: true))?.Trim();
-            if (expectedJobId is null || string.Equals(current, expectedJobId, StringComparison.Ordinal))
+            if (string.Equals(current, expectedJobId, StringComparison.Ordinal))
             {
                 await RemoveStorageAsync(ActiveAutoGenJobStorageKey, useLocal: true);
+                var context = await ReadActiveAutoGenJobContextAsync(expectedJobId);
+                if (context is not null)
+                {
+                    await RemoveStorageAsync(ActiveAutoGenJobContextStorageKey, useLocal: true);
+                }
             }
         }
         catch (JSException)
@@ -2483,73 +2547,152 @@ else
     // Відновлює прогрес і можливість скасування для задачі, що пережила перезавантаження сторінки.
     private async Task RestoreActiveAutoGenJobAsync()
     {
+        var requestVersion = _activeAutoGenRestoreGuard.Begin();
         var jobId = await ReadActiveAutoGenJobIdAsync();
+        if (!_activeAutoGenRestoreGuard.IsCurrent(requestVersion))
+        {
+            return;
+        }
         if (string.IsNullOrWhiteSpace(jobId))
         {
-            await RemoveActiveAutoGenJobIdAsync();
+            return;
+        }
+        var activeJobContext = await ReadActiveAutoGenJobContextAsync(jobId);
+        if (!_activeAutoGenRestoreGuard.IsCurrent(requestVersion))
+        {
             return;
         }
 
-        AutoGenJobStatus status;
+        _autoGenActionStarting = true;
         try
         {
-            status = await Drafts.GetAutogenJob(jobId);
-        }
-        catch (ApiErrorException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
-        {
-            await RemoveActiveAutoGenJobIdAsync(jobId);
-            return;
-        }
-        catch (ApiErrorException ex)
-        {
-            await HandleApiError(ex);
-            return;
-        }
-        catch (HttpRequestException)
-        {
-            error = "Не вдалося відновити стан автогенерації через тимчасову помилку мережі. Повторіть оновлення сторінки.";
-            return;
-        }
-
-        ApplyAutoGenJobStatus(status);
-        StartAutoGenProgressTimer();
-        await InvokeAsync(StateHasChanged);
-        var terminal = IsAutoGenJobTerminal(status.State);
-        try
-        {
-            if (!terminal)
+            await InvokeAsync(StateHasChanged);
+            AutoGenJobStatus status;
+            try
             {
-                status = await WaitForAutoGenJobTerminalAsync(status);
-                terminal = true;
+                status = await Drafts.GetAutogenJob(jobId);
             }
-            await ShowRestoredAutoGenResultAsync(status);
-        }
-        catch (OperationCanceledException) when (_componentLifetimeCts.IsCancellationRequested)
-        {
-        }
-        catch (ApiErrorException ex)
-        {
-            await HandleApiError(ex);
-        }
-        catch (HttpRequestException)
-        {
-            error = "Зв'язок із задачею автогенерації втрачено. Її ідентифікатор збережено для наступного відновлення.";
+            catch (ApiErrorException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                if (_activeAutoGenRestoreGuard.IsCurrent(requestVersion))
+                {
+                    await RemoveActiveAutoGenJobIdAsync(jobId);
+                }
+                return;
+            }
+            catch (ApiErrorException ex)
+            {
+                if (_activeAutoGenRestoreGuard.IsCurrent(requestVersion))
+                {
+                    await HandleApiError(ex);
+                }
+                return;
+            }
+            catch (HttpRequestException)
+            {
+                if (_activeAutoGenRestoreGuard.IsCurrent(requestVersion))
+                {
+                    error = "Не вдалося відновити стан автогенерації через тимчасову помилку мережі. Повторіть оновлення сторінки.";
+                }
+                return;
+            }
+            if (!_activeAutoGenRestoreGuard.IsCurrent(requestVersion))
+            {
+                return;
+            }
+
+            ApplyAutoGenJobStatus(status);
+            StartAutoGenProgressTimer();
+            await InvokeAsync(StateHasChanged);
+            var terminal = IsAutoGenJobTerminal(status.State);
+            var resultHandled = false;
+            try
+            {
+                if (!terminal)
+                {
+                    status = await WaitForAutoGenJobTerminalAsync(status);
+                    terminal = true;
+                }
+                if (!_activeAutoGenRestoreGuard.IsCurrent(requestVersion))
+                {
+                    return;
+                }
+                resultHandled = await ShowRestoredAutoGenResultAsync(
+                    status,
+                    activeJobContext);
+            }
+            catch (OperationCanceledException) when (_componentLifetimeCts.IsCancellationRequested)
+            {
+            }
+            catch (ApiErrorException ex)
+            {
+                if (_activeAutoGenRestoreGuard.IsCurrent(requestVersion))
+                {
+                    await HandleApiError(ex);
+                }
+            }
+            catch (HttpRequestException)
+            {
+                if (_activeAutoGenRestoreGuard.IsCurrent(requestVersion))
+                {
+                    error = "Зв'язок із задачею автогенерації втрачено. Її ідентифікатор збережено для наступного відновлення.";
+                }
+            }
+            finally
+            {
+                if (terminal)
+                {
+                    if (resultHandled)
+                    {
+                        await RemoveActiveAutoGenJobIdAsync(status.JobId);
+                    }
+                    StopAutoGenProgress();
+                }
+            }
         }
         finally
         {
-            if (terminal)
-            {
-                await RemoveActiveAutoGenJobIdAsync(status.JobId);
-                StopAutoGenProgress();
-            }
+            _autoGenActionStarting = false;
         }
     }
     // Показує підсумок відновленої задачі та оновлює поточну таблицю після змін у чернетках.
-    private async Task ShowRestoredAutoGenResultAsync(AutoGenJobStatus status)
+    private async Task<bool> ShowRestoredAutoGenResultAsync(
+        AutoGenJobStatus status,
+        ActiveAutoGenJobContext? activeJobContext)
     {
         var result = BuildAutoGenJobResult(status);
-        var summary = status.Plan?.State == AutoGenPlanState.Ready
-            ? $"Відновлено готовий план «{status.Title}»: додати {status.Plan.AddCount}, змінити {status.Plan.UpdateCount}, видалити {status.Plan.DeleteCount}. Чернетки ще не змінено."
+        var restoredPlan = status.Plan;
+        IReadOnlyList<AutoGenPlanChangeDto>? restoredPlanChanges = null;
+        var persistenceCourseId = activeJobContext?.CourseId;
+        if (restoredPlan is not null)
+        {
+            try
+            {
+                var planDetails = await Drafts.GetAutogenPlan(restoredPlan.PlanId);
+                restoredPlan = planDetails.Summary;
+                restoredPlanChanges = planDetails.Changes;
+                persistenceCourseId ??= ResolveCourseIdFromPlanChanges(planDetails.Changes);
+            }
+            catch (ApiErrorException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Conflict)
+            {
+                restoredPlan = null;
+            }
+        }
+        if (restoredPlan?.CanApply == true && persistenceCourseId is null)
+        {
+            error = "Готовий план збережено на сервері, але не вдалося визначити його курс. Ідентифікатор задачі залишено для повторного відновлення.";
+            return false;
+        }
+        var persistenceWeekKey = AdminScheduleAutoGenState.BuildWeekKey(status.RangeStartDate);
+        var showInCurrentContext = string.Equals(
+                                       CurrentWeekKey,
+                                       persistenceWeekKey,
+                                       StringComparison.Ordinal)
+                                   && AdminScheduleAutoGenState.CanRestoreStatusForCourse(
+                                       persistenceCourseId,
+                                       _selectedCourseId);
+        var summary = restoredPlan?.State == AutoGenPlanState.Ready
+            ? $"Відновлено готовий план «{status.Title}»: додати {restoredPlan.AddCount}, змінити {restoredPlan.UpdateCount}, видалити {restoredPlan.DeleteCount}. Чернетки ще не змінено."
             : status.State switch
         {
             AutoGenJobState.Succeeded => $"Відновлену задачу «{status.Title}» завершено: створено {result.Created}, пропущено {result.Skipped}.",
@@ -2564,8 +2707,27 @@ else
             result.Preflight,
             status.Report,
             result.WarningDetails,
-            status.Plan,
-            persist: false);
+            restoredPlan,
+            restoredPlanChanges,
+            persist: true,
+            persistenceWeekKey: persistenceWeekKey,
+            persistenceCourseId: persistenceCourseId);
+        if (!await IsAutoGenStatusPersistedAsync(
+                persistenceWeekKey,
+                summary,
+                restoredPlan?.PlanId,
+                persistenceCourseId))
+        {
+            error = "Результат задачі показано, але браузер не зберіг його для наступного відновлення. Ідентифікатор задачі залишено.";
+            return false;
+        }
+        if (!showInCurrentContext)
+        {
+            // Результат збережено для його діапазону, але не показуємо план у чужому тижні або курсі.
+            await ResetStatusAsync(clearPersisted: false);
+            await RestorePersistedAutoGenStatusAsync();
+            return true;
+        }
         if (status.Kind != AutoGenJobKind.Preflight)
         {
             try
@@ -2581,9 +2743,46 @@ else
                 error = "Задачу завершено, але не вдалося оновити таблицю через помилку мережі.";
             }
         }
+        return true;
+    }
+    // Визначає курс плану за групами у змінах, не покладаючись на глобальний останній ввід.
+    private int? ResolveCourseIdFromPlanChanges(IEnumerable<AutoGenPlanChangeDto> changes)
+    {
+        if (meta is null)
+        {
+            return null;
+        }
+        var groupIds = changes
+            .Select(change => change.After?.GroupId ?? change.Before?.GroupId)
+            .Where(groupId => groupId is > 0)
+            .Select(groupId => groupId!.Value)
+            .ToHashSet();
+        var courseIds = meta.Groups
+            .Where(group => groupIds.Contains(group.Id))
+            .Select(group => group.CourseId)
+            .Distinct()
+            .ToList();
+        return courseIds.Count == 1 ? courseIds[0] : null;
+    }
+    // Підтверджує запис у storage до видалення єдиного ідентифікатора серверної задачі.
+    private async Task<bool> IsAutoGenStatusPersistedAsync(
+        string weekKey,
+        string message,
+        string? planId,
+        int? courseId)
+    {
+        var statuses = await LoadPersistedAutoGenStatusesAsync();
+        if (!statuses.TryGetValue(weekKey, out var persisted)
+            || !string.Equals(persisted.Message, message, StringComparison.Ordinal)
+            || (courseId is int expectedCourseId && persisted.CourseId != expectedCourseId))
+        {
+            return false;
+        }
+        return planId is null
+            || string.Equals(persisted.Plan?.PlanId, planId, StringComparison.Ordinal);
     }
     // Формує запис для збереження статусу автогенерації.
-    private PersistedAutoGenStatus? BuildPersistedAutoGenStatus()
+    private PersistedAutoGenStatus? BuildPersistedAutoGenStatus(int? courseId = null)
     {
         if (string.IsNullOrWhiteSpace(ok))
             return null;
@@ -2596,15 +2795,31 @@ else
             Report: _latestAutoGenReport,
             WarningDetails: new List<AutoGenWarningDetail>(_latestWarningDetails),
             Plan: _latestAutoGenPlan,
-            PlanLogContext: _preparedAutoGenPlanLogContext
+            PlanLogContext: _preparedAutoGenPlanLogContext,
+            CourseId: courseId
+                      ?? _preparedAutoGenPlanLogContext?.CourseId
+                      ?? _selectedCourseId
         );
     }
     // Відновлює останній статус автогенерації з storage.
     private async Task RestorePersistedAutoGenStatusAsync()
     {
+        var requestVersion = _statusRestoreGuard.Begin();
+        var weekKey = CurrentWeekKey;
         var statuses = await LoadPersistedAutoGenStatusesAsync();
-        if (!statuses.TryGetValue(CurrentWeekKey, out var payload))
+        statuses.TryGetValue(weekKey, out var candidatePayload);
+        var persistedCourseId = candidatePayload?.CourseId
+                                ?? candidatePayload?.PlanLogContext?.CourseId;
+        if (!_statusRestoreGuard.IsCurrent(requestVersion)
+            || !string.Equals(CurrentWeekKey, weekKey, StringComparison.Ordinal)
+            || candidatePayload is not { } payload
+            || (payload.Plan is not null && persistedCourseId is null)
+            || !AdminScheduleAutoGenState.CanRestoreStatusForCourse(
+                persistedCourseId,
+                _selectedCourseId))
+        {
             return;
+        }
         var plan = payload.Plan;
         IReadOnlyList<AutoGenPlanChangeDto>? planChanges = null;
         if (plan is not null)
@@ -2619,6 +2834,11 @@ else
             {
                 plan = null;
             }
+        }
+        if (!_statusRestoreGuard.IsCurrent(requestVersion)
+            || !string.Equals(CurrentWeekKey, weekKey, StringComparison.Ordinal))
+        {
+            return;
         }
         _preparedAutoGenPlanLogContext = plan?.CanApply == true
             && string.Equals(payload.PlanLogContext?.PlanId, plan.PlanId, StringComparison.Ordinal)
@@ -2639,16 +2859,27 @@ else
     // Відновлює останній доступний відкіт із серверної історії незалежно від поточного повідомлення сторінки.
     private async Task RestoreLatestRollbackableAutoGenPlanAsync()
     {
+        var requestVersion = _rollbackablePlanLoadGuard.Begin();
+        var courseId = _selectedCourseId;
         try
         {
-            var details = await Drafts.GetLatestRollbackableAutogenPlan(_selectedCourseId);
+            var details = await Drafts.GetLatestRollbackableAutogenPlan(courseId);
+            if (!_rollbackablePlanLoadGuard.IsCurrent(requestVersion)
+                || courseId != _selectedCourseId)
+            {
+                return;
+            }
             _latestRollbackableAutoGenPlan = details?.Summary.CanRollback == true
                 ? details.Summary
                 : null;
         }
         catch (ApiErrorException)
         {
-            _latestRollbackableAutoGenPlan = null;
+            if (_rollbackablePlanLoadGuard.IsCurrent(requestVersion)
+                && courseId == _selectedCourseId)
+            {
+                _latestRollbackableAutoGenPlan = null;
+            }
         }
         catch (HttpRequestException)
         {
@@ -2729,8 +2960,17 @@ else
     {
         if (meta is null)
             return;
+        var requestVersion = _autoGenConfigRestoreGuard.Begin();
+        var weekKey = CurrentWeekKey;
+        var selectedCourseId = _selectedCourseId;
         var configs = await LoadPersistedAutoGenConfigsAsync();
-        if (!configs.TryGetValue(CurrentWeekKey, out var weekConfig))
+        if (!_autoGenConfigRestoreGuard.IsCurrent(requestVersion)
+            || !string.Equals(CurrentWeekKey, weekKey, StringComparison.Ordinal)
+            || (!restoreCourseSelection && _selectedCourseId != selectedCourseId))
+        {
+            return;
+        }
+        if (!configs.TryGetValue(weekKey, out var weekConfig))
         {
             _useRecommendedAutoGenProfile = false;
             _allowIncompleteDrafts = false;
@@ -3085,7 +3325,7 @@ else
             ClientJobId: clientJobId,
             PreviewOnly: previewOnly
         );
-        await PersistActiveAutoGenJobIdAsync(clientJobId);
+        await PersistActiveAutoGenJobIdAsync(clientJobId, courseId, fromDate);
         AutoGenJobStatus status;
         try
         {
@@ -3111,7 +3351,7 @@ else
             await RemoveActiveAutoGenJobIdAsync(clientJobId);
             throw;
         }
-        await PersistActiveAutoGenJobIdAsync(status.JobId);
+        await PersistActiveAutoGenJobIdAsync(status.JobId, courseId, fromDate);
         ApplyAutoGenJobStatus(status);
         await InvokeAsync(StateHasChanged);
         status = await WaitForAutoGenJobTerminalAsync(status);
@@ -3521,6 +3761,17 @@ else
                     jobError: null);
             }
         }
+        catch (ApiErrorException ex) when (ex.StatusCode == HttpStatusCode.Conflict)
+        {
+            if (string.Equals(_latestAutoGenPlan?.PlanId, plan.PlanId, StringComparison.Ordinal))
+            {
+                _latestAutoGenPlan = AdminScheduleAutoGenState.InvalidatePlanAfterConflict(plan);
+                _latestAutoGenPlanChanges = new();
+                _preparedAutoGenPlanLogContext = null;
+                await PersistAutoGenStatusAsync();
+            }
+            await HandleApiError(ex);
+        }
         catch (ApiErrorException ex)
         {
             await HandleApiError(ex);
@@ -3657,11 +3908,13 @@ else
                 CourseId: courseId
             ));
             var courseGroupIds = GetGroupIdsForCourse(courseId);
-            RemoveItemsFromState(
+            var rangeRefreshWarning = await RemoveItemsFromStateAsync(
                 TableItemSource.Draft,
                 item => !item.IsLocked && courseGroupIds.Contains(item.GroupId));
             var summary = $"Видалено {deleted} чернеток за поточний тиждень.";
-            await SetOkMessageAsync(summary);
+            await SetOkMessageAsync(
+                summary,
+                rangeRefreshWarning is null ? null : new[] { rangeRefreshWarning });
             await CompleteOperationProgressAsync(summary);
             await LogWeekClearAsync(LogActionClearDrafts, "Очищення чернеток", summary, monday);
         }
@@ -3710,11 +3963,13 @@ else
                 CourseId: courseId
             ));
             var courseGroupIds = GetGroupIdsForCourse(courseId);
-            RemoveItemsFromState(
+            var rangeRefreshWarning = await RemoveItemsFromStateAsync(
                 TableItemSource.Published,
                 item => !item.IsLocked && courseGroupIds.Contains(item.GroupId));
             var summary = $"Видалено {deleted} записів з опублікованого розкладу.";
-            await SetOkMessageAsync(summary);
+            await SetOkMessageAsync(
+                summary,
+                rangeRefreshWarning is null ? null : new[] { rangeRefreshWarning });
             await CompleteOperationProgressAsync(summary);
             await LogWeekClearAsync(LogActionClearSchedule, "Очищення розкладу", summary, monday);
         }
@@ -3854,11 +4109,17 @@ else
     // Завантажує чернетки та опублікований розклад за тиждень.
     private async Task LoadWeek()
     {
+        var requestVersion = _weekLoadGuard.Begin();
         var monday = GetMonday(_selectedDate);
         var draftTask = Drafts.GetWeek(monday, null);
         var publishedTask = Api.GetWeek(monday);
         var rangeTask = LoadGenerationRangeItemsAsync();
         await Task.WhenAll(draftTask, publishedTask, rangeTask);
+        if (!_weekLoadGuard.IsCurrent(requestVersion)
+            || GetMonday(_selectedDate) != monday)
+        {
+            return;
+        }
         var draftData = await draftTask;
         var publishedData = await publishedTask;
         draftItems.Clear();
@@ -3872,6 +4133,7 @@ else
     // Завантажує записи всіх тижнів, що перетинають діапазон генерації, для спільного лічильника.
     private async Task LoadGenerationRangeItemsAsync()
     {
+        var requestVersion = _generationRangeLoadGuard.Begin();
         var weekStarts = BuildGenerationWeekStarts();
         var draftTasks = weekStarts
             .Select(weekStart => Drafts.GetWeek(weekStart, null))
@@ -3882,15 +4144,22 @@ else
 
         await Task.WhenAll(draftTasks.Cast<Task>().Concat(publishedTasks));
 
-        _generationRangeItems.Clear();
+        var loadedItems = new List<TableItem>();
         foreach (var task in draftTasks)
         {
-            _generationRangeItems.AddRange(task.Result.Select(CreateTableItemFromDraft));
+            loadedItems.AddRange(task.Result.Select(CreateTableItemFromDraft));
         }
         foreach (var task in publishedTasks)
         {
-            _generationRangeItems.AddRange(task.Result.Select(CreateTableItemFromPublished));
+            loadedItems.AddRange(task.Result.Select(CreateTableItemFromPublished));
         }
+        if (!_generationRangeLoadGuard.IsCurrent(requestVersion))
+        {
+            return;
+        }
+
+        _generationRangeItems.Clear();
+        _generationRangeItems.AddRange(loadedItems);
     }
     private void RebuildTableItems()
     {
@@ -3899,20 +4168,32 @@ else
         tableItems.AddRange(publishedItems.Select(CreateTableItemFromPublished));
         SyncCurrentConflict();
     }
-    private void RemoveTableItemFromState(TableItem item)
+    private async Task<string?> RemoveTableItemFromStateAsync(TableItem item)
     {
-        if (item.Source == TableItemSource.Draft)
+        _generationRangeLoadGuard.Invalidate();
+        _generationRangeItems.RemoveAll(candidate =>
+            candidate.Source == item.Source
+            && candidate.Id == item.Id);
+        if (GetMonday(item.Date) == GetMonday(_selectedDate))
         {
-            draftItems.RemoveAll(x => x.Id == item.Id);
+            // Не скасовуємо завантаження іншого тижня, якщо користувач уже змінив дату.
+            _weekLoadGuard.Invalidate();
+            if (item.Source == TableItemSource.Draft)
+            {
+                draftItems.RemoveAll(x => x.Id == item.Id);
+            }
+            else
+            {
+                publishedItems.RemoveAll(x => x.Id == item.Id);
+            }
+            RebuildTableItems();
         }
-        else
-        {
-            publishedItems.RemoveAll(x => x.Id == item.Id);
-        }
-        RebuildTableItems();
+        return await RefreshGenerationRangeItemsAfterMutationAsync();
     }
-    private void RemoveItemsFromState(TableItemSource source, Func<TableItem, bool> predicate)
+    private async Task<string?> RemoveItemsFromStateAsync(TableItemSource source, Func<TableItem, bool> predicate)
     {
+        _weekLoadGuard.Invalidate();
+        _generationRangeLoadGuard.Invalidate();
         if (source == TableItemSource.Draft)
         {
             var ids = tableItems
@@ -3920,11 +4201,13 @@ else
                 .Where(predicate)
                 .Select(item => item.Id)
                 .ToHashSet();
-            if (ids.Count == 0)
+            if (ids.Count > 0)
             {
-                return;
+                _generationRangeItems.RemoveAll(item =>
+                    item.Source == TableItemSource.Draft
+                    && ids.Contains(item.Id));
+                draftItems.RemoveAll(x => ids.Contains(x.Id));
             }
-            draftItems.RemoveAll(x => ids.Contains(x.Id));
         }
         else
         {
@@ -3933,13 +4216,37 @@ else
                 .Where(predicate)
                 .Select(item => item.Id)
                 .ToHashSet();
-            if (ids.Count == 0)
+            if (ids.Count > 0)
             {
-                return;
+                _generationRangeItems.RemoveAll(item =>
+                    item.Source == TableItemSource.Published
+                    && ids.Contains(item.Id));
+                publishedItems.RemoveAll(x => ids.Contains(x.Id));
             }
-            publishedItems.RemoveAll(x => ids.Contains(x.Id));
         }
         RebuildTableItems();
+        return await RefreshGenerationRangeItemsAfterMutationAsync();
+    }
+    // Після вже успішної зміни на сервері помилка повторного читання не повинна маскувати результат операції.
+    private async Task<string?> RefreshGenerationRangeItemsAfterMutationAsync()
+    {
+        try
+        {
+            await LoadGenerationRangeItemsAsync();
+            return null;
+        }
+        catch (ApiErrorException ex)
+        {
+            return $"Зміни збережено, але не вдалося оновити лічильник пар за діапазон: {ComposeErrorHeadline(ex)}";
+        }
+        catch (HttpRequestException)
+        {
+            return "Зміни збережено, але не вдалося оновити лічильник пар за діапазон через помилку мережі.";
+        }
+        catch (Exception)
+        {
+            return "Зміни збережено, але під час оновлення лічильника пар за діапазон сталася помилка.";
+        }
     }
     private async Task LogAutoGenAsync(
         string summary,
@@ -4166,9 +4473,12 @@ else
             {
                 await Api.Delete(current.Id, current.Revision);
             }
-            RemoveTableItemFromState(current);
+            var rangeRefreshWarning = await RemoveTableItemFromStateAsync(current);
             var summary = $"Видалено заняття #{current.Id}.";
-            await SetOkMessageAsync(summary, persist: false);
+            await SetOkMessageAsync(
+                summary,
+                rangeRefreshWarning is null ? null : new[] { rangeRefreshWarning },
+                persist: false);
             await LogDeleteAsync(summary, current);
             CloseEditor();
         }
@@ -4195,11 +4505,35 @@ else
         }
         if (DateOnly.TryParse(args.Value?.ToString(), out var value))
         {
+            var requestVersion = _weekSelectionGuard.Begin();
+            _weekLoadGuard.Invalidate();
+            _statusRestoreGuard.Invalidate();
+            _rollbackablePlanLoadGuard.Invalidate();
+            _autoGenConfigRestoreGuard.Invalidate();
+            _activeAutoGenRestoreGuard.Invalidate();
+            _latestRollbackableAutoGenPlan = null;
             _selectedDate = value;
             await ResetStatusAsync(clearPersisted: false);
+            if (!_weekSelectionGuard.IsCurrent(requestVersion))
+            {
+                return;
+            }
             await RestorePersistedAutoGenConfigAsync(restoreCourseSelection: true);
+            if (!_weekSelectionGuard.IsCurrent(requestVersion))
+            {
+                return;
+            }
             await LoadWeek();
+            if (!_weekSelectionGuard.IsCurrent(requestVersion))
+            {
+                return;
+            }
             await RestorePersistedAutoGenStatusAsync();
+            if (!_weekSelectionGuard.IsCurrent(requestVersion))
+            {
+                return;
+            }
+            await RestoreLatestRollbackableAutoGenPlanAsync();
         }
     }
     // Обробляє зміну початку діапазону генерації.
@@ -4396,6 +4730,10 @@ else
         bool AllowIncompleteDrafts,
         DateTimeOffset SavedAt
     );
+    private sealed record ActiveAutoGenJobContext(
+        string JobId,
+        int CourseId,
+        DateOnly RangeStartDate);
     private sealed class ConflictDetails
     {
         public string Message { get; init; } = string.Empty;
@@ -4429,7 +4767,8 @@ else
         AutoGenRunReport? Report = null,
         List<AutoGenWarningDetail>? WarningDetails = null,
         AutoGenPlanSummaryDto? Plan = null,
-        PreparedAutoGenPlanLogContext? PlanLogContext = null);
+        PreparedAutoGenPlanLogContext? PlanLogContext = null,
+        int? CourseId = null);
     private sealed record PreparedAutoGenPlanLogContext(
         string PlanId,
         DateOnly RangeStartDate,

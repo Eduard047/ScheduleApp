@@ -392,6 +392,175 @@ public sealed class TeacherDraftsAutogenServiceRegressionTests
     }
 
     [Fact]
+    public async Task Soft_fill_ignores_historical_topic_order_regression_before_selected_range()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var generationDate = new DateOnly(2026, 9, 7);
+        var data = await fixture.SeedCurriculumProgressScenarioAsync(
+            generationDate,
+            academicPeriodStartDate: null,
+            targetHours: 1,
+            topicHours: 1);
+        var historicalModule = new Module
+        {
+            Code = "ІСТ",
+            Title = "Історичний модуль",
+            Credits = 1,
+            CourseId = data.CourseId
+        };
+        var historicalEarlierTopic = new ModuleTopic
+        {
+            Module = historicalModule,
+            Order = 2,
+            TopicCode = "ІСТ-2",
+            LessonTypeId = data.LessonTypeId,
+            TotalHours = 1,
+            AuditoriumHours = 1
+        };
+        var historicalLaterTopic = new ModuleTopic
+        {
+            Module = historicalModule,
+            Order = 1,
+            TopicCode = "ІСТ-1",
+            LessonTypeId = data.LessonTypeId,
+            TotalHours = 1,
+            AuditoriumHours = 1
+        };
+        fixture.Db.AddRange(historicalModule, historicalEarlierTopic, historicalLaterTopic);
+        await fixture.Db.SaveChangesAsync();
+
+        var earlierHistoricalDate = generationDate.AddDays(-14);
+        var laterHistoricalDate = generationDate.AddDays(-7);
+        fixture.Db.TeacherDraftItems.AddRange(
+            new TeacherDraftItem
+            {
+                Date = earlierHistoricalDate,
+                DayOfWeek = earlierHistoricalDate.DayOfWeek,
+                StartTime = data.Start,
+                EndTime = data.End,
+                GroupId = data.GroupId,
+                ModuleId = historicalModule.Id,
+                ModuleTopicId = historicalEarlierTopic.Id,
+                LessonTypeId = data.LessonTypeId
+            },
+            new TeacherDraftItem
+            {
+                Date = laterHistoricalDate,
+                DayOfWeek = laterHistoricalDate.DayOfWeek,
+                StartTime = data.Start,
+                EndTime = data.End,
+                GroupId = data.GroupId,
+                ModuleId = historicalModule.Id,
+                ModuleTopicId = historicalLaterTopic.Id,
+                LessonTypeId = data.LessonTypeId
+            });
+        await fixture.Db.SaveChangesAsync();
+
+        var action = await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(
+            new DraftAutoGenRequest(
+                WeekStart: generationDate,
+                ClearExisting: false,
+                CourseId: data.CourseId,
+                GroupIds: new List<int> { data.GroupId },
+                Days: WeekPreset.MonFri,
+                ModuleHours: new Dictionary<int, int> { [data.ModuleId] = 1 },
+                SoftFill: true,
+                AllowIncompleteDrafts: true,
+                RangeStartDate: generationDate,
+                RangeEndDate: generationDate,
+                SoftOptions: new DraftAutoGenSoftOptions(RecentRepeatWindowDays: 0)));
+
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+        Assert.True(
+            result.Created == 1,
+            $"Історичний порядок тем поза вибраним діапазоном не повинен відкочувати дозаповнення. " +
+            $"Створено: {result.Created}. Прогалини: " +
+            $"{string.Join(" | ", result.GapDetails?.Select(item => item.Reason) ?? Array.Empty<string>())}. " +
+            $"Попередження: {string.Join(" | ", result.Warnings)}");
+        var generated = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .SingleAsync(item => item.Date == generationDate);
+        Assert.Equal(data.ModuleId, generated.ModuleId);
+        Assert.Equal(data.TopicId, generated.ModuleTopicId);
+    }
+
+    [Fact]
+    public async Task Ef_nested_trial_restore_preserves_accepted_move_after_save_and_reload()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var originalDate = new DateOnly(2026, 9, 7);
+        var data = await fixture.SeedCurriculumProgressScenarioAsync(
+            originalDate,
+            academicPeriodStartDate: null,
+            targetHours: 1,
+            topicHours: 1);
+        var roomId = await fixture.Db.Rooms.Select(room => room.Id).SingleAsync();
+        var draft = new TeacherDraftItem
+        {
+            Date = originalDate,
+            DayOfWeek = originalDate.DayOfWeek,
+            StartTime = data.Start,
+            EndTime = data.End,
+            GroupId = data.GroupId,
+            ModuleId = data.ModuleId,
+            ModuleTopicId = data.TopicId,
+            LessonTypeId = data.LessonTypeId,
+            TeacherId = data.TeacherId,
+            RoomId = roomId
+        };
+        fixture.Db.TeacherDraftItems.Add(draft);
+        await fixture.Db.SaveChangesAsync();
+
+        var acceptedDate = originalDate.AddDays(1);
+        var acceptedStart = new TimeOnly(9, 10);
+        var acceptedEnd = new TimeOnly(10, 10);
+        draft.Date = acceptedDate;
+        draft.DayOfWeek = acceptedDate.DayOfWeek;
+        draft.StartTime = acceptedStart;
+        draft.EndTime = acceptedEnd;
+        fixture.Db.ChangeTracker.DetectChanges();
+        var entry = fixture.Db.Entry(draft);
+        Assert.Equal(EntityState.Modified, entry.State);
+        var modifiedProperties = entry.Properties
+            .Where(property => property.IsModified)
+            .Select(property => property.Metadata.Name)
+            .ToHashSet(StringComparer.Ordinal);
+
+        var rejectedDate = originalDate.AddDays(2);
+        draft.Date = rejectedDate;
+        draft.DayOfWeek = rejectedDate.DayOfWeek;
+        draft.StartTime = new TimeOnly(10, 20);
+        draft.EndTime = new TimeOnly(11, 20);
+        fixture.Db.ChangeTracker.DetectChanges();
+
+        entry.State = EntityState.Unchanged;
+        draft.Date = acceptedDate;
+        draft.DayOfWeek = acceptedDate.DayOfWeek;
+        draft.StartTime = acceptedStart;
+        draft.EndTime = acceptedEnd;
+        foreach (var propertyName in modifiedProperties)
+        {
+            entry.Property(propertyName).IsModified = true;
+        }
+
+        Assert.Equal(EntityState.Modified, entry.State);
+        Assert.Equal(acceptedDate, draft.Date);
+        Assert.Equal(acceptedStart, draft.StartTime);
+        Assert.Equal(acceptedEnd, draft.EndTime);
+        await fixture.Db.SaveChangesAsync();
+
+        fixture.Db.ChangeTracker.Clear();
+        var persisted = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .SingleAsync(item => item.Id == draft.Id);
+        Assert.Equal(acceptedDate, persisted.Date);
+        Assert.Equal(acceptedDate.DayOfWeek, persisted.DayOfWeek);
+        Assert.Equal(acceptedStart, persisted.StartTime);
+        Assert.Equal(acceptedEnd, persisted.EndTime);
+    }
+
+    [Fact]
     public async Task Co_teacher_rows_with_same_batch_key_consume_module_topic_once()
     {
         await using var fixture = await TestDatabase.CreateAsync();

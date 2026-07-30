@@ -63,6 +63,13 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
 
         var action = await new TeacherDraftsAutogenService(db).DraftAutoGen(request);
         var result = ExtractResult(action);
+        Assert.True(
+            action.Result is OkObjectResult,
+            string.Join(
+                " | ",
+                result.Warnings
+                    .Where(item => item.Contains("Фінальна перевірка", StringComparison.Ordinal))
+                    .Take(50)));
         var fillAction = await new TeacherDraftsAutogenService(db).DraftAutoGen(
             request with
             {
@@ -89,6 +96,16 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
             .Select(group => new { Date = group.Key, Count = group.Count() })
             .OrderBy(item => item.Date)
             .ToListAsync();
+        var createdByGroupModule = await db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => scenario.GroupIds.Contains(item.GroupId)
+                           && item.Date >= new DateOnly(2026, 9, 1)
+                           && item.Date <= new DateOnly(2026, 9, 12))
+            .GroupBy(item => new { item.GroupId, item.ModuleId })
+            .Select(group => new { group.Key.GroupId, group.Key.ModuleId, Count = group.Count() })
+            .OrderBy(item => item.GroupId)
+            .ThenBy(item => item.ModuleId)
+            .ToListAsync();
 
         var expected = scenario.GroupIds.Count * scenario.ModuleHours.Values.Sum();
         var diagnostics =
@@ -98,16 +115,38 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
             $"dates={string.Join(", ", createdByDate.Select(item => $"{item.Date:MM-dd}:{item.Count}"))}; " +
             $"modules={string.Join(", ", createdByModule.Select(item =>
                 $"{scenario.ModuleIdsByCode.Single(entry => entry.Value == item.ModuleId).Key}:{item.Count}"))}; " +
-            $"fillWarnings={string.Join(" | ", fillResult.Warnings
+            $"groupModules={string.Join(", ", createdByGroupModule.Select(item =>
+                $"{item.GroupId}/{scenario.ModuleIdsByCode.Single(entry => entry.Value == item.ModuleId).Key}:{item.Count}"))}; " +
+            $"gapReasons={string.Join(" | ", (result.GapDetails ?? new List<AutoGenGapDetail>())
+                .GroupBy(item => item.Reason ?? "<none>")
+                .OrderByDescending(group => group.Count())
+                .Select(group => $"{group.Count()}x {group.Key}"))}; " +
+            $"fillGapReasons={string.Join(" | ", (fillResult.GapDetails ?? new List<AutoGenGapDetail>())
+                .GroupBy(item => item.Reason ?? "<none>")
+                .OrderByDescending(group => group.Count())
+                .Select(group => $"{group.Count()}x {group.Key}"))}; " +
+            $"warnings={string.Join(" | ", result.Warnings
                 .Where(item => item.Contains("Фінальна перевірка", StringComparison.Ordinal))
-                .Take(20))}";
+                .Take(50))}; " +
+            $"fillWarnings={string.Join(" | ", fillResult.Warnings
+                .Where(item => item.Contains("repair-pass", StringComparison.Ordinal)
+                               || item.Contains("Фінальна перевірка", StringComparison.Ordinal))
+                .Take(100))}";
         Assert.True(action.Result is OkObjectResult, diagnostics);
         Assert.True(fillAction.Result is OkObjectResult, diagnostics);
         Assert.True(result.Created + result.Skipped <= expected, diagnostics);
-        Assert.True(result.Created >= 585, diagnostics);
-        Assert.True(result.Created + fillResult.Created >= 597, diagnostics);
-        Assert.True((result.GapDetails?.Count ?? 0) <= 66, diagnostics);
-        Assert.True((fillResult.GapDetails?.Count ?? 0) <= 54, diagnostics);
+        Assert.True(result.Created >= 615, diagnostics);
+        if (result.Created + result.Skipped < expected)
+        {
+            Assert.True(fillResult.Created > 0, diagnostics);
+        }
+        Assert.True(result.Created + fillResult.Created >= 645, diagnostics);
+        Assert.Equal(result.Created + fillResult.Created, createdByModule.Sum(item => item.Count));
+        Assert.True((result.GapDetails?.Count ?? 0) <= 36, diagnostics);
+        Assert.True((fillResult.GapDetails?.Count ?? 0) <= 6, diagnostics);
+        Assert.True(
+            (fillResult.GapDetails?.Count ?? 0) <= (result.GapDetails?.Count ?? 0),
+            diagnostics);
         Assert.DoesNotContain(
             result.Preflight ?? new List<AutoGenPreflightItem>(),
             item => item.Count > 0);
@@ -151,6 +190,34 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
             Assert.True(secondWeekCount > 0, $"Модуль {moduleCode} не потрапив до другого тижня діапазону.");
         }
 
+        var mergedLectureTopicId = await db.ModuleTopics
+            .AsNoTracking()
+            .Where(topic => topic.ModuleId == scenario.ModuleIdsByCode["5"]
+                            && topic.TopicCode == "5.1.2.1")
+            .Select(topic => topic.Id)
+            .SingleAsync();
+        var mergedLectureOccurrences = await db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => item.ModuleTopicId == mergedLectureTopicId
+                           && scenario.GroupIds.Contains(item.GroupId)
+                           && item.Date >= new DateOnly(2026, 9, 1)
+                           && item.Date <= new DateOnly(2026, 9, 12))
+            .GroupBy(item => new
+            {
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                item.TeacherId,
+                item.RoomId
+            })
+            .Select(group => new
+            {
+                GroupCount = group.Select(item => item.GroupId).Distinct().Count()
+            })
+            .ToListAsync();
+        Assert.Single(mergedLectureOccurrences);
+        Assert.Equal(scenario.GroupIds.Count, mergedLectureOccurrences[0].GroupCount);
+
         var hardRuleValidation = await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(
             new TeacherDraftsAutogenHardRuleValidationRequest(
                 scenario.CourseId,
@@ -158,9 +225,26 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
                 new DateOnly(2026, 9, 1),
                 new DateOnly(2026, 9, 12),
                 WeekPreset.MonSat,
-                AllowIncompleteDrafts: true,
+                AllowIncompleteDrafts: false,
                 MaxParallelGroupsPerModuleInSlot: AutoGenRecommendedProfile.MaxParallelGroupsPerModuleInSlot));
         Assert.Empty(hardRuleValidation.Violations);
+
+        var fingerprintBeforeIdempotenceCheck = await LoadScheduleFingerprintAsync(
+            db,
+            scenario.GroupIds);
+        var repeatedFillAction = await new TeacherDraftsAutogenService(db).DraftAutoGen(
+            request with
+            {
+                ClearExisting = false,
+                SoftFill = true
+            });
+        var repeatedFillResult = ExtractResult(repeatedFillAction);
+        var fingerprintAfterIdempotenceCheck = await LoadScheduleFingerprintAsync(
+            db,
+            scenario.GroupIds);
+        Assert.IsType<OkObjectResult>(repeatedFillAction.Result);
+        Assert.Equal(0, repeatedFillResult.Created);
+        Assert.Equal(fingerprintBeforeIdempotenceCheck, fingerprintAfterIdempotenceCheck);
     }
 
     private static async Task<L3Scenario> LoadScenarioAsync(AppDbContext source)
@@ -218,6 +302,43 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
             AdjacentRoomChangePenalty: options.AdjacentRoomChangePenalty,
             TeacherLoadPenaltyWeight: options.TeacherLoadPenaltyWeight,
             BuildingDistancePenaltyWeight: options.BuildingDistancePenaltyWeight);
+
+    private static async Task<string> LoadScheduleFingerprintAsync(
+        AppDbContext db,
+        IReadOnlyCollection<int> groupIds)
+    {
+        var rows = await db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => groupIds.Contains(item.GroupId)
+                           && item.Date >= new DateOnly(2026, 9, 1)
+                           && item.Date <= new DateOnly(2026, 9, 12))
+            .OrderBy(item => item.Date)
+            .ThenBy(item => item.StartTime)
+            .ThenBy(item => item.EndTime)
+            .ThenBy(item => item.GroupId)
+            .ThenBy(item => item.ModuleId)
+            .ThenBy(item => item.ModuleTopicId)
+            .Select(item => new
+            {
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                item.GroupId,
+                item.ModuleId,
+                item.ModuleTopicId,
+                item.LessonTypeId,
+                item.TeacherId,
+                item.RoomId,
+                item.IsSelfStudy
+            })
+            .ToListAsync();
+        return string.Join(
+            "\n",
+            rows.Select(item =>
+                $"{item.Date:yyyy-MM-dd}|{item.StartTime:HH\\:mm}|{item.EndTime:HH\\:mm}|"
+                + $"{item.GroupId}|{item.ModuleId}|{item.ModuleTopicId}|{item.LessonTypeId}|"
+                + $"{item.TeacherId}|{item.RoomId}|{item.IsSelfStudy}"));
+    }
 
     private sealed record L3Scenario(
         int CourseId,

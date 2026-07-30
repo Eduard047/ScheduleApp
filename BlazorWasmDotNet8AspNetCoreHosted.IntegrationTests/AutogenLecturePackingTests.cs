@@ -289,6 +289,155 @@ public sealed class AutogenLecturePackingTests
     }
 
     [Fact]
+    public async Task Hard_rule_validator_checks_pending_resources_without_revalidating_protected_legacy_rows()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        await using var db = new AppDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+
+        var course = new Course { Name = "Курс ресурсів", DurationWeeks = 18 };
+        var group = new Group { Name = "Група", StudentsCount = 20, Course = course };
+        var lessonType = new LessonTypeRef
+        {
+            Code = "PRACTICE",
+            Name = "Практика",
+            RequiresTeacher = true,
+            RequiresRoom = true,
+            BlocksTeacher = true,
+            BlocksRoom = true
+        };
+        var module = new Module { Code = "M1", Title = "Модуль", Course = course };
+        var allowedTeacher = new Teacher { FullName = "Дозволений викладач" };
+        var foreignTeacher = new Teacher { FullName = "Сторонній викладач" };
+        var allowedBuilding = new Building { Name = "Дозволений корпус" };
+        var foreignBuilding = new Building { Name = "Сторонній корпус" };
+        var allowedRoom = new Room
+        {
+            Name = "Дозволена аудиторія",
+            Capacity = 30,
+            Building = allowedBuilding
+        };
+        var foreignRoom = new Room
+        {
+            Name = "Стороння аудиторія",
+            Capacity = 30,
+            Building = foreignBuilding
+        };
+        db.AddRange(
+            course,
+            group,
+            lessonType,
+            module,
+            allowedTeacher,
+            foreignTeacher,
+            allowedRoom,
+            foreignRoom);
+        await db.SaveChangesAsync();
+        db.TeacherModules.Add(new TeacherModule
+        {
+            ModuleId = module.Id,
+            TeacherId = allowedTeacher.Id
+        });
+        db.ModuleRooms.Add(new ModuleRoom
+        {
+            ModuleId = module.Id,
+            RoomId = allowedRoom.Id
+        });
+        db.ModuleBuildings.Add(new ModuleBuilding
+        {
+            ModuleId = module.Id,
+            BuildingId = allowedBuilding.Id
+        });
+        var date = new DateOnly(2026, 9, 7);
+        db.TimeSlots.Add(new TimeSlot
+        {
+            CourseId = course.Id,
+            DayOfWeek = date.DayOfWeek,
+            Start = new TimeOnly(9, 0),
+            End = new TimeOnly(10, 0),
+            SortOrder = 1,
+            IsActive = true
+        });
+        await db.SaveChangesAsync();
+
+        TeacherDraftsAutogenHardRuleValidationRequest BuildRequest(int teacherId, int roomId)
+            => new(
+                course.Id,
+                new[] { group.Id },
+                date,
+                date,
+                AllowIncompleteDrafts: false,
+                PendingDrafts: new[]
+                {
+                    new TeacherDraftsAutogenPendingDraft(
+                        date,
+                        new TimeOnly(9, 0),
+                        new TimeOnly(10, 0),
+                        group.Id,
+                        module.Id,
+                        lessonType.Id,
+                        null,
+                        teacherId,
+                        roomId,
+                        false)
+                },
+                IncludeStoredDrafts: false);
+
+        var invalidResult = await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(
+            BuildRequest(foreignTeacher.Id, foreignRoom.Id));
+
+        Assert.Contains(
+            invalidResult.Violations,
+            violation => violation.Contains("не призначений модулю", StringComparison.Ordinal));
+        Assert.Contains(
+            invalidResult.Violations,
+            violation => violation.Contains("не входить до дозволених аудиторій", StringComparison.Ordinal));
+        Assert.Contains(
+            invalidResult.Violations,
+            violation => violation.Contains("поза дозволеними корпусами", StringComparison.Ordinal));
+
+        var validResult = await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(
+            BuildRequest(allowedTeacher.Id, allowedRoom.Id));
+
+        Assert.Empty(validResult.Violations);
+
+        db.TeacherDraftItems.Add(new TeacherDraftItem
+        {
+            Date = date,
+            DayOfWeek = date.DayOfWeek,
+            StartTime = new TimeOnly(9, 0),
+            EndTime = new TimeOnly(10, 0),
+            GroupId = group.Id,
+            ModuleId = module.Id,
+            LessonTypeId = lessonType.Id,
+            TeacherId = foreignTeacher.Id,
+            RoomId = foreignRoom.Id,
+            Status = DraftStatus.Draft,
+            IsLocked = true
+        });
+        await db.SaveChangesAsync();
+
+        var emptyPlanResult = await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(
+            new TeacherDraftsAutogenHardRuleValidationRequest(
+                course.Id,
+                new[] { group.Id },
+                date,
+                date,
+                AllowIncompleteDrafts: false,
+                PendingDrafts: Array.Empty<TeacherDraftsAutogenPendingDraft>()));
+
+        Assert.DoesNotContain(
+            emptyPlanResult.Violations,
+            violation => violation.Contains("не призначений модулю", StringComparison.Ordinal)
+                         || violation.Contains("не входить до дозволених аудиторій", StringComparison.Ordinal)
+                         || violation.Contains("поза дозволеними корпусами", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task Draft_autogen_passes_cancellation_token_to_first_database_query()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
@@ -965,6 +1114,50 @@ public sealed class AutogenLecturePackingTests
     }
 
     [Fact]
+    public async Task Draft_autogen_skips_five_minute_slot_when_only_different_room_is_available()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+
+        await using var db = new AppDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var data = await SeedStudentTravelGapScenarioAsync(db, useSameBuilding: true);
+
+        var request = new DraftAutoGenRequest(
+            WeekStart: data.Date,
+            ClearExisting: true,
+            CourseId: data.CourseId,
+            GroupIds: new List<int> { data.GroupId },
+            Days: WeekPreset.MonFri,
+            ModuleHours: new Dictionary<int, int> { [data.TargetModuleId] = 1 },
+            RangeStartDate: data.Date,
+            RangeEndDate: data.Date,
+            SoftOptions: new DraftAutoGenSoftOptions(RecentRepeatWindowDays: 0));
+
+        var service = new TeacherDraftsAutogenService(db);
+        var action = await service.DraftAutoGen(request);
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+
+        var generated = await db.TeacherDraftItems
+            .AsNoTracking()
+            .Include(item => item.Room)
+            .Where(item => item.GroupId == data.GroupId
+                           && item.ModuleId == data.TargetModuleId)
+            .SingleAsync();
+        var violations = await TravelInvariantVerifier.FindViolationsAsync(db, data.CourseId, data.Date, data.Date);
+
+        Assert.Equal(1, result.Created);
+        Assert.Equal(data.ReachableStart, generated.StartTime);
+        Assert.Equal(data.TargetBuildingId, generated.Room!.BuildingId);
+        Assert.Empty(violations);
+    }
+
+    [Fact]
     public async Task Draft_autogen_keeps_seven_group_topic_lecture_in_one_large_room()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
@@ -1439,6 +1632,7 @@ public sealed class AutogenLecturePackingTests
         Assert.Equal(1, result.Created);
         Assert.Equal(data.FirstSlotStart, movedDraft.StartTime);
         Assert.Equal(data.SecondSlotStart, generated.StartTime);
+        Assert.Null(movedDraft.ValidationWarnings);
         Assert.True(movedDraft.UpdatedAt > new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc));
         Assert.Empty(result.GapDetails ?? new List<AutoGenGapDetail>());
     }
@@ -1858,6 +2052,7 @@ public sealed class AutogenLecturePackingTests
             RoomId = movableRoomId,
             Status = DraftStatus.Draft,
             IsLocked = false,
+            ValidationWarnings = """{"issues":[{"code":"room-required"}]}""",
             UpdatedAt = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc)
         };
         db.TeacherDraftItems.Add(movableDraft);
@@ -3449,7 +3644,9 @@ public sealed class AutogenLecturePackingTests
         return new SharedTopicSubflowSeed(courseId, targetModuleId, sharedTopicId, groupIds, date);
     }
 
-    private static async Task<StudentTravelGapSeed> SeedStudentTravelGapScenarioAsync(AppDbContext db)
+    private static async Task<StudentTravelGapSeed> SeedStudentTravelGapScenarioAsync(
+        AppDbContext db,
+        bool useSameBuilding = false)
     {
         const int courseId = 1;
         const int groupId = 1;
@@ -3457,7 +3654,7 @@ public sealed class AutogenLecturePackingTests
         const int fixedModuleId = 1;
         const int targetModuleId = 2;
         const int sourceBuildingId = 1;
-        const int targetBuildingId = 2;
+        var targetBuildingId = useSameBuilding ? sourceBuildingId : 2;
         const int sourceRoomId = 1;
         const int targetRoomId = 2;
         const int fixedTeacherId = 1;
@@ -3519,24 +3716,26 @@ public sealed class AutogenLecturePackingTests
             TotalHours = 1,
             AuditoriumHours = 1
         });
-        db.Buildings.AddRange(
-            new Building
-            {
-                Id = sourceBuildingId,
-                Name = "Корпус A"
-            },
-            new Building
+        db.Buildings.Add(new Building
+        {
+            Id = 1,
+            Name = "Корпус A"
+        });
+        if (!useSameBuilding)
+        {
+            db.Buildings.Add(new Building
             {
                 Id = targetBuildingId,
                 Name = "Корпус B"
             });
-        db.BuildingTravels.Add(new BuildingTravel
-        {
-            Id = 1,
-            FromBuildingId = sourceBuildingId,
-            ToBuildingId = targetBuildingId,
-            Minutes = 20
-        });
+            db.BuildingTravels.Add(new BuildingTravel
+            {
+                Id = 1,
+                FromBuildingId = sourceBuildingId,
+                ToBuildingId = targetBuildingId,
+                Minutes = 20
+            });
+        }
         db.Rooms.AddRange(
             new Room
             {

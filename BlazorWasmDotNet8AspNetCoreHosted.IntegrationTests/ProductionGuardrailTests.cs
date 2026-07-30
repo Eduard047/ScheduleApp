@@ -889,6 +889,188 @@ public sealed class ProductionGuardrailTests
             violation.Contains("слот не відповідає", StringComparison.OrdinalIgnoreCase));
     }
 
+    [Fact]
+    public async Task Hard_rule_validator_rejects_empty_canonical_slot_inside_lecture_block()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var ids = await fixture.SeedMinimalScheduleModelAsync();
+        var date = new DateOnly(2026, 5, 4);
+        var lectureType = new LessonTypeRef
+        {
+            Code = "LECTURE",
+            Name = "Лекція",
+            IsActive = true,
+            RequiresRoom = false,
+            RequiresTeacher = false,
+            BlocksRoom = false,
+            BlocksTeacher = false,
+            CountInPlan = true,
+            CountInLoad = true
+        };
+        fixture.Db.LessonTypes.Add(lectureType);
+        fixture.Db.TimeSlots.AddRange(
+            new TimeSlot
+            {
+                CourseId = ids.CourseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0),
+                SortOrder = 1,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                CourseId = ids.CourseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(9, 0),
+                End = new TimeOnly(10, 0),
+                SortOrder = 2,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                CourseId = ids.CourseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(10, 0),
+                End = new TimeOnly(11, 0),
+                SortOrder = 3,
+                IsActive = true
+            });
+        await fixture.Db.SaveChangesAsync();
+
+        fixture.Db.TeacherDraftItems.AddRange(
+            new TeacherDraftItem
+            {
+                Date = date,
+                DayOfWeek = date.DayOfWeek,
+                StartTime = new TimeOnly(8, 0),
+                EndTime = new TimeOnly(9, 0),
+                GroupId = ids.GroupId,
+                ModuleId = ids.ModuleId,
+                LessonTypeId = lectureType.Id
+            },
+            new TeacherDraftItem
+            {
+                Date = date,
+                DayOfWeek = date.DayOfWeek,
+                StartTime = new TimeOnly(10, 0),
+                EndTime = new TimeOnly(11, 0),
+                GroupId = ids.GroupId,
+                ModuleId = ids.ModuleId,
+                LessonTypeId = lectureType.Id
+            });
+        await fixture.Db.SaveChangesAsync();
+
+        var result = await new TeacherDraftsAutogenHardRuleValidator(fixture.Db).ValidateAsync(
+            new TeacherDraftsAutogenHardRuleValidationRequest(
+                ids.CourseId,
+                new[] { ids.GroupId },
+                date,
+                date,
+                WeekPreset.MonFri,
+                AllowIncompleteDrafts: true));
+
+        Assert.Contains(result.Violations, violation =>
+            violation.Contains("порожнім канонічним слотом 09:00-10:00", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Theory]
+    [InlineData("single", false)]
+    [InlineData("contiguous", false)]
+    [InlineData("interrupted", true)]
+    [InlineData("nonlecture-before-lecture", true)]
+    public async Task Hard_rule_validator_enforces_lecture_prefix_without_rejecting_valid_blocks(
+        string scenario,
+        bool expectLectureOrderViolation)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var ids = await fixture.SeedMinimalScheduleModelAsync();
+        var date = new DateOnly(2026, 5, 4);
+        var lectureType = new LessonTypeRef
+        {
+            Code = "LECTURE",
+            Name = "Лекція",
+            IsActive = true,
+            RequiresRoom = false,
+            RequiresTeacher = false,
+            BlocksRoom = false,
+            BlocksTeacher = false,
+            CountInPlan = true,
+            CountInLoad = true
+        };
+        fixture.Db.LessonTypes.Add(lectureType);
+        fixture.Db.TimeSlots.AddRange(
+            new TimeSlot
+            {
+                CourseId = ids.CourseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0),
+                SortOrder = 1,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                CourseId = ids.CourseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(9, 0),
+                End = new TimeOnly(10, 0),
+                SortOrder = 2,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                CourseId = ids.CourseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(10, 0),
+                End = new TimeOnly(11, 0),
+                SortOrder = 3,
+                IsActive = true
+            });
+        await fixture.Db.SaveChangesAsync();
+
+        var lessonTypeIds = scenario switch
+        {
+            "single" => new[] { lectureType.Id },
+            "contiguous" => new[] { lectureType.Id, lectureType.Id, ids.LessonTypeId },
+            "interrupted" => new[] { lectureType.Id, ids.LessonTypeId, lectureType.Id },
+            "nonlecture-before-lecture" => new[] { ids.LessonTypeId, lectureType.Id },
+            _ => throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null)
+        };
+        var slots = new[]
+        {
+            (Start: new TimeOnly(8, 0), End: new TimeOnly(9, 0)),
+            (Start: new TimeOnly(9, 0), End: new TimeOnly(10, 0)),
+            (Start: new TimeOnly(10, 0), End: new TimeOnly(11, 0))
+        };
+        fixture.Db.TeacherDraftItems.AddRange(lessonTypeIds.Select((lessonTypeId, index) =>
+            new TeacherDraftItem
+            {
+                Date = date,
+                DayOfWeek = date.DayOfWeek,
+                StartTime = slots[index].Start,
+                EndTime = slots[index].End,
+                GroupId = ids.GroupId,
+                ModuleId = ids.ModuleId,
+                LessonTypeId = lessonTypeId
+            }));
+        await fixture.Db.SaveChangesAsync();
+
+        var result = await new TeacherDraftsAutogenHardRuleValidator(fixture.Db).ValidateAsync(
+            new TeacherDraftsAutogenHardRuleValidationRequest(
+                ids.CourseId,
+                new[] { ids.GroupId },
+                date,
+                date,
+                WeekPreset.MonFri,
+                AllowIncompleteDrafts: true));
+
+        Assert.Equal(
+            expectLectureOrderViolation,
+            result.Violations.Any(violation =>
+                violation.Contains("лекційний блок розірвано заняттям", StringComparison.OrdinalIgnoreCase)));
+    }
+
     [Theory]
     [InlineData(false, false)]
     [InlineData(true, true)]
@@ -1397,8 +1579,12 @@ public sealed class ProductionGuardrailTests
                 toBuildingId: 1));
     }
 
-    [Fact]
-    public async Task Hard_rule_validator_rejects_five_minute_change_between_rooms_in_same_building()
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public async Task Hard_rule_validator_allows_five_minute_transition_only_in_same_room(
+        bool keepSameRoom,
+        bool expectTransitionViolation)
     {
         await using var fixture = await TestDatabase.CreateAsync();
         var ids = await fixture.SeedMinimalScheduleModelAsync();
@@ -1462,7 +1648,7 @@ public sealed class ProductionGuardrailTests
                 GroupId = ids.GroupId,
                 ModuleId = ids.ModuleId,
                 LessonTypeId = lessonType.Id,
-                RoomId = secondRoom.Id
+                RoomId = keepSameRoom ? firstRoom.Id : secondRoom.Id
             });
         await fixture.Db.SaveChangesAsync();
 
@@ -1473,10 +1659,11 @@ public sealed class ProductionGuardrailTests
                 date,
                 date));
 
-        Assert.Contains(
-            result.Violations,
-            violation => violation.Contains("зміну аудиторії", StringComparison.OrdinalIgnoreCase)
-                         && violation.Contains("потрібно 10 хв", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(
+            expectTransitionViolation,
+            result.Violations.Any(violation =>
+                violation.Contains("зміну аудиторії", StringComparison.OrdinalIgnoreCase)
+                && violation.Contains("потрібно 10 хв", StringComparison.OrdinalIgnoreCase)));
     }
 
     [Fact]

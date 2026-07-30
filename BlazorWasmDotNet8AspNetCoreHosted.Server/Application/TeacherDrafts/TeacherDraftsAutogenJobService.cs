@@ -1642,7 +1642,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                                     ?? throw new InvalidOperationException("Попередній план автогенерації не сформовано."));
                                 warnings.Add("Сформовано попередній план без зміни робочих чернеток. Застосуйте його окремою дією після перегляду.");
                             }
-                            else
+                            else if (ShouldReportExecutionRollback(job.Request, failed))
                             {
                                 MarkExecutionRolledBack();
                             }
@@ -1780,6 +1780,9 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             warnings.Add(FullJobRollbackWarning);
         }
     }
+
+    private static bool ShouldReportExecutionRollback(AutoGenJobRequest request, bool failed)
+        => failed || (!request.PreflightOnly && !request.PreviewOnly);
 
     private async Task TryRollbackExecutionTransactionAsync(
         IDbContextTransaction transaction,

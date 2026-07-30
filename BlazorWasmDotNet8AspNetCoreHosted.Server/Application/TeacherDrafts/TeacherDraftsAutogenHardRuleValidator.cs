@@ -74,6 +74,12 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             }
         }
 
+        var resourceEligibilityRows = request.PendingDrafts is not null
+            ? await LoadPendingDraftRowsAsync(request.PendingDrafts, cancellationToken)
+            : currentDraftRows;
+        violations.AddRange(await FindResourceEligibilityViolationsAsync(
+            resourceEligibilityRows,
+            cancellationToken));
         violations.AddRange(await FindTimeSlotViolationsAsync(currentDraftRows, cancellationToken));
         violations.AddRange(await FindTeacherWorkingHourViolationsAsync(currentDraftRows, cancellationToken));
         if (request.MaxParallelGroupsPerModuleInSlot is int maxParallelGroups && maxParallelGroups > 0)
@@ -97,6 +103,9 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             cancellationToken));
         violations.AddRange(FindModuleTopicPlanViolations(currentDraftRows, modulesWithAuditoriumTopics));
         violations.AddRange(FindLectureBlockOrderViolations(placements));
+        violations.AddRange(await FindEmptyCanonicalLectureSlotViolationsAsync(
+            placements,
+            cancellationToken));
         var roomCapacityStats = AnalyzeRoomCapacity(placements, cancellationToken);
         violations.AddRange(roomCapacityStats.Violations);
         violations.AddRange(await FindTravelViolationsAsync(placements, cancellationToken));
@@ -105,6 +114,97 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             violations,
             roomCapacityStats.MaxSharedGroupCount,
             roomCapacityStats.MaxSharedGroupLabel);
+    }
+
+    private async Task<IReadOnlyList<string>> FindResourceEligibilityViolationsAsync(
+        IReadOnlyList<PlacementRow> currentDraftRows,
+        CancellationToken cancellationToken)
+    {
+        var moduleIds = currentDraftRows
+            .Select(row => row.ModuleId)
+            .Distinct()
+            .ToList();
+        if (moduleIds.Count == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        var teacherLinks = (await _db.TeacherModules
+                .AsNoTracking()
+                .Where(link => moduleIds.Contains(link.ModuleId))
+                .Select(link => new { link.ModuleId, link.TeacherId })
+                .ToListAsync(cancellationToken))
+            .Select(link => (link.ModuleId, link.TeacherId))
+            .ToHashSet();
+        var supervisorLinks = (await _db.ModuleSupervisors
+                .AsNoTracking()
+                .Where(link => moduleIds.Contains(link.ModuleId))
+                .Select(link => new { link.ModuleId, link.TeacherId })
+                .ToListAsync(cancellationToken))
+            .Select(link => (link.ModuleId, link.TeacherId))
+            .ToHashSet();
+        var allowedRoomIdsByModule = (await _db.ModuleRooms
+                .AsNoTracking()
+                .Where(link => moduleIds.Contains(link.ModuleId))
+                .Select(link => new { link.ModuleId, link.RoomId })
+                .ToListAsync(cancellationToken))
+            .GroupBy(link => link.ModuleId)
+            .ToDictionary(
+                group => group.Key,
+                group => group.Select(link => link.RoomId).ToHashSet());
+        var allowedBuildingIdsByModule = (await _db.ModuleBuildings
+                .AsNoTracking()
+                .Where(link => moduleIds.Contains(link.ModuleId))
+                .Select(link => new { link.ModuleId, link.BuildingId })
+                .ToListAsync(cancellationToken))
+            .GroupBy(link => link.ModuleId)
+            .ToDictionary(
+                group => group.Key,
+                group => group.Select(link => link.BuildingId).ToHashSet());
+
+        var violations = new List<string>();
+        foreach (var row in currentDraftRows)
+        {
+            if (row.TeacherId is int teacherId)
+            {
+                var teacherAllowed = row.IsSelfStudy
+                    ? supervisorLinks.Contains((row.ModuleId, teacherId))
+                    : teacherLinks.Contains((row.ModuleId, teacherId));
+                if (!teacherAllowed)
+                {
+                    var role = row.IsSelfStudy ? "керівник самостійної роботи" : "викладач";
+                    violations.Add(
+                        $"{row.Date:yyyy-MM-dd} {row.GroupName} {row.Start:HH\\:mm}: {role} "
+                        + $"{row.TeacherName ?? $"#{teacherId}"} не призначений модулю #{row.ModuleId}.");
+                }
+            }
+
+            if (row.RoomId is not int roomId)
+            {
+                continue;
+            }
+
+            if (allowedRoomIdsByModule.TryGetValue(row.ModuleId, out var allowedRoomIds)
+                && allowedRoomIds.Count > 0
+                && !allowedRoomIds.Contains(roomId))
+            {
+                violations.Add(
+                    $"{row.Date:yyyy-MM-dd} {row.GroupName} {row.Start:HH\\:mm}: аудиторія "
+                    + $"{row.RoomName ?? $"#{roomId}"} не входить до дозволених аудиторій модуля #{row.ModuleId}.");
+            }
+
+            if (allowedBuildingIdsByModule.TryGetValue(row.ModuleId, out var allowedBuildingIds)
+                && allowedBuildingIds.Count > 0
+                && (row.RoomBuildingId is not int buildingId
+                    || !allowedBuildingIds.Contains(buildingId)))
+            {
+                violations.Add(
+                    $"{row.Date:yyyy-MM-dd} {row.GroupName} {row.Start:HH\\:mm}: аудиторія "
+                    + $"{row.RoomName ?? $"#{roomId}"} розташована поза дозволеними корпусами модуля #{row.ModuleId}.");
+            }
+        }
+
+        return violations;
     }
 
     private async Task<IReadOnlyList<PlacementRow>> LoadDraftRowsAsync(
@@ -768,6 +868,102 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
                 $"{group.Key.Date:yyyy-MM-dd} {group.Key.GroupName}: лекційний блок розірвано заняттям "
                 + $"{interruption.Start:HH\\:mm}-{interruption.End:HH\\:mm}; після початку нелекційних занять "
                 + $"повертатися до лекцій цього дня не можна.");
+        }
+
+        return violations;
+    }
+
+    private async Task<IReadOnlyList<string>> FindEmptyCanonicalLectureSlotViolationsAsync(
+        IReadOnlyList<PlacementRow> placements,
+        CancellationToken cancellationToken)
+    {
+        var activePlacements = placements
+            .Where(row => !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(row.LessonTypeCode))
+            .ToList();
+        if (activePlacements.Count == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        var courseIds = activePlacements
+            .Select(row => row.CourseId)
+            .Distinct()
+            .ToList();
+        var timeSlots = await _db.TimeSlots
+            .AsNoTracking()
+            .Where(slot => slot.CourseId == null || courseIds.Contains(slot.CourseId.Value))
+            .ToListAsync(cancellationToken);
+        var lunches = await _db.LunchConfigs
+            .AsNoTracking()
+            .Where(lunch => lunch.CourseId == null || courseIds.Contains(lunch.CourseId.Value))
+            .ToListAsync(cancellationToken);
+        var slotsByCourseDay = new Dictionary<(int CourseId, DayOfWeek Day), IReadOnlyList<TimeSlot>>();
+        var violations = new List<string>();
+
+        foreach (var group in activePlacements.GroupBy(row => new
+                 {
+                     row.GroupId,
+                     row.GroupName,
+                     row.CourseId,
+                     row.Date
+                 }))
+        {
+            var ordered = CollapseLogicalDraftEventPlacements(group)
+                .OrderBy(row => row.Start)
+                .ThenBy(row => row.End)
+                .ToList();
+            var lectures = ordered
+                .Where(CanShareAcrossGroups)
+                .OrderBy(row => row.Start)
+                .ThenBy(row => row.End)
+                .ToList();
+            if (lectures.Count < 2 || !lectures.Any(row => row.IsDraft))
+            {
+                continue;
+            }
+
+            var firstLecture = lectures[0];
+            var lastLecture = lectures[^1];
+            var cacheKey = (group.Key.CourseId, group.Key.Date.DayOfWeek);
+            if (!slotsByCourseDay.TryGetValue(cacheKey, out var canonicalSlots))
+            {
+                canonicalSlots = TimeSlotsResolver
+                    .ResolveForDay(timeSlots, group.Key.CourseId, group.Key.Date.DayOfWeek, lunches)
+                    .Slots
+                    .OrderBy(slot => slot.SortOrder)
+                    .ThenBy(slot => slot.Start)
+                    .ToList();
+                slotsByCourseDay[cacheKey] = canonicalSlots;
+            }
+
+            var firstLectureSlotIndex = canonicalSlots
+                .Select((slot, index) => new { slot, index })
+                .FirstOrDefault(item => item.slot.Start == firstLecture.Start)
+                ?.index;
+            var lastLectureSlotIndex = canonicalSlots
+                .Select((slot, index) => new { slot, index })
+                .LastOrDefault(item => item.slot.End == lastLecture.End)
+                ?.index;
+            if (firstLectureSlotIndex is not int firstIndex
+                || lastLectureSlotIndex is not int lastIndex
+                || firstIndex >= lastIndex)
+            {
+                continue;
+            }
+
+            var emptySlot = canonicalSlots
+                .Skip(firstIndex)
+                .Take(lastIndex - firstIndex + 1)
+                .FirstOrDefault(slot => !ordered.Any(row =>
+                    row.Start <= slot.Start && row.End >= slot.End));
+            if (emptySlot is null)
+            {
+                continue;
+            }
+
+            violations.Add(
+                $"{group.Key.Date:yyyy-MM-dd} {group.Key.GroupName}: лекційний блок розірвано порожнім "
+                + $"канонічним слотом {emptySlot.Start:HH\\:mm}-{emptySlot.End:HH\\:mm} між першою та останньою лекцією.");
         }
 
         return violations;

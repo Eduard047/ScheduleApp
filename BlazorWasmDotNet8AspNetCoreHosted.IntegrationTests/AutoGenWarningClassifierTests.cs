@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Text.Json;
+using BlazorWasmDotNet8AspNetCoreHosted.Client.Services;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 
@@ -175,5 +176,220 @@ public sealed class AutoGenWarningClassifierTests
                 Array.Empty<AutoGenGapDetail>(),
                 Array.Empty<AutoGenPreflightItem>()
             }));
+    }
+}
+
+public sealed class AdminScheduleAutoGenStateTests
+{
+    [Theory]
+    [InlineData("2026-09-01", "2026-08-31")]
+    [InlineData("2026-09-06", "2026-08-31")]
+    [InlineData("2026-09-07", "2026-09-07")]
+    public void Status_week_key_uses_monday_of_job_range(string date, string expectedWeekKey)
+    {
+        var result = AdminScheduleAutoGenState.BuildWeekKey(DateOnly.Parse(date));
+
+        Assert.Equal(expectedWeekKey, result);
+    }
+
+    [Theory]
+    [InlineData(null, 3, true)]
+    [InlineData(3, 3, true)]
+    [InlineData(3, 4, false)]
+    [InlineData(3, null, false)]
+    public void Persisted_status_is_not_restored_for_another_course(
+        int? persistedCourseId,
+        int? selectedCourseId,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            AdminScheduleAutoGenState.CanRestoreStatusForCourse(
+                persistedCourseId,
+                selectedCourseId));
+    }
+
+    [Fact]
+    public void Technical_warnings_do_not_duplicate_separately_rendered_gaps()
+    {
+        var gaps = Enumerable.Range(1, 49)
+            .Select(index => new AutoGenGapDetail(
+                GroupId: index,
+                GroupName: $"Група {index}",
+                Date: new DateOnly(2026, 9, 1),
+                Start: new TimeOnly(9, 0),
+                End: new TimeOnly(9, 45),
+                SlotLabel: "09:00-09:45",
+                Reason: "Немає доступного ресурсу."))
+            .ToList();
+
+        var duplicatedSlotWarnings = gaps
+            .Select(gap =>
+                $"Автогенерація не заповнила слот {gap.SlotLabel} для групи {gap.GroupName} на {gap.Date:yyyy-MM-dd}. Причина: {gap.Reason}")
+            .Append("Попередження сервера.")
+            .ToList();
+        var withServerWarnings = AdminScheduleAutoGenState.BuildTechnicalWarningMessages(
+            duplicatedSlotWarnings,
+            gaps);
+
+        Assert.Equal(new[] { "Попередження сервера." }, withServerWarnings);
+    }
+
+    [Fact]
+    public void Structured_gap_warning_is_removed_but_other_metadata_is_preserved()
+    {
+        var gap = new AutoGenGapDetail(
+            GroupId: 9302,
+            GroupName: "9302",
+            Date: new DateOnly(2026, 9, 1),
+            Start: new TimeOnly(9, 0),
+            End: new TimeOnly(9, 45),
+            SlotLabel: "09:00-09:45",
+            Reason: "Немає доступного ресурсу.");
+        var gapMessage =
+            $"Автогенерація не заповнила слот {gap.SlotLabel} для групи {gap.GroupName} на {gap.Date:yyyy-MM-dd}. Причина: {gap.Reason}";
+        const string serverMessage = "Фінальна перевірка потребує ручної уваги.";
+        var expectedContext = new Dictionary<string, string>
+        {
+            ["group"] = "9302"
+        };
+        var result = AdminScheduleAutoGenState.BuildTechnicalWarningDetails(
+            warnings: new[] { gapMessage, serverMessage },
+            structuredWarnings: new[]
+            {
+                new AutoGenWarningDetail(
+                    AutoGenWarningCodes.GapUnfilled,
+                    AutoGenWarningSeverities.Warning,
+                    AutoGenWarningCategories.Optimization,
+                    gapMessage),
+                new AutoGenWarningDetail(
+                    AutoGenWarningCodes.FinalValidationFailed,
+                    AutoGenWarningSeverities.Error,
+                    AutoGenWarningCategories.Validation,
+                    serverMessage,
+                    expectedContext)
+            },
+            separatelyRenderedGapDetails: new[] { gap });
+
+        var remaining = Assert.Single(result);
+        Assert.Equal(serverMessage, remaining.Message);
+        Assert.Equal(AutoGenWarningCodes.FinalValidationFailed, remaining.Code);
+        Assert.Equal(AutoGenWarningSeverities.Error, remaining.Severity);
+        Assert.Equal(AutoGenWarningCategories.Validation, remaining.Category);
+        Assert.Same(expectedContext, remaining.Context);
+    }
+
+    [Fact]
+    public void Slot_warning_without_corresponding_gap_is_preserved()
+    {
+        const string warning =
+            "Автогенерація не заповнила слот 10:00-10:45 для групи Інша на 2026-09-02. Причина: окрема діагностика.";
+
+        var result = AdminScheduleAutoGenState.BuildTechnicalWarningMessages(
+            new[] { warning },
+            Array.Empty<AutoGenGapDetail>());
+
+        Assert.Equal(new[] { warning }, result);
+    }
+
+    [Fact]
+    public void Plan_summary_reports_updates_when_created_counter_is_zero()
+    {
+        var plan = CreatePlan(addCount: 0, updateCount: 7, deleteCount: 0);
+
+        var summary = AdminScheduleAutoGenState.BuildPlanChangeSummary(plan);
+
+        Assert.Equal("додати 0, змінити або перемістити 7, видалити 0", summary);
+    }
+
+    [Fact]
+    public void Apply_conflict_invalidates_ready_plan()
+    {
+        var plan = CreatePlan(addCount: 1, updateCount: 2, deleteCount: 0);
+
+        var invalidated = AdminScheduleAutoGenState.InvalidatePlanAfterConflict(plan);
+
+        Assert.Equal(AutoGenPlanState.Expired, invalidated.State);
+        Assert.False(invalidated.CanApply);
+        Assert.Equal(plan.PlanId, invalidated.PlanId);
+        Assert.Equal(plan.Version, invalidated.Version);
+    }
+
+    [Fact]
+    public void Latest_request_guard_rejects_stale_response_and_explicit_invalidation()
+    {
+        var guard = new LatestAsyncRequestGuard();
+
+        var first = guard.Begin();
+        var second = guard.Begin();
+
+        Assert.False(guard.IsCurrent(first));
+        Assert.True(guard.IsCurrent(second));
+
+        guard.Invalidate();
+
+        Assert.False(guard.IsCurrent(second));
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    public void Preflight_rollback_is_reported_only_for_failed_execution(bool failed, bool expected)
+    {
+        var request = CreateJobRequest(AutoGenJobKind.Preflight, preflightOnly: true, previewOnly: false);
+
+        Assert.Equal(expected, InvokeShouldReportExecutionRollback(request, failed));
+    }
+
+    [Fact]
+    public void Successful_preview_rollback_is_not_reported_as_persistence_error()
+    {
+        var request = CreateJobRequest(AutoGenJobKind.Fill, preflightOnly: false, previewOnly: true);
+
+        Assert.False(InvokeShouldReportExecutionRollback(request, failed: false));
+    }
+
+    private static AutoGenPlanSummaryDto CreatePlan(int addCount, int updateCount, int deleteCount)
+    {
+        var now = DateTimeOffset.UtcNow;
+        return new AutoGenPlanSummaryDto(
+            PlanId: "plan-1",
+            State: AutoGenPlanState.Ready,
+            Version: 3,
+            CreatedAt: now,
+            ExpiresAt: now.AddMinutes(10),
+            AppliedAt: null,
+            RolledBackAt: null,
+            AddCount: addCount,
+            UpdateCount: updateCount,
+            DeleteCount: deleteCount,
+            CanApply: true,
+            CanRollback: false);
+    }
+
+    private static AutoGenJobRequest CreateJobRequest(
+        AutoGenJobKind kind,
+        bool preflightOnly,
+        bool previewOnly)
+        => new(
+            Kind: kind,
+            FromDate: new DateOnly(2026, 9, 1),
+            ToDate: new DateOnly(2026, 9, 12),
+            CourseId: 3,
+            GroupIds: new List<int> { 1 },
+            ModuleHours: new Dictionary<int, int> { [1] = 1 },
+            Days: WeekPreset.MonSat,
+            ClearExisting: false,
+            SoftFill: kind == AutoGenJobKind.Fill,
+            PreflightOnly: preflightOnly,
+            PreviewOnly: previewOnly);
+
+    private static bool InvokeShouldReportExecutionRollback(AutoGenJobRequest request, bool failed)
+    {
+        var method = typeof(TeacherDraftsAutogenJobService).GetMethod(
+            "ShouldReportExecutionRollback",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        Assert.NotNull(method);
+        return Assert.IsType<bool>(method.Invoke(null, new object[] { request, failed }));
     }
 }

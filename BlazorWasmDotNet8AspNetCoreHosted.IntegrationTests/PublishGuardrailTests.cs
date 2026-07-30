@@ -703,6 +703,10 @@ public sealed class PublishGuardrailTests
         };
         db.AddRange(firstTeacher, secondTeacher, firstTopic, secondTopic);
         await db.SaveChangesAsync();
+        db.TeacherModules.AddRange(
+            new TeacherModule { TeacherId = firstTeacher.Id, ModuleId = model.ModuleId },
+            new TeacherModule { TeacherId = secondTeacher.Id, ModuleId = model.ModuleId });
+        await db.SaveChangesAsync();
         return (firstTopic, secondTopic, firstTeacher, secondTeacher);
     }
 
