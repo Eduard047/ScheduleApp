@@ -59,6 +59,7 @@
   </ItemGroup>
 
   <ItemGroup Condition="'$(EnableLocalAutogenHarness)' == 'true'">
+    <Compile Include="AutogenL3SeptemberTwoWeekScenarioTests.cs" />
     <Compile Include="AutogenL3Week18DiagnosticsTests.cs" />
     <Compile Include="Infrastructure\TempDatabaseAndCopy.cs" />
     <Compile Include="Infrastructure\WorkspaceAndConfig.cs" />

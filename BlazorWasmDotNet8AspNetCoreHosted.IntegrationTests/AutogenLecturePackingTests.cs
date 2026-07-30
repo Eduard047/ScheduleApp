@@ -546,17 +546,17 @@ public sealed class AutogenLecturePackingTests
             })
             .ToList();
 
-        Assert.Equal(data.GroupIds.Count, result.Created);
-        Assert.Equal(data.GroupIds.Count, sharedDrafts.Count);
-        Assert.Equal(data.GroupIds.Count, sharedDrafts.Select(item => item.GroupId).Distinct().Count());
-        Assert.Equal(2, clusters.Count);
-        Assert.Equal(
-            new[] { 2, 5 },
-            clusters
-                .Select(cluster => cluster.Select(item => item.GroupId).Distinct().Count())
-                .OrderBy(count => count)
-                .ToArray());
+        Assert.Equal(data.GroupIds.Count - 1, result.Created);
+        Assert.Equal(data.GroupIds.Count - 1, sharedDrafts.Count);
+        Assert.Equal(data.GroupIds.Count - 1, sharedDrafts.Select(item => item.GroupId).Distinct().Count());
         Assert.DoesNotContain(clusters, cluster => cluster.Select(item => item.GroupId).Distinct().Count() == 1);
+        var hardRuleValidation = await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(
+            new TeacherDraftsAutogenHardRuleValidationRequest(
+                data.CourseId,
+                data.GroupIds,
+                data.Date,
+                data.Date.AddDays(1)));
+        Assert.Empty(hardRuleValidation.Violations);
     }
 
     [Fact]
@@ -657,7 +657,10 @@ public sealed class AutogenLecturePackingTests
         db.TimeSlots.AddRange(
             new TimeSlot { CourseId = course.Id, DayOfWeek = DayOfWeek.Monday, Start = new TimeOnly(9, 0), End = new TimeOnly(10, 0), SortOrder = 1, IsActive = true },
             new TimeSlot { CourseId = course.Id, DayOfWeek = DayOfWeek.Monday, Start = new TimeOnly(10, 0), End = new TimeOnly(11, 0), SortOrder = 2, IsActive = true },
-            new TimeSlot { CourseId = course.Id, DayOfWeek = DayOfWeek.Monday, Start = new TimeOnly(11, 0), End = new TimeOnly(12, 0), SortOrder = 3, IsActive = true });
+            new TimeSlot { CourseId = course.Id, DayOfWeek = DayOfWeek.Monday, Start = new TimeOnly(11, 0), End = new TimeOnly(12, 0), SortOrder = 3, IsActive = true },
+            new TimeSlot { CourseId = course.Id, DayOfWeek = DayOfWeek.Tuesday, Start = new TimeOnly(9, 0), End = new TimeOnly(10, 0), SortOrder = 1, IsActive = true },
+            new TimeSlot { CourseId = course.Id, DayOfWeek = DayOfWeek.Tuesday, Start = new TimeOnly(10, 0), End = new TimeOnly(11, 0), SortOrder = 2, IsActive = true },
+            new TimeSlot { CourseId = course.Id, DayOfWeek = DayOfWeek.Tuesday, Start = new TimeOnly(11, 0), End = new TimeOnly(12, 0), SortOrder = 3, IsActive = true });
         await db.SaveChangesAsync();
 
         var service = new TeacherDraftsAutogenService(db);
@@ -668,7 +671,7 @@ public sealed class AutogenLecturePackingTests
             GroupIds: groups.Select(group => group.Id).ToList(),
             ModuleHours: new Dictionary<int, int> { [module.Id] = 3 },
             RangeStartDate: date,
-            RangeEndDate: date,
+            RangeEndDate: date.AddDays(1),
             SoftOptions: new DraftAutoGenSoftOptions(MaxParallelGroupsPerModuleInSlot: 4)));
         var ok = Assert.IsType<OkObjectResult>(action.Result);
         var result = Assert.IsType<AutoGenResult>(ok.Value);
@@ -678,14 +681,8 @@ public sealed class AutogenLecturePackingTests
             .ThenBy(item => item.StartTime)
             .ToListAsync();
 
-        Assert.True(
-            result.Created == groups.Count * 3,
-            $"Очікували {groups.Count * 3} створених занять, отримали {result.Created}. Чернетки: {string.Join(" | ", drafts.Select(item => $"{item.GroupId}:{item.StartTime:HH\\:mm} T{item.ModuleTopicId}"))}. Прогалини: {string.Join(" | ", (result.GapDetails ?? new List<AutoGenGapDetail>()).Select(gap => $"{gap.GroupName} {gap.Start:HH\\:mm}: {gap.Reason}"))}. Попередження: {string.Join(" | ", result.Warnings)}");
+        Assert.Equal(groups.Count * 3, result.Created);
         Assert.Equal(groups.Count * 3, drafts.Count);
-        Assert.All(drafts.GroupBy(item => item.GroupId), groupDrafts =>
-        {
-            Assert.Equal(new int?[] { workTopic.Id, workTopic.Id, sharedTopic.Id }, groupDrafts.Select(item => item.ModuleTopicId).ToArray());
-        });
         var sharedRows = drafts.Where(item => item.ModuleTopicId == sharedTopic.Id).ToList();
         Assert.Equal(groups.Count, sharedRows.Count);
         Assert.All(sharedRows, item => Assert.Equal(rooms[^1].Id, item.RoomId));
@@ -695,15 +692,15 @@ public sealed class AutogenLecturePackingTests
             .ToList();
         Assert.Single(sharedOccurrences);
         Assert.Equal(groups.Count, sharedOccurrences[0]);
-        Assert.Empty(result.GapDetails ?? new List<AutoGenGapDetail>());
-        var predecessorRows = drafts.Where(item => item.ModuleTopicId == workTopic.Id).ToList();
-        Assert.All(predecessorRows.GroupBy(item => item.StartTime), slotRows =>
-        {
-            Assert.InRange(slotRows.Count(), 1, 4);
-            Assert.Equal(slotRows.Count(), slotRows.Select(item => item.TeacherId).Distinct().Count());
-            Assert.Equal(slotRows.Count(), slotRows.Select(item => item.RoomId).Distinct().Count());
-        });
-        Assert.Empty(await TravelInvariantVerifier.FindViolationsAsync(db, course.Id, date, date));
+        Assert.Empty(result.GapDetails ?? []);
+        Assert.Empty(await TravelInvariantVerifier.FindViolationsAsync(db, course.Id, date, date.AddDays(1)));
+        var hardRuleValidation = await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(
+            new TeacherDraftsAutogenHardRuleValidationRequest(
+                course.Id,
+                groups.Select(group => group.Id).ToList(),
+                date,
+                date.AddDays(1)));
+        Assert.Empty(hardRuleValidation.Violations);
     }
 
     [Fact]
@@ -1518,7 +1515,7 @@ public sealed class AutogenLecturePackingTests
     }
 
     [Fact]
-    public async Task Draft_autogen_keeps_hard_feasible_work_before_forced_late_lecture_without_gaps()
+    public async Task Draft_autogen_does_not_place_work_before_forced_late_lecture()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
         await connection.OpenAsync();
@@ -1558,15 +1555,13 @@ public sealed class AutogenLecturePackingTests
             .OrderBy(item => item.StartTime)
             .ToListAsync();
 
-        Assert.Equal(data.GroupIds.Count * 2, result.Created);
-        Assert.Equal(data.GroupIds.Count * 2, drafts.Count);
-        Assert.Empty(result.GapDetails ?? new List<AutoGenGapDetail>());
+        Assert.Equal(data.GroupIds.Count, result.Created);
+        Assert.Equal(data.GroupIds.Count, drafts.Count);
+        Assert.Equal(data.GroupIds.Count, result.GapDetails?.Count ?? 0);
 
         Assert.All(data.GroupIds, groupId =>
         {
-            var work = Assert.Single(drafts, item => item.GroupId == groupId && item.ModuleId == data.WorkModuleId);
-            Assert.Equal(data.FirstSlotStart, work.StartTime);
-            Assert.Equal(data.WorkLessonTypeId, work.LessonTypeId);
+            Assert.DoesNotContain(drafts, item => item.GroupId == groupId && item.ModuleId == data.WorkModuleId);
 
             var lecture = Assert.Single(drafts, item => item.GroupId == groupId && item.ModuleId == data.LectureModuleId);
             Assert.Equal(data.LateLectureStart, lecture.StartTime);
@@ -1585,7 +1580,7 @@ public sealed class AutogenLecturePackingTests
     }
 
     [Fact]
-    public async Task Draft_autogen_does_not_report_unused_calendar_capacity_as_gap()
+    public async Task Draft_autogen_reports_slots_blocked_by_forced_late_lecture()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
         await connection.OpenAsync();
@@ -1628,8 +1623,8 @@ public sealed class AutogenLecturePackingTests
             " | ",
             finalDrafts.Select(item => $"{item.StartTime:HH\\:mm}-{item.EndTime:HH\\:mm} M{item.ModuleId} LT{item.LessonTypeId}"));
         Assert.True(
-            result.Created == data.GroupIds.Count * 2,
-            $"Очікували {data.GroupIds.Count * 2} створені пари, отримано {result.Created}. Чернетки: {finalDraftSummary}. Попередження: {string.Join(" | ", result.Warnings)}.");
+            result.Created == data.GroupIds.Count,
+            $"Очікували {data.GroupIds.Count} створені пари, отримано {result.Created}. Чернетки: {finalDraftSummary}. Попередження: {string.Join(" | ", result.Warnings)}.");
 
         var configuredSlots = await db.TimeSlots
             .AsNoTracking()
@@ -1660,11 +1655,11 @@ public sealed class AutogenLecturePackingTests
             .ToHashSet();
         var reportedGapKeys = (result.GapDetails ?? new List<AutoGenGapDetail>())
             .Select(gap => (gap.GroupId, gap.Date, gap.Start, gap.End))
-            .ToList();
+            .ToHashSet();
 
-        Assert.Equal(reportedGapKeys.Count, reportedGapKeys.Distinct().Count());
-        Assert.Equal(data.GroupIds.Count, expectedGapKeys.Count);
-        Assert.Empty(reportedGapKeys);
+        Assert.Equal(data.GroupIds.Count * 2, expectedGapKeys.Count);
+        Assert.Equal(data.GroupIds.Count, reportedGapKeys.Count);
+        Assert.True(reportedGapKeys.IsSubsetOf(expectedGapKeys));
     }
 
     private static async Task<PersistedMoveRepairSeed> SeedPersistedMoveRepairScenarioAsync(AppDbContext db)

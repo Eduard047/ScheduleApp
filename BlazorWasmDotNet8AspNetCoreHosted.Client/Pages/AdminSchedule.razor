@@ -206,7 +206,8 @@ else
                         {
                             <span>
                                 Активний профіль: <strong>@RecommendedAutoGenProfileName</strong>.
-                                Для автогенерації застосовується override ліміту "бажано першим" = @RecommendedPreferredFirstMaxSlotOrderOverride.
+                                Для автогенерації застосовуються override ліміту "бажано першим" = @RecommendedPreferredFirstMaxSlotOrderOverride
+                                і межа до @RecommendedSoftFillMaxParallelGroupsPerModuleInSlot груп одного модуля одночасно.
                                 Для дозаповнення використовується вікно близьких повторів @RecommendedSoftFillRepeatWindowDays день,
                                 не більше @RecommendedSoftFillMaxParallelGroupsPerModuleInSlot непотокових груп одного модуля одночасно,
                                 межа різних модулів @RecommendedSoftFillPreferredMaxDistinctModulesPerDay/@RecommendedSoftFillMaxDistinctModulesPerDay
@@ -378,7 +379,7 @@ else
                     @{
                         var moduleWeekTotals = GetModuleWeekTotals();
                     }
-                    <div class="fw-semibold">Модулі та пари на тиждень</div>
+                    <div class="fw-semibold">Модулі та пари на діапазон</div>
                     <div class="small text-muted mb-2">
                         План задається для однієї групи. Факт рахується за @GetLoadedWeekRangeLabel() для всіх вибраних груп разом.
                     </div>
@@ -922,6 +923,7 @@ else
     private WeekPreset _daysPreset = WeekPreset.MonFri;
     private int? _selectedCourseId;
     private readonly List<ModuleWeekRow> _moduleWeekRows = new();
+    private readonly List<TableItem> _generationRangeItems = new();
     private readonly List<CourseGroupRow> _courseGroupRows = new();
     private List<BuildingEditDto> _buildingOptions = new();
     private List<RoomEditDto> _roomOptions = new();
@@ -1180,7 +1182,7 @@ else
             .Select(group => group.Id)
             .ToHashSet()
            ?? new HashSet<int>();
-    // Рахує пари модуля в чернетках і опублікованому розкладі поточного завантаженого тижня.
+    // Рахує пари модуля в чернетках і опублікованому розкладі всього діапазону генерації.
     private (int Generated, int Planned, int Missing, int Over) GetModuleGeneratedHours(ModuleWeekRow row)
     {
         var selectedGroupIds = GetSelectedGroupIds().ToHashSet();
@@ -1191,14 +1193,13 @@ else
         {
             return (0, planned, Math.Max(0, planned), 0);
         }
-        var weekStart = GetMonday(_selectedDate);
-        var weekEnd = weekStart.AddDays(6);
-        var generated = tableItems
+        var (rangeStart, rangeEnd) = GetNormalizedGenerationDateRange();
+        var generated = _generationRangeItems
             .Where(item =>
                 item.ModuleId == row.ModuleId
                 && selectedGroupIds.Contains(item.GroupId)
-                && item.Date >= weekStart
-                && item.Date <= weekEnd
+                && item.Date >= rangeStart
+                && item.Date <= rangeEnd
                 && !IsServiceLessonType(item.LessonTypeId))
             .Select(item => (
                 item.Source,
@@ -1212,7 +1213,7 @@ else
             .Count();
         return (generated, planned, Math.Max(0, planned - generated), Math.Max(0, generated - planned));
     }
-    // Підсумовує план і фактичну кількість пар усіх вибраних модулів за завантажений тиждень.
+    // Підсумовує план і фактичну кількість пар усіх вибраних модулів за діапазон генерації.
     private (int Scheduled, int Planned, int Missing, int Over) GetModuleWeekTotals()
     {
         var total = (Scheduled: 0, Planned: 0, Missing: 0, Over: 0);
@@ -1229,8 +1230,8 @@ else
     // Повертає діапазон дат, за яким пораховано факт у таблиці модулів.
     private string GetLoadedWeekRangeLabel()
     {
-        var weekStart = GetMonday(_selectedDate);
-        return $"{weekStart:dd.MM.yyyy}–{weekStart.AddDays(6):dd.MM.yyyy}";
+        var (rangeStart, rangeEnd) = GetNormalizedGenerationDateRange();
+        return $"{rangeStart:dd.MM.yyyy}–{rangeEnd:dd.MM.yyyy}";
     }
     private static string FormatModuleGeneratedHours(int generated, int planned)
         => planned <= 0 ? "—" : $"{generated} / {planned}";
@@ -1862,7 +1863,8 @@ else
         }
         okWarnings = BuildSlotGapWarnings(warnings, _latestGapDetails);
         _latestWarningDetails = MergeWarningDetails(warningDetails, okWarnings);
-        okWarningsExpanded = plan?.CanApply == true && _latestWarningDetails.Count > 0;
+        // Технічні повідомлення завжди починаються у згорнутому стані.
+        okWarningsExpanded = false;
         if (persist)
         {
             await PersistAutoGenStatusAsync();
@@ -2004,7 +2006,7 @@ else
             {
                 AutoGenGapReasonCodes.Teacher => $"{item.Count} пар не вдалося поставити через викладачів. Перевірте, чи прив'язані викладачі до цих модулів і чи вільні вони в потрібний час.",
                 AutoGenGapReasonCodes.Room => $"{item.Count} пар не вдалося поставити через аудиторії. Перевірте вільні аудиторії потрібної місткості та дозволені корпуси.",
-                AutoGenGapReasonCodes.Travel => $"{item.Count} пар не вдалося поставити через переходи між корпусами. Поставте сусідні пари ближче або збільшіть перерву.",
+                AutoGenGapReasonCodes.Travel => $"{item.Count} пар не вдалося поставити через зміну аудиторії або перехід між корпусами. Залиште сусідні пари в тій самій аудиторії або збільшіть перерву.",
                 AutoGenGapReasonCodes.TopicOrder => $"{item.Count} пар заблокував порядок тем. Перевірте, чи попередні теми вже поставлені і чи не завищено план модуля.",
                 AutoGenGapReasonCodes.ModuleBlock => $"{item.Count} пар не вдалося поставити через правило суцільного модуля. Тримайте пари одного модуля поруч або перенесіть зайву пару цього дня.",
                 AutoGenGapReasonCodes.Limit => $"{item.Count} пар зупинили денні обмеження. Додайте навчальний день або час чи зменште кількість пар у вибраному діапазоні.",
@@ -2062,7 +2064,7 @@ else
         }
 
         var hasIssues = gapCount > 0 || deficitCount > 0 || warningsTotal > 0 || actionItems.Count > 0;
-        var headline = BuildAutoGenOutcomeHeadline(report, gapCount, deficitCount, warningsTotal);
+        var headline = BuildAutoGenOutcomeHeadline(report, gapCount, deficitCount, warningsTotal, gapSummary);
         var detail = report is not null
             ? BuildAutoGenOutcomeDetail(report)
             : string.IsNullOrWhiteSpace(message) ? "Операцію виконано." : message.Trim();
@@ -2078,8 +2080,20 @@ else
             actionItems.FirstOrDefault());
     }
 
-    private static string BuildAutoGenOutcomeHeadline(AutoGenRunReport? report, int gapCount, int deficitCount, int warningsTotal)
+    private static string BuildAutoGenOutcomeHeadline(
+        AutoGenRunReport? report,
+        int gapCount,
+        int deficitCount,
+        int warningsTotal,
+        IReadOnlyList<AutoGenGapSummaryItem> gapSummary)
     {
+        var topicOrderCount = gapSummary
+            .Where(item => string.Equals(item.Code, AutoGenGapReasonCodes.TopicOrder, StringComparison.Ordinal))
+            .Sum(item => item.Count);
+        if (report?.Created == 0 && gapCount > 0 && topicOrderCount > 0)
+        {
+            return $"{gapCount} пар не додано: {topicOrderCount} заблоковано доступними годинами та порядком тем";
+        }
         if (gapCount > 0 && deficitCount > 0)
         {
             return $"За останню спробу не вдалося поставити {gapCount} пар; перевірка знайшла {deficitCount} проблем";
@@ -2248,7 +2262,7 @@ else
         {
             AutoGenGapReasonCodes.Teacher => "Додайте викладача до цього модуля або відкрийте його робочий час у цей слот.",
             AutoGenGapReasonCodes.Room => "Звільніть аудиторію потрібної місткості або додайте її в дозволені для модуля/групи.",
-            AutoGenGapReasonCodes.Travel => "Поставте сусіднє заняття в той самий корпус або збільшіть перерву між корпусами.",
+            AutoGenGapReasonCodes.Travel => "Поставте сусіднє заняття в ту саму аудиторію або збільшіть перерву для зміни аудиторії.",
             AutoGenGapReasonCodes.TopicOrder => "Додайте раніший слот для попередньої теми або зменште години модуля в цьому діапазоні.",
             AutoGenGapReasonCodes.ModuleBlock => "Залиште поруч кілька слотів під цей модуль або перенесіть зайву пару з дня.",
             AutoGenGapReasonCodes.Limit => "Додайте слоти/дні для групи або зменште кількість годин у цьому діапазоні.",
@@ -2261,7 +2275,7 @@ else
         {
             AutoGenGapReasonCodes.Teacher => $"Для {gap.GroupName} немає вільного викладача на {gap.SlotLabel}.",
             AutoGenGapReasonCodes.Room => $"Для {gap.GroupName} немає вільної аудиторії на {gap.SlotLabel}.",
-            AutoGenGapReasonCodes.Travel => $"Для {gap.GroupName} не вистачає часу перейти між корпусами біля {gap.SlotLabel}.",
+            AutoGenGapReasonCodes.Travel => $"Для {gap.GroupName} не вистачає часу змінити аудиторію біля {gap.SlotLabel}.",
             AutoGenGapReasonCodes.TopicOrder => $"Для {gap.GroupName} тема модуля має йти раніше або пізніше за поточний слот.",
             AutoGenGapReasonCodes.ModuleBlock => $"Модуль {target} розривається в межах дня.",
             AutoGenGapReasonCodes.Limit => $"Для {gap.GroupName} спрацював ліміт дня або слоту.",
@@ -3021,9 +3035,9 @@ else
             ))
             .ToList();
     }
-    // Повертає рекомендований профіль м'якого дозаповнення, який показав найкращий frozen-snapshot результат у тестах.
-    private AutoGenSoftOptionsDto? BuildRecommendedSoftOptions(bool softFill)
-        => _useRecommendedAutoGenProfile && softFill ? RecommendedSoftFillOptions : null;
+    // Повертає рекомендований профіль пошуку для автогенерації та дозаповнення.
+    private AutoGenSoftOptionsDto? BuildRecommendedSoftOptions()
+        => _useRecommendedAutoGenProfile ? RecommendedSoftFillOptions : null;
     // За явного перемикача підміняємо збережений у БД ліміт "бажано першим" параметром рекомендованого профілю.
     private int? BuildRecommendedPreferredFirstLimitOverride()
         => _useRecommendedAutoGenProfile ? RecommendedPreferredFirstMaxSlotOrderOverride : null;
@@ -3057,7 +3071,7 @@ else
             PreflightOnly: preflightOnly,
             AllowIncompleteDrafts: _allowIncompleteDrafts,
             GroupRoomPreferences: groupRoomPreferences.Count > 0 ? groupRoomPreferences.ToList() : null,
-            SoftOptions: BuildRecommendedSoftOptions(softFill),
+            SoftOptions: BuildRecommendedSoftOptions(),
             PreferredFirstMaxSlotOrderOverride: BuildRecommendedPreferredFirstLimitOverride(),
             Title: previewOnly
                 ? softFill
@@ -3843,7 +3857,8 @@ else
         var monday = GetMonday(_selectedDate);
         var draftTask = Drafts.GetWeek(monday, null);
         var publishedTask = Api.GetWeek(monday);
-        await Task.WhenAll(draftTask, publishedTask);
+        var rangeTask = LoadGenerationRangeItemsAsync();
+        await Task.WhenAll(draftTask, publishedTask, rangeTask);
         var draftData = await draftTask;
         var publishedData = await publishedTask;
         draftItems.Clear();
@@ -3853,6 +3868,29 @@ else
         RebuildTableItems();
         ok ??= $"Завантажено {draftItems.Count} чернеток та {publishedItems.Count} опублікованих записів.";
         error = null;
+    }
+    // Завантажує записи всіх тижнів, що перетинають діапазон генерації, для спільного лічильника.
+    private async Task LoadGenerationRangeItemsAsync()
+    {
+        var weekStarts = BuildGenerationWeekStarts();
+        var draftTasks = weekStarts
+            .Select(weekStart => Drafts.GetWeek(weekStart, null))
+            .ToList();
+        var publishedTasks = weekStarts
+            .Select(weekStart => Api.GetWeek(weekStart))
+            .ToList();
+
+        await Task.WhenAll(draftTasks.Cast<Task>().Concat(publishedTasks));
+
+        _generationRangeItems.Clear();
+        foreach (var task in draftTasks)
+        {
+            _generationRangeItems.AddRange(task.Result.Select(CreateTableItemFromDraft));
+        }
+        foreach (var task in publishedTasks)
+        {
+            _generationRangeItems.AddRange(task.Result.Select(CreateTableItemFromPublished));
+        }
     }
     private void RebuildTableItems()
     {
@@ -4165,22 +4203,22 @@ else
         }
     }
     // Обробляє зміну початку діапазону генерації.
-    private Task OnGenerationFromDateChanged(ChangeEventArgs args)
+    private async Task OnGenerationFromDateChanged(ChangeEventArgs args)
     {
         if (DateOnly.TryParse(args.Value?.ToString(), out var value))
         {
             _generationFromDate = value;
+            await LoadGenerationRangeItemsAsync();
         }
-        return Task.CompletedTask;
     }
     // Обробляє зміну завершення діапазону генерації.
-    private Task OnGenerationToDateChanged(ChangeEventArgs args)
+    private async Task OnGenerationToDateChanged(ChangeEventArgs args)
     {
         if (DateOnly.TryParse(args.Value?.ToString(), out var value))
         {
             _generationToDate = value;
+            await LoadGenerationRangeItemsAsync();
         }
-        return Task.CompletedTask;
     }
     // Перемикає параметри сортування таблиці.
     private void ToggleSort(string field)

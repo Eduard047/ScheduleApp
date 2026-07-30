@@ -386,15 +386,10 @@ public sealed class AutogenQualityMatrixTests
         var actualHours = rows
             .GroupBy(item => (item.GroupId, item.ModuleId))
             .ToDictionary(group => group.Key, group => group.Count());
-        var planningWeekStart = StartOfWeek(rangeStart);
-        var planningWeekEndExclusive = StartOfWeek(rangeEnd).AddDays(7);
-        var rangeWeekCount = Math.Max(
-            1,
-            (planningWeekEndExclusive.DayNumber - planningWeekStart.DayNumber) / 7);
         var missingDemand = groupIds.Sum(groupId => moduleHours.Sum(module =>
             Math.Max(
                 0,
-                module.Value * rangeWeekCount - actualHours.GetValueOrDefault((groupId, module.Key)))));
+                module.Value - actualHours.GetValueOrDefault((groupId, module.Key)))));
         var scheduledWeekCount = rows
             .Select(item => (item.Date.DayNumber - rangeStart.DayNumber) / 7)
             .Distinct()
@@ -914,7 +909,7 @@ public sealed class AutogenQualityMatrixTests
                 BuildRequest(
                     courseId,
                     groupIds,
-                    moduleIds.ToDictionary(id => id, _ => hoursPerWeek),
+                    moduleIds.ToDictionary(id => id, _ => hoursPerModule),
                     MapSoftOptions(AutoGenRecommendedProfile.CreateSoftOptions()),
                     rangeEndDate: FrozenSemesterStart.AddDays(18 * 7 - 1),
                     clearExisting: false));

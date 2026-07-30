@@ -132,7 +132,7 @@ internal static class TeacherDraftsAutogenReportBuilder
         {
             AutoGenGapReasonCodes.Teacher => $"{item.Count} пар не вдалося поставити через викладачів. Перевірте прив'язку до модуля, робочі години та зайнятість.{exampleSuffix}",
             AutoGenGapReasonCodes.Room => $"{item.Count} пар не вдалося поставити через аудиторії. Перевірте місткість, дозволені корпуси та зайнятість у потрібний час.{exampleSuffix}",
-            AutoGenGapReasonCodes.Travel => $"{item.Count} пар не вдалося поставити через переходи між корпусами. Поставте сусідні пари ближче або збільшіть перерву.{exampleSuffix}",
+            AutoGenGapReasonCodes.Travel => $"{item.Count} пар не вдалося поставити через зміну аудиторії або перехід між корпусами. Залиште сусідні пари в тій самій аудиторії або збільшіть перерву.{exampleSuffix}",
             AutoGenGapReasonCodes.TopicOrder => $"{item.Count} пар заблокував порядок тем. Перевірте, чи попередні теми вже поставлені перед наступними.{exampleSuffix}",
             AutoGenGapReasonCodes.ModuleBlock => $"{item.Count} пар не вдалося поставити через правило суцільного модуля. Тримайте пари одного модуля поруч у межах дня.{exampleSuffix}",
             AutoGenGapReasonCodes.Limit => $"{item.Count} пар зупинили денні обмеження. Додайте навчальний час або зменште кількість пар у цьому діапазоні.{exampleSuffix}",

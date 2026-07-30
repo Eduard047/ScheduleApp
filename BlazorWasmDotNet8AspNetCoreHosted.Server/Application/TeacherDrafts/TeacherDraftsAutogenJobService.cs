@@ -32,7 +32,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
     private const int MaxRangeDays = 370;
     private const int MaxGroupCount = 200;
     private const int MaxModuleHourEntryCount = 200;
-    private const int MaxHoursPerModulePerWeek = 500;
+    private const int MaxHoursPerModulePerRange = 500;
     private const int MaxPreferredRoomCountPerGroup = 500;
     private const int MaxPreferredFirstSlotOrderOverride = 64;
     private const int MaxRecentRepeatWindowDays = 31;
@@ -1382,10 +1382,10 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         {
             throw new AutoGenJobValidationException("Ідентифікатори модулів і кількість годин мають бути додатними числами.");
         }
-        if (request.ModuleHours.Any(entry => entry.Value > MaxHoursPerModulePerWeek))
+        if (request.ModuleHours.Any(entry => entry.Value > MaxHoursPerModulePerRange))
         {
             throw new AutoGenJobValidationException(
-                $"Для одного модуля можна вказати не більше {MaxHoursPerModulePerWeek} годин на тиждень.");
+                $"Для одного модуля можна вказати не більше {MaxHoursPerModulePerRange} годин на вибраний діапазон.");
         }
         var moduleHours = request.ModuleHours
             .ToDictionary(entry => entry.Key, entry => entry.Value);
@@ -1609,7 +1609,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                             }
 
                             var partialResult = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight);
-                            job.CompleteWeek(runRange.WeekIndex, runRange.RangeStartDate, runRange.RangeEndDate, rangeResult, partialResult);
+                            job.CompleteWeek(weekStarts.Count - 1, runRange.RangeStartDate, runRange.RangeEndDate, rangeResult, partialResult);
                             if (persistIntermediateProgress)
                             {
                                 await PersistProgressOrCancelAsync(job, "завершення діапазону");
@@ -2014,23 +2014,21 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         DateOnly toDate,
         IReadOnlyList<DateOnly> weekStarts)
     {
-        var ranges = new List<AutoGenJobRunRange>(weekStarts.Count);
-        for (var weekIndex = 0; weekIndex < weekStarts.Count; weekIndex++)
+        if (weekStarts.Count == 0 || toDate < fromDate)
         {
-            var weekStart = weekStarts[weekIndex];
-            var weekEnd = weekStart.AddDays(6);
-            var rangeStartDate = fromDate > weekStart ? fromDate : weekStart;
-            var rangeEndDate = toDate < weekEnd ? toDate : weekEnd;
-            if (rangeEndDate >= rangeStartDate)
-            {
-                ranges.Add(new AutoGenJobRunRange(
-                    weekIndex,
-                    weekStart,
-                    rangeStartDate,
-                    rangeEndDate));
-            }
+            return Array.Empty<AutoGenJobRunRange>();
         }
-        return ranges;
+
+        // Увесь вибраний період генерується одним проходом, щоб години,
+        // теми та ресурси розподілялися між тижнями як єдиний план.
+        return new[]
+        {
+            new AutoGenJobRunRange(
+                0,
+                weekStarts[0],
+                fromDate,
+                toDate)
+        };
     }
 
     private static bool CanPersistProgressDuringExecutionTransaction(AppDbContext db)

@@ -96,6 +96,7 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             topicOrderHistoryRows,
             cancellationToken));
         violations.AddRange(FindModuleTopicPlanViolations(currentDraftRows, modulesWithAuditoriumTopics));
+        violations.AddRange(FindLectureBlockOrderViolations(placements));
         var roomCapacityStats = AnalyzeRoomCapacity(placements, cancellationToken);
         violations.AddRange(roomCapacityStats.Violations);
         violations.AddRange(await FindTravelViolationsAsync(placements, cancellationToken));
@@ -626,6 +627,18 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
 
         int TravelMinutes(int fromBuildingId, int toBuildingId)
             => TravelTimePolicy.Resolve(travelMinutesByPair, fromBuildingId, toBuildingId);
+        int TransitionMinutes(PlacementRow from, PlacementRow to)
+            => from.RoomId is int fromRoomId
+               && from.RoomBuildingId is int fromBuildingId
+               && to.RoomId is int toRoomId
+               && to.RoomBuildingId is int toBuildingId
+                ? RoomTransitionPolicy.Resolve(
+                    travelMinutesByPair,
+                    fromRoomId,
+                    fromBuildingId,
+                    toRoomId,
+                    toBuildingId)
+                : TravelMinutes(from.RoomBuildingId ?? 0, to.RoomBuildingId ?? 0);
 
         var violations = new List<string>();
         AddScopeViolations(
@@ -664,17 +677,19 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
                             continue;
                         }
                         if (!previous.IsDraft && !current.IsDraft
-                            || previous.End > current.Start
-                            || previousBuildingId == currentBuildingId)
+                            || previous.End > current.Start)
                         {
                             continue;
                         }
 
-                        var requiredMinutes = TravelMinutes(previousBuildingId, currentBuildingId);
+                        var requiredMinutes = TransitionMinutes(previous, current);
                         var availableMinutes = (current.Start.ToTimeSpan() - previous.End.ToTimeSpan()).TotalMinutes;
                         if (availableMinutes < requiredMinutes)
                         {
-                            violations.Add($"{current.Date:yyyy-MM-dd}: для {scopeLabel} {group.Key.Name} між {previous.Start:HH\\:mm}-{previous.End:HH\\:mm} і {current.Start:HH\\:mm}-{current.End:HH\\:mm} потрібно {requiredMinutes} хв на перехід між корпусами, доступно лише {availableMinutes:N0} хв.");
+                            var transitionLabel = previousBuildingId == currentBuildingId
+                                ? "зміну аудиторії"
+                                : "перехід між корпусами";
+                            violations.Add($"{current.Date:yyyy-MM-dd}: для {scopeLabel} {group.Key.Name} між {previous.Start:HH\\:mm}-{previous.End:HH\\:mm} і {current.Start:HH\\:mm}-{current.End:HH\\:mm} потрібно {requiredMinutes} хв на {transitionLabel}, доступно лише {availableMinutes:N0} хв.");
                         }
                     }
                 }
@@ -709,6 +724,50 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
                 violations.Add(
                     $"{moduleDay.Key.Date:yyyy-MM-dd} {start:HH\\:mm}-{end:HH\\:mm}: модуль #{moduleDay.Key.ModuleId} одночасно поставлено для {activeGroups.Count} груп ({string.Join(", ", activeGroups.Select(row => row.GroupName))}), дозволено не більше {maxParallelGroups}.");
             }
+        }
+
+        return violations;
+    }
+
+    private static IReadOnlyList<string> FindLectureBlockOrderViolations(
+        IReadOnlyList<PlacementRow> placements)
+    {
+        var violations = new List<string>();
+        foreach (var group in placements.GroupBy(row => new
+                 {
+                     row.GroupId,
+                     row.GroupName,
+                     row.Date
+                 }))
+        {
+            var ordered = CollapseLogicalDraftEventPlacements(group)
+                .Where(row => !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(row.LessonTypeCode))
+                .OrderBy(row => row.Start)
+                .ThenBy(row => row.End)
+                .ToList();
+            var lastLecture = ordered
+                .Where(CanShareAcrossGroups)
+                .OrderByDescending(row => row.Start)
+                .ThenByDescending(row => row.End)
+                .FirstOrDefault();
+            if (lastLecture is null)
+            {
+                continue;
+            }
+
+            var interruption = ordered.FirstOrDefault(row =>
+                row.Start < lastLecture.Start
+                && !CanShareAcrossGroups(row)
+                && (row.IsDraft || lastLecture.IsDraft));
+            if (interruption is null)
+            {
+                continue;
+            }
+
+            violations.Add(
+                $"{group.Key.Date:yyyy-MM-dd} {group.Key.GroupName}: лекційний блок розірвано заняттям "
+                + $"{interruption.Start:HH\\:mm}-{interruption.End:HH\\:mm}; після початку нелекційних занять "
+                + $"повертатися до лекцій цього дня не можна.");
         }
 
         return violations;

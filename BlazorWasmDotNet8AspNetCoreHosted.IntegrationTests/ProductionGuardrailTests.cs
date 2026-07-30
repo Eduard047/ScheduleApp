@@ -1375,6 +1375,111 @@ public sealed class ProductionGuardrailTests
     }
 
     [Fact]
+    public void Room_transition_policy_requires_ten_minutes_between_different_rooms()
+    {
+        var travelMinutes = new Dictionary<(int FromBuildingId, int ToBuildingId), int>();
+
+        Assert.Equal(
+            0,
+            RoomTransitionPolicy.Resolve(
+                travelMinutes,
+                fromRoomId: 10,
+                fromBuildingId: 1,
+                toRoomId: 10,
+                toBuildingId: 1));
+        Assert.Equal(
+            10,
+            RoomTransitionPolicy.Resolve(
+                travelMinutes,
+                fromRoomId: 10,
+                fromBuildingId: 1,
+                toRoomId: 11,
+                toBuildingId: 1));
+    }
+
+    [Fact]
+    public async Task Hard_rule_validator_rejects_five_minute_change_between_rooms_in_same_building()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var ids = await fixture.SeedMinimalScheduleModelAsync();
+        var date = new DateOnly(2026, 5, 4);
+        var building = new Building { Name = "Навчальний корпус" };
+        fixture.Db.Buildings.Add(building);
+        await fixture.Db.SaveChangesAsync();
+        var firstRoom = new Room { Name = "101", Capacity = 40, BuildingId = building.Id };
+        var secondRoom = new Room { Name = "102", Capacity = 40, BuildingId = building.Id };
+        var lessonType = new LessonTypeRef
+        {
+            Code = "ROOM",
+            Name = "Аудиторне заняття",
+            IsActive = true,
+            RequiresRoom = true,
+            RequiresTeacher = false,
+            BlocksRoom = true,
+            BlocksTeacher = false,
+            CountInPlan = true,
+            CountInLoad = true
+        };
+        fixture.Db.AddRange(firstRoom, secondRoom, lessonType);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.TimeSlots.AddRange(
+            new TimeSlot
+            {
+                CourseId = ids.CourseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0),
+                SortOrder = 1,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                CourseId = ids.CourseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(9, 5),
+                End = new TimeOnly(10, 5),
+                SortOrder = 2,
+                IsActive = true
+            });
+        fixture.Db.TeacherDraftItems.AddRange(
+            new TeacherDraftItem
+            {
+                Date = date,
+                DayOfWeek = DayOfWeek.Monday,
+                StartTime = new TimeOnly(8, 0),
+                EndTime = new TimeOnly(9, 0),
+                GroupId = ids.GroupId,
+                ModuleId = ids.ModuleId,
+                LessonTypeId = lessonType.Id,
+                RoomId = firstRoom.Id
+            },
+            new TeacherDraftItem
+            {
+                Date = date,
+                DayOfWeek = DayOfWeek.Monday,
+                StartTime = new TimeOnly(9, 5),
+                EndTime = new TimeOnly(10, 5),
+                GroupId = ids.GroupId,
+                ModuleId = ids.ModuleId,
+                LessonTypeId = lessonType.Id,
+                RoomId = secondRoom.Id
+            });
+        await fixture.Db.SaveChangesAsync();
+
+        var result = await new TeacherDraftsAutogenHardRuleValidator(fixture.Db).ValidateAsync(
+            new TeacherDraftsAutogenHardRuleValidationRequest(
+                ids.CourseId,
+                new[] { ids.GroupId },
+                date,
+                date));
+
+        Assert.Contains(
+            result.Violations,
+            violation => violation.Contains("зміну аудиторії", StringComparison.OrdinalIgnoreCase)
+                         && violation.Contains("потрібно 10 хв", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public async Task Module_delete_with_draft_returns_conflict_and_preserves_dependencies()
     {
         await using var fixture = await TestDatabase.CreateAsync();
@@ -1525,7 +1630,7 @@ public sealed class ProductionGuardrailTests
     }
 
     [Fact]
-    public void Autogen_job_run_ranges_split_multiweek_scope_into_weekly_segments()
+    public void Autogen_job_run_ranges_keep_multiweek_scope_in_one_shared_segment()
     {
         var ranges = InvokeBuildAutogenRunRanges(
             new DateOnly(2026, 5, 6),
@@ -1537,10 +1642,8 @@ public sealed class ProductionGuardrailTests
                 new DateOnly(2026, 5, 18)
             });
 
-        Assert.Equal(3, ranges.Count);
-        Assert.Equal((0, new DateOnly(2026, 5, 4), new DateOnly(2026, 5, 6), new DateOnly(2026, 5, 10)), ranges[0]);
-        Assert.Equal((1, new DateOnly(2026, 5, 11), new DateOnly(2026, 5, 11), new DateOnly(2026, 5, 17)), ranges[1]);
-        Assert.Equal((2, new DateOnly(2026, 5, 18), new DateOnly(2026, 5, 18), new DateOnly(2026, 5, 19)), ranges[2]);
+        var range = Assert.Single(ranges);
+        Assert.Equal((0, new DateOnly(2026, 5, 4), new DateOnly(2026, 5, 6), new DateOnly(2026, 5, 19)), range);
     }
 
     [Fact]

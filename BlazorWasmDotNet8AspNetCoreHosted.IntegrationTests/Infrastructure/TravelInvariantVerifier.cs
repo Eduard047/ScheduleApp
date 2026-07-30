@@ -24,8 +24,13 @@ internal static class TravelInvariantVerifier
         var travelMap = await db.BuildingTravels.AsNoTracking()
             .ToDictionaryAsync(x => (x.FromBuildingId, x.ToBuildingId), x => x.Minutes);
 
-        int TravelMinutes(int fromBuildingId, int toBuildingId)
-            => TravelTimePolicy.Resolve(travelMap, fromBuildingId, toBuildingId);
+        int TransitionMinutes(PlacementRow from, PlacementRow to)
+            => RoomTransitionPolicy.Resolve(
+                travelMap,
+                from.RoomId!.Value,
+                from.BuildingId!.Value,
+                to.RoomId!.Value,
+                to.BuildingId!.Value);
 
         var teacherNames = await db.Teachers.AsNoTracking()
             .Select(x => new { x.Id, x.FullName })
@@ -126,7 +131,10 @@ internal static class TravelInvariantVerifier
                 {
                     var prev = ordered[i - 1];
                     var current = ordered[i];
-                    if (prev.BuildingId is null || current.BuildingId is null)
+                    if (prev.RoomId is null
+                        || current.RoomId is null
+                        || prev.BuildingId is null
+                        || current.BuildingId is null)
                     {
                         continue;
                     }
@@ -136,12 +144,7 @@ internal static class TravelInvariantVerifier
                         continue;
                     }
 
-                    if (prev.BuildingId == current.BuildingId)
-                    {
-                        continue;
-                    }
-
-                    var need = TravelMinutes(prev.BuildingId.Value, current.BuildingId.Value);
+                    var need = TransitionMinutes(prev, current);
                     var gap = (current.Start.ToTimeSpan() - prev.End.ToTimeSpan()).TotalMinutes;
                     if (gap < need)
                     {
