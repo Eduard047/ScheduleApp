@@ -24,6 +24,7 @@ public class Course
     public int Id { get; set; }
     public string Name { get; set; } = default!;
     public int DurationWeeks { get; set; }
+    public DateOnly? AcademicPeriodStartDate { get; set; }
     public ICollection<Group> Groups { get; set; } = new List<Group>();
     public ICollection<Module> Modules { get; set; } = new List<Module>();
     public ICollection<ModuleCourse> ModuleCourses { get; set; } = new List<ModuleCourse>();
@@ -198,6 +199,7 @@ public class ModulePlan
 public class ScheduleItem
 {
     public int Id { get; set; }
+    public Guid Revision { get; set; } = Guid.NewGuid();
     public DateOnly Date { get; set; }
     public DayOfWeek DayOfWeek { get; set; }
     public TimeOnly StartTime { get; set; }
@@ -214,6 +216,7 @@ public class ScheduleItem
     public Teacher? Teacher { get; set; }
     public int? RoomId { get; set; }
     public Room? Room { get; set; }
+    public string? BatchKey { get; set; }
     public bool IsLocked { get; set; } = false;
     public bool IsSelfStudy { get; set; } = false;
 }
@@ -284,6 +287,7 @@ public enum DraftStatus { Draft = 0, Published = 1 }
 public class TeacherDraftItem
 {
     public int Id { get; set; }
+    public Guid Revision { get; set; } = Guid.NewGuid();
     public DateOnly Date { get; set; }
     public DayOfWeek DayOfWeek { get; set; }
     public TimeOnly StartTime { get; set; }
@@ -308,6 +312,7 @@ public class TeacherDraftItem
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
     public bool IsLocked { get; set; }   
     public bool IsSelfStudy { get; set; } = false;
+    public string? GenerationJobId { get; set; }
 }
 
 // Збережений стан запуску автогенерації для відновлення статусу після перезапуску сервера.
@@ -315,6 +320,11 @@ public class AutoGenJobRun
 {
     public int Id { get; set; }
     public string JobId { get; set; } = default!;
+    public string RequestHash { get; set; } = string.Empty;
+    public string? OwnerInstanceId { get; set; }
+    public int Attempt { get; set; }
+    public DateTime? LeaseExpiresAtUtc { get; set; }
+    public long Version { get; set; }
     public int Kind { get; set; }
     public int State { get; set; }
     public string Title { get; set; } = default!;
@@ -344,4 +354,49 @@ public class AutoGenJobRun
     public string? ResultJson { get; set; }
     public string? ReportJson { get; set; }
     public DateTime UpdatedAtUtc { get; set; }
+}
+
+// Збережений план змін автогенерації, який можна окремо переглянути, застосувати або відкотити.
+public class AutoGenDraftPlan
+{
+    public int Id { get; set; }
+    public string PlanId { get; set; } = default!;
+    public int AutoGenJobRunId { get; set; }
+    public AutoGenJobRun AutoGenJobRun { get; set; } = default!;
+    public int State { get; set; }
+    public long Version { get; set; }
+    public int CourseId { get; set; }
+    public Course Course { get; set; } = default!;
+    public DateOnly RangeStartDate { get; set; }
+    public DateOnly RangeEndDate { get; set; }
+    public int Days { get; set; }
+    public bool AllowIncompleteDrafts { get; set; }
+    public string GroupIdsJson { get; set; } = default!;
+    public Guid BeforeScopeRevision { get; set; }
+    public string InputFingerprint { get; set; } = default!;
+    public Guid? AppliedScopeRevision { get; set; }
+    public int AddCount { get; set; }
+    public int UpdateCount { get; set; }
+    public int DeleteCount { get; set; }
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime ExpiresAtUtc { get; set; }
+    public DateTime? AppliedAtUtc { get; set; }
+    public DateTime? RolledBackAtUtc { get; set; }
+    public ICollection<AutoGenDraftPlanMutation> Mutations { get; set; } = new List<AutoGenDraftPlanMutation>();
+}
+
+// Одна атомарна зміна чернетки всередині збереженого плану автогенерації.
+public class AutoGenDraftPlanMutation
+{
+    public long Id { get; set; }
+    public int AutoGenDraftPlanId { get; set; }
+    public AutoGenDraftPlan Plan { get; set; } = default!;
+    public int Ordinal { get; set; }
+    public int Operation { get; set; }
+    public int? SourceDraftId { get; set; }
+    public int? AppliedDraftId { get; set; }
+    public Guid? BeforeRevision { get; set; }
+    public Guid? AppliedRevision { get; set; }
+    public string? BeforeJson { get; set; }
+    public string? AfterJson { get; set; }
 }

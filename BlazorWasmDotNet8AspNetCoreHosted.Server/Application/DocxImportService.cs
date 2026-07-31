@@ -13,6 +13,11 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 // Сервіс імпорту модулів та тем із DOCX-документів.
 public sealed class DocxImportService
 {
+    private const long MaxFileSizeBytes = 10 * 1024 * 1024;
+    private const long MaxCharactersPerPart = 2_000_000;
+    private const int MaxTableCount = 500;
+    private const int MaxRowCount = 20_000;
+    private const int MaxCellCount = 100_000;
     private static readonly Regex CourseCodeRegex = new(@"[A-Za-zА-Яа-яІіЇїЄєҐґ]{1,6}-\d+", RegexOptions.Compiled);
     private static readonly Regex ModulePrefixRegex = new(@"\b\d+\.\d+\.\d+\b", RegexOptions.Compiled);
     private static readonly Regex TopicCodeRegex = new(@"\d+(?:\.\d+){2,}", RegexOptions.Compiled);
@@ -26,17 +31,66 @@ public sealed class DocxImportService
     {
         if (file == null || file.Length == 0)
             return new DocxImportResultDto(string.Empty, null, false, new(), new() { "Файл порожній або не надісланий" }, "Файл порожній або не надісланий");
-        using var buffer = new MemoryStream();
-        await file.CopyToAsync(buffer, ct);
+        if (file.Length > MaxFileSizeBytes)
+            return new DocxImportResultDto(string.Empty, null, false, new(), new() { "Розмір DOCX-файлу перевищує дозволені 10 МБ" }, "Розмір DOCX-файлу перевищує дозволені 10 МБ");
+        using var buffer = new MemoryStream((int)Math.Min(file.Length, MaxFileSizeBytes));
+        await using (var input = file.OpenReadStream())
+        {
+            var chunk = new byte[81920];
+            long totalBytes = 0;
+            int bytesRead;
+            while ((bytesRead = await input.ReadAsync(chunk.AsMemory(0, chunk.Length), ct)) > 0)
+            {
+                totalBytes += bytesRead;
+                if (totalBytes > MaxFileSizeBytes)
+                {
+                    return new DocxImportResultDto(string.Empty, null, false, new(), new() { "Розмір DOCX-файлу перевищує дозволені 10 МБ" }, "Розмір DOCX-файлу перевищує дозволені 10 МБ");
+                }
+                await buffer.WriteAsync(chunk.AsMemory(0, bytesRead), ct);
+            }
+        }
         buffer.Position = 0;
-        using var doc = WordprocessingDocument.Open(buffer, false);
-        var body = doc.MainDocumentPart?.Document?.Body;
-        if (body is null)
-            return new DocxImportResultDto(string.Empty, null, false, new(), new() { "Не вдалося прочитати тіло документа" }, "Не вдалося прочитати тіло документа");
+        WordprocessingDocument openedDocument;
+        try
+        {
+            openedDocument = WordprocessingDocument.Open(
+                buffer,
+                false,
+                new OpenSettings { MaxCharactersInPart = MaxCharactersPerPart });
+        }
+        catch (Exception exception) when (exception is OpenXmlPackageException
+                                                   or FileFormatException
+                                                   or IOException
+                                                   or System.Xml.XmlException)
+        {
+            return new DocxImportResultDto(string.Empty, null, false, new(), new() { "Файл не є коректним DOCX-документом або має надто великий вміст" }, "Файл не є коректним DOCX-документом або має надто великий вміст");
+        }
+        using var doc = openedDocument;
+        List<string> allTexts;
+        List<Table> tables;
+        try
+        {
+            var body = doc.MainDocumentPart?.Document?.Body;
+            if (body is null)
+                return new DocxImportResultDto(string.Empty, null, false, new(), new() { "Не вдалося прочитати тіло документа" }, "Не вдалося прочитати тіло документа");
+            if (body.Descendants<Table>().Take(MaxTableCount + 1).Count() > MaxTableCount
+                || body.Descendants<TableRow>().Take(MaxRowCount + 1).Count() > MaxRowCount
+                || body.Descendants<TableCell>().Take(MaxCellCount + 1).Count() > MaxCellCount)
+            {
+                return new DocxImportResultDto(string.Empty, null, false, new(), new() { "DOCX-документ має надто складну структуру для безпечного імпорту" }, "DOCX-документ має надто складну структуру для безпечного імпорту");
+            }
+            allTexts = body.Descendants<Text>().Select(t => t.Text ?? string.Empty).ToList();
+            tables = body.Descendants<Table>().ToList();
+        }
+        catch (Exception exception) when (exception is OpenXmlPackageException
+                                                   or FileFormatException
+                                                   or IOException
+                                                   or System.Xml.XmlException)
+        {
+            return new DocxImportResultDto(string.Empty, null, false, new(), new() { "Файл не є коректним DOCX-документом або має надто великий вміст" }, "Файл не є коректним DOCX-документом або має надто великий вміст");
+        }
         var warnings = new List<string>();
-        var allTexts = body.Descendants<Text>().Select(t => t.Text ?? string.Empty).ToList();
         var courseName = ResolveCourseName(file.FileName, allTexts);
-        var tables = body.Descendants<Table>().ToList();
         var modulesTable = tables.FirstOrDefault(LooksLikeModuleTable);
         var parsedModules = modulesTable is not null
             ? ParseModules(modulesTable, warnings)
@@ -82,7 +136,24 @@ public sealed class DocxImportService
         {
             return result;
         }
-        await ApplyAsync(db, course, parsedModules, result, ct);
+        await using var transaction = await db.Database.BeginTransactionAsync(ct);
+        try
+        {
+            await ApplyAsync(db, course, parsedModules, result, ct);
+            await transaction.CommitAsync(ct);
+        }
+        catch (DocxImportConflictException exception)
+        {
+            await transaction.RollbackAsync(CancellationToken.None);
+            db.ChangeTracker.Clear();
+            return result with { Error = exception.Message };
+        }
+        catch
+        {
+            await transaction.RollbackAsync(CancellationToken.None);
+            db.ChangeTracker.Clear();
+            throw;
+        }
         return result;
     }
     // Визначає код/назву курсу за назвою файлу або текстом документа.
@@ -317,6 +388,7 @@ public sealed class DocxImportService
     // Застосовує результат імпорту до бази даних.
     private static async Task ApplyAsync(AppDbContext db, Course course, List<DocxImportModuleDto> modules, DocxImportResultDto result, CancellationToken ct)
     {
+        ValidateParsedTopics(modules);
         var moduleCodes = modules.Select(m => m.Code).ToList();
         // Підбираємо модулі лише в межах поточного курсу, щоб однакові коди в різних курсах не змішувалися.
         var existingModuleCandidates = await db.Modules
@@ -481,6 +553,18 @@ public sealed class DocxImportService
                 if (existingByCode.TryGetValue(topic.TopicCode, out var existingTopic))
                 {
                     entityTopic = existingTopic;
+                    if (entityTopic.LessonTypeId != lessonType.Id)
+                    {
+                        var topicIsUsed = await db.ScheduleItems
+                                .AnyAsync(item => item.ModuleTopicId == entityTopic.Id, ct)
+                            || await db.TeacherDraftItems
+                                .AnyAsync(item => item.ModuleTopicId == entityTopic.Id, ct);
+                        if (topicIsUsed)
+                        {
+                            throw new DocxImportConflictException(
+                                $"Імпорт скасовано: тема \"{entityTopic.TopicCode}\" модуля \"{module.Code}\" вже використовується у розкладі або чернетках, тому її тип заняття не можна змінити на \"{lessonType.Name}\".");
+                        }
+                    }
                 }
                 else
                 {
@@ -528,6 +612,39 @@ public sealed class DocxImportService
             await db.SaveChangesAsync(ct);
         }
     }
+
+    // Відхиляє неоднозначні теми до першої зміни бази даних.
+    private static void ValidateParsedTopics(IEnumerable<DocxImportModuleDto> modules)
+    {
+        foreach (var module in modules)
+        {
+            var duplicateCode = module.Topics
+                .GroupBy(topic => topic.TopicCode.Trim(), StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault(group => group.Count() > 1)
+                ?.Key;
+            if (!string.IsNullOrWhiteSpace(duplicateCode))
+            {
+                throw new DocxImportConflictException(
+                    $"Імпорт скасовано: код теми \"{duplicateCode}\" повторюється у модулі \"{module.Code}\".");
+            }
+
+            foreach (var topic in module.Topics)
+            {
+                var hasNegativeHours = topic.TotalHours < 0
+                                       || topic.AuditoriumHours < 0
+                                       || topic.SelfStudyHours < 0;
+                var assignedHours = (long)topic.AuditoriumHours + topic.SelfStudyHours;
+                if (hasNegativeHours || assignedHours > topic.TotalHours)
+                {
+                    throw new DocxImportConflictException(
+                        $"Імпорт скасовано: тема \"{topic.TopicCode}\" модуля \"{module.Code}\" має некоректний розподіл годин (усього {topic.TotalHours}, аудиторних {topic.AuditoriumHours}, самостійних {topic.SelfStudyHours}).");
+                }
+            }
+        }
+    }
+
+    private sealed class DocxImportConflictException(string message) : InvalidOperationException(message);
+
     // Евристика для визначення таблиці модулів.
     private static bool LooksLikeModuleTable(Table table)
     {

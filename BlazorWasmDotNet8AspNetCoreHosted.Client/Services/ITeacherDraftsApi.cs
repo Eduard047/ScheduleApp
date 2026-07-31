@@ -9,8 +9,14 @@ public interface ITeacherDraftsApi
     Task<byte[]> ExportWeek(DateOnly weekStart, int? teacherId, int? groupId, int? roomId);
     // Створює або оновлює чернетку.
     Task<int> Upsert(DraftUpsertRequest req);
+    // Атомарно створює або оновлює пакет чернеток.
+    Task<TeacherDraftBatchUpsertResult> UpsertBatch(TeacherDraftBatchUpsertRequest req);
     // Видаляє чернетку з підтвердженням.
-    Task Delete(int id, bool confirm = false, bool unrestricted = false);
+    Task Delete(int id, Guid expectedRevision, bool confirm = false, bool unrestricted = false);
+    // Атомарно видаляє пакет чернеток.
+    Task<TeacherDraftBatchDeleteResult> DeleteBatch(TeacherDraftBatchDeleteRequest req);
+    // Атомарно створює, оновлює та видаляє чернетки в межах однієї операції.
+    Task<TeacherDraftBatchMutationResult> MutateBatch(TeacherDraftBatchMutationRequest req);
     // Автогенерація на тиждень.
     Task<AutoGenResult> AutogenWeek(AutoGenRequest req);
     // Попередня перевірка ресурсів автогенерації без створення чернеток.
@@ -18,6 +24,10 @@ public interface ITeacherDraftsApi
     Task<AutoGenJobStartResult> StartAutogenJob(AutoGenJobRequest req);
     Task<AutoGenJobStatus> GetAutogenJob(string jobId);
     Task<AutoGenJobStatus> CancelAutogenJob(string jobId);
+    Task<AutoGenPlanDetailsDto> GetAutogenPlan(string jobId);
+    Task<AutoGenPlanDetailsDto> ApplyAutogenPlan(string jobId, AutoGenPlanActionRequest request);
+    Task<AutoGenPlanDetailsDto> RollbackAutogenPlan(string jobId, AutoGenPlanActionRequest request);
+    Task<AutoGenPlanDetailsDto?> GetLatestRollbackableAutogenPlan(int? courseId);
     // Очищає чернетки тижня.
     Task<int> ClearWeek(ClearWeekRequest req);
     // Автогенерація на місяць.
@@ -25,5 +35,12 @@ public interface ITeacherDraftsApi
     // Автогенерація для курсу за діапазон.
     Task<AutoGenResult> AutogenCourse(AutogenCourseRequest req);
     // Публікація чернеток тижня.
-    Task PublishWeek(PublishWeekRequest req);
+    Task<PublishWeekResultDto> PublishWeek(PublishWeekRequest req);
 }
+
+// Результат пакетної публікації чернеток, який повертає сервер.
+public sealed record PublishWeekResultDto(
+    int Created,
+    int Skipped,
+    List<string> Warnings
+);

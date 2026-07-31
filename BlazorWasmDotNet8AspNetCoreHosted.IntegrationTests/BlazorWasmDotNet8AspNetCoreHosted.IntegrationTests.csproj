@@ -1,0 +1,68 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <EnableLocalAutogenHarness Condition="'$(EnableLocalAutogenHarness)' == ''">false</EnableLocalAutogenHarness>
+
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.13" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.UserSecrets" Version="8.0.1" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.12" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BlazorWasmDotNet8AspNetCoreHosted.Server\BlazorWasmDotNet8AspNetCoreHosted.Server.csproj" />
+    <ProjectReference Include="..\BlazorWasmDotNet8AspNetCoreHosted.Shared\BlazorWasmDotNet8AspNetCoreHosted.Shared.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="AdminControllerGuardrailTests.cs" />
+    <Compile Include="AutoGenGapReasonClassifierTests.cs" />
+    <Compile Include="AutoGenWarningClassifierTests.cs" />
+    <Compile Include="AutogenLecturePackingTests.cs" />
+    <Compile Include="AutogenQualityMatrixTests.cs" />
+    <Compile Include="DeterministicResidualOptimizerOracleTests.cs" />
+    <Compile Include="DeterministicResourceMatcherTests.cs" />
+    <Compile Include="LogicalEventRotationPlannerTests.cs" />
+    <Compile Include="ProductionGuardrailTests.cs" />
+    <Compile Include="PublishGuardrailTests.cs" />
+    <Compile Include="ScheduleEndpointCorrectnessTests.cs" />
+    <Compile Include="ScheduleOverviewLayoutPlannerTests.cs" />
+    <Compile Include="SpaFallbackRoutingTests.cs" />
+    <Compile Include="TeacherDraftBatchAtomicityTests.cs" />
+    <Compile Include="TeacherDraftEditMutationPlannerTests.cs" />
+    <Compile Include="TeacherDraftsAutogenJobServiceSecurityTests.cs" />
+    <Compile Include="TeacherDraftsAutogenServiceRegressionTests.cs" />
+    <Compile Include="Infrastructure\TravelInvariantVerifier.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(EnableLocalAutogenHarness)' == 'true'">
+    <Compile Include="AutogenL3SeptemberTwoWeekScenarioTests.cs" />
+    <Compile Include="AutogenL3Week18DiagnosticsTests.cs" />
+    <Compile Include="Infrastructure\TempDatabaseAndCopy.cs" />
+    <Compile Include="Infrastructure\WorkspaceAndConfig.cs" />
+  </ItemGroup>
+
+</Project>

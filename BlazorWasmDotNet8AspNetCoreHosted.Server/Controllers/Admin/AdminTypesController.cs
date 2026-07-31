@@ -1,3 +1,4 @@
+using System.Data;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Infrastructure;
@@ -90,69 +91,137 @@ public class AdminTypesController(AppDbContext db) : ControllerBase
     public async Task<ActionResult<int>> LessonUpsert([FromBody] LessonTypeEditDto dto)
     {
         if (string.IsNullOrWhiteSpace(dto.Code) || string.IsNullOrWhiteSpace(dto.Name))
-            return BadRequest(new { message = "Код та Назва є обовʼязковими" });
-        LessonTypeRef e;
-        if (dto.Id is int id && id > 0)
+            return BadRequest(new { message = "Код та назва є обов'язковими." });
+        var code = dto.Code.Trim().ToUpperInvariant();
+        var name = dto.Name.Trim();
+        if (code.Length > 64)
+            return BadRequest(new { message = "Код типу заняття не може перевищувати 64 символи." });
+        if (name.Length > 200)
+            return BadRequest(new { message = "Назва типу заняття не може перевищувати 200 символів." });
+
+        await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
+        try
         {
-            e = await db.LessonTypes.FirstOrDefaultAsync(x => x.Id == id)
-                ?? throw new ArgumentException("Тип заняття не знайдено");
-        }
-        else
-        {
-            e = new LessonTypeRef();
-            db.LessonTypes.Add(e);
-        }
-        e.Code = dto.Code.Trim();
-        e.Name = dto.Name.Trim();
-        e.IsActive = dto.IsActive;
-        var newKey = string.IsNullOrWhiteSpace(dto.CssKey) ? null : dto.CssKey.Trim();
-        if (newKey != null)
-        {
-            if (!Palette.ContainsKey(newKey))
-                return BadRequest(new { message = $"Недопустимий CSS-ключ '{newKey}'. Оберіть один із фіксованої палітри." });
-            var takenBy = await db.LessonTypes
-                .Where(x => x.CssKey == newKey)
-                .Select(x => x.Id)
-                .FirstOrDefaultAsync();
-            if (takenBy != 0 && takenBy != e.Id)
-                return Conflict(new { message = $"Колір '{newKey}' вже використовується типом #{takenBy}." });
-        }
-        e.CssKey = newKey;
-        e.RequiresRoom = dto.RequiresRoom;
-        e.RequiresTeacher = dto.RequiresTeacher;
-        e.BlocksRoom = dto.BlocksRoom;
-        e.BlocksTeacher = dto.BlocksTeacher;
-        e.CountInPlan = dto.CountInPlan;
-        e.CountInLoad = dto.CountInLoad;
-        if (dto.PreferredFirstInWeek)
-        {
-            var taken = await db.LessonTypes
-                .AsNoTracking()
-                .Where(x => x.PreferredFirstInWeek && x.Id != e.Id)
-                .Select(x => new { x.Id, x.Code, x.Name })
-                .FirstOrDefaultAsync();
-            if (taken is not null)
+            LessonTypeRef lessonType;
+            if (dto.Id is int id && id > 0)
             {
-                var label = string.IsNullOrWhiteSpace(taken.Code)
-                    ? $"#{taken.Id}"
-                    : $"{taken.Code} (#{taken.Id})";
-                return Conflict(new { message = $"Прапорець \"Бажано першим у тижні\" вже встановлено для типу {label}. Спочатку зніміть його там." });
+                var existingLessonType = await db.LessonTypes.FirstOrDefaultAsync(x => x.Id == id);
+                if (existingLessonType is null) return NotFound(new { message = "Тип заняття не знайдено." });
+                lessonType = existingLessonType;
             }
+            else
+            {
+                lessonType = new LessonTypeRef();
+                db.LessonTypes.Add(lessonType);
+            }
+
+            var codeIsTaken = await db.LessonTypes.AnyAsync(existing =>
+                existing.Id != lessonType.Id && existing.Code.ToUpper() == code);
+            if (codeIsTaken)
+                return Conflict(new { message = $"Тип заняття з кодом '{code}' вже існує." });
+
+            var newKey = string.IsNullOrWhiteSpace(dto.CssKey) ? null : dto.CssKey.Trim();
+            if (newKey != null)
+            {
+                if (!Palette.ContainsKey(newKey))
+                    return BadRequest(new { message = $"Недопустимий CSS-ключ '{newKey}'. Оберіть один із фіксованої палітри." });
+                var takenBy = await db.LessonTypes
+                    .Where(x => x.CssKey == newKey && x.Id != lessonType.Id)
+                    .Select(x => x.Id)
+                    .FirstOrDefaultAsync();
+                if (takenBy != 0)
+                    return Conflict(new { message = $"Колір '{newKey}' вже використовується типом #{takenBy}." });
+            }
+
+            if (dto.PreferredFirstInWeek)
+            {
+                var taken = await db.LessonTypes
+                    .AsNoTracking()
+                    .Where(x => x.PreferredFirstInWeek && x.Id != lessonType.Id)
+                    .Select(x => new { x.Id, x.Code, x.Name })
+                    .FirstOrDefaultAsync();
+                if (taken is not null)
+                {
+                    var label = string.IsNullOrWhiteSpace(taken.Code)
+                        ? $"#{taken.Id}"
+                        : $"{taken.Code} (#{taken.Id})";
+                    return Conflict(new { message = $"Прапорець \"Бажано першим у тижні\" вже встановлено для типу {label}. Спочатку зніміть його там." });
+                }
+            }
+
+            var changesPlacementSemantics = lessonType.Id > 0
+                && (!string.Equals(lessonType.Code, code, StringComparison.OrdinalIgnoreCase)
+                    || (lessonType.IsActive && !dto.IsActive)
+                    || lessonType.RequiresRoom != dto.RequiresRoom
+                    || lessonType.RequiresTeacher != dto.RequiresTeacher
+                    || lessonType.BlocksRoom != dto.BlocksRoom
+                    || lessonType.BlocksTeacher != dto.BlocksTeacher
+                    || lessonType.CountInPlan != dto.CountInPlan
+                    || lessonType.CountInLoad != dto.CountInLoad);
+            if (changesPlacementSemantics)
+            {
+                var isUsed = await db.ScheduleItems.AnyAsync(item => item.LessonTypeId == lessonType.Id)
+                    || await db.TeacherDraftItems.AnyAsync(item => item.LessonTypeId == lessonType.Id)
+                    || await db.ModuleTopics.AnyAsync(topic => topic.LessonTypeId == lessonType.Id);
+                if (isUsed)
+                {
+                    return Conflict(new
+                    {
+                        message = "Неможливо деактивувати або змінити код чи правила типу заняття, доки він використовується у розкладі, чернетках чи темах. Створіть новий тип і перенесіть залежні записи."
+                    });
+                }
+            }
+
+            lessonType.Code = code;
+            lessonType.Name = name;
+            lessonType.IsActive = dto.IsActive;
+            lessonType.CssKey = newKey;
+            lessonType.RequiresRoom = dto.RequiresRoom;
+            lessonType.RequiresTeacher = dto.RequiresTeacher;
+            lessonType.BlocksRoom = dto.BlocksRoom;
+            lessonType.BlocksTeacher = dto.BlocksTeacher;
+            lessonType.CountInPlan = dto.CountInPlan;
+            lessonType.CountInLoad = dto.CountInLoad;
+            lessonType.PreferredFirstInWeek = dto.PreferredFirstInWeek;
+            await db.SaveChangesAsync();
+            await tx.CommitAsync();
+            return Ok(lessonType.Id);
         }
-        e.PreferredFirstInWeek = dto.PreferredFirstInWeek;
-        await db.SaveChangesAsync();
-        return Ok(e.Id);
+        catch
+        {
+            await tx.RollbackAsync(CancellationToken.None);
+            throw;
+        }
     }
     [HttpDelete("lesson/{id:int}")]
     [RequireDeletionConfirmation("тип заняття")]
     // Видаляє тип заняття, якщо він не використовується.
     public async Task<IActionResult> LessonDelete(int id)
     {
-        var used = await db.ScheduleItems.AnyAsync(s => s.LessonTypeId == id);
-        if (used) return Conflict(new { message = "Тип заняття використовується у розкладі" });
-        var rows = await db.LessonTypes.Where(x => x.Id == id).ExecuteDeleteAsync();
-        if (rows == 0) return NotFound();
-        return NoContent();
+        await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
+        try
+        {
+            if (!await db.LessonTypes.AnyAsync(type => type.Id == id)) return NotFound();
+            var usedInSchedule = await db.ScheduleItems.AnyAsync(item => item.LessonTypeId == id);
+            var usedInDrafts = await db.TeacherDraftItems.AnyAsync(item => item.LessonTypeId == id);
+            var usedInTopics = await db.ModuleTopics.AnyAsync(topic => topic.LessonTypeId == id);
+            if (usedInSchedule || usedInDrafts || usedInTopics)
+            {
+                return Conflict(new
+                {
+                    message = "Тип заняття використовується у розкладі, чернетках або темах модулів. Спочатку змініть пов'язані записи."
+                });
+            }
+            var rows = await db.LessonTypes.Where(x => x.Id == id).ExecuteDeleteAsync();
+            if (rows == 0) return NotFound();
+            await tx.CommitAsync();
+            return NoContent();
+        }
+        catch
+        {
+            await tx.RollbackAsync(CancellationToken.None);
+            throw;
+        }
     }
 
 }

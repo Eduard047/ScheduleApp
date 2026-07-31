@@ -5,7 +5,7 @@ using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 
 public sealed record DraftAutoGenSoftOptions(
-    int? MaxParallelGroupsPerModuleInSlot = null, // М'який ліміт паралельних груп одного модуля в тому самому слоті.
+    int? MaxParallelGroupsPerModuleInSlot = null, // Жорстка межа паралельних груп одного модуля в тому самому слоті.
     int? RecentRepeatWindowDays = null, // Розмір вікна днів для близьких повторів модуля.
     int? PreferredMaxDistinctModulesPerDay = null, // Бажана кількість різних модулів у межах дня.
     int? MaxDistinctModulesPerDay = null, // Максимальна кількість різних модулів у межах дня.

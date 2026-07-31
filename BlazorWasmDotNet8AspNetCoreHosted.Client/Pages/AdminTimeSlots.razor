@@ -3,6 +3,7 @@
 @using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
 @inject HttpClient Http
 @inject BlazorWasmDotNet8AspNetCoreHosted.Client.Services.TimeSlotsApi Api
+@inject BlazorWasmDotNet8AspNetCoreHosted.Client.Services.IAdminApi AdminApi
 @inject IJSRuntime JS
 
 <h3>Слоти часу</h3>
@@ -31,7 +32,7 @@
                 <option value="@day.Value">@day.Label</option>
             }
         </select>
-        <button class="btn btn-outline-secondary" @onclick="LoadRaw">Оновити</button>
+        <button class="btn btn-outline-secondary" @onclick="RefreshAsync">Оновити</button>
     </div>
     <div class="form-text">Редагуєте: <strong>@GetContextLabel()</strong>.</div>
 </div>
@@ -108,6 +109,35 @@
                 <button class="btn btn-sm btn-primary" @onclick="Save" disabled="@(!CanSaveChanges)">Зберегти</button>
             </div>
         </div>
+        <div class="alert alert-info py-2 mb-3">
+            <div class="fw-semibold">Обідня перерва — спільна для всіх днів</div>
+            <div>@GetLunchStatusText()</div>
+            @if (CanManageLunch)
+            {
+                <div class="small mt-1">
+                    Позначте один активний слот у колонці «Обід». Щоб прибрати власну перерву,
+                    зніміть позначку та збережіть шаблон.
+                </div>
+                @if (HasExplicitLunchForCurrentScope())
+                {
+                    <button class="btn btn-sm btn-outline-danger mt-2"
+                            disabled="@_removeExplicitLunchRequested"
+                            @onclick="RequestExplicitLunchRemoval">
+                        @(_removeExplicitLunchRequested ? "Перерву буде прибрано" : "Прибрати власну перерву")
+                    </button>
+                }
+            }
+            else
+            {
+                <div class="small mt-1">
+                    У режимі окремого дня перерва лише відображається і не змінюється.
+                    Налаштування доступне в режимі «Усі дні».
+                </div>
+                <button class="btn btn-sm btn-outline-primary mt-2" @onclick="OpenCommonLunchEditorAsync">
+                    Перейти до «Усі дні»
+                </button>
+            }
+        </div>
         <table class="table table-sm align-middle">
             <thead>
                 <tr>
@@ -115,13 +145,14 @@
                     <th style="width:140px">Старт</th>
                     <th style="width:140px">Фініш</th>
                     <th style="width:140px">Активний</th>
+                    <th style="width:110px">Обід</th>
                     <th></th>
                 </tr>
             </thead>
             <tbody>
                 @if (_rows.Count == 0)
                 {
-                    <tr><td colspan="5" class="text-muted">Немає слотів</td></tr>
+                    <tr><td colspan="6" class="text-muted">Немає слотів</td></tr>
                 }
                 else
                 {
@@ -143,6 +174,20 @@
                             <td>
                                 <input class="form-check-input" type="checkbox" @bind="r.IsActive" />
                             </td>
+                            <td>
+                                @if (CanManageLunch)
+                                {
+                                    <input class="form-check-input" type="checkbox"
+                                           checked="@r.IsLunch"
+                                           disabled="@(!r.IsActive)"
+                                           aria-label="Позначити слот @r.SortOrder як обід"
+                                           @onchange="args => ToggleLunch(r, args)" />
+                                }
+                                else
+                                {
+                                    <span class="text-muted">—</span>
+                                }
+                            </td>
                             <td class="text-end">
                                 <button class="btn btn-sm btn-outline-danger" @onclick="() => RemoveRow(r)">Видалити</button>
                             </td>
@@ -152,7 +197,8 @@
             </tbody>
         </table>
         <div class="form-text">
-            Порада: Тримайте тривалості однаковими (наприклад, 45 хвилин). Автогенерація використовує ці слоти 1-в-1 без окремого обіднього конфігу.
+            Порада: тримайте тривалості однаковими (наприклад, 45 хвилин). Автогенерація використовує
+            активні слоти та виключає ті, що перетинаються зі спільною обідньою перервою.
         </div>
     </div>
 </div>
@@ -178,18 +224,28 @@
     private int? _dayOfWeek;
     private CopySourceMode _copySourceMode = CopySourceMode.CurrentScopeOnly;
     private List<LookupDto> _courses = new();
+    private List<LunchConfigEditDto> _lunches = new();
     private List<TimeSlotDto> _rows = new();
     private List<TimeSlotDto> _loadedRowsSnapshot = new();
     private List<TimeSlotDto> _copyPreviewRows = new();
     private int _preferredFirstMaxSlotOrder;
+    private bool _removeExplicitLunchRequested;
+    private int _contextLoadVersion;
+    private int _copyPreviewLoadVersion;
+    private bool _hasLoadedContext;
+    private Scope _loadedScope = Scope.Global;
+    private int? _loadedCourseId;
+    private int? _loadedDayOfWeek;
     private string? _error;
     private string? _ok;
     private bool IsScopeSelectionIncomplete => _scope == Scope.Course && _courseId is null;
     private bool CanCopyToEditor => !IsScopeSelectionIncomplete
                                     && _copyPreviewRows.Count > 0;
     private bool CanSaveEditorAsTemplate => !IsScopeSelectionIncomplete && _rows.Count > 0;
-    private bool HasUnsavedChanges => !AreRowsEquivalent(_rows, _loadedRowsSnapshot);
+    private bool HasUnsavedChanges => _removeExplicitLunchRequested
+                                      || !AreRowsEquivalent(_rows, _loadedRowsSnapshot);
     private bool CanSaveChanges => !IsScopeSelectionIncomplete && HasUnsavedChanges;
+    private bool CanManageLunch => !IsScopeSelectionIncomplete && _dayOfWeek is null;
     // Завантажує метадані курсів при старті сторінки.
     protected override async Task OnInitializedAsync()
     {
@@ -200,6 +256,11 @@
     // Оновлює контекст при перемиканні рівня.
     private async Task OnScopeChangedAsync()
     {
+        if (!await ConfirmDiscardChangesAsync())
+        {
+            RestoreLoadedContext();
+            return;
+        }
         if (_scope == Scope.Global)
         {
             _courseId = null;
@@ -210,13 +271,60 @@
     // Оновлює дані після вибору курсу.
     private async Task OnCourseChangedAsync()
     {
+        if (!await ConfirmDiscardChangesAsync())
+        {
+            RestoreLoadedContext();
+            return;
+        }
         await LoadRaw();
     }
     // Оновлює дані після вибору дня.
     private async Task OnDayChangedAsync()
     {
+        if (!await ConfirmDiscardChangesAsync())
+        {
+            RestoreLoadedContext();
+            return;
+        }
         await LoadRaw();
     }
+    // Оновлює редактор лише після явного підтвердження втрати незбережених змін.
+    private async Task RefreshAsync()
+    {
+        if (!await ConfirmDiscardChangesAsync())
+        {
+            return;
+        }
+        await LoadRaw();
+    }
+    // Запитує підтвердження перед зміною контексту, яка замінить поточний редактор.
+    private async Task<bool> ConfirmDiscardChangesAsync()
+        => !HasUnsavedChanges
+           || await JS.InvokeAsync<bool>(
+               "confirm",
+               "У редакторі є незбережені зміни. Відкинути їх і завантажити інший контекст?");
+    // Повертає селектори до останнього завантаженого контексту після відмови користувача.
+    private void RestoreLoadedContext()
+    {
+        if (!_hasLoadedContext)
+        {
+            return;
+        }
+        _scope = _loadedScope;
+        _courseId = _loadedCourseId;
+        _dayOfWeek = _loadedDayOfWeek;
+    }
+    // Запам'ятовує контекст, якому відповідають поточні рядки редактора.
+    private void RememberLoadedContext(Scope scope, int? courseId, int? dayOfWeek)
+    {
+        _hasLoadedContext = true;
+        _loadedScope = scope;
+        _loadedCourseId = courseId;
+        _loadedDayOfWeek = dayOfWeek;
+    }
+    // Перевіряє, що відповідь ще належить поточним селекторам редактора.
+    private bool IsCurrentContext(Scope scope, int? courseId, int? dayOfWeek)
+        => _scope == scope && _courseId == courseId && _dayOfWeek == dayOfWeek;
     // Оновлює попередній перегляд після зміни джерела копіювання.
     private async Task OnCopySettingsChangedAsync()
     {
@@ -225,6 +333,11 @@
     // Завантажує сирі слоти для обраного рівня.
     private async Task LoadRaw()
     {
+        var loadVersion = ++_contextLoadVersion;
+        var requestedScope = _scope;
+        var requestedCourseId = _courseId;
+        var requestedDayOfWeek = _dayOfWeek;
+        var apiCourseId = requestedScope == Scope.Global ? null : requestedCourseId;
         _error = _ok = null;
         if (IsScopeSelectionIncomplete)
         {
@@ -232,33 +345,63 @@
             _loadedRowsSnapshot = new();
             _copyPreviewRows = new();
             _preferredFirstMaxSlotOrder = 0;
+            _removeExplicitLunchRequested = false;
+            RememberLoadedContext(requestedScope, requestedCourseId, requestedDayOfWeek);
             return;
         }
         try
         {
-            _rows = await Api.GetRawAsync(CurrentCourseId(), _dayOfWeek);
+            var rowsTask = Api.GetRawAsync(apiCourseId, requestedDayOfWeek);
+            var lunchesTask = AdminApi.GetLunch();
+            await Task.WhenAll(rowsTask, lunchesTask);
+            if (loadVersion != _contextLoadVersion
+                || !IsCurrentContext(requestedScope, requestedCourseId, requestedDayOfWeek))
+            {
+                return;
+            }
+            _rows = rowsTask.Result;
+            _lunches = lunchesTask.Result;
             _loadedRowsSnapshot = CloneRows(_rows);
-            await LoadPreferredFirstSlotLimit();
+            _removeExplicitLunchRequested = false;
+            RememberLoadedContext(requestedScope, requestedCourseId, requestedDayOfWeek);
+            await LoadPreferredFirstSlotLimit(apiCourseId, loadVersion);
             await LoadCopyPreviewAsync();
         }
         catch (BlazorWasmDotNet8AspNetCoreHosted.Client.Services.ApiErrorException ex)
         {
+            if (loadVersion != _contextLoadVersion
+                || !IsCurrentContext(requestedScope, requestedCourseId, requestedDayOfWeek))
+            {
+                return;
+            }
             _rows = new();
             _loadedRowsSnapshot = new();
             _copyPreviewRows = new();
             _error = ex.Errors.FirstOrDefault() ?? ex.Message;
+            RememberLoadedContext(requestedScope, requestedCourseId, requestedDayOfWeek);
         }
         catch (Exception ex)
         {
+            if (loadVersion != _contextLoadVersion
+                || !IsCurrentContext(requestedScope, requestedCourseId, requestedDayOfWeek))
+            {
+                return;
+            }
             _rows = new();
             _loadedRowsSnapshot = new();
             _copyPreviewRows = new();
             _error = ex.Message;
+            RememberLoadedContext(requestedScope, requestedCourseId, requestedDayOfWeek);
         }
     }
     // Завантажує попередній перегляд джерела копіювання.
     private async Task LoadCopyPreviewAsync()
     {
+        var previewVersion = ++_copyPreviewLoadVersion;
+        var requestedScope = _scope;
+        var requestedCourseId = _courseId;
+        var requestedDayOfWeek = _dayOfWeek;
+        var sourceCourseId = ResolveCopySourceCourseId();
         if (IsScopeSelectionIncomplete)
         {
             _copyPreviewRows = new();
@@ -266,12 +409,23 @@
         }
         try
         {
-            var sourceCourseId = ResolveCopySourceCourseId();
-            _copyPreviewRows = await Api.GetRawAsync(sourceCourseId, dayOfWeek: null);
+            var rows = await Api.GetRawAsync(sourceCourseId, dayOfWeek: null);
+            if (previewVersion != _copyPreviewLoadVersion
+                || !IsCurrentContext(requestedScope, requestedCourseId, requestedDayOfWeek)
+                || sourceCourseId != ResolveCopySourceCourseId())
+            {
+                return;
+            }
+            _copyPreviewRows = rows;
         }
         catch
         {
-            _copyPreviewRows = new();
+            if (previewVersion == _copyPreviewLoadVersion
+                && IsCurrentContext(requestedScope, requestedCourseId, requestedDayOfWeek)
+                && sourceCourseId == ResolveCopySourceCourseId())
+            {
+                _copyPreviewRows = new();
+            }
         }
     }
     // Копіює шаблон-джерело у поточний контекст редактора.
@@ -305,8 +459,10 @@
                 SortOrder = s.SortOrder,
                 Start = s.Start,
                 End = s.End,
-                IsActive = s.IsActive
+                IsActive = s.IsActive,
+                IsLunch = _dayOfWeek is null && s.IsLunch
             }).ToList();
+            _removeExplicitLunchRequested = false;
             _ok = "Шаблон завантажено в редактор. Натисніть «Зберегти», щоб застосувати зміни.";
         }
         catch (BlazorWasmDotNet8AspNetCoreHosted.Client.Services.ApiErrorException ex)
@@ -342,12 +498,16 @@
             {
                 row.CourseId = courseId;
                 row.DayOfWeek = null;
-                row.IsLunch = false;
+            }
+            if (_dayOfWeek is not null && !TryPreserveExplicitLunch(templateRows, courseId))
+            {
+                _error = "Поточна обідня перерва не збігається з жодним активним слотом редактора. Відкрийте режим «Усі дні» та оберіть слот обіду вручну.";
+                return;
             }
             var existingTemplate = await Api.GetRawAsync(courseId, dayOfWeek: null);
             if (existingTemplate.Count > 0)
             {
-                if (AreRowsEquivalent(existingTemplate, templateRows))
+                if (!_removeExplicitLunchRequested && AreRowsEquivalent(existingTemplate, templateRows))
                 {
                     _copySourceMode = CopySourceMode.CurrentScopeOnly;
                     await LoadCopyPreviewAsync();
@@ -359,8 +519,11 @@
             }
             await Api.SaveAsync(courseId, templateRows, dayOfWeek: null);
             _copySourceMode = CopySourceMode.CurrentScopeOnly;
-            await LoadCopyPreviewAsync();
-            _ok = "Шаблон збережено. Тепер його можна копіювати у будь-який день.";
+            await LoadRaw();
+            if (_error is null)
+            {
+                _ok = "Шаблон збережено. Тепер його можна копіювати у будь-який день.";
+            }
         }
         catch (BlazorWasmDotNet8AspNetCoreHosted.Client.Services.ApiErrorException ex)
         {
@@ -405,12 +568,20 @@
         });
     }
     // Видаляє рядок слота зі списку.
-    private void RemoveRow(TimeSlotDto r) => _rows.Remove(r);
+    private void RemoveRow(TimeSlotDto r)
+    {
+        if (r.IsLunch && HasExplicitLunchForCurrentScope())
+        {
+            _removeExplicitLunchRequested = true;
+        }
+        _rows.Remove(r);
+    }
     // Повертає редактор до останньої завантаженої/збереженої версії.
     private void RevertChanges()
     {
         if (!HasUnsavedChanges) return;
         _rows = CloneRows(_loadedRowsSnapshot);
+        _removeExplicitLunchRequested = false;
         _ok = "Зміни в редакторі скасовано.";
     }
     // Перевіряє коректність часу у форматі HH:mm.
@@ -436,13 +607,13 @@
             .OrderBy(r => r.SortOrder)
             .ThenBy(r => r.Start, StringComparer.Ordinal)
             .ThenBy(r => r.End, StringComparer.Ordinal)
-            .Select(r => (r.SortOrder, Start: r.Start?.Trim() ?? string.Empty, End: r.End?.Trim() ?? string.Empty, r.IsActive))
+            .Select(r => (r.SortOrder, Start: r.Start?.Trim() ?? string.Empty, End: r.End?.Trim() ?? string.Empty, r.IsActive, r.IsLunch))
             .ToList();
         var rightNormalized = right
             .OrderBy(r => r.SortOrder)
             .ThenBy(r => r.Start, StringComparer.Ordinal)
             .ThenBy(r => r.End, StringComparer.Ordinal)
-            .Select(r => (r.SortOrder, Start: r.Start?.Trim() ?? string.Empty, End: r.End?.Trim() ?? string.Empty, r.IsActive))
+            .Select(r => (r.SortOrder, Start: r.Start?.Trim() ?? string.Empty, End: r.End?.Trim() ?? string.Empty, r.IsActive, r.IsLunch))
             .ToList();
         for (var i = 0; i < leftNormalized.Count; i++)
         {
@@ -453,15 +624,66 @@
         }
         return true;
     }
-    // Позначає слот як обідній і знімає прапорець з інших.
+    // Позначає один активний слот як спільну обідню перерву або знімає позначку.
+    private void ToggleLunch(TimeSlotDto target, ChangeEventArgs args)
+    {
+        if (!CanManageLunch) return;
+        var selected = args.Value is bool value && value;
+        foreach (var row in _rows)
+        {
+            row.IsLunch = false;
+        }
+        if (selected && target.IsActive)
+        {
+            target.IsLunch = true;
+            _removeExplicitLunchRequested = false;
+        }
+        else
+        {
+            _removeExplicitLunchRequested = HasExplicitLunchForCurrentScope();
+        }
+    }
+    // Фіксує явний намір прибрати перерву, навіть якщо вона не збігається зі слотом шаблону.
+    private void RequestExplicitLunchRemoval()
+    {
+        if (!CanManageLunch || !HasExplicitLunchForCurrentScope()) return;
+        _error = null;
+        foreach (var row in _rows)
+        {
+            row.IsLunch = false;
+        }
+        _removeExplicitLunchRequested = true;
+        _ok = "Власну обідню перерву буде прибрано після збереження.";
+    }
+    // Відкриває шаблон «Усі дні», де дозволено змінювати спільну перерву.
+    private async Task OpenCommonLunchEditorAsync()
+    {
+        if (!await ConfirmDiscardChangesAsync())
+        {
+            return;
+        }
+        _dayOfWeek = null;
+        await LoadRaw();
+    }
     // Валідатор слотів перед збереженням.
     private string? Validate()
     {
+        if (_rows.Count(row => row.IsLunch) > 1)
+            return "Можна обрати лише один слот для обідньої перерви.";
+        if (CanManageLunch
+            && HasExplicitLunchForCurrentScope()
+            && !_rows.Any(row => row.IsLunch)
+            && !_removeExplicitLunchRequested)
+        {
+            return "Оберіть слот обіду або натисніть «Прибрати власну перерву», щоб підтвердити її видалення.";
+        }
         foreach (var r in _rows)
         {
             if (!TryTime(r.Start, out var s) || !TryTime(r.End, out var e))
                 return $"Невірний час у рядку з порядком {r.SortOrder}. Формат HH:mm";
             if (s >= e) return $"Старт >= фініш у рядку {r.SortOrder}.";
+            if (r.IsLunch && !r.IsActive)
+                return $"Слот обіду з порядком {r.SortOrder} має бути активним.";
         }
         var actives = _rows.Where(x => x.IsActive).ToList();
         for (int i = 0; i < actives.Count; i++)
@@ -535,17 +757,100 @@
         => HasUnsavedChanges
             ? $"Є незбережені зміни. Слотів у редакторі: {_rows.Count}."
             : $"Слотів у редакторі: {_rows.Count}.";
+    // Повертає явну або успадковану обідню перерву для поточного рівня.
+    private LunchConfigEditDto? GetEffectiveLunch()
+    {
+        var courseId = CurrentCourseId();
+        var exact = _lunches.FirstOrDefault(lunch => lunch.CourseId == courseId);
+        if (exact is not null || courseId is null)
+        {
+            return exact;
+        }
+        return _lunches.FirstOrDefault(lunch => lunch.CourseId is null);
+    }
+    // Перевіряє наявність власної перерви саме для поточного рівня.
+    private bool HasExplicitLunchForCurrentScope()
+        => !IsScopeSelectionIncomplete
+           && _lunches.Any(lunch => lunch.CourseId == CurrentCourseId());
+    // Переносить явну перерву рівня до шаблону, створеного з окремого дня.
+    private bool TryPreserveExplicitLunch(IReadOnlyCollection<TimeSlotDto> rows, int? courseId)
+    {
+        foreach (var row in rows)
+        {
+            row.IsLunch = false;
+        }
+        var explicitLunch = _lunches.FirstOrDefault(lunch => lunch.CourseId == courseId);
+        if (explicitLunch is null)
+        {
+            return true;
+        }
+        var matchingRow = rows.FirstOrDefault(row =>
+            row.IsActive
+            && string.Equals(row.Start?.Trim(), explicitLunch.Start, StringComparison.Ordinal)
+            && string.Equals(row.End?.Trim(), explicitLunch.End, StringComparison.Ordinal));
+        if (matchingRow is null)
+        {
+            return false;
+        }
+        matchingRow.IsLunch = true;
+        return true;
+    }
+    // Формує зрозумілий статус спільної обідньої перерви та її успадкування.
+    private string GetLunchStatusText()
+    {
+        if (IsScopeSelectionIncomplete)
+        {
+            return "Оберіть курс, щоб побачити його власну або успадковану перерву.";
+        }
+        if (_removeExplicitLunchRequested)
+        {
+            var globalLunch = _scope == Scope.Course
+                ? _lunches.FirstOrDefault(lunch => lunch.CourseId is null)
+                : null;
+            return globalLunch is null
+                ? "Власну перерву буде прибрано після збереження."
+                : $"Власну перерву буде прибрано після збереження; курс успадкує глобальну {globalLunch.Start}–{globalLunch.End}.";
+        }
+        var lunch = GetEffectiveLunch();
+        if (lunch is null)
+        {
+            return _scope == Scope.Course
+                ? "Для курсу та глобального рівня перерву не налаштовано."
+                : "Глобальну перерву не налаштовано.";
+        }
+        var interval = $"{lunch.Start}–{lunch.End}";
+        var isExplicitForCurrentScope = lunch.CourseId == CurrentCourseId();
+        if (CanManageLunch
+            && isExplicitForCurrentScope
+            && !_rows.Any(row => row.IsLunch))
+        {
+            return $"Поточна перерва: {interval}, але вона не збігається з активним слотом шаблону. Оберіть слот обіду або збережіть без позначки, щоб прибрати власну перерву.";
+        }
+        if (_scope == Scope.Course && lunch.CourseId is null)
+        {
+            return $"Поточна перерва: {interval} (успадковано з глобального рівня).";
+        }
+        return _scope == Scope.Course
+            ? $"Поточна перерва курсу: {interval}."
+            : $"Поточна глобальна перерва: {interval}.";
+    }
     // Завантажує ліміт слота для типу з прапорцем "Бажано першим у тижні".
-    private async Task LoadPreferredFirstSlotLimit()
+    private async Task LoadPreferredFirstSlotLimit(int? courseId, int contextLoadVersion)
     {
         try
         {
-            var dto = await Api.GetPreferredFirstSlotLimitAsync(CurrentCourseId());
-            _preferredFirstMaxSlotOrder = Math.Max(0, dto.MaxSlotOrder);
+            var dto = await Api.GetPreferredFirstSlotLimitAsync(courseId);
+            if (contextLoadVersion == _contextLoadVersion && courseId == CurrentCourseId())
+            {
+                _preferredFirstMaxSlotOrder = Math.Max(0, dto.MaxSlotOrder);
+            }
         }
         catch
         {
-            _preferredFirstMaxSlotOrder = 0;
+            if (contextLoadVersion == _contextLoadVersion && courseId == CurrentCourseId())
+            {
+                _preferredFirstMaxSlotOrder = 0;
+            }
         }
     }
     // Зберігає ліміт слота для типу з прапорцем "Бажано першим у тижні".
@@ -589,13 +894,18 @@
         try
         {
             var courseId = CurrentCourseId();
-            foreach (var row in _rows)
+            var dayOfWeek = _dayOfWeek;
+            var rowsToSave = CloneRows(_rows);
+            foreach (var row in rowsToSave)
             {
                 row.CourseId = courseId;
-                row.DayOfWeek = _dayOfWeek;
-                row.IsLunch = false;
+                row.DayOfWeek = dayOfWeek;
+                if (dayOfWeek is not null)
+                {
+                    row.IsLunch = false;
+                }
             }
-            await Api.SaveAsync(courseId, _rows, _dayOfWeek);
+            await Api.SaveAsync(courseId, rowsToSave, dayOfWeek);
             await LoadRaw();
             if (_error is null)
             {

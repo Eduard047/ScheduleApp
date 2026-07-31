@@ -1,6 +1,6 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
+using System.Data;
 using System.Linq;
 using System.Text.Json;
 using System.Threading;
@@ -11,6 +11,7 @@ using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 
@@ -18,6 +19,17 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 public sealed class TeacherDraftsAutogenService
 {
     private static readonly SemaphoreSlim GenerationLock = new(1, 1);
+    private static readonly (
+        bool AllowRepeatPreviousDay,
+        bool AllowExtraSameDay,
+        bool Relaxed,
+        bool BypassDistinctLimit)[] ExhaustiveGapFillStages =
+    [
+        (false, false, false, false),
+        (false, true, false, false),
+        (true, true, true, false),
+        (true, true, true, true)
+    ];
 
     // Контекст БД для читання довідників та запису чернеток.
     private readonly AppDbContext _db;
@@ -37,11 +49,56 @@ public sealed class TeacherDraftsAutogenService
         int ModuleId, // Модуль, до якого належить слот.
         int LessonTypeId, // Тип заняття (для обмежень).
         int? ModuleTopicId, // Тема модуля для точного зіставлення спільних потоків.
-        bool JoinableDraft // Чи можна приєднати до цього слоту нові групи як до чернеткового потоку.
+        bool JoinableDraft, // Чи можна приєднати до цього слоту нові групи як до чернеткового потоку.
+        string? BatchKey = null // Ключ логічної події для схлопування багаторядкових занять у лічильниках.
     );
+    private readonly record struct MutableDraftProjection(
+        int GroupId,
+        DateOnly Date,
+        TimeOnly StartTime,
+        TimeOnly EndTime,
+        int ModuleId,
+        int LessonTypeId,
+        int? ModuleTopicId,
+        int? TeacherId,
+        int? RoomId);
+    private sealed record LogicalEventUsageRow(
+        int GroupId,
+        int ModuleId,
+        int LessonTypeId,
+        int? ModuleTopicId,
+        int? TeacherId,
+        int? RoomId,
+        bool IsSelfStudy,
+        DateOnly Date,
+        TimeOnly StartTime,
+        TimeOnly EndTime,
+        string? BatchKey);
+    private sealed record TeacherLoadUsageRow(
+        int TeacherId,
+        int CourseId,
+        int GroupId,
+        DateOnly Date,
+        TimeOnly StartTime,
+        TimeOnly EndTime,
+        int ModuleId,
+        int LessonTypeId,
+        int? ModuleTopicId,
+        int? RoomId);
+    private sealed record PersistedDraftConflictRow(
+        int Id,
+        int GroupId,
+        int ModuleId,
+        int LessonTypeId,
+        int? ModuleTopicId,
+        int? TeacherId,
+        int? RoomId,
+        DateOnly Date,
+        TimeOnly StartTime,
+        TimeOnly EndTime);
     private sealed record PlacementCandidate(
         TimeSlot Slot, // Слот розкладу для можливого розміщення.
-        int TeacherId, // Обраний викладач.
+        int? TeacherId, // Обраний викладач, якщо тип заняття його потребує.
         Room? Room, // Обрана аудиторія (може бути null).
         int LessonTypeId, // Обраний тип заняття.
         ModuleTopic? Topic, // Обрана тема модуля (може бути null).
@@ -63,11 +120,122 @@ public sealed class TeacherDraftsAutogenService
         bool MissingTeacher,
         bool MissingRoom,
         List<string> Notes);
+    private sealed record MovableDraftTrialState(
+        DateOnly Date,
+        DayOfWeek DayOfWeek,
+        TimeOnly StartTime,
+        TimeOnly EndTime,
+        int LessonTypeId,
+        int GroupId,
+        int ModuleId,
+        int? ModuleTopicId,
+        int? TeacherId,
+        int? RoomId,
+        DraftStatus Status,
+        int? PublishedItemId,
+        string? BatchKey,
+        string? ValidationWarnings,
+        DateTime CreatedAt,
+        DateTime UpdatedAt,
+        bool IsLocked,
+        bool IsSelfStudy,
+        EntityState EntityState,
+        HashSet<string> ModifiedProperties);
+    private sealed record AppliedDraftCalendarMove(
+        TeacherDraftItem Draft,
+        MovableDraftTrialState PreviousState,
+        BusySlot PreviousBusySlot,
+        BusySlot CurrentBusySlot,
+        int? PreviousAccountingRoomId);
+    private sealed class CreatedDraftAccounting
+    {
+        public bool CreatedCounterIncremented { get; set; }
+        public bool DayCountIncremented { get; set; }
+        public bool CurrentRangeFactIncremented { get; set; }
+        public bool RemainingDecremented { get; set; }
+        public bool SelfStudyRemainingDecremented { get; set; }
+        public bool SelfStudyTopicRemainingDecremented { get; set; }
+        public bool TopicUsageIncremented { get; set; }
+        public int? RoomUsageGroupId { get; set; }
+        public int? RoomUsageRoomId { get; set; }
+        public bool IncompleteDraftCounted { get; set; }
+        public bool MissingTeacherCounted { get; set; }
+        public bool MissingRoomCounted { get; set; }
+        public bool MissingBothCounted { get; set; }
+        public bool EmergencySingletonCounted { get; set; }
+    }
     private sealed record SequenceItem(int CourseId, int ModuleId, int GroupOrder, int Order);
     private sealed record MainModuleGroup(int GroupOrder, List<int> ModuleIds);
+    private sealed record CreatedDraftAccountingState(
+        bool CreatedCounterIncremented,
+        bool DayCountIncremented,
+        bool CurrentRangeFactIncremented,
+        bool RemainingDecremented,
+        bool SelfStudyRemainingDecremented,
+        bool SelfStudyTopicRemainingDecremented,
+        bool TopicUsageIncremented,
+        int? RoomUsageGroupId,
+        int? RoomUsageRoomId,
+        bool IncompleteDraftCounted,
+        bool MissingTeacherCounted,
+        bool MissingRoomCounted,
+        bool MissingBothCounted,
+        bool EmergencySingletonCounted);
+    private sealed class SearchLimitDiagnostics
+    {
+        public int VisitedNodes { get; set; }
+        public int MaxNodes { get; set; }
+        public bool EmergencyTimeLimitReached { get; set; }
+        public SortedSet<string> Scopes { get; } = new(StringComparer.Ordinal);
+    }
+    private sealed record SearchLimitDiagnosticsState(
+        int VisitedNodes,
+        int MaxNodes,
+        bool EmergencyTimeLimitReached,
+        string[] Scopes);
+    private sealed record AutogenTrialSnapshot(
+        HashSet<TeacherDraftItem> CreatedDrafts,
+        IReadOnlyDictionary<TeacherDraftItem, MovableDraftTrialState> MovableDrafts,
+        IReadOnlyCollection<BusySlot> BusySlots,
+        IReadOnlyCollection<BusySlot> TopicOrderSlots,
+        IReadOnlyDictionary<(int GroupId, int ModuleId), Dictionary<int, int>> TopicAssignments,
+        IReadOnlyDictionary<(int GroupId, DateOnly Date), int> PerDayCount,
+        IReadOnlyDictionary<(int GroupId, int ModuleId), int> RangeFact,
+        IReadOnlyDictionary<(int GroupId, int ModuleId), int> Remaining,
+        IReadOnlyDictionary<(int GroupId, int ModuleId), int> SelfStudyRemaining,
+        IReadOnlyDictionary<(int GroupId, int ModuleId, int TopicId), int> SelfStudyTopicRemaining,
+        IReadOnlyDictionary<int, Dictionary<int, int>> RoomUsage,
+        IReadOnlyDictionary<TeacherDraftItem, CreatedDraftAccountingState> CreatedDraftAccounting,
+        HashSet<(int GroupId, int ModuleId)> HasPreferred,
+        IReadOnlyCollection<(
+            int GroupId,
+            int ModuleId,
+            int TopicId,
+            DateOnly Date,
+            TimeOnly Start,
+            TimeOnly End)> FutureSharedCheckpointReservations,
+        int WarningCount,
+        int GapDetailCount,
+        HashSet<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End)> GapWarnings,
+        Dictionary<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End), HashSet<string>> SlotFailureReasons,
+        IReadOnlyDictionary<(int GroupId, DateOnly Date), SearchLimitDiagnosticsState> SearchLimitDiagnostics,
+        HashSet<int> AttemptedModules,
+        HashSet<(int GroupId, int ModuleId)> ExhaustedTopics,
+        HashSet<(int GroupId, int ModuleId, int TopicId)> OverflowTopics,
+        HashSet<int> MissingModules,
+        int CreatedCount,
+        int SkippedCount,
+        int IncompleteDraftCount,
+        int IncompleteMissingTeacherCount,
+        int IncompleteMissingRoomCount,
+        int IncompleteMissingBothCount,
+        int EmergencySingletonCount,
+        int? LastPrimaryModuleId,
+        int LessonTypeIndex);
     // Уніфіковані відповіді для API.
     private static ActionResult<AutoGenResult> Ok(AutoGenResult value) => new OkObjectResult(value);
     private static ActionResult<AutoGenResult> BadRequest(object value) => new BadRequestObjectResult(value);
+    private static ActionResult<AutoGenResult> Conflict(object value) => new ConflictObjectResult(value);
     // Перетворює shared-DTO м'яких параметрів на серверний record для єдиної логіки автогену.
     private static DraftAutoGenSoftOptions? MapSoftOptions(AutoGenSoftOptionsDto? dto)
         => dto is null
@@ -90,53 +258,9 @@ public sealed class TeacherDraftsAutogenService
         }
         return $"{gap.Date:yyyy-MM-dd} {gap.SlotLabel}, {gap.GroupName}: {reason}";
     }
-    private static (string Code, string Title) ClassifyGapReason(string? reason)
-    {
-        if (string.IsNullOrWhiteSpace(reason))
-        {
-            return ("unknown", "Причину не визначено");
-        }
-        var text = reason.ToLowerInvariant();
-        if (text.Contains("немає доступних викладач", StringComparison.Ordinal)
-            || text.Contains("викладач", StringComparison.Ordinal) && (text.Contains("кафедр", StringComparison.Ordinal) || text.Contains("зайнят", StringComparison.Ordinal)))
-        {
-            return ("teacher", "Немає доступного викладача");
-        }
-        if (text.Contains("усі аудитор", StringComparison.Ordinal)
-            || text.Contains("аудитор", StringComparison.Ordinal) && (text.Contains("зайнят", StringComparison.Ordinal) || text.Contains("не належ", StringComparison.Ordinal)))
-        {
-            return ("room", "Немає доступної аудиторії");
-        }
-        if (text.Contains("переход", StringComparison.Ordinal)
-            || text.Contains("корпус", StringComparison.Ordinal) && text.Contains("хв", StringComparison.Ordinal))
-        {
-            return ("travel", "Недостатньо часу на перехід");
-        }
-        if (text.Contains("хронолог", StringComparison.Ordinal)
-            || text.Contains("порядок тем", StringComparison.Ordinal)
-            || text.Contains("відкладено", StringComparison.Ordinal) && text.Contains("порядком тем", StringComparison.Ordinal))
-        {
-            return ("topic-order", "Порядок тем не дозволив слот");
-        }
-        if (text.Contains("суцільним блоком", StringComparison.Ordinal))
-        {
-            return ("module-block", "Модуль має йти суцільним блоком");
-        }
-        if (text.Contains("більше двох", StringComparison.Ordinal)
-            || text.Contains("ліміт", StringComparison.Ordinal)
-            || text.Contains("обмеж", StringComparison.Ordinal))
-        {
-            return ("limit", "Спрацювали денні або слотні ліміти");
-        }
-        if (text.Contains("спільн", StringComparison.Ordinal))
-        {
-            return ("shared-flow", "Спільний потік не готовий");
-        }
-        return ("other", "Інші причини");
-    }
     private static List<AutoGenGapSummaryItem> BuildAutoGenGapSummary(IEnumerable<AutoGenGapDetail> gaps)
         => gaps
-            .GroupBy(gap => ClassifyGapReason(gap.Reason))
+            .GroupBy(AutoGenGapReasonClassifier.Classify)
             .OrderByDescending(group => group.Count())
             .ThenBy(group => group.Key.Title, StringComparer.Ordinal)
             .Select(group => new AutoGenGapSummaryItem(
@@ -176,7 +300,7 @@ public sealed class TeacherDraftsAutogenService
         }
 
         var gapsByCode = gapList
-            .GroupBy(gap => ClassifyGapReason(gap.Reason).Code)
+            .GroupBy(gap => AutoGenGapReasonClassifier.Classify(gap).Code)
             .ToDictionary(group => group.Key, group => group.ToList(), StringComparer.Ordinal);
         var suggestions = new List<string>();
 
@@ -193,7 +317,7 @@ public sealed class TeacherDraftsAutogenService
         AddSuggestion("room", codeGaps =>
             $"Рекомендація автогенерації: {codeGaps.Count} незаповнених слотів упираються в аудиторії. Додайте аудиторії потрібної місткості, розширте дозволені аудиторії або корпуси для груп і звільніть зайняті аудиторії в цих слотах. Приклади: {FormatGapSuggestionExamples(codeGaps)}.");
         AddSuggestion("travel", codeGaps =>
-            $"Рекомендація автогенерації: {codeGaps.Count} незаповнених слотів упираються у переходи між корпусами. Додайте аудиторії в тому самому корпусі, збільшіть перерву між корпусами або рознесіть заняття по інших слотах. Приклади: {FormatGapSuggestionExamples(codeGaps)}.");
+            $"Рекомендація автогенерації: {codeGaps.Count} незаповнених слотів упираються у зміну аудиторії або перехід між корпусами. Залиште сусідні пари в тій самій аудиторії, збільшіть перерву або рознесіть заняття по інших слотах. Приклади: {FormatGapSuggestionExamples(codeGaps)}.");
         AddSuggestion("topic-order", codeGaps =>
             $"Рекомендація автогенерації: {codeGaps.Count} незаповнених слотів заблоковані порядком тем. Перевірте послідовність тем і години модулів; якщо методично допустимо, додайте ранніші слоти або послабте порядок для проблемних тем. Приклади: {FormatGapSuggestionExamples(codeGaps)}.");
         AddSuggestion("limit", codeGaps =>
@@ -202,6 +326,8 @@ public sealed class TeacherDraftsAutogenService
             $"Рекомендація автогенерації: {codeGaps.Count} незаповнених слотів пов'язані зі спільним потоком. Перевірте однаковий модуль, тип заняття, тему, викладача й аудиторію для груп потоку та додайте містку аудиторію. Приклади: {FormatGapSuggestionExamples(codeGaps)}.");
         AddSuggestion("module-block", codeGaps =>
             $"Рекомендація автогенерації: {codeGaps.Count} незаповнених слотів заблоковані правилом суцільного блоку модуля. Залиште поруч кілька слотів для одного модуля або перенесіть зайві заняття цього дня. Приклади: {FormatGapSuggestionExamples(codeGaps)}.");
+        AddSuggestion(AutoGenGapReasonCodes.SearchLimit, codeGaps =>
+            $"Рекомендація автогенерації: для {codeGaps.Count} незаповнених слотів оптимізатор досягнув безпечної межі пошуку. Перевірте діагностику вузлів і спочатку додайте дефіцитні ресурси або звузьте діапазон генерації. Приклади: {FormatGapSuggestionExamples(codeGaps)}.");
         AddSuggestion("unknown", codeGaps =>
             $"Рекомендація автогенерації: {codeGaps.Count} незаповнених слотів не мають точної причини. Перевірте приклади вручну та додайте обмежений ресурс, який там повторюється. Приклади: {FormatGapSuggestionExamples(codeGaps)}.");
         AddSuggestion("other", codeGaps =>
@@ -364,18 +490,53 @@ public sealed class TeacherDraftsAutogenService
     }
     // Створює чернетки на основі правил і доступних даних для заданого тижня.
     public async Task<ActionResult<AutoGenResult>> DraftAutoGen(DraftAutoGenRequest r, CancellationToken cancellationToken = default)
+        => await DraftAutoGenCore(r, useAmbientTransaction: false, cancellationToken);
+
+    internal async Task<ActionResult<AutoGenResult>> DraftAutoGenInAmbientTransaction(
+        DraftAutoGenRequest r,
+        CancellationToken cancellationToken = default)
+    {
+        if (_db.Database.CurrentTransaction is null)
+        {
+            throw new InvalidOperationException(
+                "Фонову автогенерацію не можна виконувати без активної зовнішньої транзакції.");
+        }
+
+        return await DraftAutoGenCore(r, useAmbientTransaction: true, cancellationToken);
+    }
+
+    private async Task<ActionResult<AutoGenResult>> DraftAutoGenCore(
+        DraftAutoGenRequest r,
+        bool useAmbientTransaction,
+        CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         // ЕТАП 1: збираємо типи занять і готуємо довідники правил.
-        var types = await _db.LessonTypes.AsNoTracking().ToListAsync();
+        var types = await _db.LessonTypes.AsNoTracking().ToListAsync(cancellationToken);
         if (types.Count == 0)
             return BadRequest(new AutoGenResult(0, 0, new() { "Типи занять відсутні або вимкнені." }));
-        // Визначаємо службові типи (перерва/скасування), які не беруть участі у плані.
-        var typeBreakId = types.FirstOrDefault(t => t.Code.ToUpper() == "BREAK" && t.IsActive)?.Id;
-        var typeCanceledId = types.FirstOrDefault(t => t.Code.ToUpper() == "CANCELED")?.Id;
-        var excludedTypeIds = new HashSet<int>(new[] { typeBreakId, typeCanceledId }.Where(x => x != null)!.Select(x => x!.Value));
         // Мапа типів за ідентифікатором для швидких перевірок.
         var typeById = types.ToDictionary(t => t.Id);
+        // Службові типи не формують навчальне навантаження; скасування й перенесення також не займають ресурси.
+        var typeBreakId = types.FirstOrDefault(t =>
+            string.Equals(t.Code?.Trim(), "BREAK", StringComparison.OrdinalIgnoreCase)
+            && t.IsActive)?.Id;
+        var excludedTypeIds = types
+            .Where(type => LessonTypeOccupancyPolicy.IsExcludedFromAutogenWorkload(type.Code))
+            .Select(type => type.Id)
+            .ToHashSet();
+        var nonOccupyingMarkerTypeIds = types
+            .Where(type => LessonTypeOccupancyPolicy.IsNonOccupyingMarker(type.Code))
+            .Select(type => type.Id)
+            .ToHashSet();
+        bool IsNonOccupyingBusySlot(BusySlot slot)
+            => nonOccupyingMarkerTypeIds.Contains(slot.LessonTypeId);
+        bool RequiresPhysicalRoom(BusySlot slot)
+            => !IsNonOccupyingBusySlot(slot)
+               && typeById.TryGetValue(slot.LessonTypeId, out var lessonType)
+               && lessonType.RequiresRoom
+               && slot.RoomId is not null
+               && slot.BuildingId is not null;
         // Евристика для визначення лекційних типів без окремого прапорця у БД.
         bool IsLectureTypeMeta(LessonTypeRef lessonType)
         {
@@ -393,6 +554,9 @@ public sealed class TeacherDraftsAutogenService
         var lectureTypeIds = types
             .Where(IsLectureTypeMeta)
             .Select(t => t.Id)
+            .ToHashSet();
+        var shareableLoadTypeIds = lectureTypeIds
+            .Concat(types.Where(type => type.PreferredFirstInWeek).Select(type => type.Id))
             .ToHashSet();
         // Активні типи, які враховуються у плані (для циклічного підбору).
         var activeStudyTypes = types.Where(t => t.IsActive && t.CountInPlan).OrderBy(t => t.Id).ToList();
@@ -420,7 +584,6 @@ public sealed class TeacherDraftsAutogenService
         var rangeEndDateExclusive = rangeEndDate.AddDays(1);
         var planningWeekStart = DateHelpers.StartOfWeek(rangeStartDate);
         var planningWeekEndExclusive = DateHelpers.StartOfWeek(rangeEndDate).AddDays(7);
-        var rangeWeekCount = Math.Max(1, (planningWeekEndExclusive.DayNumber - planningWeekStart.DayNumber) / 7);
         // Режим "м'якого заповнення" дозволяє послаблювати частину правил.
         var softFill = r.SoftFill;
         var allowIncompleteDrafts = r.AllowIncompleteDrafts;
@@ -428,13 +591,13 @@ public sealed class TeacherDraftsAutogenService
         var hasRequestedModuleHourOverrides = r.ModuleHours?.Any(kv => kv.Value > 0) == true;
         var isShortManualRange = hasRequestedModuleHourOverrides
                                  && rangeEndDateExclusive.DayNumber - rangeStartDate.DayNumber <= 5;
-        var usePressureOrderingForRange = isShortManualRange;
+        var usePressureOrderingForRange = hasRequestedModuleHourOverrides || softFill;
         var recentRepeatWindowDays = softOptions?.RecentRepeatWindowDays is int repeatWindow && repeatWindow >= 0
             ? repeatWindow
             : softFill || isShortManualRange ? 0 : 2;
         var maxParallelGroupsPerModuleInSlot = softOptions?.MaxParallelGroupsPerModuleInSlot is int parallelGroups && parallelGroups > 0
             ? parallelGroups
-            : softFill ? 3 : 2;
+            : 4;
         var preferredFirstPenaltyMultiplier = softOptions?.PreferredFirstPenaltyMultiplier is double preferredFirstMultiplier && preferredFirstMultiplier >= 0
             ? preferredFirstMultiplier
             : 1.0;
@@ -459,7 +622,7 @@ public sealed class TeacherDraftsAutogenService
         // Витягуємо календарні винятки для всього діапазону (робочі/вихідні).
         var calendar = await _db.CalendarExceptions
             .Where(c => c.Date >= rangeStartDate && c.Date < rangeEndDateExclusive)
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Перевіряємо, чи дата робоча для конкретної групи з урахуванням винятків.
         bool IsWorking(DateOnly d, Group grp)
         {
@@ -467,11 +630,7 @@ public sealed class TeacherDraftsAutogenService
             var dow = d.ToDateTime(TimeOnly.MinValue).DayOfWeek;
             if (!DayAllowed(dow)) return false;
             var scoped = TeacherDraftsHelpers.ResolveCalendarOverride(calendar, d, grp.CourseId, grp.Id);
-            if (scoped.HasValue)
-            {
-                return scoped.Value || r.AllowOnDaysOff;
-            }
-            return true;
+            return scoped ?? true;
         }
         // Нормалізуємо фільтри: 0 або null означає "без фільтра".
         int? courseId = (r.CourseId > 0) ? r.CourseId : null;
@@ -495,7 +654,7 @@ public sealed class TeacherDraftsAutogenService
         // Ручні години по модулях (якщо задані в запиті).
         var moduleHoursByModuleId = r.ModuleHours?
             .Where(kv => kv.Value > 0)
-            .ToDictionary(kv => kv.Key, kv => kv.Value * rangeWeekCount)
+            .ToDictionary(kv => kv.Key, kv => kv.Value)
             ?? new Dictionary<int, int>();
         bool hasModuleHourOverrides = moduleHoursByModuleId.Count > 0;
         var initWarnings = new List<string>();
@@ -512,7 +671,7 @@ public sealed class TeacherDraftsAutogenService
             .Include(x => x.Course)
             .Where(x => courseId == null || x.CourseId == courseId)
             .Where(x => !hasGroupFilter || requestedGroupIds.Contains(x.Id))
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         if (hasGroupFilter)
         {
             var foundGroupIds = groups.Select(g => g.Id).ToHashSet();
@@ -540,6 +699,31 @@ public sealed class TeacherDraftsAutogenService
                     .ThenBy(x => x.Id)
                     .ToList());
         var courseIds = groups.Select(g => g.CourseId).Distinct().ToList();
+        var teacherLoadGroupMetadata = await _db.Groups
+            .AsNoTracking()
+            .Where(group => courseIds.Contains(group.CourseId))
+            .Select(group => new
+            {
+                group.Id,
+                group.CourseId,
+                group.Course.AcademicPeriodStartDate,
+                group.Course.DurationWeeks
+            })
+            .ToDictionaryAsync(group => group.Id, cancellationToken);
+        bool IsTeacherLoadDateWithinAcademicPeriod(int groupId, DateOnly date)
+        {
+            if (!teacherLoadGroupMetadata.TryGetValue(groupId, out var group))
+            {
+                return false;
+            }
+            if (group.AcademicPeriodStartDate is not DateOnly academicStart)
+            {
+                return true;
+            }
+
+            var academicEndExclusive = academicStart.AddDays(group.DurationWeeks * 7);
+            return date >= academicStart && date < academicEndExclusive;
+        }
         // Валідуємо перелік модулів проти вибраного курсу.
         if (hasModuleHourOverrides)
         {
@@ -548,7 +732,7 @@ public sealed class TeacherDraftsAutogenService
                 .AsNoTracking()
                 .Where(m => m.CourseId == cid || m.ModuleCourses.Any(mc => mc.CourseId == cid))
                 .Select(m => m.Id)
-                .ToListAsync();
+                .ToListAsync(cancellationToken);
             var allowedSet = allowedModuleIds.ToHashSet();
             var invalidModuleIds = moduleHoursByModuleId.Keys
                 .Where(mid => !allowedSet.Contains(mid))
@@ -571,24 +755,83 @@ public sealed class TeacherDraftsAutogenService
             }
         }
         await GenerationLock.WaitAsync(cancellationToken);
+        IDbContextTransaction? ownedTransaction = null;
         try
         {
-        await using var tx = await _db.Database.BeginTransactionAsync(cancellationToken);
+        if (!useAmbientTransaction)
+        {
+            ownedTransaction = await _db.Database.BeginTransactionAsync(
+                IsolationLevel.Serializable,
+                cancellationToken);
+        }
+        var transaction = ownedTransaction ?? _db.Database.CurrentTransaction
+            ?? throw new InvalidOperationException(
+                "Активну транзакцію автогенерації втрачено до початку запису чернеток.");
         // За потреби очищаємо існуючі незаблоковані чернетки тижня.
         if (r.ClearExisting && !softFill)
         {
             var gids = groups.Select(g => g.Id).ToList();
-            var clearQuery = _db.TeacherDraftItems
-                .Where(x => x.Date >= rangeStartDate && x.Date < rangeEndDateExclusive && gids.Contains(x.GroupId) && !x.IsLocked);
-            if (requestedTeacherId is int clearTeacherId)
+            var scopedRows = await _db.TeacherDraftItems
+                .AsNoTracking()
+                .Where(x => x.Date >= rangeStartDate
+                            && x.Date < rangeEndDateExclusive
+                            && gids.Contains(x.GroupId))
+                .ToListAsync(cancellationToken);
+            var deletionIds = scopedRows
+                .Where(x => x.Status == DraftStatus.Draft && !x.IsLocked)
+                .Where(x => requestedTeacherId is not int clearTeacherId || x.TeacherId == clearTeacherId)
+                .Select(x => x.Id)
+                .ToHashSet();
+
+            // Вибір за викладачем розширюється до всіх рядків цілісного логічного заняття.
+            foreach (var logicalEvent in scopedRows
+                         .Where(x => !string.IsNullOrWhiteSpace(x.BatchKey))
+                         .GroupBy(x => new
+                         {
+                             BatchKey = x.BatchKey!,
+                             x.Date,
+                             x.StartTime,
+                             x.EndTime,
+                             x.GroupId,
+                             x.ModuleId,
+                             x.LessonTypeId
+                         }))
             {
-                clearQuery = clearQuery.Where(x => x.TeacherId == clearTeacherId);
+                var rows = logicalEvent.ToList();
+                if (!rows.Any(x => deletionIds.Contains(x.Id)))
+                {
+                    continue;
+                }
+                if (rows.Any(x => x.Status != DraftStatus.Draft || x.IsLocked))
+                {
+                    if (ownedTransaction is not null)
+                    {
+                        await transaction.RollbackAsync(cancellationToken);
+                    }
+                    return Conflict(new
+                    {
+                        message = "Автогенерація не може частково очистити логічне заняття зі схваленими або заблокованими рядками. Повторно схваліть чи розблокуйте весь пакет перед очищенням.",
+                        batchKey = logicalEvent.Key.BatchKey,
+                        itemIds = rows.Select(x => x.Id).OrderBy(id => id).ToList()
+                    });
+                }
+
+                foreach (var row in rows)
+                {
+                    deletionIds.Add(row.Id);
+                }
             }
-            await clearQuery.ExecuteDeleteAsync(cancellationToken);
+
+            if (deletionIds.Count > 0)
+            {
+                await _db.TeacherDraftItems
+                    .Where(x => deletionIds.Contains(x.Id))
+                    .ExecuteDeleteAsync(cancellationToken);
+            }
         }
         // Конфігурації ліміту слота для типу з прапорцем "Бажано першим у тижні" та список аудиторій для підбору.
-        var preferredFirstSlotLimitsAll = await _db.PreferredFirstSlotLimitConfigs.AsNoTracking().ToListAsync();
-        var roomsAll = await _db.Rooms.AsNoTracking().ToListAsync();
+        var preferredFirstSlotLimitsAll = await _db.PreferredFirstSlotLimitConfigs.AsNoTracking().ToListAsync(cancellationToken);
+        var roomsAll = await _db.Rooms.AsNoTracking().ToListAsync(cancellationToken);
         var roomBuildingById = roomsAll.ToDictionary(r => r.Id, r => r.BuildingId);
         var availableBuildingIds = roomsAll
             .Select(r => r.BuildingId)
@@ -659,31 +902,104 @@ public sealed class TeacherDraftsAutogenService
             }
         }
         var travelMinutesByBuildingPair = await _db.BuildingTravels.AsNoTracking()
-            .ToDictionaryAsync(k => (k.FromBuildingId, k.ToBuildingId), v => v.Minutes);
+            .ToDictionaryAsync(k => (k.FromBuildingId, k.ToBuildingId), v => v.Minutes, cancellationToken);
         int TravelMinutes(int fromBuildingId, int toBuildingId)
-        {
-            if (fromBuildingId == toBuildingId)
-                return 0;
-            if (travelMinutesByBuildingPair.TryGetValue((fromBuildingId, toBuildingId), out var minutes))
-                return minutes;
-            if (travelMinutesByBuildingPair.TryGetValue((toBuildingId, fromBuildingId), out minutes))
-                return minutes;
-            return 10;
-        }
+            => TravelTimePolicy.Resolve(travelMinutesByBuildingPair, fromBuildingId, toBuildingId);
+        int TransitionMinutes(int fromRoomId, int fromBuildingId, int toRoomId, int toBuildingId)
+            => RoomTransitionPolicy.Resolve(
+                travelMinutesByBuildingPair,
+                fromRoomId,
+                fromBuildingId,
+                toRoomId,
+                toBuildingId);
         // Список модулів для формування допустимих аудиторій/будівель.
-        var moduleIdsAll = await _db.Modules.Select(m => m.Id).ToListAsync();
+        var moduleIdsAll = await _db.Modules.Select(m => m.Id).ToListAsync(cancellationToken);
         var allowedRoomsByModule = await _db.ModuleRooms
             .Where(mr => moduleIdsAll.Contains(mr.ModuleId))
             .GroupBy(mr => mr.ModuleId)
-            .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.RoomId).ToHashSet());
+            .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.RoomId).ToHashSet(), cancellationToken);
         var allowedBuildingsByModule = await _db.ModuleBuildings
             .Where(mb => moduleIdsAll.Contains(mb.ModuleId))
             .GroupBy(mb => mb.ModuleId)
-            .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.BuildingId).ToHashSet());
+            .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.BuildingId).ToHashSet(), cancellationToken);
         // Історичне вікно для перевірки повторів.
         const int historyMonthsForRepeats = 12;
         var historyStart = rangeStartDate.AddMonths(-historyMonthsForRepeats);
         var lastWeekStart = planningWeekStart.AddDays(-7);
+        var countedTeacherLoadTypeIds = types
+            .Where(type => type.CountInLoad)
+            .Select(type => type.Id)
+            .ToHashSet();
+        var teacherLoadScheduleOutsideBusyWindow = (await _db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => item.TeacherId != null
+                           && countedTeacherLoadTypeIds.Contains(item.LessonTypeId)
+                           && courseIds.Contains(item.Group.CourseId)
+                           && (item.Group.Course.AcademicPeriodStartDate == null
+                               || item.Date >= item.Group.Course.AcademicPeriodStartDate.Value)
+                           && (item.Date < historyStart || item.Date >= planningWeekEndExclusive))
+            .Select(item => new TeacherLoadUsageRow(
+                item.TeacherId!.Value,
+                item.Group.CourseId,
+                item.GroupId,
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                item.ModuleId,
+                item.LessonTypeId,
+                item.ModuleTopicId,
+                item.RoomId))
+            .ToListAsync(cancellationToken))
+            .Where(item => IsTeacherLoadDateWithinAcademicPeriod(item.GroupId, item.Date))
+            .ToList();
+        var teacherLoadDraftsOutsideBusyWindow = (await _db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => item.TeacherId != null
+                           && countedTeacherLoadTypeIds.Contains(item.LessonTypeId)
+                           && courseIds.Contains(item.Group.CourseId)
+                           && (item.Group.Course.AcademicPeriodStartDate == null
+                               || item.Date >= item.Group.Course.AcademicPeriodStartDate.Value)
+                           && (item.Date < historyStart || item.Date >= planningWeekEndExclusive))
+            .Select(item => new TeacherLoadUsageRow(
+                item.TeacherId!.Value,
+                item.Group.CourseId,
+                item.GroupId,
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                item.ModuleId,
+                item.LessonTypeId,
+                item.ModuleTopicId,
+                item.RoomId))
+            .ToListAsync(cancellationToken))
+            .Where(item => IsTeacherLoadDateWithinAcademicPeriod(item.GroupId, item.Date))
+            .ToList();
+        var teacherLoadOutsideBusyWindowMap = new Dictionary<(int TeacherId, int CourseId), int>();
+        void AddOutsideBusyWindowTeacherLoad(IEnumerable<TeacherLoadUsageRow> source)
+        {
+            var logicalEvents = source
+                .Select(row => new
+                {
+                    row.TeacherId,
+                    row.CourseId,
+                    row.Date,
+                    row.StartTime,
+                    row.EndTime,
+                    row.ModuleId,
+                    row.LessonTypeId,
+                    row.ModuleTopicId,
+                    row.RoomId,
+                    LogicalGroupId = shareableLoadTypeIds.Contains(row.LessonTypeId) ? 0 : row.GroupId
+                })
+                .Distinct();
+            foreach (var load in logicalEvents.GroupBy(row => (row.TeacherId, row.CourseId)))
+            {
+                teacherLoadOutsideBusyWindowMap[load.Key] =
+                    teacherLoadOutsideBusyWindowMap.GetValueOrDefault(load.Key) + load.Count();
+            }
+        }
+        AddOutsideBusyWindowTeacherLoad(teacherLoadScheduleOutsideBusyWindow);
+        AddOutsideBusyWindowTeacherLoad(teacherLoadDraftsOutsideBusyWindow);
         // Завантажуємо вже зайняті слоти з чернеток і опублікованого розкладу.
         var busyDrafts = await _db.TeacherDraftItems
             .Include(x => x.Room)
@@ -699,8 +1015,11 @@ public sealed class TeacherDraftsAutogenService
                 x.ModuleId,
                 x.LessonTypeId,
                 x.ModuleTopicId,
-                true))
-            .ToListAsync();
+                x.Status == DraftStatus.Draft
+                && !x.IsLocked
+                && (x.BatchKey == null || x.BatchKey == string.Empty),
+                x.BatchKey))
+            .ToListAsync(cancellationToken);
         var busySchedule = await _db.ScheduleItems
             .Include(x => x.Room)
             .Where(x => x.Date >= historyStart && x.Date < planningWeekEndExclusive)
@@ -715,13 +1034,18 @@ public sealed class TeacherDraftsAutogenService
                 x.ModuleId,
                 x.LessonTypeId,
                 x.ModuleTopicId,
-                false))
-            .ToListAsync();
+                false,
+                x.BatchKey))
+            .ToListAsync(cancellationToken);
         var topicOrderDrafts = await _db.TeacherDraftItems
             .Include(x => x.Room)
             .Where(x => x.ModuleTopicId != null
+                        && !nonOccupyingMarkerTypeIds.Contains(x.LessonTypeId)
                         && x.Date >= historyStart
-                        && courseIds.Contains(x.Group.CourseId))
+                        && x.Date < planningWeekEndExclusive
+                        && courseIds.Contains(x.Group.CourseId)
+                        && (x.Group.Course.AcademicPeriodStartDate == null
+                            || x.Date >= x.Group.Course.AcademicPeriodStartDate.Value))
             .Select(x => new BusySlot(
                 x.GroupId,
                 x.TeacherId,
@@ -733,13 +1057,18 @@ public sealed class TeacherDraftsAutogenService
                 x.ModuleId,
                 x.LessonTypeId,
                 x.ModuleTopicId,
-                true))
-            .ToListAsync();
+                true,
+                x.BatchKey))
+            .ToListAsync(cancellationToken);
         var topicOrderSchedule = await _db.ScheduleItems
             .Include(x => x.Room)
             .Where(x => x.ModuleTopicId != null
+                        && !nonOccupyingMarkerTypeIds.Contains(x.LessonTypeId)
                         && x.Date >= historyStart
-                        && courseIds.Contains(x.Group.CourseId))
+                        && x.Date < planningWeekEndExclusive
+                        && courseIds.Contains(x.Group.CourseId)
+                        && (x.Group.Course.AcademicPeriodStartDate == null
+                            || x.Date >= x.Group.Course.AcademicPeriodStartDate.Value))
             .Select(x => new BusySlot(
                 x.GroupId,
                 x.TeacherId,
@@ -751,8 +1080,9 @@ public sealed class TeacherDraftsAutogenService
                 x.ModuleId,
                 x.LessonTypeId,
                 x.ModuleTopicId,
-                false))
-            .ToListAsync();
+                false,
+                x.BatchKey))
+            .ToListAsync(cancellationToken);
         var busy = busyDrafts
             .Concat(busySchedule)
             .ToList();
@@ -784,14 +1114,30 @@ public sealed class TeacherDraftsAutogenService
             .Where(slot => slot.RoomId is int)
             .GroupBy(slot => (slot.RoomId!.Value, slot.Date))
             .ToDictionary(group => group.Key, group => group.ToList());
-        var topicOrderByGroup = topicOrderSlots
-            .GroupBy(slot => slot.GroupId)
+        var teacherLoadMap = new Dictionary<(int TeacherId, int CourseId), int>();
+        var teacherLoadStateVersion = 0;
+        var teacherLoadMapVersion = -1;
+        var logicalModuleDayCountCache = new Dictionary<(int GroupId, DateOnly Date, int ModuleId), int>();
+        var distinctModuleDayCountCache = new Dictionary<(int GroupId, DateOnly Date), int>();
+        var moduleSlotGroupCountCache = new Dictionary<(int ModuleId, DateOnly Date, TimeOnly Start, TimeOnly End), int>();
+        var shareableTopicHoldDecisionCache = new Dictionary<(int CourseId, int ModuleId, int TopicId, int CurrentGroupCount), bool>();
+        var actualTopicUsageCountCache = new Dictionary<(int GroupId, int ModuleId, int TopicId), int>();
+        var futureSharedCheckpointReservations = new List<(
+            int GroupId,
+            int ModuleId,
+            int TopicId,
+            DateOnly Date,
+            TimeOnly Start,
+            TimeOnly End)>();
+        var unusedFutureSharedCheckpointReservationsReleased = false;
+        var topicOrderByGroupModule = topicOrderSlots
+            .GroupBy(slot => (slot.GroupId, slot.ModuleId))
             .ToDictionary(group => group.Key, group => group.ToList());
         var emptyBusySlots = Array.Empty<BusySlot>();
         IReadOnlyList<BusySlot> BusyForGroup(int groupId)
             => busyByGroup.TryGetValue(groupId, out var slotsForGroup) ? slotsForGroup : emptyBusySlots;
-        IReadOnlyList<BusySlot> TopicOrderForGroup(int groupId)
-            => topicOrderByGroup.TryGetValue(groupId, out var slotsForGroup) ? slotsForGroup : emptyBusySlots;
+        IReadOnlyList<BusySlot> TopicOrderForGroupModule(int groupId, int moduleId)
+            => topicOrderByGroupModule.TryGetValue((groupId, moduleId), out var slotsForModule) ? slotsForModule : emptyBusySlots;
         IReadOnlyList<BusySlot> BusyForDate(DateOnly date)
             => busyByDate.TryGetValue(date, out var slotsForDate) ? slotsForDate : emptyBusySlots;
         IReadOnlyList<BusySlot> BusyForGroupDate(int groupId, DateOnly date)
@@ -802,12 +1148,56 @@ public sealed class TeacherDraftsAutogenService
             => busyByRoomDate.TryGetValue((roomId, date), out var slotsForRoomDate) ? slotsForRoomDate : emptyBusySlots;
         static bool SlotOverlaps(BusySlot slot, DateOnly date, TimeOnly start, TimeOnly end)
             => slot.Date == date && slot.StartTime < end && start < slot.EndTime;
+        bool HasScheduledGroupOverlap(int groupId, DateOnly date, TimeOnly start, TimeOnly end)
+            => BusyForGroupDate(groupId, date).Any(slot =>
+                !IsNonOccupyingBusySlot(slot) && SlotOverlaps(slot, date, start, end));
+        bool HasFutureSharedCheckpointReservation(
+            int groupId,
+            DateOnly date,
+            TimeOnly start,
+            TimeOnly end)
+            => futureSharedCheckpointReservations.Any(item =>
+                item.GroupId == groupId
+                && item.Date == date
+                && item.Start < end
+                && start < item.End);
         bool HasGroupOverlap(int groupId, DateOnly date, TimeOnly start, TimeOnly end)
-            => BusyForGroupDate(groupId, date).Any(slot => SlotOverlaps(slot, date, start, end));
-        bool HasTeacherOverlap(int teacherId, DateOnly date, TimeOnly start, TimeOnly end)
-            => BusyForTeacherDate(teacherId, date).Any(slot => SlotOverlaps(slot, date, start, end));
-        bool HasRoomOverlap(int roomId, DateOnly date, TimeOnly start, TimeOnly end)
-            => BusyForRoomDate(roomId, date).Any(slot => SlotOverlaps(slot, date, start, end));
+            => HasScheduledGroupOverlap(groupId, date, start, end)
+               || HasFutureSharedCheckpointReservation(groupId, date, start, end);
+        bool HasBlockingGroupOverlapForSharedCheckpoint(
+            int groupId,
+            int moduleId,
+            int topicId,
+            DateOnly date,
+            TimeOnly start,
+            TimeOnly end)
+            => HasScheduledGroupOverlap(groupId, date, start, end)
+               || futureSharedCheckpointReservations.Any(item =>
+                   item.GroupId == groupId
+                   && item.Date == date
+                   && item.Start < end
+                   && start < item.End
+                   && (item.ModuleId != moduleId || item.TopicId != topicId));
+        bool HasTeacherOverlap(
+            int teacherId,
+            int lessonTypeId,
+            DateOnly date,
+            TimeOnly start,
+            TimeOnly end)
+            => BlocksTeacherSlot(lessonTypeId)
+               && BusyForTeacherDate(teacherId, date).Any(slot =>
+                   SlotOverlaps(slot, date, start, end)
+                   && BlocksTeacherSlot(slot.LessonTypeId));
+        bool HasRoomOverlap(
+            int roomId,
+            int lessonTypeId,
+            DateOnly date,
+            TimeOnly start,
+            TimeOnly end)
+            => BlocksRoomSlot(lessonTypeId)
+               && BusyForRoomDate(roomId, date).Any(slot =>
+                   SlotOverlaps(slot, date, start, end)
+                   && BlocksRoomSlot(slot.LessonTypeId));
         static bool SlotMatches(
             BusySlot slot,
             int groupId,
@@ -852,6 +1242,11 @@ public sealed class TeacherDraftsAutogenService
         void AddBusySlot(BusySlot slot)
         {
             busy.Add(slot);
+            teacherLoadStateVersion++;
+            logicalModuleDayCountCache.Remove((slot.GroupId, slot.Date, slot.ModuleId));
+            distinctModuleDayCountCache.Remove((slot.GroupId, slot.Date));
+            moduleSlotGroupCountCache.Clear();
+            shareableTopicHoldDecisionCache.Clear();
             AddBusyIndex(busyByGroup, slot.GroupId, slot);
             AddBusyIndex(busyByDate, slot.Date, slot);
             AddBusyIndex(busyByGroupDate, (slot.GroupId, slot.Date), slot);
@@ -867,8 +1262,9 @@ public sealed class TeacherDraftsAutogenService
             }
             if (slot.ModuleTopicId is int)
             {
+                actualTopicUsageCountCache.Remove((slot.GroupId, slot.ModuleId, slot.ModuleTopicId.Value));
                 topicOrderSlots.Add(slot);
-                AddBusyIndex(topicOrderByGroup, slot.GroupId, slot);
+                AddBusyIndex(topicOrderByGroupModule, (slot.GroupId, slot.ModuleId), slot);
             }
         }
         bool RemoveBusySlot(BusySlot slot)
@@ -878,6 +1274,11 @@ public sealed class TeacherDraftsAutogenService
             {
                 return false;
             }
+            teacherLoadStateVersion++;
+            logicalModuleDayCountCache.Remove((slot.GroupId, slot.Date, slot.ModuleId));
+            distinctModuleDayCountCache.Remove((slot.GroupId, slot.Date));
+            moduleSlotGroupCountCache.Clear();
+            shareableTopicHoldDecisionCache.Clear();
             RemoveBusyIndex(busyByGroup, slot.GroupId, slot);
             RemoveBusyIndex(busyByDate, slot.Date, slot);
             RemoveBusyIndex(busyByGroupDate, (slot.GroupId, slot.Date), slot);
@@ -893,10 +1294,56 @@ public sealed class TeacherDraftsAutogenService
             }
             if (slot.ModuleTopicId is int)
             {
+                actualTopicUsageCountCache.Remove((slot.GroupId, slot.ModuleId, slot.ModuleTopicId.Value));
                 topicOrderSlots.Remove(slot);
-                RemoveBusyIndex(topicOrderByGroup, slot.GroupId, slot);
+                RemoveBusyIndex(topicOrderByGroupModule, (slot.GroupId, slot.ModuleId), slot);
             }
             return true;
+        }
+        // Повністю відновлює зайняті слоти та всі похідні індекси після пробного проходу.
+        void RestoreBusyState(
+            IReadOnlyCollection<BusySlot> busySnapshot,
+            IReadOnlyCollection<BusySlot> topicOrderSnapshot)
+        {
+            busy.Clear();
+            busy.AddRange(busySnapshot);
+            teacherLoadStateVersion++;
+            logicalModuleDayCountCache.Clear();
+            distinctModuleDayCountCache.Clear();
+            moduleSlotGroupCountCache.Clear();
+            shareableTopicHoldDecisionCache.Clear();
+            actualTopicUsageCountCache.Clear();
+            busyByGroup.Clear();
+            busyByTeacher.Clear();
+            busyByRoom.Clear();
+            busyByDate.Clear();
+            busyByGroupDate.Clear();
+            busyByTeacherDate.Clear();
+            busyByRoomDate.Clear();
+            foreach (var slot in busy)
+            {
+                AddBusyIndex(busyByGroup, slot.GroupId, slot);
+                AddBusyIndex(busyByDate, slot.Date, slot);
+                AddBusyIndex(busyByGroupDate, (slot.GroupId, slot.Date), slot);
+                if (slot.TeacherId is int teacherId)
+                {
+                    AddBusyIndex(busyByTeacher, teacherId, slot);
+                    AddBusyIndex(busyByTeacherDate, (teacherId, slot.Date), slot);
+                }
+                if (slot.RoomId is int roomId)
+                {
+                    AddBusyIndex(busyByRoom, roomId, slot);
+                    AddBusyIndex(busyByRoomDate, (roomId, slot.Date), slot);
+                }
+            }
+
+            topicOrderSlots.Clear();
+            topicOrderSlots.AddRange(topicOrderSnapshot);
+            topicOrderByGroupModule.Clear();
+            foreach (var slot in topicOrderSlots)
+            {
+                AddBusyIndex(topicOrderByGroupModule, (slot.GroupId, slot.ModuleId), slot);
+            }
         }
         BusySlot? FindBusySlotForDraft(TeacherDraftItem draft, TimeOnly start, TimeOnly end)
         {
@@ -932,11 +1379,64 @@ public sealed class TeacherDraftsAutogenService
             .Where(b => !excludedTypeIds.Contains(b.LessonTypeId))
             .GroupBy(b => b.GroupId)
             .ToDictionary(g => g.Key, g => g.Select(x => x.ModuleId).Distinct().ToHashSet());
+        int CountLogicalBusyEvents(IEnumerable<BusySlot> source)
+        {
+            var workload = source
+                .Where(slot => !excludedTypeIds.Contains(slot.LessonTypeId))
+                .ToList();
+            var legacyCount = workload
+                .Where(slot => string.IsNullOrWhiteSpace(slot.BatchKey))
+                .GroupBy(slot => new
+                {
+                    slot.Date,
+                    slot.StartTime,
+                    slot.EndTime,
+                    slot.GroupId,
+                    slot.ModuleId,
+                    slot.LessonTypeId,
+                    slot.RoomId
+                })
+                .Sum(group => IsLegacyLogicalEvent(group) ? 1 : group.Count());
+            var batchedCount = workload
+                .Where(slot => !string.IsNullOrWhiteSpace(slot.BatchKey))
+                .GroupBy(slot => new
+                {
+                    slot.BatchKey,
+                    slot.Date,
+                    slot.StartTime,
+                    slot.EndTime,
+                    slot.GroupId,
+                    slot.ModuleId,
+                    slot.LessonTypeId
+                })
+                .Count();
+            return legacyCount + batchedCount;
+        }
+        static bool IsLegacyLogicalEvent(IEnumerable<BusySlot> rows)
+        {
+            var hasFirst = false;
+            (int? ModuleTopicId, int? TeacherId) firstKey = default;
+            foreach (var row in rows)
+            {
+                var currentKey = (row.ModuleTopicId, row.TeacherId);
+                if (!hasFirst)
+                {
+                    firstKey = currentKey;
+                    hasFirst = true;
+                    continue;
+                }
+                if (currentKey != firstKey)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
         // Лічильник кількості пар на день для кожної групи.
         var perDayCount = new Dictionary<(int groupId, DateOnly date), int>();
         foreach (var indexedDay in busyByGroupDate)
         {
-            var count = indexedDay.Value.Count(b => !excludedTypeIds.Contains(b.LessonTypeId));
+            var count = CountLogicalBusyEvents(indexedDay.Value);
             if (count > 0)
             {
                 perDayCount[indexedDay.Key] = count;
@@ -944,17 +1444,36 @@ public sealed class TeacherDraftsAutogenService
         }
         // Допоміжні методи для підрахунків навантаження по днях.
         int CountFor(int gid, DateOnly date) => perDayCount.TryGetValue((gid, date), out var c) ? c : 0;
-        int CountModuleForDay(int gid, DateOnly date, int moduleId) =>
-            BusyForGroupDate(gid, date).Count(x => x.ModuleId == moduleId
-                                                   && !excludedTypeIds.Contains(x.LessonTypeId));
-        int CountDistinctModulesForDay(int gid, DateOnly date) =>
-            BusyForGroupDate(gid, date)
+        int CountModuleForDay(int gid, DateOnly date, int moduleId)
+        {
+            var key = (gid, date, moduleId);
+            if (!logicalModuleDayCountCache.TryGetValue(key, out var count))
+            {
+                count = CountLogicalBusyEvents(BusyForGroupDate(gid, date).Where(x => x.ModuleId == moduleId));
+                logicalModuleDayCountCache[key] = count;
+            }
+            return count;
+        }
+        int CountDistinctModulesForDay(int gid, DateOnly date)
+        {
+            var key = (gid, date);
+            if (!distinctModuleDayCountCache.TryGetValue(key, out var count))
+            {
+                count = BusyForGroupDate(gid, date)
                 .Where(x => !excludedTypeIds.Contains(x.LessonTypeId))
                 .Select(x => x.ModuleId)
                 .Distinct()
                 .Count();
-        int CountGroupsWithModuleInSlot(int moduleId, DateOnly date, TimeOnly start, TimeOnly end) =>
-            BusyForDate(date)
+                distinctModuleDayCountCache[key] = count;
+            }
+            return count;
+        }
+        int CountGroupsWithModuleInSlot(int moduleId, DateOnly date, TimeOnly start, TimeOnly end)
+        {
+            var key = (moduleId, date, start, end);
+            if (!moduleSlotGroupCountCache.TryGetValue(key, out var count))
+            {
+                count = BusyForDate(date)
                 .Where(x => x.ModuleId == moduleId
                             && !excludedTypeIds.Contains(x.LessonTypeId)
                             && x.StartTime < end
@@ -962,6 +1481,10 @@ public sealed class TeacherDraftsAutogenService
                 .Select(x => x.GroupId)
                 .Distinct()
                 .Count();
+                moduleSlotGroupCountCache[key] = count;
+            }
+            return count;
+        }
         void Inc(int gid, DateOnly date)
         {
             var key = (gid, date);
@@ -1004,8 +1527,8 @@ public sealed class TeacherDraftsAutogenService
         bool UsedLastWeek(int gid, int mid) =>
             lastWeekModulesByGroup.TryGetValue(gid, out var mods) && mods.Contains(mid);
         // Базові зв'язки модуль -> викладачі / керівники самостійної роботи.
-        var teachersForModule = await _db.TeacherModules.AsNoTracking().ToListAsync();
-        var supervisorsForModule = await _db.ModuleSupervisors.AsNoTracking().ToListAsync();
+        var teachersForModule = await _db.TeacherModules.AsNoTracking().ToListAsync(cancellationToken);
+        var supervisorsForModule = await _db.ModuleSupervisors.AsNoTracking().ToListAsync(cancellationToken);
         if (requestedTeacherId is int teacherFilterId)
         {
             teachersForModule = teachersForModule
@@ -1024,18 +1547,44 @@ public sealed class TeacherDraftsAutogenService
                 Name = string.IsNullOrWhiteSpace(t.FullName) ? $"#{t.Id}" : t.FullName!,
                 t.DepartmentId
             })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Мапи для швидкого доступу до імен та кафедр викладачів.
         var teacherNames = teachersMeta.ToDictionary(x => x.Id, x => x.Name);
         var teacherDepartmentById = teachersMeta.ToDictionary(x => x.Id, x => x.DepartmentId);
-        // Назви кафедр для повідомлень та перевірок.
-        var departmentNames = await _db.Departments
-            .AsNoTracking()
-            .ToDictionaryAsync(d => d.Id, d => string.IsNullOrWhiteSpace(d.Name) ? $"#{d.Id}" : d.Name!);
+        // Кафедра теми задає пріоритет, але не скасовує явний зв'язок викладача з модулем.
+        // Якщо кафедру теми не вказано, усі викладачі модуля є рівноправними кандидатами.
+        bool IsPreferredTeacherForTopic(int teacherId, ModuleTopic? topic)
+            => topic?.DepartmentId is not int departmentId
+               || departmentId <= 0
+               || teacherDepartmentById.TryGetValue(teacherId, out var teacherDepartmentId)
+               && teacherDepartmentId == departmentId;
+        int TeacherDepartmentPriority(int teacherId, ModuleTopic? topic)
+            => IsPreferredTeacherForTopic(teacherId, topic) ? 0 : 1;
+        bool IsDepartmentFallbackTeacher(int teacherId, ModuleTopic? topic)
+            => topic?.DepartmentId is int departmentId
+               && departmentId > 0
+               && !IsPreferredTeacherForTopic(teacherId, topic);
+        List<int> PreferredOrExplicitTeacherPool(IEnumerable<int> teacherIds, ModuleTopic? topic)
+        {
+            var allCandidates = teacherIds
+                .Distinct()
+                .ToList();
+            if (topic?.DepartmentId is not int departmentId || departmentId <= 0)
+            {
+                return allCandidates;
+            }
+
+            var departmentCandidates = allCandidates
+                .Where(teacherId => IsPreferredTeacherForTopic(teacherId, topic))
+                .ToList();
+            return departmentCandidates.Count > 0
+                ? departmentCandidates
+                : allCandidates;
+        }
         // Робочі години викладачів (обмеження часу).
         var teacherWorkingHours = await _db.TeacherWorkingHours.AsNoTracking()
             .Select(w => new { w.TeacherId, w.DayOfWeek, w.Start, w.End })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Групуємо робочі години по викладачах та днях тижня.
         var workingHoursByTeacher = teacherWorkingHours
             .GroupBy(w => w.TeacherId)
@@ -1057,30 +1606,49 @@ public sealed class TeacherDraftsAutogenService
                 return false;
             return windows.Any(w => w.Start <= start && end <= w.End);
         }
-        // Навантаження викладачів у вже опублікованому розкладі.
-        var teacherLoadSchedule = await _db.ScheduleItems
-            .Include(si => si.Group)
-            .Where(si => si.TeacherId != null && courseIds.Contains(si.Group.CourseId))
-            .GroupBy(si => new { si.TeacherId, si.Group.CourseId })
-            .Select(g => new { TeacherId = g.Key.TeacherId!.Value, g.Key.CourseId, C = g.Count() })
-            .ToListAsync();
-        // Навантаження викладачів у поточних чернетках.
-        var teacherLoadDrafts = await _db.TeacherDraftItems
-            .Include(di => di.Group)
-            .Where(di => di.TeacherId != null && courseIds.Contains(di.Group.CourseId))
-            .GroupBy(di => new { di.TeacherId, di.Group.CourseId })
-            .Select(g => new { TeacherId = g.Key.TeacherId!.Value, g.Key.CourseId, C = g.Count() })
-            .ToListAsync();
-        // Об'єднана карта навантажень для балансу.
-        var teacherLoadMap = teacherLoadSchedule
-            .Concat(teacherLoadDrafts)
-            .GroupBy(x => (x.TeacherId, x.CourseId))
-            .ToDictionary(g => g.Key, g => g.Sum(x => x.C));
         // Активні плани модулів по курсах.
-        var activePlans = await _db.ModulePlans.Where(p => courseIds.Contains(p.CourseId) && p.IsActive).ToListAsync();
+        var activePlans = await _db.ModulePlans.Where(p => courseIds.Contains(p.CourseId) && p.IsActive).ToListAsync(cancellationToken);
+        // Перераховуємо лише логічні заняття з типами, які входять у навантаження.
+        void RebuildTeacherLoadMap()
+        {
+            teacherLoadMap.Clear();
+            foreach (var (key, count) in teacherLoadOutsideBusyWindowMap)
+            {
+                teacherLoadMap[key] = count;
+            }
+            var logicalEvents = busy
+                .Where(slot => slot.TeacherId is int
+                               && IsTeacherLoadDateWithinAcademicPeriod(slot.GroupId, slot.Date)
+                               && typeById.TryGetValue(slot.LessonTypeId, out var lessonType)
+                               && lessonType.CountInLoad)
+                .Select(slot => new
+                {
+                    TeacherId = slot.TeacherId!.Value,
+                    CourseId = teacherLoadGroupMetadata[slot.GroupId].CourseId,
+                    slot.Date,
+                    slot.StartTime,
+                    slot.EndTime,
+                    slot.ModuleId,
+                    slot.LessonTypeId,
+                    slot.ModuleTopicId,
+                    slot.RoomId,
+                    LogicalGroupId = shareableLoadTypeIds.Contains(slot.LessonTypeId) ? 0 : slot.GroupId
+                })
+                .Distinct()
+                .ToList();
+            foreach (var load in logicalEvents.GroupBy(row => (row.TeacherId, row.CourseId)))
+            {
+                teacherLoadMap[load.Key] = teacherLoadMap.GetValueOrDefault(load.Key) + load.Count();
+            }
+            teacherLoadMapVersion = teacherLoadStateVersion;
+        }
         // Базова метрика навантаження викладача в межах курсу.
         int TeacherLoadScore(int teacherId, int courseId)
         {
+            if (teacherLoadMapVersion != teacherLoadStateVersion)
+            {
+                RebuildTeacherLoadMap();
+            }
             if (teacherLoadMap.TryGetValue((teacherId, courseId), out var count))
             {
                 return count;
@@ -1101,14 +1669,15 @@ public sealed class TeacherDraftsAutogenService
             .Where(m => moduleIdsForPlans.Contains(m.Id))
             .ToDictionaryAsync(
                 m => m.Id,
-                m => string.IsNullOrWhiteSpace(m.Title) ? $"#{m.Id}" : m.Title.Trim());
+                m => string.IsNullOrWhiteSpace(m.Title) ? $"#{m.Id}" : m.Title.Trim(),
+                cancellationToken);
         // Формуємо зручний ярлик модуля.
         string ModuleTitleLabel(int moduleId) =>
             moduleTitles.TryGetValue(moduleId, out var title) ? title : $"#{moduleId}";
         // Теми модулів для підбору тем і самостійної роботи.
         var topicsAll = await _db.ModuleTopics
             .Where(t => moduleIdsForPlans.Contains(t.ModuleId))
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Сортуємо теми за явним порядком із БД, а код використовуємо лише як стабільний fallback.
         topicsAll.Sort((a, b) =>
         {
@@ -1159,62 +1728,194 @@ public sealed class TeacherDraftsAutogenService
                 kvp => kvp.Value
                     .Where(t => t.SelfStudyBySupervisor)
                     .Sum(t => Math.Max(0, t.SelfStudyHours)));
-        // Самостійні заняття, вже призначені у чернетках.
-        var selfStudyAssignmentsDraft = await _db.TeacherDraftItems
-            .Where(di => di.IsSelfStudy
-                         && courseIds.Contains(di.Group.CourseId)
-                         && (di.ModuleTopicId == null || flaggedSelfStudyTopicIds.Contains(di.ModuleTopicId.Value)))
-            .Select(di => new { di.GroupId, di.ModuleId })
-            .ToListAsync();
-        // Самостійні заняття, вже опубліковані у розкладі.
-        var selfStudyAssignmentsSchedule = await _db.ScheduleItems
-            .Where(si => si.IsSelfStudy
-                         && courseIds.Contains(si.Group.CourseId)
-                         && (si.ModuleTopicId == null || flaggedSelfStudyTopicIds.Contains(si.ModuleTopicId.Value)))
-            .Select(si => new { si.GroupId, si.ModuleId })
-            .ToListAsync();
-        // Самостійні заняття по конкретних темах (чернетки).
-        var selfStudyTopicAssignmentsDraft = await _db.TeacherDraftItems
-            .Where(di => di.IsSelfStudy
-                         && di.ModuleTopicId != null
-                         && flaggedSelfStudyTopicIds.Contains(di.ModuleTopicId!.Value)
-                         && courseIds.Contains(di.Group.CourseId))
-            .GroupBy(di => new { di.GroupId, di.ModuleId, TopicId = di.ModuleTopicId!.Value })
-            .Select(g => new { g.Key.GroupId, g.Key.ModuleId, g.Key.TopicId, C = g.Count() })
-            .ToListAsync();
-        // Самостійні заняття по конкретних темах (розклад).
-        var selfStudyTopicAssignmentsSchedule = await _db.ScheduleItems
-            .Where(si => si.IsSelfStudy
-                         && si.ModuleTopicId != null
-                         && flaggedSelfStudyTopicIds.Contains(si.ModuleTopicId!.Value)
-                         && courseIds.Contains(si.Group.CourseId))
-            .GroupBy(si => new { si.GroupId, si.ModuleId, TopicId = si.ModuleTopicId!.Value })
-            .Select(g => new { g.Key.GroupId, g.Key.ModuleId, g.Key.TopicId, C = g.Count() })
-            .ToListAsync();
+        // Завантажуємо рядки навчального прогресу лише в межах поточного навчального періоду курсу.
+        var draftUsageRows = await _db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => !excludedTypeIds.Contains(item.LessonTypeId)
+                           && item.Date < planningWeekEndExclusive
+                           && courseIds.Contains(item.Group.CourseId)
+                           && (item.Group.Course.AcademicPeriodStartDate == null
+                               || item.Date >= item.Group.Course.AcademicPeriodStartDate.Value))
+            .Select(item => new LogicalEventUsageRow(
+                item.GroupId,
+                item.ModuleId,
+                item.LessonTypeId,
+                item.ModuleTopicId,
+                item.TeacherId,
+                item.RoomId,
+                item.IsSelfStudy,
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                item.BatchKey))
+            .ToListAsync(cancellationToken);
+        var scheduleUsageRows = await _db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => !excludedTypeIds.Contains(item.LessonTypeId)
+                           && item.Date < planningWeekEndExclusive
+                           && courseIds.Contains(item.Group.CourseId)
+                           && (item.Group.Course.AcademicPeriodStartDate == null
+                               || item.Date >= item.Group.Course.AcademicPeriodStartDate.Value))
+            .Select(item => new LogicalEventUsageRow(
+                item.GroupId,
+                item.ModuleId,
+                item.LessonTypeId,
+                item.ModuleTopicId,
+                item.TeacherId,
+                item.RoomId,
+                item.IsSelfStudy,
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                item.BatchKey))
+            .ToListAsync(cancellationToken);
+        // Схлопуємо рядки співвикладачів до одного логічного заняття; для старих даних зберігаємо попередню евристику.
+        List<LogicalEventUsageRow> CollapseCurriculumUsageRows(IEnumerable<LogicalEventUsageRow> source)
+        {
+            var rows = source.ToList();
+            var result = new List<LogicalEventUsageRow>(rows.Count);
+            LogicalEventUsageRow SelectRepresentative(IEnumerable<LogicalEventUsageRow> eventRows)
+                => eventRows
+                    .OrderBy(row => row.ModuleTopicId is null ? 1 : 0)
+                    .ThenBy(row => row.ModuleTopicId)
+                    .ThenBy(row => row.TeacherId)
+                    .ThenBy(row => row.RoomId)
+                    .First();
+
+            foreach (var logicalEvent in rows
+                         .Where(row => !string.IsNullOrWhiteSpace(row.BatchKey))
+                         .GroupBy(row => new
+                         {
+                             row.BatchKey,
+                             row.Date,
+                             row.StartTime,
+                             row.EndTime,
+                             row.GroupId,
+                             row.ModuleId,
+                             row.LessonTypeId
+                         }))
+            {
+                result.Add(SelectRepresentative(logicalEvent));
+            }
+
+            foreach (var legacyEvent in rows
+                         .Where(row => string.IsNullOrWhiteSpace(row.BatchKey))
+                         .GroupBy(row => new
+                         {
+                             row.Date,
+                             row.StartTime,
+                             row.EndTime,
+                             row.GroupId,
+                             row.ModuleId,
+                             row.LessonTypeId,
+                             row.RoomId,
+                             row.IsSelfStudy
+                         }))
+            {
+                var eventRows = legacyEvent.ToList();
+                var isLogicalEvent = eventRows.Count > 1
+                                     && eventRows
+                                         .Select(row => (row.ModuleTopicId, row.TeacherId))
+                                         .Distinct()
+                                         .Skip(1)
+                                         .Any();
+                if (isLogicalEvent)
+                {
+                    result.Add(SelectRepresentative(eventRows));
+                }
+                else
+                {
+                    result.AddRange(eventRows);
+                }
+            }
+
+            return result;
+        }
+        List<LogicalEventUsageRow> CollapseCurriculumTopicUsageRows(IEnumerable<LogicalEventUsageRow> source)
+        {
+            var rows = source
+                .Where(row => row.ModuleTopicId is not null)
+                .ToList();
+            var result = new List<LogicalEventUsageRow>(rows.Count);
+
+            foreach (var logicalTopic in rows
+                         .Where(row => !string.IsNullOrWhiteSpace(row.BatchKey))
+                         .GroupBy(row => new
+                         {
+                             row.BatchKey,
+                             row.Date,
+                             row.StartTime,
+                             row.EndTime,
+                             row.GroupId,
+                             row.ModuleId,
+                             row.LessonTypeId,
+                             row.ModuleTopicId
+                         }))
+            {
+                result.Add(logicalTopic
+                    .OrderBy(row => row.TeacherId)
+                    .ThenBy(row => row.RoomId)
+                    .First());
+            }
+
+            foreach (var legacyEvent in rows
+                         .Where(row => string.IsNullOrWhiteSpace(row.BatchKey))
+                         .GroupBy(row => new
+                         {
+                             row.Date,
+                             row.StartTime,
+                             row.EndTime,
+                             row.GroupId,
+                             row.ModuleId,
+                             row.LessonTypeId,
+                             row.RoomId,
+                             row.IsSelfStudy
+                         }))
+            {
+                var eventRows = legacyEvent.ToList();
+                var isLogicalEvent = eventRows.Count > 1
+                                     && eventRows
+                                         .Select(row => (row.ModuleTopicId, row.TeacherId))
+                                         .Distinct()
+                                         .Skip(1)
+                                         .Any();
+                if (!isLogicalEvent)
+                {
+                    result.AddRange(eventRows);
+                    continue;
+                }
+
+                result.AddRange(eventRows
+                    .GroupBy(row => row.ModuleTopicId)
+                    .Select(topicRows => topicRows
+                        .OrderBy(row => row.TeacherId)
+                        .ThenBy(row => row.RoomId)
+                        .First()));
+            }
+
+            return result;
+        }
+        var logicalSelfStudyUsageRows = CollapseCurriculumUsageRows(draftUsageRows.Where(row =>
+                row.IsSelfStudy
+                && (row.ModuleTopicId == null || flaggedSelfStudyTopicIds.Contains(row.ModuleTopicId.Value))))
+            .Concat(CollapseCurriculumUsageRows(scheduleUsageRows.Where(row =>
+                row.IsSelfStudy
+                && (row.ModuleTopicId == null || flaggedSelfStudyTopicIds.Contains(row.ModuleTopicId.Value)))))
+            .ToList();
+        var logicalTopicUsageRows = CollapseCurriculumTopicUsageRows(draftUsageRows)
+            .Concat(CollapseCurriculumTopicUsageRows(scheduleUsageRows))
+            .ToList();
         // Зведений лічильник самостійних занять по модулю/групі.
-        var selfStudyAssignments = selfStudyAssignmentsDraft
-            .Concat(selfStudyAssignmentsSchedule)
-            .GroupBy(x => (x.GroupId, x.ModuleId))
-            .ToDictionary(g => g.Key, g => g.Count());
+        var selfStudyAssignments = logicalSelfStudyUsageRows
+            .GroupBy(row => (row.GroupId, row.ModuleId))
+            .ToDictionary(group => group.Key, group => group.Count());
         // Зведений лічильник самостійних занять по темі.
-        var selfStudyTopicAssignments = selfStudyTopicAssignmentsDraft
-            .Concat(selfStudyTopicAssignmentsSchedule)
-            .GroupBy(x => (x.GroupId, x.ModuleId, x.TopicId))
-            .ToDictionary(g => g.Key, g => g.Sum(x => x.C));
-        // Призначені теми по групі/модулю (чернетки).
-        var topicAssignmentsDraft = await _db.TeacherDraftItems
-            .Where(di => di.ModuleTopicId != null
-                         && courseIds.Contains(di.Group.CourseId)
-                         && allowedTopicIds.Contains(di.ModuleTopicId!.Value))
-            .Select(di => new { di.GroupId, di.ModuleId, TopicId = di.ModuleTopicId!.Value })
-            .ToListAsync();
-        // Призначені теми по групі/модулю (розклад).
-        var topicAssignmentsSchedule = await _db.ScheduleItems
-            .Where(si => si.ModuleTopicId != null
-                         && courseIds.Contains(si.Group.CourseId)
-                         && allowedTopicIds.Contains(si.ModuleTopicId!.Value))
-            .Select(si => new { si.GroupId, si.ModuleId, TopicId = si.ModuleTopicId!.Value })
-            .ToListAsync();
+        var selfStudyTopicAssignments = logicalTopicUsageRows
+            .Where(row => row.IsSelfStudy
+                          && row.ModuleTopicId is int topicId
+                          && flaggedSelfStudyTopicIds.Contains(topicId))
+            .GroupBy(row => (row.GroupId, row.ModuleId, TopicId: row.ModuleTopicId!.Value))
+            .ToDictionary(group => group.Key, group => group.Count());
         // Сховище використаних тем по групі/модулю.
         var topicAssignments = new Dictionary<(int GroupId, int ModuleId), Dictionary<int, int>>();
         // Збільшує лічильник використаної теми.
@@ -1229,25 +1930,41 @@ public sealed class TeacherDraftsAutogenService
             assigned.TryGetValue(topicId, out var usedCount);
             assigned[topicId] = usedCount + 1;
         }
-        foreach (var entry in topicAssignmentsDraft.Concat(topicAssignmentsSchedule))
+        foreach (var entry in logicalTopicUsageRows.Where(row => row.ModuleTopicId is int topicId
+                                                                  && allowedTopicIds.Contains(topicId)))
         {
-            SeedTopicAssignment(entry.GroupId, entry.ModuleId, entry.TopicId);
+            SeedTopicAssignment(entry.GroupId, entry.ModuleId, entry.ModuleTopicId!.Value);
         }
         // Ліміт використання теми у розкладі.
         int GetTopicUsageLimit(ModuleTopic topic)
             => topicUsageLimitById.TryGetValue(topic.Id, out var limit) ? limit : Math.Max(0, topic.AuditoriumHours);
+        int ActualTopicUsageCount(int groupId, int moduleId, int topicId)
+        {
+            var key = (groupId, moduleId, topicId);
+            if (actualTopicUsageCountCache.TryGetValue(key, out var cachedCount))
+            {
+                return cachedCount;
+            }
+            var count = TopicOrderForGroupModule(groupId, moduleId)
+                .Where(slot => slot.ModuleTopicId == topicId)
+                .GroupBy(slot => string.IsNullOrWhiteSpace(slot.BatchKey)
+                    ? $"legacy:{slot.Date:yyyyMMdd}:{slot.StartTime:HHmmss}:{slot.EndTime:HHmmss}:{slot.LessonTypeId}:{topicId}"
+                    : $"batch:{slot.BatchKey}:{slot.Date:yyyyMMdd}:{slot.StartTime:HHmmss}:{slot.EndTime:HHmmss}:{topicId}")
+                .Count();
+            actualTopicUsageCountCache[key] = count;
+            return count;
+        }
         // Вибір наступної теми строго за порядком коду.
         ModuleTopic? SelectNextTopicInOrder(int groupId, int moduleId)
         {
             if (!topicsByModule.TryGetValue(moduleId, out var list) || list.Count == 0)
                 return null;
-            topicAssignments.TryGetValue((groupId, moduleId), out var assigned);
             // Вибираємо наступну тему строго за порядком коду і не "перестрибуємо" вперед.
             foreach (var t in list)
             {
                 var limit = GetTopicUsageLimit(t);
                 if (limit <= 0) continue;
-                var usedByGroup = (assigned != null && assigned.TryGetValue(t.Id, out var usedGroupVal)) ? usedGroupVal : 0;
+                var usedByGroup = ActualTopicUsageCount(groupId, moduleId, t.Id);
                 if (usedByGroup < limit)
                 {
                     return t;
@@ -1261,6 +1978,7 @@ public sealed class TeacherDraftsAutogenService
         var missingModulesNotified = new HashSet<int>();
         int created = 0, skipped = 0;
         var allCreatedDrafts = new List<TeacherDraftItem>();
+        var createdDraftAccounting = new Dictionary<TeacherDraftItem, CreatedDraftAccounting>();
         var selectedGroupIdSet = groups.Select(g => g.Id).ToHashSet();
         var movableDrafts = await _db.TeacherDraftItems
             .Where(item => item.Date >= rangeStartDate
@@ -1268,6 +1986,88 @@ public sealed class TeacherDraftsAutogenService
                            && selectedGroupIdSet.Contains(item.GroupId)
                            && item.Status == DraftStatus.Draft)
             .ToListAsync(cancellationToken);
+        MovableDraftTrialState CaptureMovableDraftTrialState(TeacherDraftItem draft)
+        {
+            var entry = _db.Entry(draft);
+            return new MovableDraftTrialState(
+                draft.Date,
+                draft.DayOfWeek,
+                draft.StartTime,
+                draft.EndTime,
+                draft.LessonTypeId,
+                draft.GroupId,
+                draft.ModuleId,
+                draft.ModuleTopicId,
+                draft.TeacherId,
+                draft.RoomId,
+                draft.Status,
+                draft.PublishedItemId,
+                draft.BatchKey,
+                draft.ValidationWarnings,
+                draft.CreatedAt,
+                draft.UpdatedAt,
+                draft.IsLocked,
+                draft.IsSelfStudy,
+                entry.State,
+                entry.Properties
+                    .Where(property => property.IsModified)
+                    .Select(property => property.Metadata.Name)
+                    .ToHashSet(StringComparer.Ordinal));
+        }
+        // Повертає чернетку до стану перед пробним проходом без втрати стану відстеження EF.
+        void RestoreMovableDraftTrialState(TeacherDraftItem draft, MovableDraftTrialState snapshot)
+        {
+            var entry = _db.Entry(draft);
+            if (snapshot.EntityState is not EntityState.Added and not EntityState.Detached)
+            {
+                // Спочатку скидаємо невдалий пробний рух. Якщо зробити це після
+                // присвоєння координат зі знімка, EF поверне CurrentValues до
+                // OriginalValues і знову розсинхронізує сутність з busy-індексом.
+                entry.State = EntityState.Unchanged;
+            }
+
+            draft.Date = snapshot.Date;
+            draft.DayOfWeek = snapshot.DayOfWeek;
+            draft.StartTime = snapshot.StartTime;
+            draft.EndTime = snapshot.EndTime;
+            draft.LessonTypeId = snapshot.LessonTypeId;
+            draft.GroupId = snapshot.GroupId;
+            draft.ModuleId = snapshot.ModuleId;
+            draft.ModuleTopicId = snapshot.ModuleTopicId;
+            draft.TeacherId = snapshot.TeacherId;
+            draft.RoomId = snapshot.RoomId;
+            draft.Status = snapshot.Status;
+            draft.PublishedItemId = snapshot.PublishedItemId;
+            draft.BatchKey = snapshot.BatchKey;
+            draft.ValidationWarnings = snapshot.ValidationWarnings;
+            draft.CreatedAt = snapshot.CreatedAt;
+            draft.UpdatedAt = snapshot.UpdatedAt;
+            draft.IsLocked = snapshot.IsLocked;
+            draft.IsSelfStudy = snapshot.IsSelfStudy;
+
+            if (snapshot.EntityState == EntityState.Added)
+            {
+                entry.State = EntityState.Added;
+                return;
+            }
+            if (snapshot.EntityState == EntityState.Detached)
+            {
+                entry.State = EntityState.Detached;
+                return;
+            }
+
+            if (snapshot.EntityState == EntityState.Modified)
+            {
+                foreach (var propertyName in snapshot.ModifiedProperties)
+                {
+                    entry.Property(propertyName).IsModified = true;
+                }
+            }
+            else if (snapshot.EntityState == EntityState.Deleted)
+            {
+                entry.State = EntityState.Deleted;
+            }
+        }
         const int maxEmergencySingletonSharedLectures = 0;
         const int latestLectureSlotBeforeLongBreak = 6;
         const int earliestEmergencyLectureSlotOrder = 9;
@@ -1282,6 +2082,70 @@ public sealed class TeacherDraftsAutogenService
         var gapDetails = new List<AutoGenGapDetail>();
         var gapWarnings = new HashSet<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End)>();
         var slotFailureReasons = new Dictionary<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End), HashSet<string>>();
+        var searchLimitedGroupDates = new Dictionary<(int GroupId, DateOnly Date), SearchLimitDiagnostics>();
+        var searchBudgetsByGroupDate = new Dictionary<(int GroupId, DateOnly Date), DeterministicSearchBudget>();
+        void RecordSearchLimit(
+            int groupId,
+            DateOnly date,
+            string scope,
+            int visitedNodes,
+            int maxNodes,
+            bool emergencyTimeLimitReached)
+        {
+            var key = (groupId, date);
+            if (!searchLimitedGroupDates.TryGetValue(key, out var diagnostics))
+            {
+                diagnostics = new SearchLimitDiagnostics();
+                searchLimitedGroupDates[key] = diagnostics;
+            }
+
+            diagnostics.VisitedNodes = Math.Max(diagnostics.VisitedNodes, Math.Max(0, visitedNodes));
+            diagnostics.MaxNodes = Math.Max(diagnostics.MaxNodes, Math.Max(0, maxNodes));
+            diagnostics.EmergencyTimeLimitReached |= emergencyTimeLimitReached;
+            if (!string.IsNullOrWhiteSpace(scope))
+            {
+                diagnostics.Scopes.Add(scope.Trim());
+            }
+        }
+        Dictionary<(int GroupId, DateOnly Date), SearchLimitDiagnosticsState> CopySearchLimitDiagnostics()
+            => searchLimitedGroupDates.ToDictionary(
+                entry => entry.Key,
+                entry => new SearchLimitDiagnosticsState(
+                    entry.Value.VisitedNodes,
+                    entry.Value.MaxNodes,
+                    entry.Value.EmergencyTimeLimitReached,
+                    entry.Value.Scopes.ToArray()));
+        void RestoreSearchLimitDiagnostics(
+            IReadOnlyDictionary<(int GroupId, DateOnly Date), SearchLimitDiagnosticsState> snapshot)
+        {
+            searchLimitedGroupDates.Clear();
+            foreach (var (key, state) in snapshot)
+            {
+                var diagnostics = new SearchLimitDiagnostics
+                {
+                    VisitedNodes = state.VisitedNodes,
+                    MaxNodes = state.MaxNodes,
+                    EmergencyTimeLimitReached = state.EmergencyTimeLimitReached
+                };
+                foreach (var scope in state.Scopes)
+                {
+                    diagnostics.Scopes.Add(scope);
+                }
+                searchLimitedGroupDates[key] = diagnostics;
+            }
+        }
+        string SummarizeSlotFailureReasons(IEnumerable<string> values, int limit = 6)
+        {
+            var ordered = values
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(value => value, StringComparer.Ordinal)
+                .ToList();
+            var summary = string.Join("; ", ordered.Take(limit));
+            return ordered.Count > limit
+                ? $"{summary}; ще {ordered.Count - limit} причин приховано для стислості."
+                : summary;
+        }
         // Перевірка валідності типу заняття.
         bool TypeAllowed(int lessonTypeId)
         {
@@ -1290,10 +2154,6 @@ public sealed class TeacherDraftsAutogenService
                    && lt.CountInPlan
                    && !excludedTypeIds.Contains(lessonTypeId);
         }
-        int MaxSharedLectureGroupsForCourse(int courseId)
-            => selectedGroupsByCourse.TryGetValue(courseId, out var sameCourseGroups) && sameCourseGroups.Count > 0
-                ? sameCourseGroups.Count
-                : 1;
         // Перевірка, чи тип заняття трактуємо як лекцію для об'єднання груп.
         bool IsLectureType(int lessonTypeId) => lectureTypeIds.Contains(lessonTypeId);
         var preferredFirstTypeIds = types
@@ -1304,6 +2164,27 @@ public sealed class TeacherDraftsAutogenService
         bool CanShareAcrossGroups(int lessonTypeId)
             => IsLectureType(lessonTypeId)
                || preferredFirstTypeIds.Contains(lessonTypeId);
+        bool ViolatesLectureBlockOrderForPlacement(
+            int groupId,
+            DateOnly date,
+            TimeOnly start,
+            TimeOnly end,
+            int lessonTypeId)
+        {
+            var isLecture = CanShareAcrossGroups(lessonTypeId);
+            return BusyForGroupDate(groupId, date).Any(existing =>
+                       !excludedTypeIds.Contains(existing.LessonTypeId)
+                       && (isLecture
+                           ? existing.StartTime < start && !CanShareAcrossGroups(existing.LessonTypeId)
+                           : existing.StartTime > start && CanShareAcrossGroups(existing.LessonTypeId)))
+                   || isLecture
+                   && WouldCreateEmptyCanonicalLectureSlot(
+                       groupId,
+                       date,
+                       start,
+                       end,
+                       lessonTypeId);
+        }
         // Після раннього лекційного вікна потокові заняття ставимо лише як аварійний резерв.
         int RegularLectureMaxSlotOrder(int? configuredMaxSlotOrder = null)
             => configuredMaxSlotOrder is int configured && configured > 0
@@ -1322,17 +2203,73 @@ public sealed class TeacherDraftsAutogenService
             => CanShareAcrossGroups(lessonTypeId)
                && slotOrder > RegularLectureMaxSlotOrder(configuredMaxSlotOrder)
                && slotOrder >= earliestEmergencyLectureSlotOrder;
-        int SlotGroupLimitForPlacement(int courseId, int lessonTypeId, bool isSelfStudyPlacement)
-            => !isSelfStudyPlacement && CanShareAcrossGroups(lessonTypeId)
-                ? MaxSharedLectureGroupsForCourse(courseId)
-                : maxParallelGroupsPerModuleInSlot;
+        int SlotGroupLimitForPlacement(
+            int courseId,
+            int lessonTypeId,
+            bool isSelfStudyPlacement,
+            bool bypassSoftModuleParallelLimit = false)
+        {
+            if (CanShareAcrossGroups(lessonTypeId)
+                && selectedGroupsByCourse.TryGetValue(courseId, out var sameCourseGroups))
+            {
+                // Один спільний лекційний потік є однією подією, тому кількість
+                // його груп обмежує аудиторія, а не ліміт паралельних непотокових занять.
+                return Math.Max(maxParallelGroupsPerModuleInSlot, sameCourseGroups.Count);
+            }
+
+            return maxParallelGroupsPerModuleInSlot;
+        }
+        int EligibleTeacherCountForPlacement(
+            int moduleId,
+            ModuleTopic? topic,
+            bool isSelfStudyPlacement)
+            => PreferredOrExplicitTeacherPool(
+                    isSelfStudyPlacement
+                    ? supervisorsForModule
+                        .Where(link => link.ModuleId == moduleId)
+                        .Select(link => link.TeacherId)
+                    : teachersForModule
+                        .Where(link => link.ModuleId == moduleId)
+                        .Select(link => link.TeacherId),
+                    topic)
+                .Count;
+        // Кількість паралельних груп є жорсткою межею навіть для аварійних проходів.
+        // Для непотокових занять додатково враховуємо кількість придатних викладачів.
+        int ResourceBoundedSlotGroupLimitForPlacement(
+            int courseId,
+            int moduleId,
+            int lessonTypeId,
+            ModuleTopic? topic,
+            bool isSelfStudyPlacement,
+            bool bypassSoftModuleParallelLimit = false)
+        {
+            var configuredLimit = SlotGroupLimitForPlacement(
+                courseId,
+                lessonTypeId,
+                isSelfStudyPlacement,
+                bypassSoftModuleParallelLimit);
+            if (CanShareAcrossGroups(lessonTypeId)
+                || !typeById.TryGetValue(lessonTypeId, out var lessonType)
+                || !lessonType.RequiresTeacher)
+            {
+                return configuredLimit;
+            }
+
+            var eligibleTeacherCount = EligibleTeacherCountForPlacement(
+                moduleId,
+                topic,
+                isSelfStudyPlacement);
+            return eligibleTeacherCount > 0
+                ? Math.Min(configuredLimit, eligibleTeacherCount)
+                : configuredLimit;
+        }
         // Знаходимо вже створений спільний потік, до якого можна безпечно приєднати групу.
         IReadOnlyList<int> FindExistingSharedLectureGroupIds(
             int courseId,
             int moduleId,
             int lessonTypeId,
             int? moduleTopicId,
-            int teacherId,
+            int? teacherId,
             int roomId,
             DateOnly date,
             TimeOnly start,
@@ -1342,21 +2279,26 @@ public sealed class TeacherDraftsAutogenService
             {
                 return Array.Empty<int>();
             }
-            return busy
-                .Where(x => x.Date == date
-                            && x.StartTime == start
-                            && x.EndTime == end
-                            && x.ModuleId == moduleId
-                            && x.LessonTypeId == lessonTypeId
-                            && x.ModuleTopicId == moduleTopicId
-                            && x.JoinableDraft
-                            && x.TeacherId == teacherId
-                            && x.RoomId == roomId
-                            && selectedGroupsById.TryGetValue(x.GroupId, out var existingGroup)
-                            && existingGroup.CourseId == courseId)
-                .Select(x => x.GroupId)
-                .Distinct()
-                .ToList();
+            var groupIds = new List<int>(maxParallelGroupsPerModuleInSlot);
+            var seenGroupIds = new HashSet<int>();
+            foreach (var slot in BusyForDate(date))
+            {
+                if (slot.StartTime == start
+                    && slot.EndTime == end
+                    && slot.ModuleId == moduleId
+                    && slot.LessonTypeId == lessonTypeId
+                    && slot.ModuleTopicId == moduleTopicId
+                    && slot.JoinableDraft
+                    && slot.TeacherId == teacherId
+                    && slot.RoomId == roomId
+                    && selectedGroupsById.TryGetValue(slot.GroupId, out var existingGroup)
+                    && existingGroup.CourseId == courseId
+                    && seenGroupIds.Add(slot.GroupId))
+                {
+                    groupIds.Add(slot.GroupId);
+                }
+            }
+            return groupIds;
         }
         // Перевіряємо, що зайнятий слот належить саме тому спільному потоку, до якого приєднуємося.
         bool IsSameSharedLectureCluster(
@@ -1365,7 +2307,7 @@ public sealed class TeacherDraftsAutogenService
             int moduleId,
             int lessonTypeId,
             int? moduleTopicId,
-            int teacherId,
+            int? teacherId,
             int roomId,
             DateOnly date,
             TimeOnly start,
@@ -1388,9 +2330,13 @@ public sealed class TeacherDraftsAutogenService
         static string BusyRoomLabel(Room room)
             => string.IsNullOrWhiteSpace(room.Name) ? $"#{room.Id}" : room.Name!;
         bool BlocksTeacherSlot(int lessonTypeId)
-            => typeById.TryGetValue(lessonTypeId, out var lessonType) && lessonType.BlocksTeacher;
+            => typeById.TryGetValue(lessonTypeId, out var lessonType)
+               && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(lessonType.Code)
+               && lessonType.BlocksTeacher;
         bool BlocksRoomSlot(int lessonTypeId)
-            => typeById.TryGetValue(lessonTypeId, out var lessonType) && lessonType.BlocksRoom;
+            => typeById.TryGetValue(lessonTypeId, out var lessonType)
+               && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(lessonType.Code)
+               && lessonType.BlocksRoom;
         bool IsSameShareableBusySlot(
             BusySlot slot,
             int moduleId,
@@ -1437,7 +2383,8 @@ public sealed class TeacherDraftsAutogenService
 
             foreach (var groupId in newGroupSet)
             {
-                if (BusyForGroupDate(groupId, date).Any(slot => SlotOverlaps(slot, date, start, end)))
+                if (BusyForGroupDate(groupId, date).Any(slot =>
+                        !IsNonOccupyingBusySlot(slot) && SlotOverlaps(slot, date, start, end)))
                 {
                     reason = $"Група {BusyGroupLabel(groupId)} вже зайнята у слоті {date:yyyy-MM-dd} {start:HH\\:mm}-{end:HH\\:mm}.";
                     return false;
@@ -1450,7 +2397,8 @@ public sealed class TeacherDraftsAutogenService
                 foreach (var busySlot in BusyForTeacherDate(busyTeacherId, date)
                              .Where(slot => SlotOverlaps(slot, date, start, end) && BlocksTeacherSlot(slot.LessonTypeId)))
                 {
-                    if (IsSameShareableBusySlot(busySlot, moduleId, lessonTypeId, moduleTopicId, teacherId, room?.Id, date, start, end))
+                    if (busySlot.JoinableDraft
+                        && IsSameShareableBusySlot(busySlot, moduleId, lessonTypeId, moduleTopicId, teacherId, room?.Id, date, start, end))
                     {
                         continue;
                     }
@@ -1469,7 +2417,8 @@ public sealed class TeacherDraftsAutogenService
             foreach (var busySlot in BusyForRoomDate(room.Id, date)
                          .Where(slot => SlotOverlaps(slot, date, start, end) && BlocksRoomSlot(slot.LessonTypeId)))
             {
-                if (!IsSameShareableBusySlot(busySlot, moduleId, lessonTypeId, moduleTopicId, teacherId, room.Id, date, start, end))
+                if (!busySlot.JoinableDraft
+                    || !IsSameShareableBusySlot(busySlot, moduleId, lessonTypeId, moduleTopicId, teacherId, room.Id, date, start, end))
                 {
                     reason = $"Аудиторія {BusyRoomLabel(room)} вже зайнята у слоті {slotLabel}.";
                     return false;
@@ -1507,7 +2456,8 @@ public sealed class TeacherDraftsAutogenService
             DateOnly date,
             TimeOnly start,
             TimeOnly end,
-            IReadOnlyCollection<int> newGroupIds)
+            IReadOnlyCollection<int> newGroupIds,
+            IReadOnlyList<PersistedDraftConflictRow>? persistedSnapshot = null)
         {
             var newGroupSet = newGroupIds
                 .Where(selectedGroupsById.ContainsKey)
@@ -1519,27 +2469,53 @@ public sealed class TeacherDraftsAutogenService
             }
 
             var roomId = room?.Id;
-            var persistedDrafts = await _db.TeacherDraftItems
-                .AsNoTracking()
-                .Where(draft => draft.Status == DraftStatus.Draft
-                                && draft.Date == date
-                                && draft.StartTime < end
-                                && start < draft.EndTime
-                                && (newGroupSet.Contains(draft.GroupId)
-                                    || (teacherId != null && draft.TeacherId == teacherId)
-                                    || (roomId != null && draft.RoomId == roomId)))
-                .Select(draft => new
-                {
-                    draft.GroupId,
-                    draft.ModuleId,
-                    draft.LessonTypeId,
-                    draft.ModuleTopicId,
-                    draft.TeacherId,
-                    draft.RoomId,
-                    draft.StartTime,
-                    draft.EndTime
-                })
-                .ToListAsync(cancellationToken);
+            // Для переміщених чернеток індекс busy вже містить нові координати, а БД до SaveChanges ще повертає старі.
+            _db.ChangeTracker.DetectChanges();
+            var trackedAuthoritativeDraftIds = movableDrafts
+                .Where(draft => draft.Id > 0)
+                .Where(draft => _db.Entry(draft).State is EntityState.Modified or EntityState.Deleted)
+                .Select(draft => draft.Id)
+                .Distinct()
+                .ToList();
+            IReadOnlyList<PersistedDraftConflictRow> persistedDrafts;
+            if (persistedSnapshot is null)
+            {
+                persistedDrafts = await _db.TeacherDraftItems
+                    .AsNoTracking()
+                    .Where(draft => draft.Status == DraftStatus.Draft
+                                    && !trackedAuthoritativeDraftIds.Contains(draft.Id)
+                                    && draft.Date == date
+                                    && draft.StartTime < end
+                                    && start < draft.EndTime
+                                    && (newGroupSet.Contains(draft.GroupId)
+                                        || (teacherId != null && draft.TeacherId == teacherId)
+                                        || (roomId != null && draft.RoomId == roomId)))
+                    .Select(draft => new PersistedDraftConflictRow(
+                        draft.Id,
+                        draft.GroupId,
+                        draft.ModuleId,
+                        draft.LessonTypeId,
+                        draft.ModuleTopicId,
+                        draft.TeacherId,
+                        draft.RoomId,
+                        draft.Date,
+                        draft.StartTime,
+                        draft.EndTime))
+                    .ToListAsync(cancellationToken);
+            }
+            else
+            {
+                var trackedAuthoritativeDraftIdSet = trackedAuthoritativeDraftIds.ToHashSet();
+                persistedDrafts = persistedSnapshot
+                    .Where(draft => !trackedAuthoritativeDraftIdSet.Contains(draft.Id)
+                                    && draft.Date == date
+                                    && draft.StartTime < end
+                                    && start < draft.EndTime
+                                    && (newGroupSet.Contains(draft.GroupId)
+                                        || (teacherId != null && draft.TeacherId == teacherId)
+                                        || (roomId != null && draft.RoomId == roomId)))
+                    .ToList();
+            }
             var slotLabel = $"{date:yyyy-MM-dd} {start:HH\\:mm}-{end:HH\\:mm}";
             foreach (var draft in persistedDrafts)
             {
@@ -1677,9 +2653,7 @@ public sealed class TeacherDraftsAutogenService
             {
                 return false;
             }
-            foreach (var slot in TopicOrderForGroup(groupIdCheck).Where(x =>
-                         x.ModuleId == moduleIdCheck
-                         && x.ModuleTopicId is int))
+            foreach (var slot in TopicOrderForGroupModule(groupIdCheck, moduleIdCheck))
             {
                 if (slot.ModuleTopicId is not int existingTopicId)
                 {
@@ -1717,18 +2691,49 @@ public sealed class TeacherDraftsAutogenService
             }
             return false;
         }
+        bool HasSelectedGroupTopicOrderViolation()
+        {
+            foreach (var group in topicOrderSlots
+                         .Where(slot => selectedGroupIdSet.Contains(slot.GroupId)
+                                        && slot.Date >= rangeStartDate
+                                        && slot.Date < rangeEndDateExclusive
+                                        && slot.ModuleTopicId is not null
+                                        && !excludedTypeIds.Contains(slot.LessonTypeId))
+                         .GroupBy(slot => new { slot.GroupId, slot.ModuleId }))
+            {
+                int? highestOrder = null;
+                foreach (var slot in group
+                             .OrderBy(item => item.Date)
+                             .ThenBy(item => item.StartTime)
+                             .ThenBy(item => item.EndTime)
+                             .ThenBy(item => item.ModuleTopicId))
+                {
+                    if (slot.ModuleTopicId is not int topicId
+                        || !topicById.TryGetValue(topicId, out var topic))
+                    {
+                        continue;
+                    }
+                    if (highestOrder is int currentHighest && topic.Order < currentHighest)
+                    {
+                        return true;
+                    }
+                    highestOrder = highestOrder is int previousHighest
+                        ? Math.Max(previousHighest, topic.Order)
+                        : topic.Order;
+                }
+            }
+            return false;
+        }
         // Перевіряє, чи вичерпано всі теми модуля для групи.
         bool TopicsDepleted(int groupIdCheck, int moduleIdCheck)
         {
             if (!topicsByModule.TryGetValue(moduleIdCheck, out var list) || list.Count == 0)
                 return false;
-            var key = (groupIdCheck, moduleIdCheck);
-            topicAssignments.TryGetValue(key, out var assigned);
             return list.All(topic =>
             {
                 var limit = GetTopicUsageLimit(topic);
                 if (limit <= 0) return true;
-                var usedCount = assigned != null && assigned.TryGetValue(topic.Id, out var count) ? count : 0;
+                var usedCount = ActualTopicUsageCount(groupIdCheck, moduleIdCheck, topic.Id);
                 return usedCount >= limit;
             });
         }
@@ -1742,27 +2747,24 @@ public sealed class TeacherDraftsAutogenService
                 .ToList();
             if (usableTopics.Count == 0)
                 return null;
-            topicAssignments.TryGetValue((groupIdCheck, moduleIdCheck), out var assigned);
-            if (assigned is not null)
+            var latestUsed = usableTopics
+                .Where(topic => ActualTopicUsageCount(groupIdCheck, moduleIdCheck, topic.Id) > 0)
+                .LastOrDefault();
+            if (latestUsed is not null)
             {
-                var latestUsed = usableTopics
-                    .Where(topic => assigned.TryGetValue(topic.Id, out var usedCount) && usedCount > 0)
-                    .LastOrDefault();
-                if (latestUsed is not null)
-                {
-                    return latestUsed;
-                }
+                return latestUsed;
             }
             return usableTopics.Last();
         }
+        ModuleTopic? SelectPendingOrOverflowTopicForRepair(int groupIdCheck, int moduleIdCheck)
+            => SelectNextTopicInOrder(groupIdCheck, moduleIdCheck)
+               ?? SelectOverflowTopicInOrder(groupIdCheck, moduleIdCheck);
         bool IsOverflowTopicUse(int groupIdCheck, int moduleIdCheck, ModuleTopic topic)
         {
             var limit = GetTopicUsageLimit(topic);
             if (limit <= 0)
                 return false;
-            return topicAssignments.TryGetValue((groupIdCheck, moduleIdCheck), out var assigned)
-                   && assigned.TryGetValue(topic.Id, out var usedCount)
-                   && usedCount >= limit;
+            return ActualTopicUsageCount(groupIdCheck, moduleIdCheck, topic.Id) >= limit;
         }
         ModuleTopic? SelectCalendarSafeOverflowTopic(
             int groupIdCheck,
@@ -1772,6 +2774,13 @@ public sealed class TeacherDraftsAutogenService
             TimeOnly end)
         {
             if (!softFill || !topicsByModule.TryGetValue(moduleIdCheck, out var list) || list.Count == 0)
+            {
+                return null;
+            }
+
+            // Не повторюємо вже вичерпану тему, доки за планом лишається наступна тема.
+            // Інакше рання прогалина може витратити залишок модуля й назавжди заблокувати наступну потокову лекцію.
+            if (!TopicsDepleted(groupIdCheck, moduleIdCheck))
             {
                 return null;
             }
@@ -1847,7 +2856,7 @@ public sealed class TeacherDraftsAutogenService
             .Where(x => courseIds.Contains(x.CourseId))
             .OrderBy(x => x.Order)
             .Select(x => new SequenceItem(x.CourseId, x.ModuleId, x.GroupOrder, x.Order))
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Мапа курс -> основна послідовність модулів.
         var mainSequenceByCourse = sequenceItems
             .GroupBy(x => x.CourseId)
@@ -1856,7 +2865,7 @@ public sealed class TeacherDraftsAutogenService
         var fillerByCourse = await _db.ModuleFillers
             .Where(x => courseIds.Contains(x.CourseId))
             .GroupBy(x => x.CourseId)
-            .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.ModuleId).ToHashSet());
+            .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.ModuleId).ToHashSet(), cancellationToken);
         // Формуємо порядок модулів з урахуванням основної послідовності та fillers.
         List<int> BuildCourseModuleOrder(int courseId, List<int> planModules)
         {
@@ -1899,21 +2908,89 @@ public sealed class TeacherDraftsAutogenService
         var allGroupsByCourse = await _db.Groups
             .Where(g => courseIds.Contains(g.CourseId))
             .GroupBy(g => g.CourseId)
-            .ToDictionaryAsync(g => g.Key, g => g.OrderBy(x => x.Id).ToList());
+            .ToDictionaryAsync(g => g.Key, g => g.OrderBy(x => x.Id).ToList(), cancellationToken);
+        void SubtractLogicalEventDuplicates(
+            Dictionary<(int GroupId, int ModuleId), int> fact,
+            IEnumerable<LogicalEventUsageRow> rows,
+            DateOnly? startInclusive = null,
+            DateOnly? endExclusive = null)
+        {
+            var scopedRows = rows
+                .Where(row => startInclusive is null || row.Date >= startInclusive.Value)
+                .Where(row => endExclusive is null || row.Date < endExclusive.Value)
+                .ToList();
+            var logicalEvents = scopedRows
+                .Where(row => !string.IsNullOrWhiteSpace(row.BatchKey))
+                .GroupBy(row => new
+                {
+                    row.BatchKey,
+                    row.Date,
+                    row.StartTime,
+                    row.EndTime,
+                    row.GroupId,
+                    row.ModuleId,
+                    row.LessonTypeId
+                });
+            foreach (var logicalEvent in logicalEvents)
+            {
+                var duplicateCount = logicalEvent.Count() - 1;
+                var key = (logicalEvent.Key.GroupId, logicalEvent.Key.ModuleId);
+                if (duplicateCount > 0 && fact.TryGetValue(key, out var count))
+                {
+                    fact[key] = Math.Max(0, count - duplicateCount);
+                }
+            }
+            var legacyLogicalEvents = scopedRows
+                .Where(row => string.IsNullOrWhiteSpace(row.BatchKey))
+                .GroupBy(row => new
+                {
+                    row.Date,
+                    row.StartTime,
+                    row.EndTime,
+                    row.GroupId,
+                    row.ModuleId,
+                    row.LessonTypeId,
+                    row.RoomId,
+                    row.IsSelfStudy
+                })
+                .Where(group => group.Count() > 1
+                                && group
+                                    .Select(row => (row.ModuleTopicId, row.TeacherId))
+                                    .Distinct()
+                                    .Skip(1)
+                                    .Any());
+            foreach (var logicalEvent in legacyLogicalEvents)
+            {
+                var duplicateCount = logicalEvent.Count() - 1;
+                var key = (logicalEvent.Key.GroupId, logicalEvent.Key.ModuleId);
+                if (fact.TryGetValue(key, out var count))
+                {
+                    fact[key] = Math.Max(0, count - duplicateCount);
+                }
+            }
+        }
         // Факт по модулях у чернетках (без службових типів).
         var factByGroupModule = await _db.TeacherDraftItems
-            .Where(si => !excludedTypeIds.Contains(si.LessonTypeId) && courseIds.Contains(si.Group.CourseId))
+            .Where(si => !excludedTypeIds.Contains(si.LessonTypeId)
+                         && si.Date < planningWeekEndExclusive
+                         && courseIds.Contains(si.Group.CourseId)
+                         && (si.Group.Course.AcademicPeriodStartDate == null
+                             || si.Date >= si.Group.Course.AcademicPeriodStartDate.Value))
             .GroupBy(si => new { si.GroupId, si.ModuleId })
             .Select(g => new { g.Key.GroupId, g.Key.ModuleId, C = g.Count() })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         // Перетворюємо факт у словник для швидких доступів.
         var factMap = factByGroupModule.ToDictionary(k => (k.GroupId, k.ModuleId), v => v.C);
         // Факт по модулях у вже опублікованому розкладі.
         var scheduleByGroupModule = await _db.ScheduleItems
-            .Where(si => !excludedTypeIds.Contains(si.LessonTypeId) && courseIds.Contains(si.Group.CourseId))
+            .Where(si => !excludedTypeIds.Contains(si.LessonTypeId)
+                         && si.Date < planningWeekEndExclusive
+                         && courseIds.Contains(si.Group.CourseId)
+                         && (si.Group.Course.AcademicPeriodStartDate == null
+                             || si.Date >= si.Group.Course.AcademicPeriodStartDate.Value))
             .GroupBy(si => new { si.GroupId, si.ModuleId })
             .Select(g => new { g.Key.GroupId, g.Key.ModuleId, C = g.Count() })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         foreach (var item in scheduleByGroupModule)
         {
             var key = (item.GroupId, item.ModuleId);
@@ -1926,24 +3003,30 @@ public sealed class TeacherDraftsAutogenService
                 factMap[key] = item.C;
             }
         }
+        SubtractLogicalEventDuplicates(factMap, draftUsageRows);
+        SubtractLogicalEventDuplicates(factMap, scheduleUsageRows);
         // Факт поточного діапазону потрібен для дозаповнення, щоб не перевищувати ручні ліміти модулів.
         var rangeFactByGroupModule = await _db.TeacherDraftItems
             .Where(si => !excludedTypeIds.Contains(si.LessonTypeId)
                          && si.Date >= rangeStartDate
                          && si.Date < rangeEndDateExclusive
-                         && courseIds.Contains(si.Group.CourseId))
+                         && courseIds.Contains(si.Group.CourseId)
+                         && (si.Group.Course.AcademicPeriodStartDate == null
+                             || si.Date >= si.Group.Course.AcademicPeriodStartDate.Value))
             .GroupBy(si => new { si.GroupId, si.ModuleId })
             .Select(g => new { g.Key.GroupId, g.Key.ModuleId, C = g.Count() })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         var rangeFactMap = rangeFactByGroupModule.ToDictionary(k => (k.GroupId, k.ModuleId), v => v.C);
         var rangeScheduleByGroupModule = await _db.ScheduleItems
             .Where(si => !excludedTypeIds.Contains(si.LessonTypeId)
                          && si.Date >= rangeStartDate
                          && si.Date < rangeEndDateExclusive
-                         && courseIds.Contains(si.Group.CourseId))
+                         && courseIds.Contains(si.Group.CourseId)
+                         && (si.Group.Course.AcademicPeriodStartDate == null
+                             || si.Date >= si.Group.Course.AcademicPeriodStartDate.Value))
             .GroupBy(si => new { si.GroupId, si.ModuleId })
             .Select(g => new { g.Key.GroupId, g.Key.ModuleId, C = g.Count() })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         foreach (var item in rangeScheduleByGroupModule)
         {
             var key = (item.GroupId, item.ModuleId);
@@ -1956,8 +3039,22 @@ public sealed class TeacherDraftsAutogenService
                 rangeFactMap[key] = item.C;
             }
         }
+        SubtractLogicalEventDuplicates(
+            rangeFactMap,
+            draftUsageRows,
+            rangeStartDate,
+            rangeEndDateExclusive);
+        SubtractLogicalEventDuplicates(
+            rangeFactMap,
+            scheduleUsageRows,
+            rangeStartDate,
+            rangeEndDateExclusive);
         int CurrentRangeFactFor(int gid, int mid) =>
             rangeFactMap.TryGetValue((gid, mid), out var used) ? used : 0;
+        // Словник уже враховує чернетки, опубліковані заняття та логічні дублікати,
+        // тому не перебираємо всі зайняті слоти під час кожної оцінки кандидата.
+        int CurrentRangeScheduledHoursFor(int gid, int mid) =>
+            CurrentRangeFactFor(gid, mid);
         void AddCurrentRangeFact(int gid, int mid)
         {
             var key = (gid, mid);
@@ -2093,10 +3190,12 @@ public sealed class TeacherDraftsAutogenService
             remainingByGroupModule.TryGetValue((gid, mid), out var left) ? left : 0;
         int ManualRangeRemainingFor(int gid, int mid) =>
             hasModuleHourOverrides && moduleHoursByModuleId.TryGetValue(mid, out var hours)
-                ? Math.Max(0, hours - CurrentRangeFactFor(gid, mid))
+                ? Math.Max(0, hours - CurrentRangeScheduledHoursFor(gid, mid))
                 : RemainingFor(gid, mid);
         int PlacementRemainingFor(int gid, int mid) =>
-            RemainingFor(gid, mid);
+            hasModuleHourOverrides
+                ? Math.Min(RemainingFor(gid, mid), ManualRangeRemainingFor(gid, mid))
+                : RemainingFor(gid, mid);
         // Доступ до залишків самостійної роботи.
         int SelfStudyRemaining(int gid, int mid) =>
             selfStudyRemainingByGroupModule.TryGetValue((gid, mid), out var left) ? left : 0;
@@ -2116,13 +3215,16 @@ public sealed class TeacherDraftsAutogenService
             return null;
         }
         var sharedTimeSlots = await _db.TimeSlots.AsNoTracking()
-            .Where(s => s.IsActive && (s.CourseId == null || courseIds.Contains(s.CourseId.Value)))
+            .Where(s => s.CourseId == null || courseIds.Contains(s.CourseId.Value))
             .OrderBy(s => s.SortOrder)
             .ThenBy(s => s.Start)
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
+        var sharedLunches = await _db.LunchConfigs.AsNoTracking()
+            .Where(lunch => lunch.CourseId == null || courseIds.Contains(lunch.CourseId.Value))
+            .ToListAsync(cancellationToken);
         var sharedSlotsByCourse = courseIds.ToDictionary(
             cid => cid,
-            cid => TimeSlotsResolver.ResolveForWeek(sharedTimeSlots, cid));
+            cid => TimeSlotsResolver.ResolveForWeek(sharedTimeSlots, cid, sharedLunches));
 
         bool RoomMatchesGroupPreferenceFor(int groupId, Room room)
         {
@@ -2139,21 +3241,20 @@ public sealed class TeacherDraftsAutogenService
 
         bool ViolatesSharedLectureTravel(Func<BusySlot, bool> ownerMatch, Room room, DateOnly date, TimeOnly start, TimeOnly end)
         {
-            if (room.BuildingId == 0)
-            {
-                return false;
-            }
             foreach (var existing in BusyForDate(date).Where(existing =>
-                         existing.RoomId != null
-                         && existing.BuildingId.HasValue
+                         RequiresPhysicalRoom(existing)
                          && ownerMatch(existing)))
             {
                 var sourceBuildingId = existing.BuildingId!.Value;
-                if (sourceBuildingId == room.BuildingId)
+                if (existing.RoomId is not int sourceRoomId)
                 {
                     continue;
                 }
-                var needMinutes = TravelMinutes(sourceBuildingId, room.BuildingId);
+                var needMinutes = TransitionMinutes(
+                    sourceRoomId,
+                    sourceBuildingId,
+                    room.Id,
+                    room.BuildingId);
                 var gapBefore = (start.ToTimeSpan() - existing.EndTime.ToTimeSpan()).TotalMinutes;
                 var gapAfter = (existing.StartTime.ToTimeSpan() - end.ToTimeSpan()).TotalMinutes;
                 if (existing.EndTime <= start && gapBefore < needMinutes)
@@ -2175,6 +3276,120 @@ public sealed class TeacherDraftsAutogenService
                    && resolvedByDay.TryGetValue(dayOfWeek, out var resolved)
                 ? resolved.Slots
                 : Array.Empty<TimeSlot>();
+        }
+
+        bool WouldCreateEmptyCanonicalLectureSlot(
+            int groupId,
+            DateOnly date,
+            TimeOnly start,
+            TimeOnly end,
+            int lessonTypeId)
+        {
+            if (!CanShareAcrossGroups(lessonTypeId)
+                || !selectedGroupsById.TryGetValue(groupId, out var group))
+            {
+                return false;
+            }
+
+            var canonicalSlots = SharedSlotsForDate(group.CourseId, date);
+            if (canonicalSlots.Count < 2)
+            {
+                return false;
+            }
+            var active = BusyForGroupDate(groupId, date)
+                .Where(slot => !excludedTypeIds.Contains(slot.LessonTypeId))
+                .ToList();
+            var lectureRanges = active
+                .Where(slot => CanShareAcrossGroups(slot.LessonTypeId))
+                .Select(slot => (Start: slot.StartTime, End: slot.EndTime))
+                .Append((Start: start, End: end))
+                .Distinct()
+                .ToList();
+            if (lectureRanges.Count < 2)
+            {
+                return false;
+            }
+
+            var firstLectureIndex = canonicalSlots
+                .Select((slot, index) => new { slot, index })
+                .Where(item => lectureRanges.Any(lecture =>
+                    lecture.Start <= item.slot.Start && lecture.End >= item.slot.End))
+                .Select(item => (int?)item.index)
+                .FirstOrDefault();
+            var lastLectureIndex = canonicalSlots
+                .Select((slot, index) => new { slot, index })
+                .Where(item => lectureRanges.Any(lecture =>
+                    lecture.Start <= item.slot.Start && lecture.End >= item.slot.End))
+                .Select(item => (int?)item.index)
+                .LastOrDefault();
+            if (firstLectureIndex is not int firstIndex
+                || lastLectureIndex is not int lastIndex
+                || firstIndex >= lastIndex)
+            {
+                return false;
+            }
+
+            return canonicalSlots
+                .Skip(firstIndex)
+                .Take(lastIndex - firstIndex + 1)
+                .Any(slot =>
+                    !(start <= slot.Start && end >= slot.End)
+                    && !active.Any(existing =>
+                        existing.StartTime <= slot.Start && existing.EndTime >= slot.End));
+        }
+
+        bool HasSelectedGroupEmptyCanonicalLectureSlotViolation(
+            DateOnly? onlyDate = null,
+            IReadOnlyCollection<int>? onlyGroupIds = null)
+        {
+            var groupIds = onlyGroupIds ?? selectedGroupIdSet;
+            foreach (var groupId in groupIds)
+            {
+                if (!selectedGroupsById.TryGetValue(groupId, out var group))
+                {
+                    continue;
+                }
+                var dates = onlyDate is DateOnly onlyDateValue
+                    ? new[] { onlyDateValue }
+                    : DatesBetween(rangeStartDate, rangeEndDateExclusive);
+                foreach (var calendarDate in dates)
+                {
+                    var active = BusyForGroupDate(groupId, calendarDate)
+                        .Where(slot => !excludedTypeIds.Contains(slot.LessonTypeId))
+                        .ToList();
+                    var lectures = active
+                        .Where(slot => CanShareAcrossGroups(slot.LessonTypeId))
+                        .ToList();
+                    if (lectures.Count < 2)
+                    {
+                        continue;
+                    }
+
+                    var canonicalSlots = SharedSlotsForDate(group.CourseId, calendarDate);
+                    var occupiedLectureIndexes = canonicalSlots
+                        .Select((slot, index) => new { slot, index })
+                        .Where(item => lectures.Any(lecture =>
+                            lecture.StartTime <= item.slot.Start && lecture.EndTime >= item.slot.End))
+                        .Select(item => item.index)
+                        .ToList();
+                    if (occupiedLectureIndexes.Count < 2)
+                    {
+                        continue;
+                    }
+
+                    var firstIndex = occupiedLectureIndexes[0];
+                    var lastIndex = occupiedLectureIndexes[^1];
+                    if (canonicalSlots
+                        .Skip(firstIndex)
+                        .Take(lastIndex - firstIndex + 1)
+                        .Any(slot => !active.Any(existing =>
+                            existing.StartTime <= slot.Start && existing.EndTime >= slot.End)))
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
         }
 
         List<Room> CandidateRoomsForPreflight(int groupId, int moduleId, int requiredCapacity)
@@ -2248,6 +3463,47 @@ public sealed class TeacherDraftsAutogenService
             var rangeDates = Enumerable.Range(0, Math.Max(0, rangeEndDateExclusive.DayNumber - rangeStartDate.DayNumber))
                 .Select(offset => rangeStartDate.AddDays(offset))
                 .ToList();
+            foreach (var group in selectedGroupsById.Values.OrderBy(group => group.Id))
+            {
+                var totalRequired = remainingByGroupModule
+                    .Where(entry => entry.Key.GroupId == group.Id && entry.Value > 0)
+                    .Sum(entry => entry.Value);
+                if (totalRequired <= 0)
+                {
+                    continue;
+                }
+
+                var workingDates = rangeDates.Where(date => IsWorking(date, group)).ToList();
+                var openSlotCount = workingDates
+                    .SelectMany(date => SharedSlotsForDate(group.CourseId, date).Select(slot => (date, slot)))
+                    .Count(pair => !HasGroupOverlap(group.Id, pair.date, pair.slot.Start, pair.slot.End));
+                if (openSlotCount >= totalRequired)
+                {
+                    continue;
+                }
+
+                var missingSlots = totalRequired - openSlotCount;
+                var closedCandidateDates = rangeDates
+                    .Where(date => DayAllowed(date.DayOfWeek) && !IsWorking(date, group))
+                    .Select(date => new
+                    {
+                        Date = date,
+                        SlotCount = SharedSlotsForDate(group.CourseId, date).Count
+                    })
+                    .Where(entry => entry.SlotCount > 0)
+                    .OrderBy(entry => entry.Date)
+                    .ToList();
+                var calendarAdvice = closedCandidateDates.Count == 0
+                    ? string.Empty
+                    : $" Зробіть робочим днем для цього курсу або групи: {string.Join(", ", closedCandidateDates.Select(entry => $"{entry.Date:dd.MM.yyyy} — можна додати до {entry.SlotCount} пар"))}.";
+                AddItem(
+                    "calendar-capacity",
+                    "Не вистачає вільного часу в розкладі",
+                    missingSlots,
+                    $"Групі {group.Name} потрібно поставити {totalRequired} пар, але у вибраних датах є лише {openSlotCount} вільних місць. Не поміщається {missingSlots} пар.{calendarAdvice} Також можна обрати довший період або додати час до сітки занять у робочі дні.",
+                    $"{group.Name}: потрібно поставити {totalRequired} пар, вільних місць — {openSlotCount}, не поміщається — {missingSlots}.");
+            }
+
             foreach (var entry in remainingByGroupModule
                          .Where(kv => kv.Value > 0)
                          .OrderBy(kv => kv.Key.GroupId)
@@ -2279,16 +3535,35 @@ public sealed class TeacherDraftsAutogenService
                 }
 
                 var nextTopic = SelectNextTopicInOrder(group.Id, moduleId);
+                var preflightRequiredTeacherHours = 0;
+                var preflightTeacherLessonTypeId = 0;
+                var hasPendingTopicHours = false;
                 if (topicsByModule.TryGetValue(moduleId, out var moduleTopics) && moduleTopics.Count > 0)
                 {
-                    topicAssignments.TryGetValue((group.Id, moduleId), out var assignedTopics);
+                    foreach (var topic in moduleTopics.Where(topic => TypeAllowed(topic.LessonTypeId)))
+                    {
+                        var used = ActualTopicUsageCount(group.Id, moduleId, topic.Id);
+                        var pendingHours = Math.Max(0, GetTopicUsageLimit(topic) - used);
+                        if (pendingHours <= 0)
+                        {
+                            continue;
+                        }
+                        hasPendingTopicHours = true;
+                        if (typeById.TryGetValue(topic.LessonTypeId, out var pendingLessonType)
+                            && pendingLessonType.RequiresTeacher)
+                        {
+                            preflightRequiredTeacherHours += pendingHours;
+                            if (preflightTeacherLessonTypeId == 0)
+                            {
+                                preflightTeacherLessonTypeId = topic.LessonTypeId;
+                            }
+                        }
+                    }
                     var topicCapacity = moduleTopics
                         .Where(topic => GetTopicUsageLimit(topic) > 0 && TypeAllowed(topic.LessonTypeId))
                         .Sum(topic =>
                         {
-                            var used = assignedTopics is not null && assignedTopics.TryGetValue(topic.Id, out var usedCount)
-                                ? usedCount
-                                : 0;
+                            var used = ActualTopicUsageCount(group.Id, moduleId, topic.Id);
                             return Math.Max(0, GetTopicUsageLimit(topic) - used);
                         });
                     if (topicCapacity <= 0)
@@ -2312,35 +3587,37 @@ public sealed class TeacherDraftsAutogenService
                     }
                 }
 
-                var teacherIds = teachersForModule
-                    .Where(link => link.ModuleId == moduleId)
-                    .Select(link => link.TeacherId)
-                    .Concat(supervisorsForModule
-                        .Where(link => link.ModuleId == moduleId)
-                        .Select(link => link.TeacherId))
-                    .Distinct()
-                    .ToList();
-                if (nextTopic?.DepartmentId is int departmentId && departmentId > 0)
+                var preflightLessonTypeId = preflightTeacherLessonTypeId != 0
+                    ? preflightTeacherLessonTypeId
+                    : nextTopic?.LessonTypeId
+                      ?? activeStudyTypes.Select(type => type.Id).FirstOrDefault(TypeAllowed);
+                if (!hasPendingTopicHours)
                 {
-                    teacherIds = teacherIds
-                        .Where(teacherId => teacherDepartmentById.TryGetValue(teacherId, out var teacherDepartmentId)
-                                            && teacherDepartmentId == departmentId)
-                        .ToList();
+                    var fallbackRequiresTeacher = preflightLessonTypeId == 0
+                                                  || !typeById.TryGetValue(preflightLessonTypeId, out var fallbackLessonType)
+                                                  || fallbackLessonType.RequiresTeacher;
+                    preflightRequiredTeacherHours = fallbackRequiresTeacher ? required : 0;
                 }
-                if (teacherIds.Count == 0)
+                preflightRequiredTeacherHours = Math.Min(required, preflightRequiredTeacherHours);
+                var preflightRequiresTeacher = preflightRequiredTeacherHours > 0;
+                var teacherIds = PreferredOrExplicitTeacherPool(
+                    teachersForModule
+                        .Where(link => link.ModuleId == moduleId)
+                        .Select(link => link.TeacherId)
+                        .Concat(supervisorsForModule
+                            .Where(link => link.ModuleId == moduleId)
+                            .Select(link => link.TeacherId)),
+                    nextTopic);
+                if (preflightRequiresTeacher && teacherIds.Count == 0)
                 {
-                    var departmentHint = nextTopic?.DepartmentId is int topicDepartmentId
-                        && departmentNames.TryGetValue(topicDepartmentId, out var departmentName)
-                        ? $" кафедри <{departmentName}>"
-                        : string.Empty;
                     AddItem(
                         "teacher",
                         "Немає викладачів для модуля",
-                        required,
-                        $"Додайте викладача{departmentHint} до модуля <{moduleLabel}>, перевірте кафедру теми або призначте керівника самостійної роботи.",
-                        $"{examplePrefix}: потрібно {required} викладацьких слотів, не знайдено жодного викладача.");
+                        preflightRequiredTeacherHours,
+                        $"Додайте до модуля <{moduleLabel}> хоча б одного викладача або керівника самостійної роботи. Кафедру викладача можна не вказувати: явний зв'язок із модулем буде використано як резерв.",
+                        $"{examplePrefix}: потрібно {preflightRequiredTeacherHours} викладацьких слотів, не знайдено жодного викладача.");
                 }
-                else
+                else if (preflightRequiresTeacher)
                 {
                     var teacherSlotCapacity = 0;
                     foreach (var date in workingDates)
@@ -2353,32 +3630,32 @@ public sealed class TeacherDraftsAutogenService
                                 {
                                     continue;
                                 }
-                                if (HasTeacherOverlap(teacherId, date, slot.Start, slot.End))
+                                if (HasTeacherOverlap(teacherId, preflightLessonTypeId, date, slot.Start, slot.End))
                                 {
                                     continue;
                                 }
                                 teacherSlotCapacity++;
                                 break;
                             }
-                            if (teacherSlotCapacity >= required)
+                            if (teacherSlotCapacity >= preflightRequiredTeacherHours)
                             {
                                 break;
                             }
                         }
-                        if (teacherSlotCapacity >= required)
+                        if (teacherSlotCapacity >= preflightRequiredTeacherHours)
                         {
                             break;
                         }
                     }
-                    if (teacherSlotCapacity < required)
+                    if (teacherSlotCapacity < preflightRequiredTeacherHours)
                     {
-                        var missingTeacherSlots = required - teacherSlotCapacity;
+                        var missingTeacherSlots = preflightRequiredTeacherHours - teacherSlotCapacity;
                         AddItem(
                             "teacher",
                             "Мало вільних слотів викладачів",
                             missingTeacherSlots,
                             $"Для модуля <{moduleLabel}> у групі {group.Name} бракує {missingTeacherSlots} вільних викладацьких пар. Перевірте робочі години, зайнятість і прив'язку викладачів.",
-                            $"{examplePrefix}: потрібно {required}, знайдено {teacherSlotCapacity}, бракує {missingTeacherSlots} викладацьких слотів.");
+                            $"{examplePrefix}: потрібно {preflightRequiredTeacherHours}, знайдено {teacherSlotCapacity}, бракує {missingTeacherSlots} викладацьких слотів.");
                     }
                 }
 
@@ -2410,7 +3687,7 @@ public sealed class TeacherDraftsAutogenService
                             var hasReachableRoom = false;
                             foreach (var room in roomCandidates)
                             {
-                                if (HasRoomOverlap(room.Id, date, slot.Start, slot.End))
+                                if (HasRoomOverlap(room.Id, preflightLessonTypeId, date, slot.Start, slot.End))
                                 {
                                     continue;
                                 }
@@ -2447,9 +3724,9 @@ public sealed class TeacherDraftsAutogenService
                         var candidateBuildings = roomCandidates.Select(room => room.BuildingId).Where(buildingId => buildingId != 0);
                         AddItem(
                             "travel",
-                            "Переходи між корпусами звужують вибір",
+                            "Зміна аудиторії звужує вибір",
                             missingReachableRoomSlots,
-                            $"Бракує {missingReachableRoomSlots} досяжних аудиторних слотів: додайте аудиторії в корпусах {FormatPreflightIds(candidateBuildings)}, збільшіть перерви між корпусами або рознесіть сусідні заняття.",
+                            $"Бракує {missingReachableRoomSlots} досяжних аудиторних слотів: додайте аудиторії в корпусах {FormatPreflightIds(candidateBuildings)}, залиште сусідні пари в тій самій аудиторії, збільшіть перерви або рознесіть заняття.",
                             $"{examplePrefix}: до переходів {roomSlotCapacityBeforeTravel}, після переходів {roomSlotCapacity}, переходи відсіяли {travelFilteredSlots} варіантів.");
                     }
                     else if (roomSlotCapacity < required)
@@ -2475,8 +3752,7 @@ public sealed class TeacherDraftsAutogenService
             {
                 return false;
             }
-            topicAssignments.TryGetValue((groupIdCheck, moduleIdCheck), out var assigned);
-            var usedCount = assigned is not null && assigned.TryGetValue(topic.Id, out var used) ? used : 0;
+            var usedCount = ActualTopicUsageCount(groupIdCheck, moduleIdCheck, topic.Id);
             return usedCount < GetTopicUsageLimit(topic);
         }
 
@@ -2600,27 +3876,109 @@ public sealed class TeacherDraftsAutogenService
             return false;
         }
 
-        bool ShouldHoldShareableTopicForMissingPendingGroups(
+        bool MustPreserveFutureSharedCheckpoint(
             int courseIdCheck,
             int moduleIdCheck,
-            ModuleTopic topic,
-            IReadOnlyCollection<int> currentGroupIds)
+            ModuleTopic currentTopic)
         {
-            if (!CanShareAcrossGroups(topic.LessonTypeId)
+            if (CanShareAcrossGroups(currentTopic.LessonTypeId)
+                || !topicsByModule.TryGetValue(moduleIdCheck, out var moduleTopics)
                 || !selectedGroupsByCourse.TryGetValue(courseIdCheck, out var sameCourseGroups)
                 || sameCourseGroups.Count <= 1)
             {
                 return false;
             }
 
-            var currentGroupSet = currentGroupIds.ToHashSet();
-            var pendingGroups = sameCourseGroups
-                .Where(group => PlacementRemainingFor(group.Id, moduleIdCheck) > 0)
-                .Where(group => IsTopicStillPendingForGroup(group.Id, moduleIdCheck, topic))
-                .ToList();
-            if (pendingGroups.Count <= currentGroupSet.Count)
+            var currentIndex = moduleTopics.FindIndex(topic => topic.Id == currentTopic.Id);
+            if (currentIndex < 0)
             {
                 return false;
+            }
+
+            return moduleTopics
+                .Skip(currentIndex + 1)
+                .Where(topic => GetTopicUsageLimit(topic) > 0 && CanShareAcrossGroups(topic.LessonTypeId))
+                .Any(topic =>
+                {
+                    var pendingGroups = sameCourseGroups.Count(group =>
+                        PlacementRemainingFor(group.Id, moduleIdCheck) > 0
+                        && IsTopicStillPendingForGroup(group.Id, moduleIdCheck, topic));
+                    var checkpointGroups = sameCourseGroups.Count(group =>
+                        ActualTopicUsageCount(group.Id, moduleIdCheck, topic.Id) > 0);
+                    return pendingGroups >= 2 || checkpointGroups >= 2;
+                });
+        }
+
+        bool ShouldHoldShareableTopicForMissingPendingGroups(
+            int courseIdCheck,
+            int moduleIdCheck,
+            ModuleTopic topic,
+            IReadOnlyCollection<int> currentGroupIds)
+        {
+            var currentGroupCount = currentGroupIds.Count;
+            if (currentGroupIds is IReadOnlyList<int> currentGroupList)
+            {
+                currentGroupCount = 0;
+                for (var index = 0; index < currentGroupList.Count; index++)
+                {
+                    var duplicate = false;
+                    for (var previousIndex = 0; previousIndex < index; previousIndex++)
+                    {
+                        if (currentGroupList[previousIndex] == currentGroupList[index])
+                        {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate)
+                    {
+                        currentGroupCount++;
+                    }
+                }
+            }
+            else if (currentGroupIds is not ISet<int>)
+            {
+                currentGroupCount = currentGroupIds.Distinct().Count();
+            }
+            var decisionCacheKey = (courseIdCheck, moduleIdCheck, topic.Id, currentGroupCount);
+            if (shareableTopicHoldDecisionCache.TryGetValue(decisionCacheKey, out var cachedDecision))
+            {
+                return cachedDecision;
+            }
+            bool CacheDecision(bool decision)
+            {
+                shareableTopicHoldDecisionCache[decisionCacheKey] = decision;
+                return decision;
+            }
+
+            if (!CanShareAcrossGroups(topic.LessonTypeId)
+                || !selectedGroupsByCourse.TryGetValue(courseIdCheck, out var sameCourseGroups)
+                || sameCourseGroups.Count <= 1)
+            {
+                return CacheDecision(false);
+            }
+
+            var pendingGroups = new List<Group>(sameCourseGroups.Count);
+            foreach (var group in sameCourseGroups)
+            {
+                if (PlacementRemainingFor(group.Id, moduleIdCheck) > 0
+                    && IsTopicStillPendingForGroup(group.Id, moduleIdCheck, topic))
+                {
+                    pendingGroups.Add(group);
+                }
+            }
+            if (pendingGroups.Count <= currentGroupCount)
+            {
+                return CacheDecision(false);
+            }
+            if (pendingGroups.Count > SlotGroupLimitForPlacement(
+                    courseIdCheck,
+                    topic.LessonTypeId,
+                    isSelfStudyPlacement: false))
+            {
+                // Коли всі групи не можуть законно ввійти в один слот, не чекаємо
+                // на повний потік і дозволяємо генератору будувати підпотоки.
+                return CacheDecision(false);
             }
 
             var pendingStudents = pendingGroups.Sum(group => group.StudentsCount);
@@ -2634,7 +3992,166 @@ public sealed class TeacherDraftsAutogenService
                 .Select(candidateRoom => candidateRoom.Capacity)
                 .DefaultIfEmpty(0)
                 .Max();
-            return pendingStudents <= largestCompatibleRoomCapacity;
+            if (pendingStudents > largestCompatibleRoomCapacity)
+            {
+                return CacheDecision(false);
+            }
+
+            var lessonType = typeById[topic.LessonTypeId];
+            var teacherCandidates = lessonType.RequiresTeacher
+                ? PreferredOrExplicitTeacherPool(
+                        teachersForModule
+                            .Where(item => item.ModuleId == moduleIdCheck)
+                            .Select(item => item.TeacherId),
+                        topic)
+                    .OrderBy(teacherId => TeacherDepartmentPriority(teacherId, topic))
+                    .ThenBy(teacherId => teacherId)
+                    .Select(teacherId => (int?)teacherId)
+                    .ToList()
+                : new List<int?> { null };
+            var roomCandidates = roomsAll
+                .Where(room => room.Capacity >= pendingStudents
+                               && (allowedBuildings == null || allowedBuildings.Count == 0 || allowedBuildings.Contains(room.BuildingId))
+                               && (allowedRooms == null || allowedRooms.Count == 0 || allowedRooms.Contains(room.Id))
+                               && pendingGroups.All(group => RoomMatchesGroupPreferenceFor(group.Id, room)))
+                .OrderBy(room => room.Id)
+                .ToList();
+            if (teacherCandidates.Count == 0 || roomCandidates.Count == 0)
+            {
+                return CacheDecision(false);
+            }
+
+            var preferredFirstSlotLimit = preferredFirstSlotLimitsAll.FirstOrDefault(item => item.CourseId == courseIdCheck)
+                                          ?? preferredFirstSlotLimitsAll.FirstOrDefault(item => item.CourseId == null);
+            int? maxPreferredSlotOrder = r.PreferredFirstMaxSlotOrderOverride is int preferredFirstOverride
+                ? preferredFirstOverride > 0 ? preferredFirstOverride : null
+                : preferredFirstSlotLimit is not null && preferredFirstSlotLimit.MaxSlotOrder > 0
+                    ? preferredFirstSlotLimit.MaxSlotOrder
+                    : preferredFirstTypeId != 0 ? 6 : null;
+
+            bool PreservesSingleModuleSegment(int groupId, DateOnly date, TimeSlot slot)
+            {
+                var orderedLessons = BusyForGroupDate(groupId, date)
+                    .Where(existing => !excludedTypeIds.Contains(existing.LessonTypeId))
+                    .Select(existing => (Start: existing.StartTime, End: existing.EndTime, ModuleId: existing.ModuleId))
+                    .Append((Start: slot.Start, End: slot.End, ModuleId: moduleIdCheck))
+                    .Distinct()
+                    .OrderBy(lesson => lesson.Start)
+                    .ThenBy(lesson => lesson.End)
+                    .ToList();
+                var segments = 0;
+                var inSegment = false;
+                foreach (var lesson in orderedLessons)
+                {
+                    if (lesson.ModuleId == moduleIdCheck)
+                    {
+                        if (!inSegment && ++segments > 1)
+                        {
+                            return false;
+                        }
+                        inSegment = true;
+                    }
+                    else
+                    {
+                        inSegment = false;
+                    }
+                }
+                return true;
+            }
+
+            // Чекаємо повний потік лише тоді, коли для всіх незапланованих груп існує одна
+            // фактично допустима комбінація слот/викладач/аудиторія з усіма жорсткими перевірками.
+            // Інакше очікування всіх груп створює взаємне блокування, хоча коректні підпотоки можливі.
+            foreach (var date in DatesBetween(rangeStartDate, rangeEndDateExclusive))
+            {
+                if (pendingGroups.Any(group => !IsWorking(date, group)))
+                {
+                    continue;
+                }
+                var slotsForDate = SharedSlotsForDate(courseIdCheck, date);
+                for (var slotIndex = 0; slotIndex < slotsForDate.Count; slotIndex++)
+                {
+                    var slot = slotsForDate[slotIndex];
+                    if (IsBlockedLateLectureSlot(topic.LessonTypeId, slotIndex + 1, maxPreferredSlotOrder)
+                        || pendingGroups.Any(group => CountFor(group.Id, date) >= slotsForDate.Count
+                                                      || HasGroupOverlap(group.Id, date, slot.Start, slot.End)
+                                                      || ViolatesTopicCalendarOrder(group.Id, moduleIdCheck, topic, date, slot.Start, slot.End)
+                                                      || !PreservesSingleModuleSegment(group.Id, date, slot)))
+                    {
+                        continue;
+                    }
+                    foreach (var teacherId in teacherCandidates)
+                    {
+                        if (teacherId is int resolvedTeacherId
+                            && (!TeacherFitsWorkingHours(resolvedTeacherId, date, slot.Start, slot.End)
+                                || HasTeacherOverlap(resolvedTeacherId, topic.LessonTypeId, date, slot.Start, slot.End)))
+                        {
+                            continue;
+                        }
+                        foreach (var room in roomCandidates)
+                        {
+                            if (HasRoomOverlap(room.Id, topic.LessonTypeId, date, slot.Start, slot.End)
+                                || pendingGroups.Any(group => ViolatesSharedLectureTravel(
+                                    existing => existing.GroupId == group.Id,
+                                    room,
+                                    date,
+                                    slot.Start,
+                                    slot.End))
+                                || teacherId is int teacherIdForTravel
+                                && ViolatesSharedLectureTravel(
+                                    existing => existing.TeacherId == teacherIdForTravel,
+                                    room,
+                                    date,
+                                    slot.Start,
+                                    slot.End)
+                                || !TryValidatePlacementAgainstBusy(
+                                    moduleIdCheck,
+                                    topic.LessonTypeId,
+                                    topic.Id,
+                                    teacherId,
+                                    room,
+                                    date,
+                                    slot.Start,
+                                    slot.End,
+                                    pendingGroups.Select(group => group.Id).ToList(),
+                                    out _))
+                            {
+                                continue;
+                            }
+                            return CacheDecision(true);
+                        }
+                    }
+                }
+            }
+
+            return CacheDecision(false);
+        }
+
+        List<int> ApplyParallelModuleLimitToSharedPack(
+            IReadOnlyList<int> candidateGroupIds,
+            int courseId,
+            int moduleId,
+            int lessonTypeId,
+            DateOnly date,
+            TimeOnly start,
+            TimeOnly end)
+        {
+            var groupsAlreadyInSlot = CountGroupsWithModuleInSlot(moduleId, date, start, end);
+            var slotGroupLimit = SlotGroupLimitForPlacement(
+                courseId,
+                lessonTypeId,
+                isSelfStudyPlacement: false);
+            var available = Math.Max(0, slotGroupLimit - groupsAlreadyInSlot);
+            var take = Math.Min(candidateGroupIds.Count, available);
+            if (candidateGroupIds.Count > take
+                && candidateGroupIds.Count - take == 1
+                && take > 2)
+            {
+                // Не залишаємо одиночний лекційний хвіст, якщо потік можна
+                // детерміновано розділити, наприклад 5 груп як 3 + 2.
+                take--;
+            }
+            return candidateGroupIds.Take(take).ToList();
         }
 
         List<int> BuildPotentialSharedLectureGroupPack(
@@ -2647,7 +4164,8 @@ public sealed class TeacherDraftsAutogenService
         {
             var result = new List<int>();
             var totalStudents = 0;
-            foreach (var group in courseGroups.OrderBy(g => g.StudentsCount).ThenBy(g => g.Id))
+            // Групи курсу вже один раз відсортовані під час побудови індексу.
+            foreach (var group in courseGroups)
             {
                 if (!IsWorking(date, group))
                 {
@@ -2674,7 +4192,13 @@ public sealed class TeacherDraftsAutogenService
                 {
                     continue;
                 }
-                var groupBusy = HasGroupOverlap(group.Id, date, slot.Start, slot.End);
+                var groupBusy = HasBlockingGroupOverlapForSharedCheckpoint(
+                    group.Id,
+                    moduleId,
+                    topic.Id,
+                    date,
+                    slot.Start,
+                    slot.End);
                 if (groupBusy)
                 {
                     continue;
@@ -2686,7 +4210,448 @@ public sealed class TeacherDraftsAutogenService
                 result.Add(group.Id);
                 totalStudents += group.StudentsCount;
             }
-            return result;
+            return ApplyParallelModuleLimitToSharedPack(
+                result,
+                courseGroups[0].CourseId,
+                moduleId,
+                topic.LessonTypeId,
+                date,
+                slot.Start,
+                slot.End);
+        }
+
+        int PendingEarlierTopicHoursForGroup(int groupId, int moduleId, ModuleTopic targetTopic)
+        {
+            if (!topicsByModule.TryGetValue(moduleId, out var moduleTopics))
+            {
+                return int.MaxValue;
+            }
+            var targetIndex = moduleTopics.FindIndex(candidate => candidate.Id == targetTopic.Id);
+            if (targetIndex < 0)
+            {
+                return int.MaxValue;
+            }
+            return moduleTopics
+                .Take(targetIndex)
+                .Sum(candidate =>
+                {
+                    var used = ActualTopicUsageCount(groupId, moduleId, candidate.Id);
+                    return Math.Max(0, GetTopicUsageLimit(candidate) - used);
+                });
+        }
+
+        bool HasPendingNonLectureBeforeTopic(int groupId, int moduleId, ModuleTopic targetTopic)
+        {
+            if (!topicsByModule.TryGetValue(moduleId, out var moduleTopics))
+            {
+                return true;
+            }
+            var targetIndex = moduleTopics.FindIndex(candidate => candidate.Id == targetTopic.Id);
+            if (targetIndex < 0)
+            {
+                return true;
+            }
+            return moduleTopics
+                .Take(targetIndex)
+                .Any(candidate => GetTopicUsageLimit(candidate) > ActualTopicUsageCount(groupId, moduleId, candidate.Id)
+                                  && !CanShareAcrossGroups(candidate.LessonTypeId));
+        }
+
+        bool HasShortSharedRoomTransition(
+            int groupId,
+            DateOnly date,
+            TimeOnly start,
+            TimeOnly end)
+        {
+            foreach (var existing in BusyForGroupDate(groupId, date).Where(existing =>
+                         CanShareAcrossGroups(existing.LessonTypeId)
+                         && RequiresPhysicalRoom(existing)))
+            {
+                var gapBefore = (start.ToTimeSpan() - existing.EndTime.ToTimeSpan()).TotalMinutes;
+                var gapAfter = (existing.StartTime.ToTimeSpan() - end.ToTimeSpan()).TotalMinutes;
+                var isShortAdjacentGap = existing.EndTime <= start
+                                         && gapBefore < RoomTransitionPolicy.MinimumRoomChangeMinutes
+                                         || end <= existing.StartTime
+                                         && gapAfter < RoomTransitionPolicy.MinimumRoomChangeMinutes;
+                if (!isShortAdjacentGap)
+                {
+                    continue;
+                }
+                var sharedGroupCount = busy.Count(candidate =>
+                    candidate.Date == existing.Date
+                    && candidate.StartTime == existing.StartTime
+                    && candidate.EndTime == existing.EndTime
+                    && candidate.ModuleId == existing.ModuleId
+                    && candidate.ModuleTopicId == existing.ModuleTopicId
+                    && candidate.LessonTypeId == existing.LessonTypeId
+                    && candidate.RoomId == existing.RoomId);
+                if (sharedGroupCount > 1)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        int CountReservableEarlierTopicSlots(
+            Group group,
+            int moduleId,
+            DateOnly checkpointDate,
+            TimeOnly checkpointStart,
+            TimeOnly checkpointEnd,
+            bool allowCheckpointDay,
+            bool pendingNonLectureBeforeCheckpoint,
+            DateOnly? candidateDate = null,
+            TimeOnly? candidateStart = null,
+            TimeOnly? candidateEnd = null,
+            bool candidateConsumesPendingTopic = false)
+        {
+            var capacity = 0;
+            // Попередні теми не можна вставляти перед уже проведеною темою цього модуля.
+            // Тому резерв рахуємо лише від останньої фактично поставленої теми до контрольної лекції.
+            var latestPlacedEarlierSlot = TopicOrderForGroupModule(group.Id, moduleId)
+                .Where(existing => CompareSlotPosition(
+                    existing.Date,
+                    existing.StartTime,
+                    existing.EndTime,
+                    checkpointDate,
+                    checkpointStart,
+                    checkpointEnd) < 0)
+                .OrderBy(existing => existing.Date)
+                .ThenBy(existing => existing.StartTime)
+                .ThenBy(existing => existing.EndTime)
+                .LastOrDefault();
+            foreach (var date in DatesBetween(rangeStartDate, checkpointDate.AddDays(1)))
+            {
+                if (!IsWorking(date, group))
+                {
+                    continue;
+                }
+                if (!allowCheckpointDay && date == checkpointDate)
+                {
+                    continue;
+                }
+
+                var slotsForDate = SharedSlotsForDate(group.CourseId, date);
+                var states = new byte[slotsForDate.Count];
+                var stateCount = 0;
+                var firstSame = -1;
+                var lastSame = -1;
+                foreach (var slot in slotsForDate)
+                {
+                    if (latestPlacedEarlierSlot is not null
+                        && CompareSlotPosition(
+                            date,
+                            slot.Start,
+                            slot.End,
+                            latestPlacedEarlierSlot.Date,
+                            latestPlacedEarlierSlot.StartTime,
+                            latestPlacedEarlierSlot.EndTime) < 0)
+                    {
+                        continue;
+                    }
+                    if (date == checkpointDate
+                        && CompareSlotPosition(
+                            date,
+                            slot.Start,
+                            slot.End,
+                            checkpointDate,
+                            checkpointStart,
+                            checkpointEnd) > 0)
+                    {
+                        continue;
+                    }
+
+                    byte state;
+                    var isCheckpoint = date == checkpointDate
+                                       && slot.Start == checkpointStart
+                                       && slot.End == checkpointEnd;
+                    var isCandidate = candidateDate == date
+                                      && candidateStart == slot.Start
+                                      && candidateEnd == slot.End;
+                    if (isCheckpoint || isCandidate && candidateConsumesPendingTopic)
+                    {
+                        state = 1;
+                    }
+                    else if (isCandidate)
+                    {
+                        state = 2;
+                    }
+                    else if (pendingNonLectureBeforeCheckpoint
+                             && HasShortSharedRoomTransition(
+                                 group.Id,
+                                 date,
+                                 slot.Start,
+                                 slot.End))
+                    {
+                        // Після потокової лекції лише одна група може залишитися
+                        // у тій самій аудиторії. Такий слот не можна рахувати як
+                        // гарантовану місткість для нелекційних тем усього потоку.
+                        state = 2;
+                    }
+                    else
+                    {
+                        var hasOverlap = false;
+                        var onlySameModuleSlot = true;
+                        foreach (var existing in BusyForGroupDate(group.Id, date))
+                        {
+                            if (IsNonOccupyingBusySlot(existing)
+                                || !SlotOverlaps(existing, date, slot.Start, slot.End))
+                            {
+                                continue;
+                            }
+                            hasOverlap = true;
+                            if (existing.ModuleId != moduleId
+                                || existing.StartTime != slot.Start
+                                || existing.EndTime != slot.End)
+                            {
+                                onlySameModuleSlot = false;
+                                break;
+                            }
+                        }
+                        state = !hasOverlap ? (byte)0 : onlySameModuleSlot ? (byte)1 : (byte)2;
+                    }
+
+                    states[stateCount] = state;
+                    if (state == 1)
+                    {
+                        firstSame = firstSame < 0 ? stateCount : firstSame;
+                        lastSame = stateCount;
+                    }
+                    stateCount++;
+                }
+                if (stateCount == 0)
+                {
+                    continue;
+                }
+
+                if (firstSame < 0)
+                {
+                    var longestOpenRun = 0;
+                    var currentOpenRun = 0;
+                    for (var index = 0; index < stateCount; index++)
+                    {
+                        if (states[index] == 0)
+                        {
+                            currentOpenRun++;
+                            longestOpenRun = Math.Max(longestOpenRun, currentOpenRun);
+                        }
+                        else
+                        {
+                            currentOpenRun = 0;
+                        }
+                    }
+                    capacity += longestOpenRun;
+                    continue;
+                }
+
+                var blockedInsideSameModuleRun = false;
+                for (var index = firstSame; index <= lastSame; index++)
+                {
+                    if (states[index] == 2)
+                    {
+                        blockedInsideSameModuleRun = true;
+                        break;
+                    }
+                }
+                if (blockedInsideSameModuleRun)
+                {
+                    continue;
+                }
+                var firstReachable = firstSame;
+                while (firstReachable > 0 && states[firstReachable - 1] == 0)
+                {
+                    firstReachable--;
+                }
+                var lastReachable = lastSame;
+                while (lastReachable + 1 < stateCount && states[lastReachable + 1] == 0)
+                {
+                    lastReachable++;
+                }
+                for (var index = firstReachable; index <= lastReachable; index++)
+                {
+                    if (states[index] == 0)
+                    {
+                        capacity++;
+                    }
+                }
+            }
+
+            return capacity;
+        }
+
+        bool WouldConsumeFutureSharedCheckpointCapacity(
+            int groupId,
+            int candidateModuleId,
+            ModuleTopic? candidateTopic,
+            bool isSelfStudy,
+            DateOnly candidateDate,
+            TimeOnly candidateStart,
+            TimeOnly candidateEnd)
+        {
+            if (!selectedGroupsById.TryGetValue(groupId, out var group))
+            {
+                return false;
+            }
+
+            foreach (var reservation in futureSharedCheckpointReservations
+                         .Where(item => item.GroupId == groupId)
+                         .OrderBy(item => item.Date)
+                         .ThenBy(item => item.Start)
+                         .ThenBy(item => item.End)
+                         .ThenBy(item => item.ModuleId)
+                         .ThenBy(item => item.TopicId))
+            {
+                var positionToReservation = CompareSlotPosition(
+                    candidateDate,
+                    candidateStart,
+                    candidateEnd,
+                    reservation.Date,
+                    reservation.Start,
+                    reservation.End);
+                var isReservedCheckpointPlacement = positionToReservation == 0
+                                                    && candidateModuleId == reservation.ModuleId
+                                                    && candidateTopic?.Id == reservation.TopicId
+                                                    && !isSelfStudy;
+                if (isReservedCheckpointPlacement)
+                {
+                    continue;
+                }
+                if (positionToReservation == 0)
+                {
+                    return true;
+                }
+                if (positionToReservation > 0
+                    || !topicById.TryGetValue(reservation.TopicId, out var checkpointTopic))
+                {
+                    continue;
+                }
+
+                var pendingEarlierHours = PendingEarlierTopicHoursForGroup(
+                    groupId,
+                    reservation.ModuleId,
+                    checkpointTopic);
+                if (pendingEarlierHours <= 0 || pendingEarlierHours == int.MaxValue)
+                {
+                    continue;
+                }
+
+                var consumesPendingEarlierHour = false;
+                if (!isSelfStudy
+                    && candidateModuleId == reservation.ModuleId
+                    && candidateTopic is not null
+                    && topicsByModule.TryGetValue(reservation.ModuleId, out var moduleTopics))
+                {
+                    var candidateIndex = moduleTopics.FindIndex(topic => topic.Id == candidateTopic.Id);
+                    var checkpointIndex = moduleTopics.FindIndex(topic => topic.Id == checkpointTopic.Id);
+                    consumesPendingEarlierHour = candidateIndex >= 0
+                                                  && checkpointIndex > candidateIndex
+                                                  && IsTopicStillPendingForGroup(
+                                                      groupId,
+                                                      reservation.ModuleId,
+                                                      candidateTopic);
+                }
+
+                var remainingPendingHours = Math.Max(
+                    0,
+                    pendingEarlierHours - (consumesPendingEarlierHour ? 1 : 0));
+                var remainingReservableSlots = CountReservableEarlierTopicSlots(
+                    group,
+                    reservation.ModuleId,
+                    reservation.Date,
+                    reservation.Start,
+                    reservation.End,
+                    allowCheckpointDay: !HasPendingNonLectureBeforeTopic(
+                        groupId,
+                        reservation.ModuleId,
+                        checkpointTopic),
+                    pendingNonLectureBeforeCheckpoint: HasPendingNonLectureBeforeTopic(
+                        groupId,
+                        reservation.ModuleId,
+                        checkpointTopic),
+                    candidateDate,
+                    candidateStart,
+                    candidateEnd,
+                    consumesPendingEarlierHour);
+                if (remainingReservableSlots < remainingPendingHours)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        bool CanReserveFutureSharedTopic(
+            Group group,
+            int moduleId,
+            ModuleTopic topic,
+            DateOnly date,
+            TimeSlot slot)
+        {
+            var pendingEarlierHours = PendingEarlierTopicHoursForGroup(group.Id, moduleId, topic);
+            var placementRemaining = PlacementRemainingFor(group.Id, moduleId);
+            if (pendingEarlierHours <= 0
+                || pendingEarlierHours == int.MaxValue
+                || placementRemaining <= pendingEarlierHours
+                || ViolatesTopicCalendarOrder(group.Id, moduleId, topic, date, slot.Start, slot.End))
+            {
+                return false;
+            }
+
+            var reservableEarlierSlots = CountReservableEarlierTopicSlots(
+                group,
+                moduleId,
+                date,
+                slot.Start,
+                slot.End,
+                allowCheckpointDay: !HasPendingNonLectureBeforeTopic(group.Id, moduleId, topic),
+                pendingNonLectureBeforeCheckpoint: HasPendingNonLectureBeforeTopic(
+                    group.Id,
+                    moduleId,
+                    topic));
+            if (reservableEarlierSlots < pendingEarlierHours)
+            {
+                return false;
+            }
+
+            var pendingLaterHours = Math.Max(0, placementRemaining - pendingEarlierHours - 1);
+            if (pendingLaterHours == 0)
+            {
+                return true;
+            }
+            var openLaterSlots = 0;
+            foreach (var candidateDate in DatesBetween(date, rangeEndDateExclusive))
+            {
+                if (!IsWorking(candidateDate, group))
+                {
+                    continue;
+                }
+                foreach (var candidateSlot in SharedSlotsForDate(group.CourseId, candidateDate))
+                {
+                    if (CompareSlotPosition(
+                            candidateDate,
+                            candidateSlot.Start,
+                            candidateSlot.End,
+                            date,
+                            slot.Start,
+                            slot.End) <= 0
+                        || HasGroupOverlap(
+                            group.Id,
+                            candidateDate,
+                            candidateSlot.Start,
+                            candidateSlot.End))
+                    {
+                        continue;
+                    }
+                    openLaterSlots++;
+                    if (openLaterSlots >= pendingLaterHours)
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
         }
 
         List<int> BuildSharedLectureGroupPack(
@@ -2699,7 +4664,7 @@ public sealed class TeacherDraftsAutogenService
         {
             var result = new List<int>();
             var totalStudents = 0;
-            foreach (var group in courseGroups.OrderBy(g => g.StudentsCount).ThenBy(g => g.Id))
+            foreach (var group in courseGroups)
             {
                 if (!IsWorking(date, group))
                 {
@@ -2734,7 +4699,13 @@ public sealed class TeacherDraftsAutogenService
                 {
                     continue;
                 }
-                var groupBusy = HasGroupOverlap(group.Id, date, slot.Start, slot.End);
+                var groupBusy = HasBlockingGroupOverlapForSharedCheckpoint(
+                    group.Id,
+                    moduleId,
+                    topic.Id,
+                    date,
+                    slot.Start,
+                    slot.End);
                 if (groupBusy)
                 {
                     continue;
@@ -2746,7 +4717,14 @@ public sealed class TeacherDraftsAutogenService
                 result.Add(group.Id);
                 totalStudents += group.StudentsCount;
             }
-            return result;
+            return ApplyParallelModuleLimitToSharedPack(
+                result,
+                courseGroups[0].CourseId,
+                moduleId,
+                topic.LessonTypeId,
+                date,
+                slot.Start,
+                slot.End);
         }
 
         bool TryPreplaceSharedLectureTopic(int courseIdValue, int moduleId, ModuleTopic topic)
@@ -2765,20 +4743,33 @@ public sealed class TeacherDraftsAutogenService
                 return false;
             }
 
-            if (HasUnreadySelectedGroupForShareableTopic(courseIdValue, moduleId, topic))
+            var hasUnreadyGroups = HasUnreadySelectedGroupForShareableTopic(courseIdValue, moduleId, topic);
+            var reserveFutureCheckpoint = hasModuleHourOverrides
+                                          && hasUnreadyGroups
+                                          && !unusedFutureSharedCheckpointReservationsReleased;
+            if (hasUnreadyGroups && !reserveFutureCheckpoint)
+            {
+                return false;
+            }
+            var existingTopicReservations = futureSharedCheckpointReservations
+                .Where(item => item.ModuleId == moduleId && item.TopicId == topic.Id)
+                .ToList();
+            if (reserveFutureCheckpoint
+                && (existingTopicReservations.Count > 0
+                    || futureSharedCheckpointReservations.Any(item =>
+                        item.ModuleId == moduleId && item.TopicId != topic.Id)))
             {
                 return false;
             }
 
             var teacherIds = lessonType.RequiresTeacher
-                ? teachersForModule
-                    .Where(x => x.ModuleId == moduleId)
-                    .Select(x => x.TeacherId)
-                    .Distinct()
-                    .Where(tid => topic.DepartmentId is not int departmentId
-                                  || departmentId <= 0
-                                  || (teacherDepartmentById.TryGetValue(tid, out var teacherDepartment) && teacherDepartment == departmentId))
-                    .OrderBy(tid => TeacherLoadScore(tid, courseIdValue))
+                ? PreferredOrExplicitTeacherPool(
+                        teachersForModule
+                            .Where(x => x.ModuleId == moduleId)
+                            .Select(x => x.TeacherId),
+                        topic)
+                    .OrderBy(tid => TeacherDepartmentPriority(tid, topic))
+                    .ThenBy(tid => TeacherLoadScore(tid, courseIdValue))
                     .ThenBy(tid => tid)
                     .Cast<int?>()
                     .ToList()
@@ -2831,20 +4822,30 @@ public sealed class TeacherDraftsAutogenService
                     .GroupBy(slot => new { slot.ModuleId, slot.ModuleTopicId, slot.StartTime, slot.EndTime })
                     .Count();
             }
-            bool JoinsExistingTopicOccurrence(DateOnly date, TimeSlot slot)
+            bool JoinsExistingTopicOccurrence(
+                DateOnly date,
+                TimeSlot slot,
+                int? teacherId,
+                int roomId)
             {
-                return BusyForDate(date).Any(existing => existing.StartTime == slot.Start
-                                                        && existing.EndTime == slot.End
-                                                        && existing.ModuleId == moduleId
-                                                        && existing.ModuleTopicId == topic.Id
-                                                        && selectedGroupsById.TryGetValue(existing.GroupId, out var existingGroup)
-                                                        && existingGroup.CourseId == courseIdValue);
+                return FindExistingSharedLectureGroupIds(
+                        courseIdValue,
+                        moduleId,
+                        topic.LessonTypeId,
+                        topic.Id,
+                        teacherId,
+                        roomId,
+                        date,
+                        slot.Start,
+                        slot.End)
+                    .Count > 0;
             }
             // Оцінює, наскільки слот продовжує вже розпочату тему без розриву іншими заняттями.
             int TopicContinuationDistance(DateOnly date, TimeSlot slot, IReadOnlyList<TimeSlot> slotsForDate)
             {
                 var existingTopicSlots = busy
-                    .Where(existing => existing.ModuleId == moduleId
+                    .Where(existing => !IsNonOccupyingBusySlot(existing)
+                                       && existing.ModuleId == moduleId
                                        && existing.ModuleTopicId == topic.Id
                                        && selectedGroupsById.TryGetValue(existing.GroupId, out var existingGroup)
                                        && existingGroup.CourseId == courseIdValue)
@@ -2886,7 +4887,7 @@ public sealed class TeacherDraftsAutogenService
             }
             int SharedLectureGapTrapPenalty(DateOnly date, TimeSlot slot, IReadOnlyList<TimeSlot> slotsForDate, Room room, IReadOnlyList<int> groupIds)
             {
-                if (room.BuildingId == 0 || groupIds.Count == 0)
+                if (groupIds.Count == 0)
                 {
                     return 0;
                 }
@@ -2915,20 +4916,32 @@ public sealed class TeacherDraftsAutogenService
                         {
                             continue;
                         }
-                        var reachableBuildingCount = roomsAll
-                            .Where(candidateRoom => candidateRoom.BuildingId != 0
+                        var studentsCount = selectedGroupsById.TryGetValue(groupId, out var adjacentGroup)
+                            ? adjacentGroup.StudentsCount
+                            : 0;
+                        var reachableRoomCount = roomsAll
+                            .Where(candidateRoom => candidateRoom.Capacity >= studentsCount
                                                     && RoomMatchesGroupPreferenceFor(groupId, candidateRoom)
-                                                    && !HasRoomOverlap(candidateRoom.Id, date, adjacentSlot.Start, adjacentSlot.End))
-                            .Select(candidateRoom => candidateRoom.BuildingId)
-                            .Distinct()
-                            .Count(buildingId =>
+                                                    && !HasRoomOverlap(candidateRoom.Id, topic.LessonTypeId, date, adjacentSlot.Start, adjacentSlot.End))
+                            .Where(candidateRoom =>
                             {
                                 var needMinutes = adjacentBefore
-                                    ? TravelMinutes(buildingId, room.BuildingId)
-                                    : TravelMinutes(room.BuildingId, buildingId);
+                                    ? TransitionMinutes(
+                                        candidateRoom.Id,
+                                        candidateRoom.BuildingId,
+                                        room.Id,
+                                        room.BuildingId)
+                                    : TransitionMinutes(
+                                        room.Id,
+                                        room.BuildingId,
+                                        candidateRoom.Id,
+                                        candidateRoom.BuildingId);
                                 return gapMinutes >= needMinutes;
-                            });
-                        if (reachableBuildingCount <= 1)
+                            })
+                            .Select(candidateRoom => candidateRoom.Id)
+                            .Distinct()
+                            .Count();
+                        if (reachableRoomCount <= 1)
                         {
                             trapped++;
                         }
@@ -2991,6 +5004,156 @@ public sealed class TeacherDraftsAutogenService
                 return false;
             }
 
+            bool CanCompleteRemainingSharedSubflow(
+                IReadOnlyCollection<int> remainingGroupIds,
+                DateOnly reservedDate,
+                TimeSlot reservedSlot)
+            {
+                if (remainingGroupIds.Count < 2)
+                {
+                    return false;
+                }
+
+                var remainingGroups = courseGroups
+                    .Where(group => remainingGroupIds.Contains(group.Id))
+                    .OrderBy(group => group.StudentsCount)
+                    .ThenBy(group => group.Id)
+                    .ToList();
+                if (remainingGroups.Count != remainingGroupIds.Count)
+                {
+                    return false;
+                }
+                var completionPackSize = Math.Min(
+                    SlotGroupLimitForPlacement(
+                        courseIdValue,
+                        topic.LessonTypeId,
+                        isSelfStudyPlacement: false),
+                    remainingGroups.Count);
+                if (remainingGroups.Count > completionPackSize
+                    && remainingGroups.Count - completionPackSize == 1
+                    && completionPackSize > 2)
+                {
+                    completionPackSize--;
+                }
+                remainingGroups = remainingGroups
+                    .Take(completionPackSize)
+                    .ToList();
+                var completionGroupIds = remainingGroups
+                    .Select(group => group.Id)
+                    .ToList();
+                var requiredCapacity = remainingGroups.Sum(group => group.StudentsCount);
+
+                foreach (var completionDate in DatesBetween(rangeStartDate, rangeEndDateExclusive))
+                {
+                    if (remainingGroups.Any(group => !IsWorking(completionDate, group)))
+                    {
+                        continue;
+                    }
+                    var completionSlots = SharedSlotsForDate(courseIdValue, completionDate);
+                    for (var completionSlotIndex = 0; completionSlotIndex < completionSlots.Count; completionSlotIndex++)
+                    {
+                        var completionSlot = completionSlots[completionSlotIndex];
+                        if (IsBlockedLateLectureSlot(
+                                topic.LessonTypeId,
+                                completionSlotIndex + 1,
+                                coursePreferredFirstMaxSlotOrder)
+                            || remainingGroups.Any(group =>
+                                CountFor(group.Id, completionDate) >= completionSlots.Count
+                                || !CanAssignSpecificTopic(group.Id, moduleId, topic)
+                                || HasGroupOverlap(group.Id, completionDate, completionSlot.Start, completionSlot.End)
+                                || ViolatesTopicCalendarOrder(
+                                    group.Id,
+                                    moduleId,
+                                    topic,
+                                    completionDate,
+                                    completionSlot.Start,
+                                    completionSlot.End))
+                            || ViolatesSharedModuleBlockSplit(
+                                completionDate,
+                                completionSlot,
+                                completionSlots,
+                                completionGroupIds)
+                            || CountGroupsWithModuleInSlot(
+                                moduleId,
+                                completionDate,
+                                completionSlot.Start,
+                                completionSlot.End) + completionGroupIds.Count > SlotGroupLimitForPlacement(
+                                    courseIdValue,
+                                    topic.LessonTypeId,
+                                    isSelfStudyPlacement: false))
+                        {
+                            continue;
+                        }
+
+                        foreach (var completionTeacherId in teacherIds)
+                        {
+                            if (completionTeacherId is int resolvedTeacherId
+                                && (!TeacherFitsWorkingHours(
+                                        resolvedTeacherId,
+                                        completionDate,
+                                        completionSlot.Start,
+                                        completionSlot.End)
+                                    || HasTeacherOverlap(
+                                        resolvedTeacherId,
+                                        topic.LessonTypeId,
+                                        completionDate,
+                                        completionSlot.Start,
+                                        completionSlot.End)))
+                            {
+                                continue;
+                            }
+
+                            foreach (var completionRoom in roomCandidates.Where(room => room.Capacity >= requiredCapacity))
+                            {
+                                var overlapsReservedOccurrence = completionDate == reservedDate
+                                                                 && completionSlot.Start == reservedSlot.Start
+                                                                 && completionSlot.End == reservedSlot.End;
+                                if (overlapsReservedOccurrence
+                                    || HasRoomOverlap(
+                                        completionRoom.Id,
+                                        topic.LessonTypeId,
+                                        completionDate,
+                                        completionSlot.Start,
+                                        completionSlot.End)
+                                    || remainingGroups.Any(group =>
+                                        !RoomMatchesGroupPreferenceFor(group.Id, completionRoom)
+                                        || ViolatesSharedLectureTravel(
+                                            existing => existing.GroupId == group.Id,
+                                            completionRoom,
+                                            completionDate,
+                                            completionSlot.Start,
+                                            completionSlot.End))
+                                    || completionTeacherId is int teacherForTravel
+                                    && ViolatesSharedLectureTravel(
+                                        existing => existing.TeacherId == teacherForTravel,
+                                        completionRoom,
+                                        completionDate,
+                                        completionSlot.Start,
+                                        completionSlot.End)
+                                    || !TryValidatePlacementAgainstBusy(
+                                        moduleId,
+                                        topic.LessonTypeId,
+                                        topic.Id,
+                                        completionTeacherId,
+                                        completionRoom,
+                                        completionDate,
+                                        completionSlot.Start,
+                                        completionSlot.End,
+                                        completionGroupIds,
+                                        out _))
+                                {
+                                    continue;
+                                }
+
+                                return true;
+                            }
+                        }
+                    }
+                }
+
+                return false;
+            }
+
             (DateOnly Date, TimeSlot Slot, int? TeacherId, Room Room, List<int> GroupIds, int TopicContinuationDistance, int PreferredFirstLoad, int GapTrapPenalty, int LectureOrderConflict, bool JoinsExistingOccurrence, bool BeyondPreferredLimit, bool EmergencyLateLecture)? best = null;
             foreach (var date in DatesBetween(rangeStartDate, rangeEndDateExclusive))
             {
@@ -3001,6 +5164,15 @@ public sealed class TeacherDraftsAutogenService
                 }
                 foreach (var slot in slotsForDate)
                 {
+                    if (!reserveFutureCheckpoint
+                        && existingTopicReservations.Count > 0
+                        && !existingTopicReservations.Any(item =>
+                            item.Date == date
+                            && item.Start == slot.Start
+                            && item.End == slot.End))
+                    {
+                        continue;
+                    }
                     var sharedSlotOrder = GetSharedSlotOrder(slotsForDate, slot);
                     if (IsBlockedLateLectureSlot(topic.LessonTypeId, sharedSlotOrder, coursePreferredFirstMaxSlotOrder))
                     {
@@ -3011,6 +5183,85 @@ public sealed class TeacherDraftsAutogenService
                                                && coursePreferredFirstMaxSlotOrder is int maxPreferredSlot
                                                && sharedSlotOrder > maxPreferredSlot;
                     var emergencyLateLecture = IsEmergencyLateLectureSlot(topic.LessonTypeId, sharedSlotOrder, coursePreferredFirstMaxSlotOrder);
+                    // Готовність груп залежить від слота, але не від конкретного викладача чи аудиторії.
+                    // Обчислюємо її один раз замість повторення для кожної комбінації ресурсів.
+                    var pendingTopicGroups = courseGroups
+                        .Where(group => PlacementRemainingFor(group.Id, moduleId) > 0
+                                        && IsTopicStillPendingForGroup(group.Id, moduleId, topic))
+                        .ToList();
+                    if (pendingTopicGroups.Any(group => WouldConsumeFutureSharedCheckpointCapacity(
+                            group.Id,
+                            moduleId,
+                            topic,
+                            isSelfStudy: false,
+                            date,
+                            slot.Start,
+                            slot.End)))
+                    {
+                        continue;
+                    }
+                    if (reserveFutureCheckpoint
+                        && (pendingTopicGroups.Count < 2
+                            || pendingTopicGroups.Any(group => !CanReserveFutureSharedTopic(
+                                group,
+                                moduleId,
+                                topic,
+                                date,
+                                slot))))
+                    {
+                        continue;
+                    }
+                    var pendingTopicGroupIds = pendingTopicGroups
+                        .Select(group => group.Id)
+                        .ToHashSet();
+                    var roomPackCandidates = new List<(Room Room, List<int> Pack)>();
+                    foreach (var room in roomCandidates)
+                    {
+                        var pack = reserveFutureCheckpoint
+                            ? BuildPotentialSharedLectureGroupPack(courseGroups, moduleId, topic, room, date, slot)
+                            : BuildSharedLectureGroupPack(courseGroups, moduleId, topic, room, date, slot);
+                        if (pack.Count < 2)
+                        {
+                            continue;
+                        }
+                        var potentialPack = reserveFutureCheckpoint
+                            ? pack
+                            : BuildPotentialSharedLectureGroupPack(courseGroups, moduleId, topic, room, date, slot);
+                        if (reserveFutureCheckpoint && pack.Count < pendingTopicGroups.Count
+                            || pack.Count < potentialPack.Count
+                            || ShouldHoldShareableTopicForMissingPendingGroups(
+                                courseIdValue,
+                                moduleId,
+                                topic,
+                                pack)
+                            || pack.Any(groupId => ViolatesLectureBlockOrderForPlacement(
+                                groupId,
+                                date,
+                                slot.Start,
+                                slot.End,
+                                topic.LessonTypeId))
+                            || ViolatesSharedModuleBlockSplit(date, slot, slotsForDate, pack))
+                        {
+                            continue;
+                        }
+                        var pendingAfterPack = pendingTopicGroupIds
+                            .Where(groupId => !pack.Contains(groupId))
+                            .ToList();
+                        if (pendingAfterPack.Count > 0
+                            && !CanCompleteRemainingSharedSubflow(
+                                pendingAfterPack,
+                                date,
+                                slot))
+                        {
+                            // Не створюємо підпотік, якщо для решти груп немає окремого доведеного розміщення.
+                            continue;
+                        }
+                        roomPackCandidates.Add((room, pack));
+                    }
+                    if (roomPackCandidates.Count == 0)
+                    {
+                        continue;
+                    }
                     foreach (var teacherId in teacherIds)
                     {
                         if (teacherId is int tid)
@@ -3019,16 +5270,24 @@ public sealed class TeacherDraftsAutogenService
                             {
                                 continue;
                             }
-                            var teacherBusy = HasTeacherOverlap(tid, date, slot.Start, slot.End);
-                            if (teacherBusy)
-                            {
-                                continue;
-                            }
                         }
-                        foreach (var room in roomCandidates)
+                        foreach (var roomPackCandidate in roomPackCandidates)
                         {
-                            var roomBusy = HasRoomOverlap(room.Id, date, slot.Start, slot.End);
-                            if (roomBusy)
+                            var room = roomPackCandidate.Room;
+                            var pack = roomPackCandidate.Pack;
+                            // Єдиний валідатор зайнятості також дозволяє безпечно
+                            // приєднати нові групи до вже створеного спільного потоку.
+                            if (!TryValidatePlacementAgainstBusy(
+                                    moduleId,
+                                    topic.LessonTypeId,
+                                    topic.Id,
+                                    teacherId,
+                                    room,
+                                    date,
+                                    slot.Start,
+                                    slot.End,
+                                    pack,
+                                    out _))
                             {
                                 continue;
                             }
@@ -3037,26 +5296,12 @@ public sealed class TeacherDraftsAutogenService
                             {
                                 continue;
                             }
-                            var pack = BuildSharedLectureGroupPack(courseGroups, moduleId, topic, room, date, slot);
-                            if (pack.Count < 2)
-                            {
-                                continue;
-                            }
-                            var potentialPack = BuildPotentialSharedLectureGroupPack(courseGroups, moduleId, topic, room, date, slot);
-                            if (pack.Count < potentialPack.Count)
-                            {
-                                continue;
-                            }
-                            if (ShouldHoldShareableTopicForMissingPendingGroups(courseIdValue, moduleId, topic, pack))
-                            {
-                                continue;
-                            }
-                            if (ViolatesSharedModuleBlockSplit(date, slot, slotsForDate, pack))
-                            {
-                                continue;
-                            }
                             var preferredFirstLoad = PreferredFirstLectureLoadForCourseDate(date);
-                            var joinsExistingOccurrence = JoinsExistingTopicOccurrence(date, slot);
+                            var joinsExistingOccurrence = JoinsExistingTopicOccurrence(
+                                date,
+                                slot,
+                                teacherId,
+                                room.Id);
                             var topicContinuationDistance = TopicContinuationDistance(date, slot, slotsForDate);
                             var gapTrapPenalty = SharedLectureGapTrapPenalty(date, slot, slotsForDate, room, pack);
                             var lectureOrderConflict = SharedLectureOrderConflictCount(date, slot, pack);
@@ -3134,6 +5379,20 @@ public sealed class TeacherDraftsAutogenService
             {
                 return false;
             }
+            if (reserveFutureCheckpoint)
+            {
+                foreach (var groupId in best.Value.GroupIds)
+                {
+                    futureSharedCheckpointReservations.Add((
+                        groupId,
+                        moduleId,
+                        topic.Id,
+                        best.Value.Date,
+                        best.Value.Slot.Start,
+                        best.Value.Slot.End));
+                }
+                return false;
+            }
             if (!TryValidatePlacementAgainstBusy(
                     moduleId,
                     topic.LessonTypeId,
@@ -3174,8 +5433,12 @@ public sealed class TeacherDraftsAutogenService
                 _db.TeacherDraftItems.Add(item);
                 allCreatedDrafts.Add(item);
                 movableDrafts.Add(item);
+                var accounting = new CreatedDraftAccounting();
+                createdDraftAccounting.Add(item, accounting);
                 AddCurrentRangeFact(groupId, moduleId);
+                accounting.CurrentRangeFactIncremented = true;
                 MarkTopicUsed(groupId, moduleId, topic);
+                accounting.TopicUsageIncremented = true;
                 AddBusySlot(new BusySlot(
                     groupId,
                     best.Value.TeacherId,
@@ -3189,7 +5452,9 @@ public sealed class TeacherDraftsAutogenService
                     topic.Id,
                     true));
                 created++;
+                accounting.CreatedCounterIncremented = true;
                 Inc(groupId, best.Value.Date);
+                accounting.DayCountIncremented = true;
                 if (preferredFirstTypeId != 0 && topic.LessonTypeId == preferredFirstTypeId)
                 {
                     hasPreferred.Add((groupId, moduleId));
@@ -3198,8 +5463,13 @@ public sealed class TeacherDraftsAutogenService
                 if (remainingByGroupModule.TryGetValue(remainingKey, out var leftRemaining) && leftRemaining > 0)
                 {
                     remainingByGroupModule[remainingKey] = Math.Max(0, leftRemaining - 1);
+                    accounting.RemainingDecremented = true;
                 }
             }
+            futureSharedCheckpointReservations.RemoveAll(item =>
+                item.ModuleId == moduleId
+                && item.TopicId == topic.Id
+                && best.Value.GroupIds.Contains(item.GroupId));
 
             return true;
         }
@@ -3227,6 +5497,7 @@ public sealed class TeacherDraftsAutogenService
                     {
                         while (TryPreplaceSharedLectureTopic(courseEntry.Key, moduleId, topic))
                         {
+                            cancellationToken.ThrowIfCancellationRequested();
                             placed++;
                         }
                     }
@@ -3253,6 +5524,153 @@ public sealed class TeacherDraftsAutogenService
         }
 
         PreplaceAvailableSharedLectureTopics();
+        // Оцінює реальний запас комбінацій ресурсів для групи перед жадібним проходом.
+        int CountFeasibleGroupModuleOptions(Group group, int moduleId, int stopAfter = 96)
+        {
+            var selfStudyPlacement = SelfStudyRemaining(group.Id, moduleId) > 0;
+            var teacherIds = (selfStudyPlacement
+                    ? supervisorsForModule.Where(item => item.ModuleId == moduleId).Select(item => item.TeacherId)
+                    : teachersForModule.Where(item => item.ModuleId == moduleId).Select(item => item.TeacherId))
+                .Distinct()
+                .OrderBy(id => id)
+                .ToList();
+            allowedRoomsByModule.TryGetValue(moduleId, out var allowedRooms);
+            allowedBuildingsByModule.TryGetValue(moduleId, out var allowedBuildings);
+            var candidateRooms = roomsAll
+                .Where(room => room.Capacity >= group.StudentsCount
+                               && (allowedRooms == null || allowedRooms.Count == 0 || allowedRooms.Contains(room.Id))
+                               && (allowedBuildings == null || allowedBuildings.Count == 0 || allowedBuildings.Contains(room.BuildingId))
+                               && (softFill || RoomMatchesGroupPreferenceFor(group.Id, room)))
+                .OrderBy(room => room.Id)
+                .ToList();
+            if (!sharedSlotsByCourse.TryGetValue(group.CourseId, out var resolvedByDay))
+            {
+                return 0;
+            }
+
+            var optionCount = 0;
+            foreach (var placementDate in DatesBetween(rangeStartDate, rangeEndDateExclusive))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!IsWorking(placementDate, group)
+                    || !resolvedByDay.TryGetValue(placementDate.DayOfWeek, out var resolved)
+                    || resolved.Slots.Count == 0)
+                {
+                    continue;
+                }
+
+                var topic = selfStudyPlacement
+                    ? PeekSelfStudyTopic(group.Id, moduleId)
+                    : SelectNextTopicInOrder(group.Id, moduleId);
+                var lessonTypeId = topic?.LessonTypeId
+                                   ?? PeekLessonTypeForDate(group.Id, group.CourseId, moduleId, placementDate);
+                if (!TypeAllowed(lessonTypeId) || !typeById.TryGetValue(lessonTypeId, out var lessonType))
+                {
+                    continue;
+                }
+
+                foreach (var slot in resolved.Slots)
+                {
+                    if (HasGroupOverlap(group.Id, placementDate, slot.Start, slot.End))
+                    {
+                        continue;
+                    }
+                    if (topic is not null
+                        && ViolatesTopicCalendarOrder(group.Id, moduleId, topic, placementDate, slot.Start, slot.End))
+                    {
+                        continue;
+                    }
+
+                    var feasibleTeachers = lessonType.RequiresTeacher
+                        ? PreferredOrExplicitTeacherPool(
+                                teacherIds.Where(teacherId =>
+                                TeacherFitsWorkingHours(teacherId, placementDate, slot.Start, slot.End)
+                                && !HasTeacherOverlap(teacherId, lessonTypeId, placementDate, slot.Start, slot.End)),
+                                topic)
+                            .OrderBy(teacherId => TeacherDepartmentPriority(teacherId, topic))
+                            .Select(teacherId => (int?)teacherId)
+                            .ToList()
+                        : new List<int?> { null };
+                    if (feasibleTeachers.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    var feasibleRooms = lessonType.RequiresRoom
+                        ? candidateRooms
+                            .Where(room => !HasRoomOverlap(room.Id, lessonTypeId, placementDate, slot.Start, slot.End))
+                            .Select(room => (Room?)room)
+                            .ToList()
+                        : new List<Room?> { null };
+                    if (feasibleRooms.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    foreach (var teacherId in feasibleTeachers)
+                    {
+                        foreach (var room in feasibleRooms)
+                        {
+                            if (room is not null
+                                && (ViolatesSharedLectureTravel(
+                                        existing => existing.GroupId == group.Id,
+                                        room,
+                                        placementDate,
+                                        slot.Start,
+                                        slot.End)
+                                    || teacherId is int resolvedTeacherId
+                                    && ViolatesSharedLectureTravel(
+                                        existing => existing.TeacherId == resolvedTeacherId,
+                                        room,
+                                        placementDate,
+                                        slot.Start,
+                                        slot.End)))
+                            {
+                                continue;
+                            }
+
+                            optionCount++;
+                            if (optionCount >= stopAfter)
+                            {
+                                return stopAfter;
+                            }
+                        }
+                    }
+                }
+            }
+            return optionCount;
+        }
+        // Ставить спочатку найскладніші групи важливо: рання гнучка група не повинна забрати єдиний ресурс у пізнішої.
+        var generationGroups = groups
+            .Select(group =>
+            {
+                var pendingModules = remainingByGroupModule
+                    .Where(entry => entry.Key.GroupId == group.Id && entry.Value > 0)
+                    .Select(entry => new
+                    {
+                        entry.Key.ModuleId,
+                        Hours = entry.Value,
+                        Options = CountFeasibleGroupModuleOptions(group, entry.Key.ModuleId)
+                    })
+                    .ToList();
+                var pendingHours = pendingModules.Sum(entry => entry.Hours);
+                var totalOptions = pendingModules.Sum(entry => Math.Min(96, entry.Options));
+                var minOptions = pendingModules.Count == 0
+                    ? int.MaxValue
+                    : pendingModules.Min(entry => entry.Options);
+                var optionsPerHour = pendingHours == 0
+                    ? double.MaxValue
+                    : totalOptions / (double)pendingHours;
+                return new { Group = group, PendingHours = pendingHours, MinOptions = minOptions, OptionsPerHour = optionsPerHour };
+            })
+            .OrderBy(entry => entry.MinOptions)
+            .ThenBy(entry => entry.OptionsPerHour)
+            .ThenByDescending(entry => entry.PendingHours)
+            .ThenByDescending(entry => entry.Group.StudentsCount)
+            .ThenBy(entry => entry.Group.Name, StringComparer.Ordinal)
+            .ThenBy(entry => entry.Group.Id)
+            .Select(entry => entry.Group)
+            .ToList();
         // Основний цикл генерації: обходимо всі групи.
         void RemoveDraftEntity(TeacherDraftItem draft)
         {
@@ -3269,8 +5687,632 @@ public sealed class TeacherDraftsAutogenService
             }
             _db.TeacherDraftItems.Remove(draft);
         }
-        foreach (var grp in groups)
+        var roomUsageByGroup = new Dictionary<int, Dictionary<int, int>>();
+        // Симетрично відкочує всі зміни обліку лише для створеної цим запуском незаблокованої чернетки.
+        bool RemoveCreatedUnlockedDraft(
+            TeacherDraftItem draft,
+            ICollection<TeacherDraftItem>? groupCreatedDrafts = null,
+            Action? refreshLocalState = null)
         {
+            if (draft.Status != DraftStatus.Draft
+                || draft.IsLocked
+                || !allCreatedDrafts.Contains(draft)
+                || !createdDraftAccounting.TryGetValue(draft, out var accounting))
+            {
+                return false;
+            }
+
+            var busySlot = FindBusySlotForDraft(draft, draft.StartTime, draft.EndTime);
+            if (busySlot is not null && !RemoveBusySlot(busySlot))
+            {
+                return false;
+            }
+
+            RemoveDraftEntity(draft);
+            allCreatedDrafts.Remove(draft);
+            movableDrafts.Remove(draft);
+            groupCreatedDrafts?.Remove(draft);
+
+            if (accounting.CreatedCounterIncremented && created > 0)
+            {
+                created--;
+            }
+            if (accounting.DayCountIncremented)
+            {
+                Dec(draft.GroupId, draft.Date);
+            }
+            if (accounting.CurrentRangeFactIncremented)
+            {
+                RemoveCurrentRangeFact(draft.GroupId, draft.ModuleId);
+            }
+
+            var remainingKey = (draft.GroupId, draft.ModuleId);
+            if (accounting.RemainingDecremented)
+            {
+                remainingByGroupModule[remainingKey] = RemainingFor(draft.GroupId, draft.ModuleId) + 1;
+            }
+            if (accounting.SelfStudyRemainingDecremented)
+            {
+                selfStudyRemainingByGroupModule[remainingKey] = SelfStudyRemaining(draft.GroupId, draft.ModuleId) + 1;
+            }
+            if (accounting.SelfStudyTopicRemainingDecremented && draft.ModuleTopicId is int selfStudyTopicId)
+            {
+                var topicKey = (draft.GroupId, draft.ModuleId, selfStudyTopicId);
+                selfStudyTopicRemaining[topicKey] = selfStudyTopicRemaining.TryGetValue(topicKey, out var topicLeft)
+                    ? topicLeft + 1
+                    : 1;
+            }
+            if (accounting.TopicUsageIncremented && draft.ModuleTopicId is int topicId)
+            {
+                UnmarkTopicUsed(draft.GroupId, draft.ModuleId, topicId);
+            }
+
+            if (accounting.RoomUsageGroupId is int roomUsageGroupId
+                && accounting.RoomUsageRoomId is int roomUsageRoomId
+                && roomUsageByGroup.TryGetValue(roomUsageGroupId, out var roomUsage)
+                && roomUsage.TryGetValue(roomUsageRoomId, out var usedRoomCount))
+            {
+                if (usedRoomCount <= 1)
+                {
+                    roomUsage.Remove(roomUsageRoomId);
+                }
+                else
+                {
+                    roomUsage[roomUsageRoomId] = usedRoomCount - 1;
+                }
+            }
+
+            if (preferredFirstTypeId != 0 && draft.LessonTypeId == preferredFirstTypeId)
+            {
+                var preferredKey = (draft.GroupId, draft.ModuleId);
+                var stillHasPreferred = BusyForGroup(draft.GroupId).Any(slot =>
+                    slot.Date >= rangeStartDate
+                    && slot.Date < rangeEndDateExclusive
+                    && slot.ModuleId == draft.ModuleId
+                    && slot.LessonTypeId == preferredFirstTypeId
+                    && !excludedTypeIds.Contains(slot.LessonTypeId));
+                if (stillHasPreferred)
+                {
+                    hasPreferred.Add(preferredKey);
+                }
+                else
+                {
+                    hasPreferred.Remove(preferredKey);
+                }
+            }
+
+            if (accounting.IncompleteDraftCounted && incompleteDraftsCreated > 0)
+            {
+                incompleteDraftsCreated--;
+            }
+            if (accounting.MissingTeacherCounted && incompleteMissingTeacherCount > 0)
+            {
+                incompleteMissingTeacherCount--;
+            }
+            if (accounting.MissingRoomCounted && incompleteMissingRoomCount > 0)
+            {
+                incompleteMissingRoomCount--;
+            }
+            if (accounting.MissingBothCounted && incompleteMissingBothCount > 0)
+            {
+                incompleteMissingBothCount--;
+            }
+            if (accounting.EmergencySingletonCounted && emergencySingletonSharedLecturesCreated > 0)
+            {
+                emergencySingletonSharedLecturesCreated--;
+            }
+
+            createdDraftAccounting.Remove(draft);
+            refreshLocalState?.Invoke();
+            return true;
+        }
+        // Атомарно зсуває весь спільний лекційний потік у найраніший валідний слот.
+        // Це прибирає резервні порожні вікна, не роз'єднуючи групи та не послаблюючи жодного правила.
+        int CompactSharedLecturePrefixes()
+        {
+            var roomById = roomsAll.ToDictionary(room => room.Id);
+            var movedEvents = 0;
+            var safetyBudget = Math.Max(1, movableDrafts.Count * 2);
+
+            void ChangeAccountedRoomUsage(TeacherDraftItem draft, int? targetRoomId)
+            {
+                createdDraftAccounting.TryGetValue(draft, out var accounting);
+                var previousRoomId = accounting?.RoomUsageRoomId ?? draft.RoomId;
+                if (previousRoomId == targetRoomId)
+                {
+                    return;
+                }
+                if (previousRoomId is int resolvedPreviousRoomId
+                    && roomUsageByGroup.TryGetValue(draft.GroupId, out var previousUsage)
+                    && previousUsage.TryGetValue(resolvedPreviousRoomId, out var previousCount))
+                {
+                    if (previousCount <= 1)
+                    {
+                        previousUsage.Remove(resolvedPreviousRoomId);
+                    }
+                    else
+                    {
+                        previousUsage[resolvedPreviousRoomId] = previousCount - 1;
+                    }
+                }
+                if (targetRoomId is int resolvedTargetRoomId)
+                {
+                    if (!roomUsageByGroup.TryGetValue(draft.GroupId, out var targetUsage))
+                    {
+                        targetUsage = new Dictionary<int, int>();
+                        roomUsageByGroup[draft.GroupId] = targetUsage;
+                    }
+                    targetUsage[resolvedTargetRoomId] =
+                        targetUsage.TryGetValue(resolvedTargetRoomId, out var targetCount)
+                            ? targetCount + 1
+                            : 1;
+                    if (accounting is not null)
+                    {
+                        accounting.RoomUsageGroupId = draft.GroupId;
+                        accounting.RoomUsageRoomId = resolvedTargetRoomId;
+                    }
+                }
+                else if (accounting is not null)
+                {
+                    accounting.RoomUsageGroupId = null;
+                    accounting.RoomUsageRoomId = null;
+                }
+            }
+
+            bool WouldSplitModuleBlock(
+                int groupId,
+                DateOnly date,
+                int moduleId,
+                TimeSlot targetSlot)
+            {
+                var orderedLessons = BusyForGroupDate(groupId, date)
+                    .Where(existing => !excludedTypeIds.Contains(existing.LessonTypeId))
+                    .Select(existing => (
+                        existing.StartTime,
+                        existing.EndTime,
+                        existing.ModuleId))
+                    .Append((
+                        StartTime: targetSlot.Start,
+                        EndTime: targetSlot.End,
+                        ModuleId: moduleId))
+                    .Distinct()
+                    .OrderBy(lesson => lesson.StartTime)
+                    .ThenBy(lesson => lesson.EndTime)
+                    .ToList();
+                var moduleSegments = 0;
+                var insideModuleSegment = false;
+                foreach (var lesson in orderedLessons)
+                {
+                    if (lesson.ModuleId == moduleId)
+                    {
+                        if (!insideModuleSegment)
+                        {
+                            moduleSegments++;
+                            insideModuleSegment = true;
+                        }
+                    }
+                    else
+                    {
+                        insideModuleSegment = false;
+                    }
+                }
+                return moduleSegments > 1;
+            }
+
+            bool TryCompactOneEvent()
+            {
+                foreach (var courseEntry in selectedGroupsByCourse.OrderBy(entry => entry.Key))
+                {
+                    foreach (var date in DatesBetween(rangeStartDate, rangeEndDateExclusive))
+                    {
+                        var slotsForDate = SharedSlotsForDate(courseEntry.Key, date);
+                        if (slotsForDate.Count < 2)
+                        {
+                            continue;
+                        }
+                        var slotIndexByTime = slotsForDate
+                            .Select((slot, index) => new { slot, index })
+                            .ToDictionary(entry => (entry.slot.Start, entry.slot.End), entry => entry.index);
+                        var logicalEvents = movableDrafts
+                            .Where(draft =>
+                                draft.Date == date
+                                && selectedGroupIdSet.Contains(draft.GroupId)
+                                && selectedGroupsById.TryGetValue(draft.GroupId, out var group)
+                                && group.CourseId == courseEntry.Key
+                                && AutogenDraftMutationPolicy.CanMutateInRepair(draft)
+                                && !draft.IsSelfStudy
+                                && CanShareAcrossGroups(draft.LessonTypeId)
+                                && !excludedTypeIds.Contains(draft.LessonTypeId))
+                            .GroupBy(draft => new
+                            {
+                                draft.Date,
+                                draft.StartTime,
+                                draft.EndTime,
+                                draft.ModuleId,
+                                draft.LessonTypeId,
+                                draft.ModuleTopicId,
+                                draft.TeacherId,
+                                draft.RoomId
+                            })
+                            .Select(group => new
+                            {
+                                group.Key,
+                                Drafts = group
+                                    .OrderBy(draft => draft.GroupId)
+                                    .ThenBy(draft => draft.Id)
+                                    .ToList()
+                            })
+                            .Where(entry => slotIndexByTime.ContainsKey((entry.Key.StartTime, entry.Key.EndTime)))
+                            .OrderBy(entry => slotIndexByTime[(entry.Key.StartTime, entry.Key.EndTime)])
+                            .ThenBy(entry => entry.Key.ModuleId)
+                            .ThenBy(entry => entry.Key.ModuleTopicId)
+                            .ToList();
+
+                        foreach (var logicalEvent in logicalEvents)
+                        {
+                            var currentSlotIndex = slotIndexByTime[(logicalEvent.Key.StartTime, logicalEvent.Key.EndTime)];
+                            if (currentSlotIndex <= 0)
+                            {
+                                continue;
+                            }
+                            var groupIds = logicalEvent.Drafts
+                                .Select(draft => draft.GroupId)
+                                .Distinct()
+                                .ToList();
+                            if (groupIds.Count != logicalEvent.Drafts.Count)
+                            {
+                                continue;
+                            }
+                            if (!typeById.TryGetValue(logicalEvent.Key.LessonTypeId, out var lessonType))
+                            {
+                                continue;
+                            }
+                            var eventTopic = logicalEvent.Key.ModuleTopicId is int topicId
+                                             && topicById.TryGetValue(topicId, out var resolvedTopic)
+                                ? resolvedTopic
+                                : null;
+                            var teacherCandidates = lessonType.RequiresTeacher
+                                ? (logicalEvent.Key.TeacherId is int currentTeacherId
+                                        ? new[] { currentTeacherId }
+                                        : Array.Empty<int>())
+                                    .Concat(PreferredOrExplicitTeacherPool(
+                                        teachersForModule
+                                            .Where(link => link.ModuleId == logicalEvent.Key.ModuleId)
+                                            .Select(link => link.TeacherId),
+                                        eventTopic))
+                                    .Distinct()
+                                    .OrderBy(teacherId => teacherId == logicalEvent.Key.TeacherId ? 0 : 1)
+                                    .ThenBy(teacherId => TeacherDepartmentPriority(teacherId, eventTopic))
+                                    .ThenBy(teacherId => TeacherLoadScore(teacherId, courseEntry.Key))
+                                    .ThenBy(teacherId => teacherId)
+                                    .Select(teacherId => (int?)teacherId)
+                                    .ToList()
+                                : new int?[] { logicalEvent.Key.TeacherId, null }
+                                    .Distinct()
+                                    .ToList();
+                            if (teacherCandidates.Count == 0)
+                            {
+                                continue;
+                            }
+
+                            allowedRoomsByModule.TryGetValue(logicalEvent.Key.ModuleId, out var allowedRooms);
+                            allowedBuildingsByModule.TryGetValue(logicalEvent.Key.ModuleId, out var allowedBuildings);
+                            var requiredCapacity = groupIds.Sum(groupId => selectedGroupsById[groupId].StudentsCount);
+                            var roomCandidates = lessonType.RequiresRoom
+                                ? roomsAll
+                                    .Where(candidateRoom =>
+                                        candidateRoom.Capacity >= requiredCapacity
+                                        && (allowedRooms == null
+                                            || allowedRooms.Count == 0
+                                            || allowedRooms.Contains(candidateRoom.Id))
+                                        && (allowedBuildings == null
+                                            || allowedBuildings.Count == 0
+                                            || allowedBuildings.Contains(candidateRoom.BuildingId))
+                                        && groupIds.All(groupId =>
+                                            RoomMatchesGroupPreferenceFor(groupId, candidateRoom)))
+                                    .OrderBy(candidateRoom => candidateRoom.Id == logicalEvent.Key.RoomId ? 0 : 1)
+                                    .ThenBy(candidateRoom => candidateRoom.Capacity)
+                                    .ThenBy(candidateRoom => candidateRoom.Id)
+                                    .Select(candidateRoom => (Room?)candidateRoom)
+                                    .ToList()
+                                : new Room?[]
+                                    {
+                                        logicalEvent.Key.RoomId is int currentRoomId
+                                            && roomById.TryGetValue(currentRoomId, out var currentRoom)
+                                                ? currentRoom
+                                                : null,
+                                        null
+                                    }
+                                    .Distinct()
+                                    .ToList();
+                            if (roomCandidates.Count == 0)
+                            {
+                                continue;
+                            }
+
+                            var matchingBusySlots = BusyForDate(date)
+                                .Where(slot =>
+                                    selectedGroupsById.TryGetValue(slot.GroupId, out var group)
+                                    && group.CourseId == courseEntry.Key
+                                    && slot.Date == logicalEvent.Key.Date
+                                    && slot.StartTime == logicalEvent.Key.StartTime
+                                    && slot.EndTime == logicalEvent.Key.EndTime
+                                    && slot.ModuleId == logicalEvent.Key.ModuleId
+                                    && slot.LessonTypeId == logicalEvent.Key.LessonTypeId
+                                    && slot.ModuleTopicId == logicalEvent.Key.ModuleTopicId
+                                    && slot.TeacherId == logicalEvent.Key.TeacherId
+                                    && slot.RoomId == logicalEvent.Key.RoomId)
+                                .ToList();
+                            if (matchingBusySlots.Count != logicalEvent.Drafts.Count
+                                || matchingBusySlots.Any(slot =>
+                                    !slot.JoinableDraft
+                                    || !string.IsNullOrWhiteSpace(slot.BatchKey))
+                                || !matchingBusySlots.Select(slot => slot.GroupId).ToHashSet().SetEquals(groupIds))
+                            {
+                                continue;
+                            }
+
+                            var removedBusySlots = new List<BusySlot>(matchingBusySlots.Count);
+                            var removalFailed = false;
+                            foreach (var busySlot in matchingBusySlots)
+                            {
+                                if (!RemoveBusySlot(busySlot))
+                                {
+                                    removalFailed = true;
+                                    break;
+                                }
+                                removedBusySlots.Add(busySlot);
+                            }
+                            if (removalFailed)
+                            {
+                                foreach (var removedBusySlot in removedBusySlots)
+                                {
+                                    AddBusySlot(removedBusySlot);
+                                }
+                                continue;
+                            }
+
+                            TimeSlot? acceptedTarget = null;
+                            int? acceptedTeacherId = null;
+                            Room? acceptedRoom = null;
+                            foreach (var targetSlot in slotsForDate.Take(currentSlotIndex))
+                            {
+                                if (groupIds.Any(groupId =>
+                                        WouldConsumeFutureSharedCheckpointCapacity(
+                                            groupId,
+                                            logicalEvent.Key.ModuleId,
+                                            eventTopic,
+                                            isSelfStudy: false,
+                                            date,
+                                            targetSlot.Start,
+                                            targetSlot.End)))
+                                {
+                                    continue;
+                                }
+                                if (groupIds.Any(groupId =>
+                                        ViolatesLectureBlockOrderForPlacement(
+                                            groupId,
+                                            date,
+                                            targetSlot.Start,
+                                            targetSlot.End,
+                                            logicalEvent.Key.LessonTypeId)
+                                        || WouldSplitModuleBlock(
+                                            groupId,
+                                            date,
+                                            logicalEvent.Key.ModuleId,
+                                            targetSlot)))
+                                {
+                                    continue;
+                                }
+                                if (eventTopic is not null
+                                    && groupIds.Any(groupId => ViolatesTopicCalendarOrder(
+                                        groupId,
+                                        logicalEvent.Key.ModuleId,
+                                        eventTopic,
+                                        date,
+                                        targetSlot.Start,
+                                        targetSlot.End)))
+                                {
+                                    continue;
+                                }
+
+                                var targetModuleGroups = BusyForDate(date)
+                                    .Where(slot =>
+                                        slot.ModuleId == logicalEvent.Key.ModuleId
+                                        && !excludedTypeIds.Contains(slot.LessonTypeId)
+                                        && slot.StartTime < targetSlot.End
+                                        && targetSlot.Start < slot.EndTime)
+                                    .Select(slot => slot.GroupId)
+                                    .Concat(groupIds)
+                                    .Distinct()
+                                    .Count();
+                                if (targetModuleGroups > SlotGroupLimitForPlacement(
+                                        courseEntry.Key,
+                                        logicalEvent.Key.LessonTypeId,
+                                        isSelfStudyPlacement: false))
+                                {
+                                    continue;
+                                }
+
+                                foreach (var teacherId in teacherCandidates)
+                                {
+                                    if (teacherId is int resolvedTeacherId
+                                        && !TeacherFitsWorkingHours(
+                                            resolvedTeacherId,
+                                            date,
+                                            targetSlot.Start,
+                                            targetSlot.End))
+                                    {
+                                        continue;
+                                    }
+                                    foreach (var room in roomCandidates)
+                                    {
+                                        if (lessonType.RequiresRoom && room is null)
+                                        {
+                                            continue;
+                                        }
+                                        if (room is not null
+                                            && (groupIds.Any(groupId =>
+                                                    ViolatesSharedLectureTravel(
+                                                        existing => existing.GroupId == groupId,
+                                                        room,
+                                                        date,
+                                                        targetSlot.Start,
+                                                        targetSlot.End))
+                                                || teacherId is int teacherForTravel
+                                                && ViolatesSharedLectureTravel(
+                                                    existing => existing.TeacherId == teacherForTravel,
+                                                    room,
+                                                    date,
+                                                    targetSlot.Start,
+                                                    targetSlot.End)))
+                                        {
+                                            continue;
+                                        }
+                                        if (!TryValidatePlacementAgainstBusy(
+                                                logicalEvent.Key.ModuleId,
+                                                logicalEvent.Key.LessonTypeId,
+                                                logicalEvent.Key.ModuleTopicId,
+                                                teacherId,
+                                                room,
+                                                date,
+                                                targetSlot.Start,
+                                                targetSlot.End,
+                                                groupIds,
+                                                out _))
+                                        {
+                                            continue;
+                                        }
+
+                                        acceptedTarget = targetSlot;
+                                        acceptedTeacherId = teacherId;
+                                        acceptedRoom = room;
+                                        break;
+                                    }
+                                    if (acceptedTarget is not null)
+                                    {
+                                        break;
+                                    }
+                                }
+                                if (acceptedTarget is not null)
+                                {
+                                    break;
+                                }
+                            }
+
+                            if (acceptedTarget is null)
+                            {
+                                foreach (var removedBusySlot in removedBusySlots)
+                                {
+                                    AddBusySlot(removedBusySlot);
+                                }
+                                continue;
+                            }
+
+                            var updatedAt = DateTime.UtcNow;
+                            for (var draftIndex = 0; draftIndex < logicalEvent.Drafts.Count; draftIndex++)
+                            {
+                                var draft = logicalEvent.Drafts[draftIndex];
+                                var previousBusySlot = removedBusySlots.Single(slot => slot.GroupId == draft.GroupId);
+                                ChangeAccountedRoomUsage(draft, acceptedRoom?.Id);
+                                draft.StartTime = acceptedTarget.Start;
+                                draft.EndTime = acceptedTarget.End;
+                                draft.DayOfWeek = date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
+                                draft.TeacherId = acceptedTeacherId;
+                                draft.RoomId = acceptedRoom?.Id;
+                                if (typeById.TryGetValue(draft.LessonTypeId, out var movedLessonType))
+                                {
+                                    draft.ValidationWarnings = BuildIncompleteDraftWarningJson(
+                                        movedLessonType.RequiresTeacher && draft.TeacherId is null,
+                                        movedLessonType.RequiresRoom && draft.RoomId is null);
+                                }
+                                draft.UpdatedAt = updatedAt;
+                                var draftEntry = _db.Entry(draft);
+                                if (draft.Id > 0 && draftEntry.State == EntityState.Unchanged)
+                                {
+                                    draftEntry.State = EntityState.Modified;
+                                }
+                                AddBusySlot(new BusySlot(
+                                    draft.GroupId,
+                                    acceptedTeacherId,
+                                    acceptedRoom?.Id,
+                                    date,
+                                    acceptedTarget.Start,
+                                    acceptedTarget.End,
+                                    acceptedRoom?.BuildingId,
+                                    draft.ModuleId,
+                                    draft.LessonTypeId,
+                                    draft.ModuleTopicId,
+                                    previousBusySlot.JoinableDraft,
+                                    previousBusySlot.BatchKey));
+                            }
+                            movedEvents++;
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+
+            while (safetyBudget-- > 0 && TryCompactOneEvent())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            return movedEvents;
+        }
+        (int AssignedHours, int ReadyGroups) MeasureSharedBarrierProgress()
+        {
+            var assignedHours = 0;
+            var readyGroups = 0;
+            foreach (var group in generationGroups)
+            {
+                foreach (var moduleEntry in topicsByModule)
+                {
+                    if (!remainingByGroupModule.ContainsKey((group.Id, moduleEntry.Key)))
+                    {
+                        continue;
+                    }
+                    foreach (var topic in moduleEntry.Value.Where(candidate =>
+                                 GetTopicUsageLimit(candidate) > 0
+                                 && CanShareAcrossGroups(candidate.LessonTypeId)))
+                    {
+                        assignedHours += ActualTopicUsageCount(group.Id, moduleEntry.Key, topic.Id);
+                        if (IsTopicStillPendingForGroup(group.Id, moduleEntry.Key, topic)
+                            && CanAssignSpecificTopic(group.Id, moduleEntry.Key, topic))
+                        {
+                            readyGroups++;
+                        }
+                    }
+                }
+            }
+            return (assignedHours, readyGroups);
+        }
+
+        var globalCatchUpRound = 0;
+        var globalCatchUpProgress = false;
+        var atomicSharedTailRepairRequested = false;
+        var atomicSharedTailRepairAttempted = false;
+        var remainingAfterGlobalCatchUp = remainingByGroupModule.Values.Sum(value => Math.Max(0, value));
+        var maxGlobalCatchUpRounds = Math.Max(1, remainingAfterGlobalCatchUp);
+        var maxInterleavedDateRounds = generationGroups
+            .Select(group => DatesBetween(rangeStartDate, rangeEndDateExclusive).Count(date => IsWorking(date, group)))
+            .DefaultIfEmpty(0)
+            .Max();
+        do
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            globalCatchUpRound++;
+            var remainingBeforeGlobalCatchUp = remainingByGroupModule.Values.Sum(value => Math.Max(0, value));
+            var sharedBarrierProgressBefore = MeasureSharedBarrierProgress();
+            var groupRoundOffset = generationGroups.Count == 0
+                ? 0
+                : (globalCatchUpRound - 1) % generationGroups.Count;
+            var groupsForCatchUpRound = generationGroups
+                .Skip(groupRoundOffset)
+                .Concat(generationGroups.Take(groupRoundOffset))
+                .ToList();
+            foreach (var grp in groupsForCatchUpRound)
+            {
             cancellationToken.ThrowIfCancellationRequested();
             // Обідня перерва для курсу або глобальна (якщо не задано для курсу).
             var preferredFirstSlotLimit = preferredFirstSlotLimitsAll.FirstOrDefault(x => x.CourseId == grp.CourseId)
@@ -3280,16 +6322,12 @@ public sealed class TeacherDraftsAutogenService
                 : preferredFirstSlotLimit is not null && preferredFirstSlotLimit.MaxSlotOrder > 0
                     ? preferredFirstSlotLimit.MaxSlotOrder
                     : preferredFirstTypeId != 0 ? 6 : null;
-            var allSlots = await _db.TimeSlots.AsNoTracking()
-                .Where(s => s.IsActive && (s.CourseId == grp.CourseId || s.CourseId == null))
-                .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
-                .ToListAsync();
-            if (allSlots.Count == 0)
+            if (!sharedSlotsByCourse.TryGetValue(grp.CourseId, out var resolvedByDay)
+                || resolvedByDay.Values.All(value => value.Slots.Count == 0))
             {
                 warnings.Add($"Не знайдено жодного слоту розкладу (глобального або для курсу {grp.Course.Name}). Група {grp.Name} пропущена.");
                 continue;
             }
-            var resolvedByDay = TimeSlotsResolver.ResolveForWeek(allSlots, grp.CourseId);
             List<TimeSlot> slots = new();
             Dictionary<(TimeOnly Start, TimeOnly End), int> slotIndexByTime = new();
             // Один модуль у межах дня може мати довгий блок, але без розриву іншими модулями.
@@ -3355,7 +6393,7 @@ public sealed class TeacherDraftsAutogenService
                               && CanShareAcrossGroups(b.LessonTypeId)
                               && !excludedTypeIds.Contains(b.LessonTypeId));
             bool SlotFilledForGroup(int groupId, DateOnly date, TimeSlot slot) =>
-                BusyForGroupDate(groupId, date).Any(b => b.StartTime == slot.Start && b.EndTime == slot.End);
+                HasGroupOverlap(groupId, date, slot.Start, slot.End);
             bool SlotFilled(DateOnly date, TimeSlot slot) =>
                 SlotFilledForGroup(grp.Id, date, slot);
             // Повертає викладача, який веде цей модуль у сусідньому слоті.
@@ -3609,7 +6647,7 @@ public sealed class TeacherDraftsAutogenService
                 var key = (grp.Id, date, slot.Start, slot.End);
                 if (slotFailureReasons.TryGetValue(key, out var reasons) && reasons.Count > 0)
                 {
-                    return string.Join("; ", reasons);
+                    return SummarizeSlotFailureReasons(reasons);
                 }
                 if (!remainingByGroupModule.Any(entry => entry.Key.GroupId == grp.Id && entry.Value > 0))
                 {
@@ -3620,6 +6658,11 @@ public sealed class TeacherDraftsAutogenService
             // Додає попередження щодо порожнього слоту.
             void WarnGap(DateOnly date, TimeSlot gap)
             {
+                if (!remainingByGroupModule.Any(entry => entry.Key.GroupId == grp.Id && entry.Value > 0))
+                {
+                    // Вільний календарний слот не є помилкою, якщо всі задані години групи вже розміщено.
+                    return;
+                }
                 var label = $"{gap.Start:HH\\:mm}-{gap.End:HH\\:mm}";
                 var key = (grp.Id, date, gap.Start, gap.End);
                 if (gapWarnings.Add(key))
@@ -3703,6 +6746,7 @@ public sealed class TeacherDraftsAutogenService
                 var attempted = new HashSet<TeacherDraftItem>();
                 while (DayHasGaps(date, out var gap) && gap is not null)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     if (HasLaterLectureFirstPlacement(date, gap.Start))
                     {
                         break;
@@ -3735,13 +6779,12 @@ public sealed class TeacherDraftsAutogenService
                         {
                             return false;
                         }
-                        if (!roomBuildingById.TryGetValue(candidateRoomId, out var candidateBuildingId) || candidateBuildingId == 0)
+                        if (!roomBuildingById.TryGetValue(candidateRoomId, out var candidateBuildingId))
                         {
                             return false;
                         }
                         foreach (var existing in BusyForDate(date).Where(x =>
-                                     x.RoomId != null
-                                     && x.BuildingId.HasValue
+                                     RequiresPhysicalRoom(x)
                                      && ownerMatch(x)
                                      && !(x.GroupId == candidate.GroupId
                                           && x.TeacherId == candidate.TeacherId
@@ -3751,21 +6794,25 @@ public sealed class TeacherDraftsAutogenService
                                           && x.EndTime == candidate.EndTime)))
                         {
                             var sourceBuildingId = existing.BuildingId!.Value;
-                            if (sourceBuildingId == candidateBuildingId)
+                            if (existing.RoomId is not int sourceRoomId)
                             {
                                 continue;
                             }
-                            var needMinutes = TravelMinutes(sourceBuildingId, candidateBuildingId);
+                            var needMinutes = TransitionMinutes(
+                                sourceRoomId,
+                                sourceBuildingId,
+                                candidateRoomId,
+                                candidateBuildingId);
                             var gapBefore = (s.ToTimeSpan() - existing.EndTime.ToTimeSpan()).TotalMinutes;
                             var gapAfter = (existing.StartTime.ToTimeSpan() - e.ToTimeSpan()).TotalMinutes;
                             if (existing.EndTime <= s && gapBefore < needMinutes)
                             {
-                                reason = $"Для {subjectLabel} недостатньо часу на перехід до корпусу #{candidateBuildingId} після заняття в корпусі #{sourceBuildingId}: доступно {gapBefore:N0} хв, потрібно {needMinutes} хв.";
+                                reason = $"Для {subjectLabel} недостатньо часу на зміну аудиторії або корпусу після попереднього заняття: доступно {gapBefore:N0} хв, потрібно {needMinutes} хв.";
                                 return true;
                             }
                             if (e <= existing.StartTime && gapAfter < needMinutes)
                             {
-                                reason = $"Для {subjectLabel} недостатньо часу на перехід від корпусу #{sourceBuildingId} до корпусу #{candidateBuildingId} перед заняттям: доступно {gapAfter:N0} хв, потрібно {needMinutes} хв.";
+                                reason = $"Для {subjectLabel} недостатньо часу на зміну аудиторії або корпусу перед наступним заняттям: доступно {gapAfter:N0} хв, потрібно {needMinutes} хв.";
                                 return true;
                             }
                         }
@@ -3836,7 +6883,12 @@ public sealed class TeacherDraftsAutogenService
                         continue;
                     }
                     bool peopleBusy = BusyForDate(date).Any(x =>
-                        (x.GroupId == grp.Id || (tidCandidate is int t && x.TeacherId == t))
+                        !IsNonOccupyingBusySlot(x)
+                        && (x.GroupId == grp.Id
+                            || tidCandidate is int teacherId
+                            && x.TeacherId == teacherId
+                            && BlocksTeacherSlot(candidate.LessonTypeId)
+                            && BlocksTeacherSlot(x.LessonTypeId))
                         && !(x.GroupId == candidate.GroupId
                              && x.StartTime == candidate.StartTime
                              && x.EndTime == candidate.EndTime
@@ -3854,7 +6906,9 @@ public sealed class TeacherDraftsAutogenService
                     if (requiresRoom && candidate.RoomId is int rid)
                     {
                         bool roomBusy = BusyForRoomDate(rid, date).Any(x =>
-                            !(x.GroupId == candidate.GroupId
+                            BlocksRoomSlot(candidate.LessonTypeId)
+                            && BlocksRoomSlot(x.LessonTypeId)
+                            && !(x.GroupId == candidate.GroupId
                               && x.StartTime == candidate.StartTime
                               && x.EndTime == candidate.EndTime
                               && x.ModuleId == candidate.ModuleId
@@ -4012,18 +7066,33 @@ public sealed class TeacherDraftsAutogenService
                 if (date < firstMainDate.Value) return true;
                 return date == firstMainDate.Value && start < firstMainStart.Value;
             }
-            // Детемінований генератор для стабільного випадкового вибору.
-            var groupRandom = new Random(StableSeed(weekStart.DayNumber, grp.Id, grp.CourseId));
-            var sequenceRandom = new Random(StableSeed(weekStart.DayNumber, grp.Id, grp.CourseId, 17));
             int? lastPrimaryModuleId = null;
             // Лічильник використання аудиторій поточною групою.
             var groupRoomUsage = busy
-                .Where(b => b.GroupId == grp.Id && b.Date >= rangeStartDate && b.Date < rangeEndDateExclusive && b.RoomId != null)
+                .Where(b => b.GroupId == grp.Id
+                            && b.Date >= rangeStartDate
+                            && b.Date < rangeEndDateExclusive
+                            && b.RoomId != null
+                            && !excludedTypeIds.Contains(b.LessonTypeId))
                 .GroupBy(b => b.RoomId!.Value)
                 .ToDictionary(g => g.Key, g => g.Count());
-            var teacherDaySlackCache = new Dictionary<(DateOnly Date, int TeacherId), int>();
-            var roomDaySlackCache = new Dictionary<(DateOnly Date, int RoomId), int>();
-            var neighborGapBuildingPenaltyCache = new Dictionary<(DateOnly Date, TimeOnly Start, TimeOnly End, int BuildingId, int GapBudget), double>();
+            roomUsageByGroup[grp.Id] = groupRoomUsage;
+            foreach (var accountedDraft in allCreatedDrafts.Where(draft =>
+                         draft.GroupId == grp.Id
+                         && draft.Date >= rangeStartDate
+                         && draft.Date < rangeEndDateExclusive
+                         && draft.RoomId is not null))
+            {
+                if (createdDraftAccounting.TryGetValue(accountedDraft, out var accounting)
+                    && accounting.RoomUsageGroupId is null)
+                {
+                    accounting.RoomUsageGroupId = grp.Id;
+                    accounting.RoomUsageRoomId = accountedDraft.RoomId;
+                }
+            }
+            var teacherDaySlackCache = new Dictionary<(DateOnly Date, int TeacherId, int LessonTypeId), int>();
+            var roomDaySlackCache = new Dictionary<(DateOnly Date, int RoomId, int LessonTypeId), int>();
+            var neighborGapBuildingPenaltyCache = new Dictionary<(DateOnly Date, TimeOnly Start, TimeOnly End, int BuildingId, int GapBudget, int LessonTypeId), double>();
             // Ваги штрафів для вибору найкращого кандидата у слоті.
             // 0 вимикає вплив конкретного правила.
             const double penaltySameModulePrevDay = 10.0; // Повтор того ж модуля у сусідній день.
@@ -4051,7 +7120,7 @@ public sealed class TeacherDraftsAutogenService
             int? NextGroupBuilding(DateOnly date, TimeOnly end)
             {
                 return BusyForGroupDate(grp.Id, date)
-                    .Where(b => b.StartTime >= end && b.RoomId != null)
+                    .Where(b => b.StartTime >= end && RequiresPhysicalRoom(b))
                     .OrderBy(b => b.StartTime)
                     .FirstOrDefault()?.BuildingId;
             }
@@ -4059,7 +7128,7 @@ public sealed class TeacherDraftsAutogenService
             int? NextTeacherBuilding(int teacherId, DateOnly date, TimeOnly end)
             {
                 return BusyForTeacherDate(teacherId, date)
-                    .Where(b => b.StartTime >= end && b.RoomId != null)
+                    .Where(b => b.StartTime >= end && RequiresPhysicalRoom(b))
                     .OrderBy(b => b.StartTime)
                     .FirstOrDefault()?.BuildingId;
             }
@@ -4067,7 +7136,7 @@ public sealed class TeacherDraftsAutogenService
             int? PreferredGroupBuildingForDay(DateOnly date)
             {
                 return BusyForGroupDate(grp.Id, date)
-                    .Where(b => b.BuildingId.HasValue && b.RoomId != null)
+                    .Where(RequiresPhysicalRoom)
                     .GroupBy(b => b.BuildingId!.Value)
                     .OrderByDescending(g => g.Count())
                     .ThenByDescending(g => g.Max(x => x.EndTime))
@@ -4077,11 +7146,11 @@ public sealed class TeacherDraftsAutogenService
             // Кількість занять групи в конкретному корпусі за день.
             int CountGroupBuildingUsageForDay(DateOnly date, int buildingId)
             {
-                return BusyForGroupDate(grp.Id, date).Count(b => b.RoomId != null
-                                                                && b.BuildingId == buildingId);
+                return BusyForGroupDate(grp.Id, date).Count(b =>
+                    RequiresPhysicalRoom(b) && b.BuildingId == buildingId);
             }
             // Штраф за зміну будівлі для групи або викладача.
-            double BuildingDistancePenalty(int teacherId, Room? room, DateOnly date, TimeOnly start, TimeOnly end)
+            double BuildingDistancePenalty(int? teacherId, Room? room, DateOnly date, TimeOnly start, TimeOnly end)
             {
                 if (room is null || room.BuildingId == 0)
                     return 2.0 * buildingDistancePenaltyWeight;
@@ -4089,8 +7158,12 @@ public sealed class TeacherDraftsAutogenService
                 var targetBuildingId = room.BuildingId;
                 var groupPrev = LastGroupBuilding(date, start);
                 var groupNext = NextGroupBuilding(date, end);
-                var teacherPrev = LastTeacherBuilding(teacherId, date, start);
-                var teacherNext = NextTeacherBuilding(teacherId, date, end);
+                var teacherPrev = teacherId is int resolvedTeacherId
+                    ? LastTeacherBuilding(resolvedTeacherId, date, start)
+                    : null;
+                var teacherNext = teacherId is int resolvedTeacherIdForNext
+                    ? NextTeacherBuilding(resolvedTeacherIdForNext, date, end)
+                    : null;
                 var preferredGroupBuilding = PreferredGroupBuildingForDay(date);
                 var groupBuildingUsage = CountGroupBuildingUsageForDay(date, targetBuildingId);
                 if (groupPrev is int gb && gb != targetBuildingId) score += 1.8;
@@ -4121,36 +7194,48 @@ public sealed class TeacherDraftsAutogenService
                         .OrderBy(id => TeacherLoadPenalty(id))
                         .ThenBy(id => id)
                         .ToList();
-                    if (altTids.Count == 0) continue;
-                    var altRooms = CandidateRoomsFor(altModuleId);
-                    foreach (var tid in altTids)
+                    ModuleTopic? altTopic;
+                    int altLtId;
+                    if (altSelfStudy)
                     {
-                        if (!TeacherFitsWorkingHours(tid, date, start, end))
+                        altTopic = PeekSelfStudyTopic(grp.Id, altModuleId);
+                        altLtId = altTopic?.LessonTypeId ?? PickLessonType(grp.Id, grp.CourseId, altModuleId, date).LessonTypeId;
+                    }
+                    else
+                    {
+                        var pick = PickLessonType(grp.Id, grp.CourseId, altModuleId, date);
+                        altLtId = pick.LessonTypeId;
+                        altTopic = pick.Topic;
+                    }
+                    if (!TypeAllowed(altLtId)) continue;
+                    var altRequiresTeacher = !typeById.TryGetValue(altLtId, out var altLessonType)
+                                             || altLessonType.RequiresTeacher;
+                    var altTeacherCandidates = altTids.Count > 0
+                        ? PreferredOrExplicitTeacherPool(
+                                altTids.Where(teacherId => TeacherFitsWorkingHours(teacherId, date, start, end)),
+                                altTopic)
+                            .OrderBy(teacherId => TeacherDepartmentPriority(teacherId, altTopic))
+                            .Select(teacherId => (int?)teacherId)
+                            .ToList()
+                        : altRequiresTeacher
+                            ? new List<int?>()
+                            : new List<int?> { null };
+                    if (altTeacherCandidates.Count == 0) continue;
+                    var altRooms = CandidateRoomsFor(altModuleId);
+                    foreach (var tid in altTeacherCandidates)
+                    {
+                        if (tid is int resolvedTeacherId
+                            && !TeacherFitsWorkingHours(resolvedTeacherId, date, start, end))
                             continue;
                         bool peopleBusy = BusyForDate(date).Any(x =>
-                            (x.GroupId == grp.Id || x.TeacherId == tid)
+                            !IsNonOccupyingBusySlot(x)
+                            && (x.GroupId == grp.Id
+                                || tid is int teacherId
+                                && x.TeacherId == teacherId
+                                && BlocksTeacherSlot(altLtId)
+                                && BlocksTeacherSlot(x.LessonTypeId))
                             && x.StartTime < end && start < x.EndTime);
                         if (peopleBusy) continue;
-                        ModuleTopic? altTopic = null;
-                        int altLtId;
-                        if (altSelfStudy)
-                        {
-                            altTopic = PeekSelfStudyTopic(grp.Id, altModuleId);
-                            altLtId = altTopic?.LessonTypeId ?? PickLessonType(grp.Id, grp.CourseId, altModuleId, date).LessonTypeId;
-                        }
-                        else
-                        {
-                            var pick = PickLessonType(grp.Id, grp.CourseId, altModuleId, date);
-                            altLtId = pick.LessonTypeId;
-                            altTopic = pick.Topic;
-                        }
-                        if (altTopic?.DepartmentId is int altDepId
-                            && altDepId > 0
-                            && (!teacherDepartmentById.TryGetValue(tid, out var teacherDep) || teacherDep != altDepId))
-                        {
-                            continue;
-                        }
-                        if (!TypeAllowed(altLtId)) continue;
                         var altSlotGroupLimit = SlotGroupLimitForPlacement(grp.CourseId, altLtId, altSelfStudy);
                         if (CountGroupsWithModuleInSlot(altModuleId, date, start, end) >= altSlotGroupLimit) continue;
                         var requiresRoom = (typeById.TryGetValue(altLtId, out var ltMetaAlt) ? ltMetaAlt.RequiresRoom : (bool?)null) ?? true;
@@ -4159,7 +7244,7 @@ public sealed class TeacherDraftsAutogenService
                             if (altRooms.Count == 0) continue;
                             foreach (var rm in altRooms)
                             {
-                                bool roomBusy = HasRoomOverlap(rm.Id, date, start, end);
+                                bool roomBusy = HasRoomOverlap(rm.Id, altLtId, date, start, end);
                                 if (roomBusy) continue;
                                 return true;
                             }
@@ -4223,28 +7308,54 @@ public sealed class TeacherDraftsAutogenService
                 allowedRoomsByModule.TryGetValue(mid, out var allowedRooms);
                 allowedBuildingsByModule.TryGetValue(mid, out var allowedBuildings);
                 var minCapacity = requiredCapacity > 0 ? requiredCapacity : grp.StudentsCount;
-                return roomsAll
-                    .Where(rm => (allowedBuildings == null || allowedBuildings.Count == 0 || allowedBuildings.Contains(rm.BuildingId))
-                                 && (allowedRooms == null || allowedRooms.Count == 0 || allowedRooms.Contains(rm.Id))
-                                 && (ignoreGroupPreference || RoomMatchesGroupPreference(groupId, rm))
-                                 && rm.Capacity >= minCapacity)
-                    .OrderBy(rm => groupRoomUsage.TryGetValue(rm.Id, out var used) ? used : 0)
-                    .ThenBy(rm => rm.Capacity)
-                    .ThenBy(rm => rm.Id)
-                    .ToList();
+                // Відомий розмір списку дає змогу уникнути повторних великих буферів LINQ у гарячому циклі.
+                var candidates = new List<Room>(roomsAll.Count);
+                foreach (var room in roomsAll)
+                {
+                    if ((allowedBuildings == null || allowedBuildings.Count == 0 || allowedBuildings.Contains(room.BuildingId))
+                        && (allowedRooms == null || allowedRooms.Count == 0 || allowedRooms.Contains(room.Id))
+                        && (ignoreGroupPreference || RoomMatchesGroupPreference(groupId, room))
+                        && room.Capacity >= minCapacity)
+                    {
+                        candidates.Add(room);
+                    }
+                }
+                candidates.Sort((left, right) =>
+                {
+                    var leftUsage = groupRoomUsage.TryGetValue(left.Id, out var leftUsed) ? leftUsed : 0;
+                    var rightUsage = groupRoomUsage.TryGetValue(right.Id, out var rightUsed) ? rightUsed : 0;
+                    var comparison = leftUsage.CompareTo(rightUsage);
+                    if (comparison != 0)
+                    {
+                        return comparison;
+                    }
+                    comparison = left.Capacity.CompareTo(right.Capacity);
+                    return comparison != 0 ? comparison : left.Id.CompareTo(right.Id);
+                });
+                return candidates;
             }
             List<Room> CandidateRoomsFor(int mid, int requiredCapacity = -1, bool ignoreGroupPreference = false)
                 => CandidateRoomsForGroup(grp.Id, mid, requiredCapacity, ignoreGroupPreference);
             // Впорядковує аудиторії під конкретний тип розміщення.
-            IReadOnlyList<Room> OrderCandidateRoomsForPlacement(IReadOnlyList<Room> candidateRooms, bool isShareableLecturePlacement)
+            IReadOnlyList<Room> OrderCandidateRoomsForPlacement(List<Room> candidateRooms, bool isShareableLecturePlacement)
             {
-                return isShareableLecturePlacement
-                    ? candidateRooms
-                        .OrderBy(rm => groupRoomUsage.TryGetValue(rm.Id, out var used) ? used : 0)
-                        .ThenByDescending(rm => rm.Capacity)
-                        .ThenBy(rm => rm.Id)
-                        .ToList()
-                    : candidateRooms;
+                if (!isShareableLecturePlacement)
+                {
+                    return candidateRooms;
+                }
+                candidateRooms.Sort((left, right) =>
+                {
+                    var leftUsage = groupRoomUsage.TryGetValue(left.Id, out var leftUsed) ? leftUsed : 0;
+                    var rightUsage = groupRoomUsage.TryGetValue(right.Id, out var rightUsed) ? rightUsed : 0;
+                    var comparison = leftUsage.CompareTo(rightUsage);
+                    if (comparison != 0)
+                    {
+                        return comparison;
+                    }
+                    comparison = right.Capacity.CompareTo(left.Capacity);
+                    return comparison != 0 ? comparison : left.Id.CompareTo(right.Id);
+                });
+                return candidateRooms;
             }
             // Зміна аудиторії в суміжному блоці є небажаною, але не має створювати неповну чернетку, якщо є вільна аудиторія.
             double AdjacentRoomSwitchPenalty()
@@ -4268,7 +7379,9 @@ public sealed class TeacherDraftsAutogenService
                 }
                 var averageGroupSize = Math.Max(1, (int)Math.Ceiling(sameCourseGroups.Average(x => x.StudentsCount)));
                 var remainingCapacity = Math.Max(0, room.Capacity - sharedStudents);
-                var remainingGroupSlots = Math.Max(0, sameCourseGroups.Count - totalSharedGroupCount);
+                var remainingGroupSlots = Math.Max(
+                    0,
+                    sameCourseGroups.Count - totalSharedGroupCount);
                 return Math.Min(remainingGroupSlots, remainingCapacity / averageGroupSize);
             }
             // Додає дефіцитний пріоритет до аудиторій:
@@ -4302,7 +7415,7 @@ public sealed class TeacherDraftsAutogenService
             int? LastGroupBuilding(DateOnly date, TimeOnly start)
             {
                 return BusyForGroupDate(grp.Id, date)
-                    .Where(b => b.EndTime <= start && b.RoomId != null)
+                    .Where(b => b.EndTime <= start && RequiresPhysicalRoom(b))
                     .OrderBy(b => b.EndTime)
                     .LastOrDefault()?.BuildingId;
             }
@@ -4310,7 +7423,7 @@ public sealed class TeacherDraftsAutogenService
             int? LastTeacherBuilding(int teacherId, DateOnly date, TimeOnly start)
             {
                 return BusyForTeacherDate(teacherId, date)
-                    .Where(b => b.EndTime <= start && b.RoomId != null)
+                    .Where(b => b.EndTime <= start && RequiresPhysicalRoom(b))
                     .OrderBy(b => b.EndTime)
                     .LastOrDefault()?.BuildingId;
             }
@@ -4337,36 +7450,64 @@ public sealed class TeacherDraftsAutogenService
                 out string reason)
             {
                 reason = string.Empty;
-                if (room is null || room.BuildingId == 0)
+                if (room is null)
                 {
                     return false;
                 }
                 var targetBuildingId = room.BuildingId;
                 foreach (var existing in BusyForDate(date).Where(existing =>
-                             existing.RoomId != null
-                             && existing.BuildingId.HasValue
+                             RequiresPhysicalRoom(existing)
                              && ownerMatch(existing)))
                 {
                     var sourceBuildingId = existing.BuildingId!.Value;
-                    if (sourceBuildingId == targetBuildingId)
+                    if (existing.RoomId is not int sourceRoomId)
                     {
                         continue;
                     }
-                    var needMinutes = TravelMinutes(sourceBuildingId, targetBuildingId);
+                    var needMinutes = TransitionMinutes(
+                        sourceRoomId,
+                        sourceBuildingId,
+                        room.Id,
+                        targetBuildingId);
                     var gapBefore = (start.ToTimeSpan() - existing.EndTime.ToTimeSpan()).TotalMinutes;
                     var gapAfter = (existing.StartTime.ToTimeSpan() - end.ToTimeSpan()).TotalMinutes;
                     if (existing.EndTime <= start && gapBefore < needMinutes)
                     {
-                        reason = $"Для {subjectLabel} недостатньо часу на перехід до корпусу #{targetBuildingId} після заняття в корпусі #{sourceBuildingId}: доступно {gapBefore:N0} хв, потрібно {needMinutes} хв.";
+                        reason = $"Для {subjectLabel} недостатньо часу на зміну аудиторії або корпусу після попереднього заняття: доступно {gapBefore:N0} хв, потрібно {needMinutes} хв.";
                         return true;
                     }
                     if (end <= existing.StartTime && gapAfter < needMinutes)
                     {
-                        reason = $"Для {subjectLabel} недостатньо часу на перехід від корпусу #{sourceBuildingId} до корпусу #{targetBuildingId} перед заняттям: доступно {gapAfter:N0} хв, потрібно {needMinutes} хв.";
+                        reason = $"Для {subjectLabel} недостатньо часу на зміну аудиторії або корпусу перед наступним заняттям: доступно {gapAfter:N0} хв, потрібно {needMinutes} хв.";
                         return true;
                     }
                 }
                 return false;
+            }
+            var emptySharedGroupResolutionCache = new Dictionary<(
+                int StateVersion,
+                int ModuleId,
+                int LessonTypeId,
+                int? TopicId,
+                bool IsSelfStudy,
+                int MaxSegments,
+                DateOnly Date,
+                TimeOnly Start,
+                TimeOnly End,
+                int RoomId), IReadOnlyList<int>>();
+            var feasiblePendingShareablePartnerCache = new Dictionary<(int StateVersion, int ModuleId, int? TopicId), bool>();
+            var futurePendingShareablePartnerCache = new Dictionary<(int StateVersion, int ModuleId, int? TopicId), bool>();
+            var shareableCandidateCacheVersion = teacherLoadStateVersion;
+            void EnsureShareableCandidateCachesCurrent()
+            {
+                if (shareableCandidateCacheVersion == teacherLoadStateVersion)
+                {
+                    return;
+                }
+                emptySharedGroupResolutionCache.Clear();
+                feasiblePendingShareablePartnerCache.Clear();
+                futurePendingShareablePartnerCache.Clear();
+                shareableCandidateCacheVersion = teacherLoadStateVersion;
             }
             IReadOnlyList<int> ResolveSharedLectureGroups(
                 int moduleId,
@@ -4380,24 +7521,53 @@ public sealed class TeacherDraftsAutogenService
                 TimeOnly end,
                 Room room)
             {
+                EnsureShareableCandidateCachesCurrent();
+                var canUseCache = alreadySharedGroupIds.Count == 0;
+                var cacheKey = (
+                    teacherLoadStateVersion,
+                    moduleId,
+                    lessonTypeId,
+                    topic?.Id,
+                    isSelfStudyPlacement,
+                    maxModuleSegmentsAllowed,
+                    date,
+                    start,
+                    end,
+                    room.Id);
+                if (canUseCache
+                    && emptySharedGroupResolutionCache.TryGetValue(cacheKey, out var cachedGroups))
+                {
+                    return cachedGroups;
+                }
+                IReadOnlyList<int> CacheGroups(IReadOnlyList<int> groupIds)
+                {
+                    if (canUseCache)
+                    {
+                        emptySharedGroupResolutionCache[cacheKey] = groupIds;
+                    }
+                    return groupIds;
+                }
+
                 var sharedGroupIds = new List<int> { grp.Id };
                 if (isSelfStudyPlacement || !CanShareAcrossGroups(lessonTypeId))
                 {
-                    return sharedGroupIds;
+                    return CacheGroups(sharedGroupIds);
                 }
                 if (!selectedGroupsByCourse.TryGetValue(grp.CourseId, out var sameCourseGroups) || sameCourseGroups.Count <= 1)
                 {
-                    return sharedGroupIds;
+                    return CacheGroups(sharedGroupIds);
                 }
-                var alreadySharedGroupSet = alreadySharedGroupIds.ToHashSet();
-                int totalStudents = SharedStudentsCount(alreadySharedGroupIds.ToList()) + grp.StudentsCount;
+                var alreadySharedGroupSet = alreadySharedGroupIds.Count > 0
+                    ? alreadySharedGroupIds.ToHashSet()
+                    : null;
+                int totalStudents = SharedStudentsCount(alreadySharedGroupIds) + grp.StudentsCount;
                 foreach (var otherGroup in sameCourseGroups)
                 {
                     if (sharedGroupIds.Count + alreadySharedGroupIds.Count >= sameCourseGroups.Count)
                     {
                         break;
                     }
-                    if (otherGroup.Id == grp.Id || alreadySharedGroupSet.Contains(otherGroup.Id))
+                    if (otherGroup.Id == grp.Id || alreadySharedGroupSet?.Contains(otherGroup.Id) == true)
                     {
                         continue;
                     }
@@ -4425,6 +7595,15 @@ public sealed class TeacherDraftsAutogenService
                     {
                         continue;
                     }
+                    if (ViolatesLectureBlockOrderForPlacement(
+                            otherGroup.Id,
+                            date,
+                            start,
+                            end,
+                            lessonTypeId))
+                    {
+                        continue;
+                    }
                     if (!RoomMatchesGroupPreference(otherGroup.Id, room))
                     {
                         continue;
@@ -4449,13 +7628,32 @@ public sealed class TeacherDraftsAutogenService
                     sharedGroupIds.Add(otherGroup.Id);
                     totalStudents += otherGroup.StudentsCount;
                 }
-                return sharedGroupIds;
+                return CacheGroups(ApplyParallelModuleLimitToSharedPack(
+                    sharedGroupIds,
+                    grp.CourseId,
+                    moduleId,
+                    lessonTypeId,
+                    date,
+                    start,
+                    end));
             }
             bool HasFeasiblePendingShareablePartner(int moduleId, ModuleTopic? topic)
             {
+                EnsureShareableCandidateCachesCurrent();
+                var cacheKey = (teacherLoadStateVersion, moduleId, topic?.Id);
+                if (feasiblePendingShareablePartnerCache.TryGetValue(cacheKey, out var cachedResult))
+                {
+                    return cachedResult;
+                }
+                bool CacheResult(bool result)
+                {
+                    feasiblePendingShareablePartnerCache[cacheKey] = result;
+                    return result;
+                }
+
                 if (!selectedGroupsByCourse.TryGetValue(grp.CourseId, out var sameCourseGroups) || sameCourseGroups.Count <= 1)
                 {
-                    return false;
+                    return CacheResult(false);
                 }
                 allowedRoomsByModule.TryGetValue(moduleId, out var allowedRooms);
                 allowedBuildingsByModule.TryGetValue(moduleId, out var allowedBuildings);
@@ -4486,19 +7684,31 @@ public sealed class TeacherDraftsAutogenService
                         && RoomMatchesGroupPreference(otherGroup.Id, room));
                     if (roomExists)
                     {
-                        return true;
+                        return CacheResult(true);
                     }
                 }
-                return false;
+                return CacheResult(false);
             }
             // Рахує сумарну кількість слухачів для груп у спільній парі.
             bool HasFuturePendingShareablePartner(int moduleId, ModuleTopic? topic)
             {
+                EnsureShareableCandidateCachesCurrent();
+                var cacheKey = (teacherLoadStateVersion, moduleId, topic?.Id);
+                if (futurePendingShareablePartnerCache.TryGetValue(cacheKey, out var cachedResult))
+                {
+                    return cachedResult;
+                }
+                bool CacheResult(bool result)
+                {
+                    futurePendingShareablePartnerCache[cacheKey] = result;
+                    return result;
+                }
+
                 if (topic is null
                     || !selectedGroupsByCourse.TryGetValue(grp.CourseId, out var sameCourseGroups)
                     || sameCourseGroups.Count <= 1)
                 {
-                    return false;
+                    return CacheResult(false);
                 }
                 allowedRoomsByModule.TryGetValue(moduleId, out var allowedRooms);
                 allowedBuildingsByModule.TryGetValue(moduleId, out var allowedBuildings);
@@ -4525,10 +7735,10 @@ public sealed class TeacherDraftsAutogenService
                         && RoomMatchesGroupPreference(otherGroup.Id, room));
                     if (roomExists)
                     {
-                        return true;
+                        return CacheResult(true);
                     }
                 }
-                return false;
+                return CacheResult(false);
             }
             bool HasJoinableFutureShareableGroupOutside(
                 int moduleId,
@@ -4546,7 +7756,7 @@ public sealed class TeacherDraftsAutogenService
                     return false;
                 }
                 var currentGroupSet = currentGroupIds.ToHashSet();
-                var totalStudents = SharedStudentsCount(currentGroupIds.ToList());
+                var totalStudents = SharedStudentsCount(currentGroupIds);
                 foreach (var otherGroup in sameCourseGroups)
                 {
                     if (currentGroupSet.Contains(otherGroup.Id))
@@ -4589,7 +7799,7 @@ public sealed class TeacherDraftsAutogenService
                 }
                 return false;
             }
-            int SharedStudentsCount(IReadOnlyList<int> groupIds)
+            int SharedStudentsCount(IEnumerable<int> groupIds)
             {
                 int total = 0;
                 foreach (var gid in groupIds)
@@ -4626,9 +7836,9 @@ public sealed class TeacherDraftsAutogenService
                 return baseWeight * 1.75;
             }
             // Рахує, у скількох слотах дня викладач узагалі залишається вільним.
-            int CountTeacherFreeSlotsForDay(DateOnly day, int teacherId)
+            int CountTeacherFreeSlotsForDay(DateOnly day, int teacherId, int lessonTypeId)
             {
-                var cacheKey = (day, teacherId);
+                var cacheKey = (day, teacherId, lessonTypeId);
                 if (teacherDaySlackCache.TryGetValue(cacheKey, out var cachedCount))
                 {
                     return cachedCount;
@@ -4640,7 +7850,7 @@ public sealed class TeacherDraftsAutogenService
                     {
                         continue;
                     }
-                    var isBusy = HasTeacherOverlap(teacherId, day, slot.Start, slot.End);
+                    var isBusy = HasTeacherOverlap(teacherId, lessonTypeId, day, slot.Start, slot.End);
                     if (!isBusy)
                     {
                         count++;
@@ -4650,9 +7860,9 @@ public sealed class TeacherDraftsAutogenService
                 return count;
             }
             // Рахує, у скількох слотах дня аудиторія ще досяжна для поточної групи без порушення переходів.
-            int CountRoomReachableSlotsForDay(DateOnly day, Room room)
+            int CountRoomReachableSlotsForDay(DateOnly day, Room room, int lessonTypeId)
             {
-                var cacheKey = (day, room.Id);
+                var cacheKey = (day, room.Id, lessonTypeId);
                 if (roomDaySlackCache.TryGetValue(cacheKey, out var cachedCount))
                 {
                     return cachedCount;
@@ -4660,7 +7870,7 @@ public sealed class TeacherDraftsAutogenService
                 var count = 0;
                 foreach (var slot in slots)
                 {
-                    var roomBusy = HasRoomOverlap(room.Id, day, slot.Start, slot.End);
+                    var roomBusy = HasRoomOverlap(room.Id, lessonTypeId, day, slot.Start, slot.End);
                     if (roomBusy)
                     {
                         continue;
@@ -4682,7 +7892,12 @@ public sealed class TeacherDraftsAutogenService
                 return count;
             }
             // Рахує, скільки корпусів ще досяжні для сусіднього порожнього слоту після вибору поточного корпусу.
-            int CountReachableBuildingsForAdjacentGap(DateOnly day, TimeSlot currentSlot, TimeSlot adjacentGap, int currentBuildingId)
+            int CountReachableBuildingsForAdjacentGap(
+                DateOnly day,
+                TimeSlot currentSlot,
+                TimeSlot adjacentGap,
+                int currentBuildingId,
+                int lessonTypeId)
             {
                 var reachableBuildings = new HashSet<int>();
                 var adjacentGapBeforeCurrent = adjacentGap.End <= currentSlot.Start;
@@ -4692,7 +7907,7 @@ public sealed class TeacherDraftsAutogenService
                     {
                         continue;
                     }
-                    var roomBusy = HasRoomOverlap(room.Id, day, adjacentGap.Start, adjacentGap.End);
+                    var roomBusy = HasRoomOverlap(room.Id, lessonTypeId, day, adjacentGap.Start, adjacentGap.End);
                     if (roomBusy)
                     {
                         continue;
@@ -4716,7 +7931,13 @@ public sealed class TeacherDraftsAutogenService
                 return reachableBuildings.Count;
             }
             // Штрафує корпус, який занадто сильно обмежує наступні або попередні порожні слоти.
-            double NeighborGapBuildingPreservationPenalty(Room room, DateOnly day, TimeSlot currentSlot, int? forcedGapVariantBudget, bool isShareableLecturePlacement)
+            double NeighborGapBuildingPreservationPenalty(
+                Room room,
+                DateOnly day,
+                TimeSlot currentSlot,
+                int lessonTypeId,
+                int? forcedGapVariantBudget,
+                bool isShareableLecturePlacement)
             {
                 var preservationWeight = GapResourcePreservationWeight(forcedGapVariantBudget);
                 if (preservationWeight <= 0 && isShareableLecturePlacement)
@@ -4728,7 +7949,7 @@ public sealed class TeacherDraftsAutogenService
                     return 0;
                 }
                 var gapBudget = forcedGapVariantBudget ?? 9;
-                var cacheKey = (day, currentSlot.Start, currentSlot.End, room.BuildingId, gapBudget);
+                var cacheKey = (day, currentSlot.Start, currentSlot.End, room.BuildingId, gapBudget, lessonTypeId);
                 if (neighborGapBuildingPenaltyCache.TryGetValue(cacheKey, out var cachedPenalty))
                 {
                     return cachedPenalty;
@@ -4747,7 +7968,12 @@ public sealed class TeacherDraftsAutogenService
                         {
                             continue;
                         }
-                        var reachableBuildingCount = CountReachableBuildingsForAdjacentGap(day, currentSlot, adjacentGap, room.BuildingId);
+                        var reachableBuildingCount = CountReachableBuildingsForAdjacentGap(
+                            day,
+                            currentSlot,
+                            adjacentGap,
+                            room.BuildingId,
+                            lessonTypeId);
                         penalty += reachableBuildingCount switch
                         {
                             <= 0 => 8.5,
@@ -4762,14 +7988,14 @@ public sealed class TeacherDraftsAutogenService
                 return penalty;
             }
             // Бережемо викладачів, у яких лишається занадто мало вільних слотів на день.
-            double TeacherScarcityReservationPenalty(int teacherId, DateOnly day, int? forcedGapVariantBudget)
+            double TeacherScarcityReservationPenalty(int teacherId, int lessonTypeId, DateOnly day, int? forcedGapVariantBudget)
             {
                 var preservationWeight = GapResourcePreservationWeight(forcedGapVariantBudget);
                 if (preservationWeight <= 0)
                 {
                     return 0;
                 }
-                var freeSlots = CountTeacherFreeSlotsForDay(day, teacherId);
+                var freeSlots = CountTeacherFreeSlotsForDay(day, teacherId, lessonTypeId);
                 var basePenalty = freeSlots switch
                 {
                     <= 1 => 8.0,
@@ -4781,14 +8007,19 @@ public sealed class TeacherDraftsAutogenService
                 return basePenalty * preservationWeight;
             }
             // Бережемо аудиторії, які для групи лишаються досяжними лише в небагатьох слотах дня.
-            double RoomReachabilityReservationPenalty(Room room, DateOnly day, int? forcedGapVariantBudget, bool isShareableLecturePlacement)
+            double RoomReachabilityReservationPenalty(
+                Room room,
+                int lessonTypeId,
+                DateOnly day,
+                int? forcedGapVariantBudget,
+                bool isShareableLecturePlacement)
             {
                 var preservationWeight = GapResourcePreservationWeight(forcedGapVariantBudget);
                 if (preservationWeight <= 0)
                 {
                     return 0;
                 }
-                var reachableSlots = CountRoomReachableSlotsForDay(day, room);
+                var reachableSlots = CountRoomReachableSlotsForDay(day, room, lessonTypeId);
                 var basePenalty = reachableSlots switch
                 {
                     <= 1 => 7.0,
@@ -4847,11 +8078,23 @@ public sealed class TeacherDraftsAutogenService
                         return orderedCandidates[0];
                     }
                 }
-                return candidates[sequenceRandom.Next(candidates.Count)];
+                // Стабільний псевдовипадковий ключ не залежить від кількості пробних проходів.
+                return candidates
+                    .OrderBy(moduleId => StableSeed(weekStart.DayNumber, grp.Id, grp.CourseId, moduleId, 17))
+                    .ThenBy(moduleId => moduleId)
+                    .First();
             }
             var generationDates = DatesBetween(rangeStartDate, rangeEndDateExclusive)
                 .Where(date => IsWorking(date, grp))
                 .ToList();
+            // Для кількох груп спочатку завершуємо один день для всього потоку,
+            // а вже потім переходимо до наступного. Так рання група не забирає
+            // дефіцитні слоти всього діапазону до початку роботи над пізніми.
+            IReadOnlyList<DateOnly> datesForGenerationRound = r.ClearExisting
+                                                               && generationGroups.Count > 1
+                                                               && globalCatchUpRound <= generationDates.Count
+                ? new[] { generationDates[globalCatchUpRound - 1] }
+                : generationDates;
             int CountPendingPreferredFirstPlacements()
             {
                 if (preferredFirstTypeId == 0 || !TypeAllowed(preferredFirstTypeId))
@@ -4869,13 +8112,10 @@ public sealed class TeacherDraftsAutogenService
                     var topicLeft = 0;
                     if (topicsByModule.TryGetValue(moduleId, out var topicList))
                     {
-                        topicAssignments.TryGetValue((grp.Id, moduleId), out var assignedTopics);
                         foreach (var topic in topicList.Where(t => t.LessonTypeId == preferredFirstTypeId))
                         {
                             var limit = GetTopicUsageLimit(topic);
-                            var used = assignedTopics is not null && assignedTopics.TryGetValue(topic.Id, out var usedCount)
-                                ? usedCount
-                                : 0;
+                            var used = ActualTopicUsageCount(grp.Id, moduleId, topic.Id);
                             topicLeft += Math.Max(0, limit - used);
                         }
                     }
@@ -5006,10 +8246,20 @@ public sealed class TeacherDraftsAutogenService
                     {
                         return true;
                     }
+                    if (moduleTitles.TryGetValue(moduleId, out var cachedTitle))
+                    {
+                        moduleTitle = cachedTitle;
+                        return true;
+                    }
+                    if (missingModulesNotified.Contains(moduleId))
+                    {
+                        skipped++;
+                        return false;
+                    }
                     moduleTitle = await _db.Modules
                         .Where(m => m.Id == moduleId)
                         .Select(m => m.Title)
-                        .FirstOrDefaultAsync();
+                        .FirstOrDefaultAsync(cancellationToken);
                     if (moduleTitle is null)
                     {
                         if (missingModulesNotified.Add(moduleId))
@@ -5019,6 +8269,9 @@ public sealed class TeacherDraftsAutogenService
                         skipped++;
                         return false;
                     }
+                    // Запам'ятовуємо модулі, яких не було в початковій вибірці планів,
+                    // щоб наступні варіанти не виконували той самий SQL-запит.
+                    moduleTitles[moduleId] = moduleTitle;
                     return true;
                 }
                 // Лейбл модуля для текстів попереджень.
@@ -5033,13 +8286,9 @@ public sealed class TeacherDraftsAutogenService
                 {
                     return false;
                 }
-                // Якщо теми вичерпано — прибираємо модуль з плану.
+                // Якщо теми вичерпано — фіксуємо дефіцит, не маскуючи незапланований залишок годин.
                 if (!softFill && TopicsDepleted(grp.Id, moduleId))
                 {
-                    if (remainingByGroupModule.ContainsKey(remainingKey))
-                    {
-                        remainingByGroupModule[remainingKey] = 0;
-                    }
                     if (topicsExhaustedNotified.Add(remainingKey))
                     {
                         warnings.Add($"Для модуля <{ModuleLabel()}> у групи {grp.Name} вичерпано теми. Пропустили розкладення.");
@@ -5058,26 +8307,7 @@ public sealed class TeacherDraftsAutogenService
                     .OrderBy(id => TeacherLoadPenalty(id))
                     .ThenBy(id => id)
                     .ToList();
-                // Якщо немає викладачів — фіксуємо причину і пропускаємо.
-                if (tids.Count == 0)
-                {
-                    var teacherReason = placeSelfStudy
-                        ? $"Не знайдено керівників для модуля <{ModuleLabel()}> (група {grp.Name}). Самостійну годину не створено."
-                        : $"Не знайдено викладачів для модуля <{ModuleLabel()}> (група {grp.Name}).";
-                    RecordSlotFailureReasonForAllSlots(date, teacherReason);
-                    warnings.Add(teacherReason);
-                    if (placeSelfStudy && !allowIncompleteDrafts)
-                    {
-                        var key = (grp.Id, moduleId);
-                        if (selfStudyRemainingByGroupModule.ContainsKey(key))
-                            selfStudyRemainingByGroupModule[key] = 0;
-                    }
-                    if (!allowIncompleteDrafts)
-                    {
-                        skipped++;
-                        return false;
-                    }
-                }
+                var missingRequiredTeachersNotified = false;
                 // Кандидатні аудиторії для модуля.
                 var candidateRooms = CandidateRoomsFor(moduleId, ignoreGroupPreference: softFill);
                 var maxModuleSegmentsAllowed = Math.Max(maxModuleSegmentsPerDay, maxModuleSegmentsOverride ?? maxModuleSegmentsPerDay);
@@ -5113,13 +8343,12 @@ public sealed class TeacherDraftsAutogenService
                     var e = sl.End;
                     var slotLabel = $"{s:HH\\:mm}-{e:HH\\:mm}";
                     // Тимчасові колекції причин та кандидатів для цього слоту.
-                    var slotIssues = new HashSet<string>();
-                    var slotCandidates = new List<PlacementCandidate>();
+                    var slotIssues = new HashSet<string>(16);
+                    var slotCandidateCapacity = Math.Max(4, Math.Max(1, tids.Count) * Math.Max(1, candidateRooms.Count));
+                    var slotCandidates = new List<PlacementCandidate>(slotCandidateCapacity);
                     int slotIndex = slotIndexByTime.TryGetValue((s, e), out var si) ? si : 0;
-                    var sameModuleIndexes = busy
-                        .Where(b => b.GroupId == grp.Id
-                                    && b.Date == date
-                                    && b.ModuleId == moduleId
+                    var sameModuleIndexes = BusyForGroupDate(grp.Id, date)
+                        .Where(b => b.ModuleId == moduleId
                                     && !excludedTypeIds.Contains(b.LessonTypeId))
                         .Select(b => slotIndexByTime.TryGetValue((b.StartTime, b.EndTime), out var existingIndex) ? existingIndex : -1)
                         .Where(idx => idx >= 0)
@@ -5264,6 +8493,14 @@ public sealed class TeacherDraftsAutogenService
                             $"Лекційний тип не можна ставити у слот №{currentSlotOrder}: раннє лекційне вікно вже завершилось, а аварійний резерв починається з 9-ї.");
                         continue;
                     }
+                    if (ViolatesLectureBlockOrderForPlacement(grp.Id, date, s, e, ltypeId))
+                    {
+                        RecordSlotFailureReason(
+                            date,
+                            sl,
+                            "Лекцію не можна ставити після початку нелекційних занять: лекційний блок має бути суцільним.");
+                        continue;
+                    }
                     if (preferredFirstEnabled
                         && ltypeId == preferredFirstTypeId
                         && !CanShareAcrossGroups(ltypeId)
@@ -5275,7 +8512,6 @@ public sealed class TeacherDraftsAutogenService
                         preferredFirstWeekBalancePenalty = 34.0 * preferredFirstPenaltyMultiplier;
                         preferredFirstWeekBalanceNote = "Тип з прапорцем \"Бажано першим у тижні\" поставлено раніше тижневого балансу, щоб не лишати порожній слот";
                     }
-                    // Лекційні потоки лімітуємо кількістю вибраних груп курсу, а не фіксованою стелею.
                     if (!isSelfStudyPlacement
                         && topicSelection is not null
                         && CanShareAcrossGroups(ltypeId)
@@ -5287,7 +8523,20 @@ public sealed class TeacherDraftsAutogenService
                             $"Спільну лекційну тему {topicSelection.TopicCode} модуля <{ModuleLabel()}> відкладено, доки всі вибрані групи курсу дійдуть до неї за порядком тем.");
                         continue;
                     }
-                    var preselectedSlotGroupLimit = SlotGroupLimitForPlacement(grp.CourseId, ltypeId, isSelfStudyPlacement);
+                    // Межа паралельних груп однакова для основних і відновлювальних проходів.
+                    var preselectedSlotGroupLimit = ResourceBoundedSlotGroupLimitForPlacement(
+                        grp.CourseId,
+                        moduleId,
+                        ltypeId,
+                        topicSelection,
+                        isSelfStudyPlacement,
+                        bypassSoftModuleParallelLimit: relaxed
+                                                       || bypassCatchUpHold
+                                                       || topicSelection is not null
+                                                       && MustPreserveFutureSharedCheckpoint(
+                                                           grp.CourseId,
+                                                           moduleId,
+                                                           topicSelection));
                     if (CountGroupsWithModuleInSlot(moduleId, date, s, e) >= preselectedSlotGroupLimit)
                     {
                         continue;
@@ -5300,6 +8549,21 @@ public sealed class TeacherDraftsAutogenService
                             date,
                             sl,
                             $"Для групи {grp.Name} порушується хронологічний порядок тем модуля <{ModuleLabel()}> у слоті {slotLabel}.");
+                        continue;
+                    }
+                    if (WouldConsumeFutureSharedCheckpointCapacity(
+                            grp.Id,
+                            moduleId,
+                            topicSelection,
+                            isSelfStudyPlacement,
+                            date,
+                            s,
+                            e))
+                    {
+                        RecordSlotFailureReason(
+                            date,
+                            sl,
+                            $"Слот {slotLabel} збережено для завершення попередніх тем перед спільною лекційною контрольною точкою.");
                         continue;
                     }
                     var catchUpHoldBypassed = false;
@@ -5334,29 +8598,32 @@ public sealed class TeacherDraftsAutogenService
                             nonPreferredBeforeFirstPreferredNote = "Ранній слот бажано віддати під перше заняття з прапорцем \"Бажано першим у тижні\"";
                         }
                     }
-                    // За потреби фільтруємо викладачів за кафедрою теми.
-                    var filteredTeacherIds = tids;
-                    if (topicSelection?.DepartmentId is int departmentId && departmentId > 0)
+                    // Для необов'язкового викладача зберігаємо явний зв'язок, а без нього використовуємо null-кандидата.
+                    var requiresTeacher = (typeById.TryGetValue(ltypeId, out var ltMetaForFallback) ? ltMetaForFallback.RequiresTeacher : (bool?)null) ?? true;
+                    var mappedTeacherIds = PreferredOrExplicitTeacherPool(
+                            tids.Where(tid => TeacherFitsWorkingHours(tid, date, s, e)),
+                            topicSelection)
+                        .OrderBy(tid => TeacherDepartmentPriority(tid, topicSelection))
+                        .ToList();
+                    List<int?> filteredTeacherIds = mappedTeacherIds.Count > 0
+                        ? mappedTeacherIds.Select(teacherId => (int?)teacherId).ToList()
+                        : requiresTeacher
+                            ? new()
+                            : new() { null };
+                    if (requiresTeacher && filteredTeacherIds.Count == 0 && !allowIncompleteDrafts)
                     {
-                        filteredTeacherIds = tids
-                            .Where(tid => teacherDepartmentById.TryGetValue(tid, out var depId) && depId == departmentId)
-                            .ToList();
-                        if (filteredTeacherIds.Count == 0)
+                        var teacherReason = placeSelfStudy
+                            ? $"Не знайдено керівників для модуля <{ModuleLabel()}> (група {grp.Name}). Самостійну годину не створено."
+                            : $"Не знайдено викладачів для модуля <{ModuleLabel()}> (група {grp.Name}).";
+                        RecordSlotFailureReason(date, sl, teacherReason);
+                        if (!missingRequiredTeachersNotified)
                         {
-                            var depName = departmentNames.TryGetValue(departmentId, out var dn) ? dn : $"#{departmentId}";
-                            var topicCode = string.IsNullOrWhiteSpace(topicSelection.TopicCode) ? null : topicSelection.TopicCode.Trim();
-                            var reason = topicCode is null
-                                ? $"Для модуля <{ModuleLabel()}> обрано кафедру \"{depName}\", але немає доступних викладачів цієї кафедри."
-                                : $"Для модуля <{ModuleLabel()}> (тема {topicCode}) обрано кафедру \"{depName}\", але немає доступних викладачів цієї кафедри.";
-                            RecordSlotFailureReason(date, sl, reason);
-                            if (!allowIncompleteDrafts)
-                            {
-                                continue;
-                            }
+                            warnings.Add(teacherReason);
+                            missingRequiredTeachersNotified = true;
                         }
+                        continue;
                     }
                     // Перебір кандидатів-викладачів для цього слоту.
-                    var requiresTeacher = (typeById.TryGetValue(ltypeId, out var ltMetaForFallback) ? ltMetaForFallback.RequiresTeacher : (bool?)null) ?? true;
                     var requiresRoomForFallback = (typeById.TryGetValue(ltypeId, out var ltMetaRoomFallback) ? ltMetaRoomFallback.RequiresRoom : (bool?)null) ?? true;
                     var isShareableLecturePlacementForFallback = !isSelfStudyPlacement && CanShareAcrossGroups(ltypeId);
                     var orderedCandidateRoomsForFallback = requiresRoomForFallback
@@ -5369,13 +8636,13 @@ public sealed class TeacherDraftsAutogenService
                         {
                             return null;
                         }
-                        foreach (var teacherId in filteredTeacherIds)
+                        foreach (var teacherId in filteredTeacherIds.OfType<int>())
                         {
                             if (!TeacherFitsWorkingHours(teacherId, date, s, e))
                             {
                                 continue;
                             }
-                            var teacherBusyForSlot = HasTeacherOverlap(teacherId, date, s, e);
+                            var teacherBusyForSlot = HasTeacherOverlap(teacherId, ltypeId, date, s, e);
                             if (!teacherBusyForSlot)
                             {
                                 return teacherId;
@@ -5391,7 +8658,7 @@ public sealed class TeacherDraftsAutogenService
                         }
                         foreach (var roomCandidate in orderedCandidateRoomsForFallback)
                         {
-                            var roomBusyForSlot = HasRoomOverlap(roomCandidate.Id, date, s, e);
+                            var roomBusyForSlot = HasRoomOverlap(roomCandidate.Id, ltypeId, date, s, e);
                             if (roomBusyForSlot)
                             {
                                 continue;
@@ -5411,9 +8678,23 @@ public sealed class TeacherDraftsAutogenService
                         }
                         return null;
                     }
-                    TeacherDraftItem? FindDraftForBusySlot(BusySlot busySlot)
-                        => allCreatedDrafts.FirstOrDefault(draft =>
-                            SlotMatches(
+                    bool RequiredResourcesRemainMatchableWithIncompleteDraft(
+                        int? proposedTeacherId,
+                        Room? proposedRoom)
+                    {
+                        // Перепризначати дозволено лише створені цим запуском непотокові чернетки.
+                        // Опубліковані, заблоковані та потокові заняття лишаються фіксованою зайнятістю.
+                        var rematchableDraftsInSlot = allCreatedDrafts
+                            .Where(draft => draft.Status == DraftStatus.Draft
+                                            && !draft.IsLocked
+                                            && !CanShareAcrossGroups(draft.LessonTypeId)
+                                            && draft.Date == date
+                                            && draft.StartTime == s
+                                            && draft.EndTime == e)
+                            .ToList();
+
+                        bool BelongsToRematchableDraft(BusySlot busySlot)
+                            => rematchableDraftsInSlot.Any(draft => SlotMatches(
                                 busySlot,
                                 draft.GroupId,
                                 draft.Date,
@@ -5423,282 +8704,146 @@ public sealed class TeacherDraftsAutogenService
                                 draft.TeacherId,
                                 draft.RoomId,
                                 draft.ModuleTopicId));
-                    bool TryReassignSingleRoomOccupant(
-                        Room targetRoom,
-                        IReadOnlySet<int> ignoredSharedGroupIds,
-                        int currentTeacherId,
-                        out string note)
-                    {
-                        note = string.Empty;
-                        if (!softFill || !relaxed || forcedSlot is null)
-                        {
-                            return false;
-                        }
-                        var conflictingSlots = BusyForRoomDate(targetRoom.Id, date)
-                            .Where(slot => slot.StartTime < e && s < slot.EndTime)
-                            .Where(slot => !IsSameSharedLectureCluster(
-                                slot,
-                                ignoredSharedGroupIds,
-                                moduleId,
-                                ltypeId,
-                                topicSelection?.Id,
-                                currentTeacherId,
-                                targetRoom.Id,
-                                date,
-                                s,
-                                e))
-                            .ToList();
-                        if (conflictingSlots.Count != 1)
-                        {
-                            return false;
-                        }
-                        var occupiedSlot = conflictingSlots[0];
-                        var occupiedDraft = FindDraftForBusySlot(occupiedSlot);
-                        if (occupiedDraft is null
-                            || occupiedDraft.IsLocked
-                            || occupiedDraft.Status != DraftStatus.Draft
-                            || occupiedDraft.RoomId != targetRoom.Id
-                            || CanShareAcrossGroups(occupiedDraft.LessonTypeId)
-                            || excludedTypeIds.Contains(occupiedDraft.LessonTypeId)
-                            || !selectedGroupsById.TryGetValue(occupiedDraft.GroupId, out var occupiedGroup))
-                        {
-                            return false;
-                        }
-                        var alternativeRooms = CandidateRoomsForGroup(
-                                occupiedDraft.GroupId,
-                                occupiedDraft.ModuleId,
-                                occupiedGroup.StudentsCount,
-                                ignoreGroupPreference: true)
-                            .Where(room => room.Id != targetRoom.Id)
-                            .OrderBy(room => room.Capacity)
-                            .ThenBy(room => room.Id)
-                            .ToList();
-                        foreach (var alternativeRoom in alternativeRooms)
-                        {
-                            if (BusyForRoomDate(alternativeRoom.Id, date).Any(slot => slot.StartTime < e && s < slot.EndTime))
-                            {
-                                continue;
-                            }
-                            if (ViolatesTravelFeasibility(
-                                    existing => existing.GroupId == occupiedDraft.GroupId,
-                                    alternativeRoom,
-                                    date,
-                                    s,
-                                    e,
-                                    $"групи {occupiedGroup.Name}",
-                                    out _))
-                            {
-                                continue;
-                            }
-                            if (occupiedDraft.TeacherId is int occupiedTeacherId
-                                && ViolatesTravelFeasibility(
-                                    existing => existing.TeacherId == occupiedTeacherId,
-                                    alternativeRoom,
-                                    date,
-                                    s,
-                                    e,
-                                    $"викладача {TeacherLabel(occupiedTeacherId)}",
-                                    out _))
-                            {
-                                continue;
-                            }
-                            var oldBusySlot = FindBusySlotForDraft(occupiedDraft, occupiedDraft.StartTime, occupiedDraft.EndTime);
-                            if (oldBusySlot is null || !RemoveBusySlot(oldBusySlot))
-                            {
-                                return false;
-                            }
-                            occupiedDraft.RoomId = alternativeRoom.Id;
-                            AddBusySlot(new BusySlot(
-                                occupiedDraft.GroupId,
-                                occupiedDraft.TeacherId,
-                                occupiedDraft.RoomId,
-                                date,
-                                occupiedDraft.StartTime,
-                                occupiedDraft.EndTime,
-                                alternativeRoom.BuildingId,
-                                occupiedDraft.ModuleId,
-                                occupiedDraft.LessonTypeId,
-                                occupiedDraft.ModuleTopicId,
-                                true));
-                            InvalidateGapResourceCaches();
-                            note = $"Аудиторію #{targetRoom.Id} звільнено пересадкою групи {occupiedGroup.Name} в аудиторію #{alternativeRoom.Id}.";
-                            warnings.Add($"[{date:yyyy-MM-dd} {s:HH\\:mm}-{e:HH\\:mm}] {note}");
-                            return true;
-                        }
-                        return false;
-                    }
-                    bool TryMoveDraftToSlotPreservingResources(TeacherDraftItem draft, TimeSlot targetSlot, out string note)
-                    {
-                        note = string.Empty;
-                        if (draft.IsLocked
-                            || draft.Status != DraftStatus.Draft
-                            || draft.Date != date
-                            || CanShareAcrossGroups(draft.LessonTypeId)
-                            || excludedTypeIds.Contains(draft.LessonTypeId)
-                            || (draft.StartTime == targetSlot.Start && draft.EndTime == targetSlot.End))
-                        {
-                            return false;
-                        }
-                        if (draft.TeacherId is not int draftTeacherId
-                            || draft.RoomId is not int draftRoomId
-                            || !selectedGroupsById.TryGetValue(draft.GroupId, out var draftGroup))
-                        {
-                            return false;
-                        }
-                        var draftRoom = roomsAll.FirstOrDefault(room => room.Id == draftRoomId);
-                        if (draftRoom is null)
-                        {
-                            return false;
-                        }
-                        if (!slotIndexByTime.TryGetValue((draft.StartTime, draft.EndTime), out var oldSlotIndex)
-                            || !slotIndexByTime.TryGetValue((targetSlot.Start, targetSlot.End), out var targetSlotIndex))
-                        {
-                            return false;
-                        }
-                        var maxSegmentsAllowed = softFill ? 2 : maxModuleSegmentsPerDay;
-                        var moduleIndexesAfterMove = BusyForGroupDate(draft.GroupId, date)
-                            .Where(slot => slot.ModuleId == draft.ModuleId
-                                           && !excludedTypeIds.Contains(slot.LessonTypeId))
-                            .Select(slot => slotIndexByTime.TryGetValue((slot.StartTime, slot.EndTime), out var idx) ? idx : -1)
-                            .Where(idx => idx >= 0 && idx != oldSlotIndex)
-                            .Append(targetSlotIndex)
-                            .Distinct()
-                            .OrderBy(idx => idx)
-                            .ToList();
-                        if (CountModuleSegments(moduleIndexesAfterMove) > maxSegmentsAllowed
-                            || InsertionWouldSplitExistingModuleBlock(draft.GroupId, date, draft.ModuleId, targetSlot.Start, targetSlot.End, out _, maxSegmentsAllowed))
-                        {
-                            return false;
-                        }
-                        var oldBusySlot = FindBusySlotForDraft(draft, draft.StartTime, draft.EndTime);
-                        if (oldBusySlot is null || !RemoveBusySlot(oldBusySlot))
-                        {
-                            return false;
-                        }
-                        var oldStart = draft.StartTime;
-                        var oldEnd = draft.EndTime;
-                        try
-                        {
-                            if (!TeacherFitsWorkingHours(draftTeacherId, date, targetSlot.Start, targetSlot.End)
-                                || HasGroupOverlap(draft.GroupId, date, targetSlot.Start, targetSlot.End)
-                                || HasTeacherOverlap(draftTeacherId, date, targetSlot.Start, targetSlot.End)
-                                || HasRoomOverlap(draftRoomId, date, targetSlot.Start, targetSlot.End))
-                            {
-                                return false;
-                            }
-                            if (draft.ModuleTopicId is int draftTopicId
-                                && topicById.TryGetValue(draftTopicId, out var draftTopic)
-                                && ViolatesTopicCalendarOrder(draft.GroupId, draft.ModuleId, draftTopic, date, targetSlot.Start, targetSlot.End))
-                            {
-                                return false;
-                            }
-                            if (ViolatesTravelFeasibility(
-                                    existing => existing.GroupId == draft.GroupId,
-                                    draftRoom,
-                                    date,
-                                    targetSlot.Start,
-                                    targetSlot.End,
-                                    $"групи {draftGroup.Name}",
-                                    out _))
-                            {
-                                return false;
-                            }
-                            if (ViolatesTravelFeasibility(
-                                    existing => existing.TeacherId == draftTeacherId,
-                                    draftRoom,
-                                    date,
-                                    targetSlot.Start,
-                                    targetSlot.End,
-                                    $"викладача {TeacherLabel(draftTeacherId)}",
-                                    out _))
-                            {
-                                return false;
-                            }
-                            draft.StartTime = targetSlot.Start;
-                            draft.EndTime = targetSlot.End;
-                            draft.DayOfWeek = date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
-                            AddBusySlot(new BusySlot(
+
+                        var resourceEvents = rematchableDraftsInSlot
+                            .Select((draft, index) => (
+                                Key: index,
                                 draft.GroupId,
-                                draft.TeacherId,
-                                draft.RoomId,
-                                date,
-                                targetSlot.Start,
-                                targetSlot.End,
-                                draftRoom.BuildingId,
                                 draft.ModuleId,
-                                draft.LessonTypeId,
                                 draft.ModuleTopicId,
-                                true));
-                            InvalidateGapResourceCaches();
-                            note = $"Заняття групи {draftGroup.Name} перенесено з {oldStart:HH\\:mm}-{oldEnd:HH\\:mm} у {targetSlot.Start:HH\\:mm}-{targetSlot.End:HH\\:mm}, щоб звільнити дефіцитний ресурс.";
-                            warnings.Add($"[{date:yyyy-MM-dd} {s:HH\\:mm}-{e:HH\\:mm}] {note}");
-                            return true;
-                        }
-                        finally
+                                draft.LessonTypeId,
+                                draft.IsSelfStudy,
+                                draft.TeacherId,
+                                draft.RoomId))
+                            .ToList();
+                        resourceEvents.Add((
+                            resourceEvents.Count,
+                            grp.Id,
+                            moduleId,
+                            topicSelection?.Id,
+                            ltypeId,
+                            isSelfStudyPlacement,
+                            proposedTeacherId,
+                            proposedRoom?.Id));
+
+                        var teacherCandidatesByEvent = new Dictionary<int, IReadOnlyList<int>>();
+                        var roomCandidatesByEvent = new Dictionary<int, IReadOnlyList<int>>();
+                        foreach (var resourceEvent in resourceEvents)
                         {
-                            if (draft.StartTime == oldStart && draft.EndTime == oldEnd)
+                            var eventRequiresTeacher = (typeById.TryGetValue(resourceEvent.LessonTypeId, out var eventType)
+                                ? eventType.RequiresTeacher
+                                : (bool?)null) ?? true;
+                            var eventRequiresRoom = (typeById.TryGetValue(resourceEvent.LessonTypeId, out eventType)
+                                ? eventType.RequiresRoom
+                                : (bool?)null) ?? true;
+                            var eventTopic = resourceEvent.ModuleTopicId is int eventTopicId
+                                             && topicById.TryGetValue(eventTopicId, out var resolvedTopic)
+                                ? resolvedTopic
+                                : null;
+                            var eventRoom = resourceEvent.RoomId is int eventRoomId
+                                ? roomsAll.FirstOrDefault(room => room.Id == eventRoomId)
+                                : null;
+
+                            if (eventRequiresTeacher)
                             {
-                                AddBusySlot(oldBusySlot);
-                                InvalidateGapResourceCaches();
+                                var eventTeacherCandidates = PreferredOrExplicitTeacherPool(
+                                        (resourceEvent.IsSelfStudy
+                                        ? supervisorsForModule
+                                            .Where(link => link.ModuleId == resourceEvent.ModuleId)
+                                            .Select(link => link.TeacherId)
+                                        : teachersForModule
+                                            .Where(link => link.ModuleId == resourceEvent.ModuleId)
+                                            .Select(link => link.TeacherId))
+                                        .Where(teacherId => TeacherFitsWorkingHours(teacherId, date, s, e))
+                                        .Where(teacherId => !BlocksTeacherSlot(resourceEvent.LessonTypeId)
+                                                            || !BusyForTeacherDate(teacherId, date).Any(busySlot =>
+                                                                SlotOverlaps(busySlot, date, s, e)
+                                                                && BlocksTeacherSlot(busySlot.LessonTypeId)
+                                                                && !BelongsToRematchableDraft(busySlot))),
+                                        eventTopic)
+                                    .Where(teacherId => eventRoom is null
+                                                        || !ViolatesTravelFeasibility(
+                                                            existing => existing.TeacherId == teacherId,
+                                                            eventRoom,
+                                                            date,
+                                                            s,
+                                                            e,
+                                                            $"викладача {TeacherLabel(teacherId)}",
+                                                            out _))
+                                    .OrderBy(teacherId => TeacherDepartmentPriority(teacherId, eventTopic))
+                                    .ThenBy(teacherId => teacherId)
+                                    .ToList();
+                                if (eventTeacherCandidates.Count == 0)
+                                {
+                                    return false;
+                                }
+                                if (BlocksTeacherSlot(resourceEvent.LessonTypeId))
+                                {
+                                    teacherCandidatesByEvent[resourceEvent.Key] = eventTeacherCandidates;
+                                }
+                            }
+
+                            if (eventRequiresRoom)
+                            {
+                                if (!selectedGroupsById.TryGetValue(resourceEvent.GroupId, out var eventGroup))
+                                {
+                                    return false;
+                                }
+                                var eventRoomCandidates = CandidateRoomsForGroup(
+                                        resourceEvent.GroupId,
+                                        resourceEvent.ModuleId,
+                                        eventGroup.StudentsCount,
+                                        ignoreGroupPreference: softFill)
+                                    .Where(room => !BlocksRoomSlot(resourceEvent.LessonTypeId)
+                                                   || !BusyForRoomDate(room.Id, date).Any(busySlot =>
+                                                       SlotOverlaps(busySlot, date, s, e)
+                                                       && BlocksRoomSlot(busySlot.LessonTypeId)
+                                                       && !BelongsToRematchableDraft(busySlot)))
+                                    .Where(room => !ViolatesTravelFeasibility(
+                                        existing => existing.GroupId == resourceEvent.GroupId,
+                                        room,
+                                        date,
+                                        s,
+                                        e,
+                                        $"групи {eventGroup.Name}",
+                                        out _))
+                                    .Where(room => resourceEvent.TeacherId is not int eventTeacherId
+                                                   || !ViolatesTravelFeasibility(
+                                                       existing => existing.TeacherId == eventTeacherId,
+                                                       room,
+                                                       date,
+                                                       s,
+                                                       e,
+                                                       $"викладача {TeacherLabel(eventTeacherId)}",
+                                                       out _))
+                                    .Select(room => room.Id)
+                                    .Distinct()
+                                    .OrderBy(roomId => roomId)
+                                    .ToList();
+                                if (eventRoomCandidates.Count == 0)
+                                {
+                                    return false;
+                                }
+                                if (BlocksRoomSlot(resourceEvent.LessonTypeId))
+                                {
+                                    roomCandidatesByEvent[resourceEvent.Key] = eventRoomCandidates;
+                                }
                             }
                         }
-                    }
-                    bool TryDisplaceSingleTeacherOccupant(
-                        int targetTeacherId,
-                        IReadOnlySet<int> ignoredSharedGroupIds,
-                        int currentRoomId,
-                        out string note)
-                    {
-                        note = string.Empty;
-                        if (!softFill || !relaxed || forcedSlot is null)
-                        {
-                            return false;
-                        }
-                        var conflictingSlots = BusyForTeacherDate(targetTeacherId, date)
-                            .Where(slot => slot.StartTime < e && s < slot.EndTime)
-                            .Where(slot => !IsSameSharedLectureCluster(
-                                slot,
-                                ignoredSharedGroupIds,
-                                moduleId,
-                                ltypeId,
-                                topicSelection?.Id,
-                                targetTeacherId,
-                                currentRoomId,
-                                date,
-                                s,
-                                e))
-                            .ToList();
-                        if (conflictingSlots.Count != 1)
-                        {
-                            return false;
-                        }
-                        var occupiedDraft = FindDraftForBusySlot(conflictingSlots[0]);
-                        if (occupiedDraft is null
-                            || occupiedDraft.GroupId == grp.Id
-                            || occupiedDraft.TeacherId != targetTeacherId
-                            || occupiedDraft.RoomId is null)
-                        {
-                            return false;
-                        }
-                        var targetSlots = slots
-                            .Where(slot => !(slot.Start == s && slot.End == e))
-                            .OrderBy(slot => slotIndexByTime.TryGetValue((slot.Start, slot.End), out var idx) ? Math.Abs(idx - slotIndex) : int.MaxValue)
-                            .ThenBy(slot => slot.Start)
-                            .ToList();
-                        foreach (var targetSlot in targetSlots)
-                        {
-                            if (TryMoveDraftToSlotPreservingResources(occupiedDraft, targetSlot, out note))
-                            {
-                                return true;
-                            }
-                        }
-                        return false;
+
+                        return DeterministicResourceMatcher.TryMatchAll(
+                                   teacherCandidatesByEvent,
+                                   out _)
+                               && DeterministicResourceMatcher.TryMatchAll(
+                                   roomCandidatesByEvent,
+                                   out _);
                     }
                     foreach (var tidCandidate in filteredTeacherIds)
                     {
-                        if (!TeacherFitsWorkingHours(tidCandidate, date, s, e))
+                        if (tidCandidate is int resolvedTeacherId
+                            && !TeacherFitsWorkingHours(resolvedTeacherId, date, s, e))
                         {
-                            slotIssues.Add($"Викладач {TeacherLabel(tidCandidate)} не працює у слоті {slotLabel}.");
+                            slotIssues.Add($"Викладач {TeacherLabel(resolvedTeacherId)} не працює у слоті {slotLabel}.");
                             continue;
                         }
                         // Перевірка конфліктів поточної групи у слоті.
@@ -5709,7 +8854,7 @@ public sealed class TeacherDraftsAutogenService
                             continue;
                         }
                         // Накопичуємо штрафи та їх пояснення.
-                        var penalties = new List<string>();
+                        var penalties = new List<string>(16);
                         double penaltyScore = 0;
                         if (catchUpHoldBypassed)
                         {
@@ -5842,8 +8987,13 @@ public sealed class TeacherDraftsAutogenService
                             ? OrderCandidateRoomsForPlacement(candidateRooms, isShareableLecturePlacement)
                             : Array.Empty<Room>();
                         // Додаємо штраф за навантаження викладача.
-                        penaltyScore += TeacherLoadPenalty(tidCandidate);
-                        var teacherReservationPenalty = TeacherScarcityReservationPenalty(tidCandidate, date, forcedGapVariantBudget);
+                        if (tidCandidate is int teacherForLoad)
+                        {
+                            penaltyScore += TeacherLoadPenalty(teacherForLoad);
+                        }
+                        var teacherReservationPenalty = tidCandidate is int teacherForReservation
+                            ? TeacherScarcityReservationPenalty(teacherForReservation, ltypeId, date, forcedGapVariantBudget)
+                            : 0;
                         if (teacherReservationPenalty > 0)
                         {
                             penaltyScore += teacherReservationPenalty;
@@ -5900,38 +9050,43 @@ public sealed class TeacherDraftsAutogenService
                                         e)
                                     : Array.Empty<int>();
                                 var existingSharedLectureGroupSet = existingSharedLectureGroupIds.ToHashSet();
-                                bool teacherBusy = BusyForTeacherDate(tidCandidate, date).Any(x =>
-                                                                 x.StartTime < e && s < x.EndTime
-                                                                 && !IsSameSharedLectureCluster(
-                                                                     x,
-                                                                     existingSharedLectureGroupSet,
-                                                                     moduleId,
-                                                                     ltypeId,
-                                                                     topicId,
-                                                                     tidCandidate,
-                                                                     rm.Id,
-                                                                     date,
-                                                                     s,
-                                                                     e));
-                                if (teacherBusy && !TryDisplaceSingleTeacherOccupant(tidCandidate, existingSharedLectureGroupSet, rm.Id, out _))
+                                bool teacherBusy = tidCandidate is int teacherForOverlap
+                                                   && BlocksTeacherSlot(ltypeId)
+                                                   && BusyForTeacherDate(teacherForOverlap, date).Any(x =>
+                                                       BlocksTeacherSlot(x.LessonTypeId)
+                                                       && x.StartTime < e && s < x.EndTime
+                                                       && !IsSameSharedLectureCluster(
+                                                           x,
+                                                           existingSharedLectureGroupSet,
+                                                           moduleId,
+                                                           ltypeId,
+                                                           topicId,
+                                                           tidCandidate,
+                                                           rm.Id,
+                                                           date,
+                                                           s,
+                                                           e));
+                                if (teacherBusy)
                                 {
-                                    slotIssues.Add($"Викладач {TeacherLabel(tidCandidate)} зайнятий у слоті {slotLabel}.");
+                                    slotIssues.Add($"Викладач {TeacherLabel(tidCandidate!.Value)} зайнятий у слоті {slotLabel}.");
                                     continue;
                                 }
-                                bool roomBusy = BusyForRoomDate(rm.Id, date).Any(x =>
-                                                              x.StartTime < e && s < x.EndTime
-                                                              && !IsSameSharedLectureCluster(
-                                                                  x,
-                                                                  existingSharedLectureGroupSet,
-                                                                  moduleId,
-                                                                  ltypeId,
-                                                                  topicId,
-                                                                  tidCandidate,
-                                                                  rm.Id,
-                                                                  date,
-                                                                  s,
-                                                                  e));
-                                if (roomBusy && !TryReassignSingleRoomOccupant(rm, existingSharedLectureGroupSet, tidCandidate, out _))
+                                bool roomBusy = BlocksRoomSlot(ltypeId)
+                                                && BusyForRoomDate(rm.Id, date).Any(x =>
+                                                    BlocksRoomSlot(x.LessonTypeId)
+                                                    && x.StartTime < e && s < x.EndTime
+                                                    && !IsSameSharedLectureCluster(
+                                                        x,
+                                                        existingSharedLectureGroupSet,
+                                                        moduleId,
+                                                        ltypeId,
+                                                        topicId,
+                                                        tidCandidate,
+                                                        rm.Id,
+                                                        date,
+                                                        s,
+                                                        e));
+                                if (roomBusy)
                                 {
                                     slotIssues.Add($"Усі аудиторії для модуля <{ModuleLabel()}> зайняті у слоті {slotLabel}.");
                                     continue;
@@ -5947,13 +9102,30 @@ public sealed class TeacherDraftsAutogenService
                                     s,
                                     e,
                                     rm);
-                                var allSharedGroupIds = existingSharedLectureGroupIds
-                                    .Concat(sharedGroupIds)
-                                    .Distinct()
-                                    .ToList();
-                                var newSharedGroupIds = allSharedGroupIds
-                                    .Except(existingSharedLectureGroupIds)
-                                    .ToList();
+                                var allSharedGroupIds = new List<int>(existingSharedLectureGroupIds.Count + sharedGroupIds.Count);
+                                var allSharedGroupIdSet = new HashSet<int>();
+                                foreach (var groupId in existingSharedLectureGroupIds)
+                                {
+                                    if (allSharedGroupIdSet.Add(groupId))
+                                    {
+                                        allSharedGroupIds.Add(groupId);
+                                    }
+                                }
+                                foreach (var groupId in sharedGroupIds)
+                                {
+                                    if (allSharedGroupIdSet.Add(groupId))
+                                    {
+                                        allSharedGroupIds.Add(groupId);
+                                    }
+                                }
+                                var newSharedGroupIds = new List<int>(allSharedGroupIds.Count);
+                                foreach (var groupId in allSharedGroupIds)
+                                {
+                                    if (!existingSharedLectureGroupSet.Contains(groupId))
+                                    {
+                                        newSharedGroupIds.Add(groupId);
+                                    }
+                                }
                                 if (isShareableLecturePlacement
                                     && topicSelection is not null
                                     && ShouldHoldShareableTopicForMissingPendingGroups(grp.CourseId, moduleId, topicSelection, allSharedGroupIds))
@@ -5977,8 +9149,10 @@ public sealed class TeacherDraftsAutogenService
                                     continue;
                                 }
                                 var groupsWithModuleInSlot = CountGroupsWithModuleInSlot(moduleId, date, s, e);
-                                if (allowJoinExistingSharedLecture
-                                    && groupsWithModuleInSlot + newSharedGroupIds.Count > MaxSharedLectureGroupsForCourse(grp.CourseId))
+                                if (groupsWithModuleInSlot + newSharedGroupIds.Count > SlotGroupLimitForPlacement(
+                                        grp.CourseId,
+                                        ltypeId,
+                                        isSelfStudyPlacement))
                                 {
                                     continue;
                                 }
@@ -6004,13 +9178,15 @@ public sealed class TeacherDraftsAutogenService
                                         break;
                                     }
                                 }
-                                if (!travelViolation && ViolatesTravelFeasibility(
-                                        existing => existing.TeacherId == tidCandidate,
+                                if (!travelViolation
+                                    && tidCandidate is int teacherForTravel
+                                    && ViolatesTravelFeasibility(
+                                        existing => existing.TeacherId == teacherForTravel,
                                         rm,
                                         date,
                                         s,
                                         e,
-                                        $"викладача {TeacherLabel(tidCandidate)}",
+                                        $"викладача {TeacherLabel(teacherForTravel)}",
                                         out var teacherTravelReason))
                                 {
                                     travelViolation = true;
@@ -6063,6 +9239,7 @@ public sealed class TeacherDraftsAutogenService
                                     allSharedGroupIds.Count);
                                 var roomReachabilityReservationPenalty = RoomReachabilityReservationPenalty(
                                     rm,
+                                    ltypeId,
                                     date,
                                     forcedGapVariantBudget,
                                     isShareableLecturePlacement);
@@ -6070,6 +9247,7 @@ public sealed class TeacherDraftsAutogenService
                                     rm,
                                     date,
                                     sl,
+                                    ltypeId,
                                     forcedGapVariantBudget,
                                     isShareableLecturePlacement);
                                 var sharedLectureBonus = isShareableLecturePlacement
@@ -6081,6 +9259,11 @@ public sealed class TeacherDraftsAutogenService
                                                                  && bypassCatchUpHold
                                     ? 180.0
                                     : 0.0;
+                                // Розкладаємо непотоковий модуль між різними слотами, щоб ранні
+                                // групи не вичерпували спільний пул викладачів до пізніх груп.
+                                var parallelTeacherPoolPenalty = !isShareableLecturePlacement && requiresTeacher
+                                    ? groupsWithModuleInSlot * groupsWithModuleInSlot * 18.0
+                                    : 0.0;
                                 var totalPenalty = penaltyScore
                                     + roomSwitchPenalty
                                     + BuildingDistancePenalty(tidCandidate, rm, date, s, e)
@@ -6089,8 +9272,10 @@ public sealed class TeacherDraftsAutogenService
                                     + roomReachabilityReservationPenalty
                                     + neighborGapBuildingPenalty
                                     + singleSharedLecturePenalty
+                                    + parallelTeacherPoolPenalty
                                     - sharedLectureBonus;
-                                var notes = new List<string>(penalties);
+                                var notes = new List<string>(penalties.Count + 6);
+                                notes.AddRange(penalties);
                                 if (roomSwitchPenalty > 0)
                                 {
                                     notes.Add("Змінено аудиторію всередині суміжного блоку модуля");
@@ -6115,6 +9300,10 @@ public sealed class TeacherDraftsAutogenService
                                 {
                                     notes.Add("Одиночну спільну лекцію дозволено лише для аварійного дозаповнення");
                                 }
+                                if (parallelTeacherPoolPenalty > 0)
+                                {
+                                    notes.Add("Модуль розподілено між слотами для збереження дефіцитного пулу викладачів");
+                                }
                                 var candidate = new PlacementCandidate(
                                     sl,
                                     tidCandidate,
@@ -6133,10 +9322,11 @@ public sealed class TeacherDraftsAutogenService
                         }
                         else
                         {
-                            bool teacherBusy = HasTeacherOverlap(tidCandidate, date, s, e);
+                            bool teacherBusy = tidCandidate is int teacherForOverlap
+                                               && HasTeacherOverlap(teacherForOverlap, ltypeId, date, s, e);
                             if (teacherBusy)
                             {
-                                slotIssues.Add($"Викладач {TeacherLabel(tidCandidate)} зайнятий у слоті {slotLabel}.");
+                                slotIssues.Add($"Викладач {TeacherLabel(tidCandidate!.Value)} зайнятий у слоті {slotLabel}.");
                                 continue;
                             }
                             if (!TryValidatePlacementAgainstBusy(
@@ -6157,7 +9347,16 @@ public sealed class TeacherDraftsAutogenService
                                 }
                                 continue;
                             }
-                            var notes = new List<string>(penalties);
+                            var groupsWithModuleInSlot = CountGroupsWithModuleInSlot(moduleId, date, s, e);
+                            var parallelTeacherPoolPenalty = requiresTeacher
+                                ? groupsWithModuleInSlot * groupsWithModuleInSlot * 18.0
+                                : 0.0;
+                            var notes = new List<string>(penalties.Count + 1);
+                            notes.AddRange(penalties);
+                            if (parallelTeacherPoolPenalty > 0)
+                            {
+                                notes.Add("Модуль розподілено між слотами для збереження дефіцитного пулу викладачів");
+                            }
                             var candidate = new PlacementCandidate(
                                 sl,
                                 tidCandidate,
@@ -6169,7 +9368,7 @@ public sealed class TeacherDraftsAutogenService
                                 1,
                                 startsNewDistinctModule,
                                 expandsContiguousModuleBlock,
-                                penaltyScore,
+                                penaltyScore + parallelTeacherPoolPenalty,
                                 notes);
                             slotCandidates.Add(candidate);
                         }
@@ -6190,6 +9389,16 @@ public sealed class TeacherDraftsAutogenService
                         var missingRoom = requiresRoomForFallback && fallbackRoom is null;
                         if (missingTeacher || missingRoom)
                         {
+                            if (!RequiredResourcesRemainMatchableWithIncompleteDraft(
+                                    fallbackTeacherId,
+                                    fallbackRoom))
+                            {
+                                RecordSlotFailureReason(
+                                    date,
+                                    sl,
+                                    $"Додавання неповної чернетки модуля <{ModuleLabel()}> зробило б повне призначення обов'язкових ресурсів у слоті {slotLabel} неможливим.");
+                                continue;
+                            }
                             int? assignedTeacherId = missingRoom && !missingTeacher ? fallbackTeacherId : null;
                             var assignedRoom = missingTeacher && !missingRoom ? fallbackRoom : null;
                             var fallbackPenalty = (missingTeacher ? 40.0 : 0.0) + (missingRoom ? 40.0 : 0.0);
@@ -6197,7 +9406,7 @@ public sealed class TeacherDraftsAutogenService
                             {
                                 fallbackPenalty += slotIndex * 0.20;
                             }
-                            var notes = new List<string>();
+                            var notes = new List<string>(2);
                             if (missingTeacher)
                             {
                                 notes.Add("Чернетку створено без викладача");
@@ -6234,7 +9443,11 @@ public sealed class TeacherDraftsAutogenService
                             .ThenByDescending(SharedLectureCandidatePriority)
                             .ThenByDescending(c => c.TotalSharedGroupCount)
                             .ThenBy(c => c.Penalty)
-                            .ThenBy(c => groupRandom.Next())
+                            .ThenBy(c => c.TeacherId)
+                            .ThenBy(c => c.Room?.Id ?? int.MaxValue)
+                            .ThenBy(c => c.LessonTypeId)
+                            .ThenBy(c => c.Topic?.Id ?? int.MaxValue)
+                            .ThenBy(c => string.Join(",", c.SharedGroupIds.OrderBy(groupId => groupId)), StringComparer.Ordinal)
                             .First();
                         var localBest = bestAny;
                         if (preferredAdjacentTeacherId is int pt && maxExtraPenaltyPreferSameTeacherForConsecutiveModule > 0)
@@ -6248,7 +9461,11 @@ public sealed class TeacherDraftsAutogenService
                                 .ThenByDescending(SharedLectureCandidatePriority)
                                 .ThenByDescending(c => c.TotalSharedGroupCount)
                                 .ThenBy(c => c.Penalty)
-                                .ThenBy(c => groupRandom.Next())
+                                .ThenBy(c => c.TeacherId)
+                                .ThenBy(c => c.Room?.Id ?? int.MaxValue)
+                                .ThenBy(c => c.LessonTypeId)
+                                .ThenBy(c => c.Topic?.Id ?? int.MaxValue)
+                                .ThenBy(c => string.Join(",", c.SharedGroupIds.OrderBy(groupId => groupId)), StringComparer.Ordinal)
                                 .FirstOrDefault();
                             if (bestPreferred is not null
                                 && bestPreferred.Penalty <= bestAny.Penalty + maxExtraPenaltyPreferSameTeacherForConsecutiveModule)
@@ -6405,23 +9622,8 @@ public sealed class TeacherDraftsAutogenService
                     RecordSlotFailureReason(date, selectedSlot, persistedConflictReason);
                     return false;
                 }
-                if (selectedIncomplete is not null)
-                {
-                    incompleteDraftsCreated++;
-                    if (selectedIncomplete.MissingTeacher)
-                    {
-                        incompleteMissingTeacherCount++;
-                    }
-                    if (selectedIncomplete.MissingRoom)
-                    {
-                        incompleteMissingRoomCount++;
-                    }
-                    if (selectedIncomplete.MissingTeacher && selectedIncomplete.MissingRoom)
-                    {
-                        incompleteMissingBothCount++;
-                    }
-                }
                 bool currentGroupPlaced = false;
+                TeacherDraftItem? currentGroupCreatedDraft = null;
                 foreach (var sharedGroupId in writablePlacedGroupIds)
                 {
                     if (!selectedGroupsById.TryGetValue(sharedGroupId, out var sharedGroup))
@@ -6448,11 +9650,15 @@ public sealed class TeacherDraftsAutogenService
                     _db.TeacherDraftItems.Add(item);
                     allCreatedDrafts.Add(item);
                     movableDrafts.Add(item);
+                    var accounting = new CreatedDraftAccounting();
+                    createdDraftAccounting.Add(item, accounting);
                     AddCurrentRangeFact(sharedGroupId, moduleId);
+                    accounting.CurrentRangeFactIncremented = true;
                     if (sharedGroupId == grp.Id)
                     {
                         createdDrafts.Add(item);
                         currentGroupPlaced = true;
+                        currentGroupCreatedDraft = item;
                     }
                     // Позначаємо тему як використану (для звичайних занять).
                     if (selectedTopic is not null && !selectedIsSelfStudy)
@@ -6463,6 +9669,7 @@ public sealed class TeacherDraftsAutogenService
                             warnings.Add($"Для модуля <{ModuleLabel()}> у групі {sharedGroup.Name} повторно використано тему {selectedTopic.TopicCode}, щоб заповнити слот без порушення жорстких правил.");
                         }
                         MarkTopicUsed(sharedGroupId, moduleId, selectedTopic);
+                        accounting.TopicUsageIncremented = true;
                     }
                     // Додаємо слот у список зайнятих.
                     AddBusySlot(new BusySlot(
@@ -6479,7 +9686,9 @@ public sealed class TeacherDraftsAutogenService
                         true));
                     // Збільшуємо лічильники створених записів і зайнятих слотів.
                     created++;
+                    accounting.CreatedCounterIncremented = true;
                     Inc(sharedGroupId, date);
+                    accounting.DayCountIncremented = true;
                     // Фіксуємо, що пріоритетний тип вже використано для модуля.
                     if (preferredFirstTypeId != 0 && selectedLessonTypeId == preferredFirstTypeId)
                     {
@@ -6490,6 +9699,7 @@ public sealed class TeacherDraftsAutogenService
                     if (selectedIsSelfStudy && selfStudyRemainingByGroupModule.TryGetValue(sharedRemainingKey, out var ssLeft) && ssLeft > 0)
                     {
                         selfStudyRemainingByGroupModule[sharedRemainingKey] = Math.Max(0, ssLeft - 1);
+                        accounting.SelfStudyRemainingDecremented = true;
                     }
                     if (selectedIsSelfStudy && selectedTopic is not null)
                     {
@@ -6497,6 +9707,7 @@ public sealed class TeacherDraftsAutogenService
                         if (selfStudyTopicRemaining.TryGetValue(topicKey, out var leftByTopic) && leftByTopic > 0)
                         {
                             selfStudyTopicRemaining[topicKey] = Math.Max(0, leftByTopic - 1);
+                            accounting.SelfStudyTopicRemainingDecremented = true;
                         }
                     }
                     // Зменшуємо загальні залишки годин по модулю.
@@ -6504,6 +9715,7 @@ public sealed class TeacherDraftsAutogenService
                     {
                         leftRemaining--;
                         remainingByGroupModule[sharedRemainingKey] = Math.Max(0, leftRemaining);
+                        accounting.RemainingDecremented = true;
                     }
                     if (sharedGroupId == grp.Id && forceFirstMainModule && !firstMainPlaced && moduleId == firstMainModuleId)
                     {
@@ -6512,13 +9724,36 @@ public sealed class TeacherDraftsAutogenService
                         firstMainStart = startTime;
                     }
                 }
-                if (!currentGroupPlaced)
+                if (!currentGroupPlaced
+                    || currentGroupCreatedDraft is null
+                    || !createdDraftAccounting.TryGetValue(currentGroupCreatedDraft, out var currentGroupAccounting))
                 {
                     return false;
+                }
+                if (selectedIncomplete is not null)
+                {
+                    incompleteDraftsCreated++;
+                    currentGroupAccounting.IncompleteDraftCounted = true;
+                    if (selectedIncomplete.MissingTeacher)
+                    {
+                        incompleteMissingTeacherCount++;
+                        currentGroupAccounting.MissingTeacherCounted = true;
+                    }
+                    if (selectedIncomplete.MissingRoom)
+                    {
+                        incompleteMissingRoomCount++;
+                        currentGroupAccounting.MissingRoomCounted = true;
+                    }
+                    if (selectedIncomplete.MissingTeacher && selectedIncomplete.MissingRoom)
+                    {
+                        incompleteMissingBothCount++;
+                        currentGroupAccounting.MissingBothCounted = true;
+                    }
                 }
                 if (selectedIsEmergencySingletonSharedLecture)
                 {
                     emergencySingletonSharedLecturesCreated++;
+                    currentGroupAccounting.EmergencySingletonCounted = true;
                 }
                 // Оновлюємо статистику використання аудиторій.
                 if (selectedRoom?.Id is int ridSelected)
@@ -6526,6 +9761,8 @@ public sealed class TeacherDraftsAutogenService
                     groupRoomUsage[ridSelected] = groupRoomUsage.TryGetValue(ridSelected, out var usedRoom)
                         ? usedRoom + 1
                         : 1;
+                    currentGroupAccounting.RoomUsageGroupId = grp.Id;
+                    currentGroupAccounting.RoomUsageRoomId = ridSelected;
                 }
                 InvalidateGapResourceCaches();
                 if (isPrimary)
@@ -6538,8 +9775,7 @@ public sealed class TeacherDraftsAutogenService
                     var noteText = string.Join("; ", selectedNotes);
                     warnings.Add($"[{date:yyyy-MM-dd} {startTime:HH\\:mm}-{endTime:HH\\:mm}] {grp.Name}: {noteText}");
                 }
-                var nextShareableTopicUnlocked = !softFill
-                    && !selectedIsSelfStudy
+                var nextShareableTopicUnlocked = !selectedIsSelfStudy
                     && selectedTopic is not null
                     && placedGroupIds.Any(sharedGroupId =>
                         PlacementRemainingFor(sharedGroupId, moduleId) > 0
@@ -6551,7 +9787,7 @@ public sealed class TeacherDraftsAutogenService
                 }
                 return true;
             }
-            foreach (var date in generationDates)
+            foreach (var date in datesForGenerationRound)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 ApplySlotsForDate(date);
@@ -6559,6 +9795,28 @@ public sealed class TeacherDraftsAutogenService
                 if (maxPerDay == 0) continue;
                 var modulesAttemptedToday = new HashSet<int>();
                 var orderedModulesForDay = BuildOrderedModulesForDay(date);
+                var groupDateSearchBudgetKey = (grp.Id, date);
+                DeterministicSearchBudget? groupDateSearchBudget = searchBudgetsByGroupDate.GetValueOrDefault(groupDateSearchBudgetKey);
+                DeterministicSearchBudget ResolveGroupDateSearchBudget()
+                {
+                    if (groupDateSearchBudget is not null)
+                    {
+                        return groupDateSearchBudget;
+                    }
+                    var scaledGroupDateSearchNodes = slots.Count
+                                                     * Math.Max(1, orderedModulesForDay.Count)
+                                                     * (softFill ? 2_000 : 1_000);
+                    var maxGroupDateSearchNodes = Math.Clamp(
+                        scaledGroupDateSearchNodes,
+                        softFill ? 50_000 : 20_000,
+                        softFill ? 200_000 : 80_000);
+                    groupDateSearchBudget = new DeterministicSearchBudget(
+                        maxGroupDateSearchNodes,
+                        TimeSpan.FromSeconds(30));
+                    searchBudgetsByGroupDate[groupDateSearchBudgetKey] = groupDateSearchBudget;
+                    return groupDateSearchBudget;
+                }
+                var boundedSearchEnabledForCurrentPass = false;
                 var lectureFirstModulesForDay = orderedModulesForDay
                     .Where(mid => RemainingFor(grp.Id, mid) > 0)
                     .Where(mid => CanShareAcrossGroups(PeekLessonTypeForDate(grp.Id, grp.CourseId, mid, date)))
@@ -6622,6 +9880,7 @@ public sealed class TeacherDraftsAutogenService
 
                     var moduleBudgetCache = new Dictionary<(TimeOnly Start, TimeOnly End, int ModuleId, bool BypassDistinctLimit), int>();
                     var pressureByModule = new Dictionary<int, (int Budget, double Score)>();
+                    var openSlots = slots.Where(slot => !SlotFilled(date, slot)).ToList();
 
                     (int Budget, double Score) MeasurePressure(int moduleId)
                     {
@@ -6632,7 +9891,7 @@ public sealed class TeacherDraftsAutogenService
 
                         var remaining = Math.Max(1, PlacementRemainingFor(grp.Id, moduleId));
                         var budget = 0;
-                        foreach (var gap in slots.Where(slot => !SlotFilled(date, slot)))
+                        foreach (var gap in openSlots)
                         {
                             var slotBudget = EstimateModuleGapPlacementBudget(
                                 gap,
@@ -6668,6 +9927,7 @@ public sealed class TeacherDraftsAutogenService
                     bool tryAnotherCycle;
                     do
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         tryAnotherCycle = false;
                         foreach (var moduleId in OrderModulesByCurrentPressure(
                                      PreferNotUsedLastWeek(orderedModulesForDay),
@@ -6712,6 +9972,7 @@ public sealed class TeacherDraftsAutogenService
                     bool progressed;
                     do
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         progressed = false;
                         if (CountDistinctModulesForDay(grp.Id, date) >= targetDistinctCount || CountFor(grp.Id, date) >= maxPerDay)
                         {
@@ -6793,34 +10054,36 @@ public sealed class TeacherDraftsAutogenService
                     }
                     return lessonTypeId != 0;
                 }
-                // Перевіряє відповідність кафедри теми викладачу.
-                bool TeacherMatchesTopicDepartment(ModuleTopic? topicSelection, int teacherId)
-                {
-                    return topicSelection?.DepartmentId is not int departmentId
-                           || departmentId <= 0
-                           || (teacherDepartmentById.TryGetValue(teacherId, out var teacherDepartment) && teacherDepartment == departmentId);
-                }
                 // Грубо оцінює, скільки викладачів реально доступні для модуля в конкретному порожньому слоті.
-                int CountFeasibleTeacherOptionsForGap(TimeSlot gap, int moduleId, bool isSelfStudyPlacement, ModuleTopic? topicSelection, int stopAfter = 4)
+                int CountFeasibleTeacherOptionsForGap(
+                    TimeSlot gap,
+                    int moduleId,
+                    int lessonTypeId,
+                    bool isSelfStudyPlacement,
+                    ModuleTopic? topicSelection,
+                    int stopAfter = 4)
                 {
+                    if (typeById.TryGetValue(lessonTypeId, out var lessonType) && !lessonType.RequiresTeacher)
+                    {
+                        return 1;
+                    }
                     int count = 0;
-                    var teacherIds = (isSelfStudyPlacement
+                    var teacherIds = PreferredOrExplicitTeacherPool(
+                            (isSelfStudyPlacement
                             ? supervisorsForModule.Where(x => x.ModuleId == moduleId).Select(x => x.TeacherId)
                             : teachersForModule.Where(x => x.ModuleId == moduleId).Select(x => x.TeacherId))
-                        .Distinct()
+                            .Where(teacherId => TeacherFitsWorkingHours(teacherId, date, gap.Start, gap.End))
+                            .Where(teacherId => !HasTeacherOverlap(teacherId, lessonTypeId, date, gap.Start, gap.End)),
+                            topicSelection)
                         .OrderBy(id => TeacherLoadPenalty(id))
                         .ThenBy(id => id);
                     foreach (var teacherId in teacherIds)
                     {
-                        if (!TeacherMatchesTopicDepartment(topicSelection, teacherId))
-                        {
-                            continue;
-                        }
                         if (!TeacherFitsWorkingHours(teacherId, date, gap.Start, gap.End))
                         {
                             continue;
                         }
-                        var teacherBusy = HasTeacherOverlap(teacherId, date, gap.Start, gap.End);
+                        var teacherBusy = HasTeacherOverlap(teacherId, lessonTypeId, date, gap.Start, gap.End);
                         if (teacherBusy)
                         {
                             continue;
@@ -6834,12 +10097,18 @@ public sealed class TeacherDraftsAutogenService
                     return count;
                 }
                 // Грубо оцінює, скільки аудиторій реально доступні для модуля в конкретному порожньому слоті.
-                int CountFeasibleRoomOptionsForGap(TimeSlot gap, int moduleId, int requiredCapacity, bool ignoreGroupPreference = false, int stopAfter = 4)
+                int CountFeasibleRoomOptionsForGap(
+                    TimeSlot gap,
+                    int moduleId,
+                    int lessonTypeId,
+                    int requiredCapacity,
+                    bool ignoreGroupPreference = false,
+                    int stopAfter = 4)
                 {
                     int count = 0;
                     foreach (var room in CandidateRoomsFor(moduleId, requiredCapacity, ignoreGroupPreference))
                     {
-                        var roomBusy = HasRoomOverlap(room.Id, date, gap.Start, gap.End);
+                        var roomBusy = HasRoomOverlap(room.Id, lessonTypeId, date, gap.Start, gap.End);
                         if (roomBusy)
                         {
                             continue;
@@ -6883,14 +10152,35 @@ public sealed class TeacherDraftsAutogenService
                         && !InsertionWouldSplitExistingModuleBlock(grp.Id, date, moduleId, gap.Start, gap.End, out _, maxModuleSegmentsAllowed)
                         && TryPeekGapPlacementBlueprint(moduleId, date, out var isSelfStudyPlacement, out var lessonTypeId, out var topicSelection)
                         && TypeAllowed(lessonTypeId)
-                        && CountGroupsWithModuleInSlot(moduleId, date, gap.Start, gap.End) < SlotGroupLimitForPlacement(grp.CourseId, lessonTypeId, isSelfStudyPlacement))
+                        && CountGroupsWithModuleInSlot(moduleId, date, gap.Start, gap.End) < ResourceBoundedSlotGroupLimitForPlacement(
+                            grp.CourseId,
+                            moduleId,
+                            lessonTypeId,
+                            topicSelection,
+                            isSelfStudyPlacement,
+                            bypassSoftModuleParallelLimit: bypassDistinctLimit
+                                                           || topicSelection is not null
+                                                           && MustPreserveFutureSharedCheckpoint(
+                                                               grp.CourseId,
+                                                               moduleId,
+                                                               topicSelection)))
                     {
-                        var teacherCount = CountFeasibleTeacherOptionsForGap(gap, moduleId, isSelfStudyPlacement, topicSelection);
+                        var teacherCount = CountFeasibleTeacherOptionsForGap(
+                            gap,
+                            moduleId,
+                            lessonTypeId,
+                            isSelfStudyPlacement,
+                            topicSelection);
                         if (teacherCount > 0)
                         {
                             var requiresRoom = (typeById.TryGetValue(lessonTypeId, out var lessonTypeMeta) ? lessonTypeMeta.RequiresRoom : (bool?)null) ?? true;
                             var roomCount = requiresRoom
-                                ? CountFeasibleRoomOptionsForGap(gap, moduleId, grp.StudentsCount, ignoreGroupPreference: softFill && bypassDistinctLimit)
+                                ? CountFeasibleRoomOptionsForGap(
+                                    gap,
+                                    moduleId,
+                                    lessonTypeId,
+                                    grp.StudentsCount,
+                                    ignoreGroupPreference: softFill && bypassDistinctLimit)
                                 : 1;
                             if (roomCount > 0)
                             {
@@ -6945,10 +10235,13 @@ public sealed class TeacherDraftsAutogenService
                     TimeSlot gap,
                     bool bypassDistinctLimit,
                     int maxModuleSegmentsAllowed,
-                    Dictionary<(TimeOnly Start, TimeOnly End, int ModuleId, bool BypassDistinctLimit), int> moduleBudgetCache)
+                    Dictionary<(TimeOnly Start, TimeOnly End, int ModuleId, bool BypassDistinctLimit), int> moduleBudgetCache,
+                    IReadOnlyList<int>? pressureOrderedCandidateModules = null)
                 {
                     int totalBudget = 0;
-                    foreach (var moduleId in BuildGapCandidateModules())
+                    var candidateModules = pressureOrderedCandidateModules
+                                           ?? BuildGapCandidateModules().Distinct().ToList();
+                    foreach (var moduleId in candidateModules)
                     {
                         var moduleBudget = EstimateModuleGapPlacementBudget(gap, moduleId, bypassDistinctLimit, maxModuleSegmentsAllowed, moduleBudgetCache);
                         totalBudget += Math.Min(3, moduleBudget);
@@ -6972,8 +10265,15 @@ public sealed class TeacherDraftsAutogenService
                         return null;
                     }
                     var moduleBudgetCache = new Dictionary<(TimeOnly Start, TimeOnly End, int ModuleId, bool BypassDistinctLimit), int>();
+                    // Стан не змінюється під час оцінювання прогалин, тому дорогий порядок модулів рахуємо один раз.
+                    var candidateModules = BuildGapCandidateModules().Distinct().ToList();
                     var minGapBudget = gaps
-                        .Select(gap => EstimateGapVariantBudget(gap, bypassDistinctLimit: false, maxModuleSegmentsAllowed: 1, moduleBudgetCache))
+                        .Select(gap => EstimateGapVariantBudget(
+                            gap,
+                            bypassDistinctLimit: false,
+                            maxModuleSegmentsAllowed: 1,
+                            moduleBudgetCache,
+                            candidateModules))
                         .DefaultIfEmpty(9)
                         .Min();
                     return minGapBudget <= 4 ? minGapBudget : null;
@@ -6983,9 +10283,12 @@ public sealed class TeacherDraftsAutogenService
                     TimeSlot gap,
                     bool bypassDistinctLimit,
                     IReadOnlyDictionary<(TimeOnly Start, TimeOnly End), int>? gapVariantBudgetBySlot,
-                    Dictionary<(TimeOnly Start, TimeOnly End, int ModuleId, bool BypassDistinctLimit), int>? moduleBudgetCache)
+                    Dictionary<(TimeOnly Start, TimeOnly End, int ModuleId, bool BypassDistinctLimit), int>? moduleBudgetCache,
+                    IReadOnlyList<int>? pressureOrderedCandidateModules = null)
                 {
-                    var orderedModules = BuildGapCandidateModules().Distinct().Select((moduleId, index) => (ModuleId: moduleId, Index: index)).ToList();
+                    var candidateModules = pressureOrderedCandidateModules
+                                           ?? BuildGapCandidateModules().Distinct().ToList();
+                    var orderedModules = candidateModules.Select((moduleId, index) => (ModuleId: moduleId, Index: index)).ToList();
                     if (gapVariantBudgetBySlot is null || moduleBudgetCache is null)
                     {
                         return orderedModules
@@ -7041,13 +10344,22 @@ public sealed class TeacherDraftsAutogenService
                     bool bypassDistinctLimit,
                     int maxModuleSegmentsAllowed,
                     IReadOnlyDictionary<(TimeOnly Start, TimeOnly End), int>? gapVariantBudgetBySlot = null,
-                    Dictionary<(TimeOnly Start, TimeOnly End, int ModuleId, bool BypassDistinctLimit), int>? moduleBudgetCache = null)
+                    Dictionary<(TimeOnly Start, TimeOnly End, int ModuleId, bool BypassDistinctLimit), int>? moduleBudgetCache = null,
+                    IReadOnlyList<int>? residualModuleOrder = null,
+                    IReadOnlyList<int>? pressureOrderedCandidateModules = null)
                 {
                     int? forcedGapVariantBudget = gapVariantBudgetBySlot is not null
                         && gapVariantBudgetBySlot.TryGetValue((gap.Start, gap.End), out var gapBudget)
                         ? gapBudget
                         : null;
-                    foreach (var moduleId in OrderGapCandidateModulesByScarcity(gap, bypassDistinctLimit, gapVariantBudgetBySlot, moduleBudgetCache))
+                    var orderedModuleIds = residualModuleOrder
+                                           ?? OrderGapCandidateModulesByScarcity(
+                                               gap,
+                                               bypassDistinctLimit,
+                                               gapVariantBudgetBySlot,
+                                               moduleBudgetCache,
+                                               pressureOrderedCandidateModules);
+                    foreach (var moduleId in orderedModuleIds)
                     {
                         if (RemainingFor(grp.Id, moduleId) <= 0)
                         {
@@ -7092,14 +10404,145 @@ public sealed class TeacherDraftsAutogenService
                         var maxModuleSegmentsAllowedForGapFill = GapFillSegmentLimit(relaxed, bypassDistinctLimit);
                         var moduleBudgetCache = new Dictionary<(TimeOnly Start, TimeOnly End, int ModuleId, bool BypassDistinctLimit), int>();
                         var gaps = slots.Where(sl => !SlotFilled(date, sl)).ToList();
+                        // У межах етапу до першого розміщення стан незмінний, тож повторно використовуємо той самий порядок.
+                        var pressureOrderedCandidateModules = BuildGapCandidateModules().Distinct().ToList();
                         var gapVariantBudgetBySlot = gaps.ToDictionary(
                             gap => (gap.Start, gap.End),
-                            gap => EstimateGapVariantBudget(gap, bypassDistinctLimit, maxModuleSegmentsAllowedForGapFill, moduleBudgetCache));
+                            gap => EstimateGapVariantBudget(
+                                gap,
+                                bypassDistinctLimit,
+                                maxModuleSegmentsAllowedForGapFill,
+                                moduleBudgetCache,
+                                pressureOrderedCandidateModules));
                         gaps = gaps
                             .OrderBy(gap => gapVariantBudgetBySlot[(gap.Start, gap.End)])
                             // Прогалини дозаповнюємо за ходом дня, щоб раніший слот не отримав пізнішу тему після пізнього слоту.
                             .ThenBy(gap => slotIndexByTime.TryGetValue((gap.Start, gap.End), out var gapIndex) ? gapIndex : 0)
                             .ToList();
+
+                        var availableAssignments = Math.Max(0, maxPerDay - CountFor(grp.Id, date));
+                        if (boundedSearchEnabledForCurrentPass
+                            && availableAssignments > 0
+                            && gaps.Count > 1)
+                        {
+                            var residualCandidates = new List<ResidualPlacementCandidate>();
+                            var residualGapById = new Dictionary<int, TimeSlot>();
+                            var capacityByModule = new SortedDictionary<int, int>();
+                            var candidateId = 1;
+                            var candidateModules = BuildGapCandidateModules()
+                                .Distinct()
+                                .OrderBy(moduleId => moduleId)
+                                .ToList();
+                            foreach (var moduleId in candidateModules)
+                            {
+                                capacityByModule[moduleId] = Math.Min(
+                                    availableAssignments,
+                                    Math.Max(0, PlacementRemainingFor(grp.Id, moduleId)));
+                            }
+                            foreach (var gap in gaps)
+                            {
+                                var gapId = slotIndexByTime.TryGetValue((gap.Start, gap.End), out var stableGapIndex)
+                                    ? stableGapIndex
+                                    : residualGapById.Count;
+                                residualGapById[gapId] = gap;
+                                foreach (var moduleId in candidateModules)
+                                {
+                                    var placementBudget = EstimateModuleGapPlacementBudget(
+                                        gap,
+                                        moduleId,
+                                        bypassDistinctLimit,
+                                        maxModuleSegmentsAllowedForGapFill,
+                                        moduleBudgetCache);
+                                    if (placementBudget <= 0 || capacityByModule[moduleId] <= 0)
+                                    {
+                                        continue;
+                                    }
+
+                                    var scarcity = MeasureModuleScarcity(
+                                        moduleId,
+                                        bypassDistinctLimit,
+                                        maxModuleSegmentsAllowedForGapFill,
+                                        moduleBudgetCache);
+                                    var catchUpCost = ModuleHasPendingSharedLectureCatchUp(moduleId) ? 100_000 : 0;
+                                    var scarcityCost = Math.Min(
+                                        10_000,
+                                        scarcity.ViableSlots * 100
+                                        + (int)Math.Round(Math.Min(100, scarcity.Score) * 10));
+                                    var robustnessCost = (9 - Math.Min(9, placementBudget)) * 10;
+                                    residualCandidates.Add(new ResidualPlacementCandidate(
+                                        candidateId++,
+                                        gapId,
+                                        moduleId,
+                                        catchUpCost + scarcityCost + robustnessCost));
+                                }
+                            }
+
+                            if (residualCandidates.Count > 0)
+                            {
+                                var residualSearchBudget = ResolveGroupDateSearchBudget();
+                                var residualPlan = DeterministicResidualOptimizer.Optimize(
+                                    residualCandidates,
+                                    capacityByModule,
+                                    availableAssignments,
+                                    residualSearchBudget,
+                                    cancellationToken);
+                                if (residualPlan.SearchLimitReached)
+                                {
+                                    RecordSearchLimit(
+                                        grp.Id,
+                                        date,
+                                        "residual-optimizer",
+                                        residualSearchBudget.VisitedNodes,
+                                        residualSearchBudget.MaxNodes,
+                                        residualPlan.EmergencyLimitReached);
+                                    var limitKind = residualPlan.EmergencyLimitReached
+                                        ? "аварійну часову межу"
+                                        : $"детерміновану межу {residualSearchBudget.MaxNodes} вузлів";
+                                    var limitMarker = $"[{date:yyyy-MM-dd}] {grp.Name}: [search-limit] залишковий оптимізатор досягнув";
+                                    if (!warnings.Any(warning => warning.StartsWith(limitMarker, StringComparison.Ordinal)))
+                                    {
+                                        warnings.Add($"{limitMarker} {limitKind}; застосовано найкращий знайдений план для {residualPlan.FilledGapCount} слотів.");
+                                    }
+                                }
+
+                                if (residualPlan.Placements.Count > 0)
+                                {
+                                    var residualSnapshot = CaptureTrialState();
+
+                                    void RollbackResidualPlan()
+                                        => RestoreTrialState(residualSnapshot);
+
+                                    var planApplication = await DeterministicResidualOptimizer.TryApplyPlanAtomicallyAsync(
+                                        residualPlan.Placements,
+                                        async (placement, _) =>
+                                        {
+                                            if (!residualGapById.TryGetValue(placement.GapId, out var plannedGap)
+                                                || SlotFilled(date, plannedGap))
+                                            {
+                                                return false;
+                                            }
+                                            return await TryFillGapWithVariantsAsync(
+                                                plannedGap,
+                                                allowRepeatPreviousDay,
+                                                allowExtraSameDay,
+                                                relaxed,
+                                                bypassDistinctLimit,
+                                                maxModuleSegmentsAllowedForGapFill,
+                                                gapVariantBudgetBySlot,
+                                                moduleBudgetCache,
+                                                new[] { placement.ResourceId });
+                                        },
+                                        () => slots.Count - CountDayGaps(),
+                                        RollbackResidualPlan,
+                                        cancellationToken);
+                                    if (planApplication.Committed)
+                                    {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+
                         foreach (var gap in gaps)
                         {
                             if (CountFor(grp.Id, date) >= maxPerDay)
@@ -7118,7 +10561,8 @@ public sealed class TeacherDraftsAutogenService
                                 bypassDistinctLimit,
                                 maxModuleSegmentsAllowedForGapFill,
                                 gapVariantBudgetBySlot,
-                                moduleBudgetCache);
+                                moduleBudgetCache,
+                                pressureOrderedCandidateModules: pressureOrderedCandidateModules);
                             if (placed)
                             {
                                 return true;
@@ -7128,28 +10572,22 @@ public sealed class TeacherDraftsAutogenService
                     }
                     do
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         progress = false;
                         pass++;
-                        var placed = await TryFillGapStageAsync(
-                                         allowRepeatPreviousDay: false,
-                                         allowExtraSameDay: false,
-                                         relaxed: false,
-                                         bypassDistinctLimit: false)
-                                     || await TryFillGapStageAsync(
-                                         allowRepeatPreviousDay: false,
-                                         allowExtraSameDay: true,
-                                         relaxed: false,
-                                         bypassDistinctLimit: false)
-                                     || await TryFillGapStageAsync(
-                                         allowRepeatPreviousDay: true,
-                                         allowExtraSameDay: true,
-                                         relaxed: true,
-                                         bypassDistinctLimit: false)
-                                     || await TryFillGapStageAsync(
-                                         allowRepeatPreviousDay: true,
-                                         allowExtraSameDay: true,
-                                         relaxed: true,
-                                         bypassDistinctLimit: true);
+                        var placed = false;
+                        foreach (var stage in ExhaustiveGapFillStages)
+                        {
+                            placed = await TryFillGapStageAsync(
+                                stage.AllowRepeatPreviousDay,
+                                stage.AllowExtraSameDay,
+                                stage.Relaxed,
+                                stage.BypassDistinctLimit);
+                            if (placed)
+                            {
+                                break;
+                            }
+                        }
                         if (placed)
                         {
                             progress = true;
@@ -7178,33 +10616,35 @@ public sealed class TeacherDraftsAutogenService
                 {
                     reason = string.Empty;
                     if (candidate.RoomId is not int roomId
-                        || !roomBuildingById.TryGetValue(roomId, out var targetBuildingId)
-                        || targetBuildingId == 0)
+                        || !roomBuildingById.TryGetValue(roomId, out var targetBuildingId))
                     {
                         return false;
                     }
                     foreach (var existing in BusyForDate(date).Where(slot =>
-                                 slot.RoomId != null
-                                 && slot.BuildingId.HasValue
+                                 RequiresPhysicalRoom(slot)
                                  && ownerMatch(slot)
                                  && !IsSameDraftBusySlot(candidate, slot, candidate.StartTime, candidate.EndTime)))
                     {
                         var sourceBuildingId = existing.BuildingId!.Value;
-                        if (sourceBuildingId == targetBuildingId)
+                        if (existing.RoomId is not int sourceRoomId)
                         {
                             continue;
                         }
-                        var needMinutes = TravelMinutes(sourceBuildingId, targetBuildingId);
+                        var needMinutes = TransitionMinutes(
+                            sourceRoomId,
+                            sourceBuildingId,
+                            roomId,
+                            targetBuildingId);
                         var gapBefore = (targetSlot.Start.ToTimeSpan() - existing.EndTime.ToTimeSpan()).TotalMinutes;
                         var gapAfter = (existing.StartTime.ToTimeSpan() - targetSlot.End.ToTimeSpan()).TotalMinutes;
                         if (existing.EndTime <= targetSlot.Start && gapBefore < needMinutes)
                         {
-                            reason = $"Для {subjectLabel} недостатньо часу на перехід до корпусу #{targetBuildingId} після заняття в корпусі #{sourceBuildingId}: доступно {gapBefore:N0} хв, потрібно {needMinutes} хв.";
+                            reason = $"Для {subjectLabel} недостатньо часу на зміну аудиторії або корпусу після попереднього заняття: доступно {gapBefore:N0} хв, потрібно {needMinutes} хв.";
                             return true;
                         }
                         if (targetSlot.End <= existing.StartTime && gapAfter < needMinutes)
                         {
-                            reason = $"Для {subjectLabel} недостатньо часу на перехід від корпусу #{sourceBuildingId} до корпусу #{targetBuildingId} перед заняттям: доступно {gapAfter:N0} хв, потрібно {needMinutes} хв.";
+                            reason = $"Для {subjectLabel} недостатньо часу на зміну аудиторії або корпусу перед наступним заняттям: доступно {gapAfter:N0} хв, потрібно {needMinutes} хв.";
                             return true;
                         }
                     }
@@ -7218,7 +10658,7 @@ public sealed class TeacherDraftsAutogenService
                         : grp;
                     if (SlotFilledForGroup(candidate.GroupId, date, targetGap)
                         || candidate.Date != date
-                        || candidate.IsLocked
+                        || !AutogenDraftMutationPolicy.CanMutateInRepair(candidate)
                         || CanShareAcrossGroups(candidate.LessonTypeId)
                         || excludedTypeIds.Contains(candidate.LessonTypeId))
                     {
@@ -7229,8 +10669,17 @@ public sealed class TeacherDraftsAutogenService
                     {
                         return false;
                     }
+                    if (BusyForGroupDate(candidate.GroupId, date).Any(existing =>
+                            !excludedTypeIds.Contains(existing.LessonTypeId)
+                            && !IsSameDraftBusySlot(candidate, existing, candidate.StartTime, candidate.EndTime)
+                            && existing.StartTime > targetGap.Start
+                            && CanShareAcrossGroups(existing.LessonTypeId)))
+                    {
+                        reason = $"Для групи {candidateGroup.Name} перенесення розірве ранковий лекційний блок.";
+                        return false;
+                    }
                     var maxSegmentsAllowed = softFill ? 2 : maxModuleSegmentsPerDay;
-                    var moduleIndexesAfterMove = BusyForGroupDate(grp.Id, date)
+                    var moduleIndexesAfterMove = BusyForGroupDate(candidate.GroupId, date)
                         .Where(slot => slot.ModuleId == candidate.ModuleId
                                        && !excludedTypeIds.Contains(slot.LessonTypeId))
                         .Select(slot => slotIndexByTime.TryGetValue((slot.StartTime, slot.EndTime), out var idx) ? idx : -1)
@@ -7263,8 +10712,10 @@ public sealed class TeacherDraftsAutogenService
                             reason = $"Викладач {TeacherLabel(teacherId)} не працює у слоті {targetGap.Start:HH\\:mm}-{targetGap.End:HH\\:mm}.";
                             return false;
                         }
-                        if (BusyForTeacherDate(teacherId, date).Any(slot =>
+                        if (BlocksTeacherSlot(candidate.LessonTypeId)
+                            && BusyForTeacherDate(teacherId, date).Any(slot =>
                                 SlotOverlaps(slot, date, targetGap.Start, targetGap.End)
+                                && BlocksTeacherSlot(slot.LessonTypeId)
                                 && !IsSameDraftBusySlot(candidate, slot, candidate.StartTime, candidate.EndTime)))
                         {
                             reason = $"Викладач {TeacherLabel(teacherId)} зайнятий у слоті {targetGap.Start:HH\\:mm}-{targetGap.End:HH\\:mm}.";
@@ -7273,6 +10724,7 @@ public sealed class TeacherDraftsAutogenService
                     }
                     if (BusyForGroupDate(candidate.GroupId, date).Any(slot =>
                             SlotOverlaps(slot, date, targetGap.Start, targetGap.End)
+                            && !IsNonOccupyingBusySlot(slot)
                             && !IsSameDraftBusySlot(candidate, slot, candidate.StartTime, candidate.EndTime)))
                     {
                         reason = $"Група {candidateGroup.Name} зайнята у слоті {targetGap.Start:HH\\:mm}-{targetGap.End:HH\\:mm}.";
@@ -7280,8 +10732,10 @@ public sealed class TeacherDraftsAutogenService
                     }
                     if (candidate.RoomId is int roomId)
                     {
-                        if (BusyForRoomDate(roomId, date).Any(slot =>
+                        if (BlocksRoomSlot(candidate.LessonTypeId)
+                            && BusyForRoomDate(roomId, date).Any(slot =>
                                 SlotOverlaps(slot, date, targetGap.Start, targetGap.End)
+                                && BlocksRoomSlot(slot.LessonTypeId)
                                 && !IsSameDraftBusySlot(candidate, slot, candidate.StartTime, candidate.EndTime)))
                         {
                             reason = $"Аудиторія #{roomId} зайнята у слоті {targetGap.Start:HH\\:mm}-{targetGap.End:HH\\:mm}.";
@@ -7310,16 +10764,28 @@ public sealed class TeacherDraftsAutogenService
                     }
                     return true;
                 }
+                void RefreshMovedDraftValidationWarnings(TeacherDraftItem draft)
+                {
+                    if (!typeById.TryGetValue(draft.LessonTypeId, out var lessonType))
+                    {
+                        return;
+                    }
+                    draft.ValidationWarnings = BuildIncompleteDraftWarningJson(
+                        lessonType.RequiresTeacher && draft.TeacherId is null,
+                        lessonType.RequiresRoom && draft.RoomId is null);
+                }
                 bool TryApplyDraftMove(
                     TeacherDraftItem candidate,
                     TimeSlot targetGap,
                     out TimeOnly oldStart,
                     out TimeOnly oldEnd,
+                    out DateTime oldUpdatedAt,
                     out BusySlot? oldBusySlot,
                     out BusySlot newBusySlot)
                 {
                     oldStart = candidate.StartTime;
                     oldEnd = candidate.EndTime;
+                    oldUpdatedAt = candidate.UpdatedAt;
                     oldBusySlot = FindBusySlotForDraft(candidate, oldStart, oldEnd);
                     var buildingId = candidate.RoomId is int roomId && roomBuildingById.TryGetValue(roomId, out var candidateBuildingId)
                         ? candidateBuildingId
@@ -7343,16 +10809,24 @@ public sealed class TeacherDraftsAutogenService
                     candidate.StartTime = targetGap.Start;
                     candidate.EndTime = targetGap.End;
                     candidate.DayOfWeek = date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
+                    candidate.UpdatedAt = DateTime.UtcNow;
                     AddBusySlot(newBusySlot);
                     InvalidateGapResourceCaches();
                     return true;
                 }
-                void RollbackDraftMove(TeacherDraftItem candidate, TimeOnly oldStart, TimeOnly oldEnd, BusySlot oldBusySlot, BusySlot newBusySlot)
+                void RollbackDraftMove(
+                    TeacherDraftItem candidate,
+                    TimeOnly oldStart,
+                    TimeOnly oldEnd,
+                    DateTime oldUpdatedAt,
+                    BusySlot oldBusySlot,
+                    BusySlot newBusySlot)
                 {
                     RemoveBusySlot(newBusySlot);
                     candidate.StartTime = oldStart;
                     candidate.EndTime = oldEnd;
                     candidate.DayOfWeek = date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
+                    candidate.UpdatedAt = oldUpdatedAt;
                     AddBusySlot(oldBusySlot);
                     InvalidateGapResourceCaches();
                 }
@@ -7365,11 +10839,11 @@ public sealed class TeacherDraftsAutogenService
                     var targetIndex = slotIndexByTime.TryGetValue((targetGap.Start, targetGap.End), out var idx)
                         ? idx
                         : 0;
-                    var candidates = movableDrafts
-                        .Where(candidate => candidate.GroupId == grp.Id
-                                            && candidate.Date == date
-                                            && !candidate.IsLocked
-                                            && !CanShareAcrossGroups(candidate.LessonTypeId)
+                        var candidates = movableDrafts
+                            .Where(candidate => candidate.GroupId == grp.Id
+                                                && candidate.Date == date
+                                                && AutogenDraftMutationPolicy.CanMutateInRepair(candidate)
+                                                && !CanShareAcrossGroups(candidate.LessonTypeId)
                                             && !excludedTypeIds.Contains(candidate.LessonTypeId)
                                             && !(candidate.StartTime == targetGap.Start && candidate.EndTime == targetGap.End))
                         .Select(candidate => new
@@ -7418,6 +10892,7 @@ public sealed class TeacherDraftsAutogenService
                                 targetGap,
                                 out var oldStart,
                                 out var oldEnd,
+                                out var oldUpdatedAt,
                                 out var oldBusySlot,
                                 out var newBusySlot)
                             || oldBusySlot is null)
@@ -7445,10 +10920,17 @@ public sealed class TeacherDraftsAutogenService
                         }
                         if (filledOldSlot)
                         {
+                            RefreshMovedDraftValidationWarnings(candidateEntry.Draft);
                             warnings.Add($"[{date:yyyy-MM-dd}] {grp.Name}: цільовий repair-pass пересунув заняття {candidateEntry.Draft.ModuleId} у слот {targetGap.Start:HH\\:mm}-{targetGap.End:HH\\:mm} і дозаповнив звільнений слот {oldStart:HH\\:mm}-{oldEnd:HH\\:mm}.");
                             return true;
                         }
-                        RollbackDraftMove(candidateEntry.Draft, oldStart, oldEnd, oldBusySlot, newBusySlot);
+                        RollbackDraftMove(
+                            candidateEntry.Draft,
+                            oldStart,
+                            oldEnd,
+                            oldUpdatedAt,
+                            oldBusySlot,
+                            newBusySlot);
                     }
                     return false;
                 }
@@ -7479,10 +10961,9 @@ public sealed class TeacherDraftsAutogenService
                                        && slot.StartTime == targetGap.Start
                                        && slot.EndTime == targetGap.End)
                         .Select(FindCreatedDraftForBusySlot)
-                        .Where(draft => draft is not null
+                            .Where(draft => draft is not null
                                         && draft.Date == date
-                                        && !draft.IsLocked
-                                        && draft.Status == DraftStatus.Draft
+                                        && AutogenDraftMutationPolicy.CanMutateInRepair(draft)
                                         && !CanShareAcrossGroups(draft.LessonTypeId)
                                         && !excludedTypeIds.Contains(draft.LessonTypeId)
                                         && selectedGroupsById.TryGetValue(draft.GroupId, out var blockerGroup)
@@ -7522,6 +11003,7 @@ public sealed class TeacherDraftsAutogenService
                                     blockerTargetSlot,
                                     out var oldStart,
                                     out var oldEnd,
+                                    out var oldUpdatedAt,
                                     out var oldBusySlot,
                                     out var newBusySlot)
                                 || oldBusySlot is null)
@@ -7538,6 +11020,7 @@ public sealed class TeacherDraftsAutogenService
                                 maxModuleSegmentsAllowed: softFill ? 2 : maxModuleSegmentsPerDay);
                             if (filledTargetGap)
                             {
+                                RefreshMovedDraftValidationWarnings(blocker.Draft);
                                 var blockerGroupName = selectedGroupsById.TryGetValue(blocker.Draft.GroupId, out var blockerGroup)
                                     ? blockerGroup.Name
                                     : $"#{blocker.Draft.GroupId}";
@@ -7545,7 +11028,13 @@ public sealed class TeacherDraftsAutogenService
                                 return true;
                             }
 
-                            RollbackDraftMove(blocker.Draft, oldStart, oldEnd, oldBusySlot, newBusySlot);
+                            RollbackDraftMove(
+                                blocker.Draft,
+                                oldStart,
+                                oldEnd,
+                                oldUpdatedAt,
+                                oldBusySlot,
+                                newBusySlot);
                         }
                     }
 
@@ -7584,7 +11073,7 @@ public sealed class TeacherDraftsAutogenService
                         var candidates = movableDrafts
                             .Where(candidate => candidate.GroupId == grp.Id
                                                 && candidate.Date == date
-                                                && !candidate.IsLocked
+                                                && AutogenDraftMutationPolicy.CanMutateInRepair(candidate)
                                                 && !movedDrafts.Contains(candidate)
                                                 && !CanShareAcrossGroups(candidate.LessonTypeId)
                                                 && !excludedTypeIds.Contains(candidate.LessonTypeId)
@@ -7643,6 +11132,7 @@ public sealed class TeacherDraftsAutogenService
                                     currentGap,
                                     out var oldStart,
                                     out var oldEnd,
+                                    out var oldUpdatedAt,
                                     out var oldBusySlot,
                                     out var newBusySlot)
                                 || oldBusySlot is null)
@@ -7669,12 +11159,19 @@ public sealed class TeacherDraftsAutogenService
                             }
                             if (repaired && CountDayGaps() < gapCountBefore)
                             {
+                                RefreshMovedDraftValidationWarnings(candidateEntry.Draft);
                                 return true;
                             }
 
                             movedDrafts.Remove(candidateEntry.Draft);
                             visitedGaps.Remove(oldSlotKey);
-                            RollbackDraftMove(candidateEntry.Draft, oldStart, oldEnd, oldBusySlot, newBusySlot);
+                            RollbackDraftMove(
+                                candidateEntry.Draft,
+                                oldStart,
+                                oldEnd,
+                                oldUpdatedAt,
+                                oldBusySlot,
+                                newBusySlot);
                         }
 
                         return false;
@@ -7704,7 +11201,7 @@ public sealed class TeacherDraftsAutogenService
                         return false;
                     }
 
-                    var firstLectureOrder = lectureSlots[0].Order;
+                    var lastLectureOrder = lectureSlots[^1].Order;
                     var lastLectureEnd = lectureSlots
                         .OrderByDescending(slot => slot.Order)
                         .First()
@@ -7712,8 +11209,7 @@ public sealed class TeacherDraftsAutogenService
                     var earlyNonLectures = movableDrafts
                         .Where(candidate => candidate.GroupId == grp.Id
                                             && candidate.Date == date
-                                            && candidate.Status == DraftStatus.Draft
-                                            && !candidate.IsLocked
+                                            && AutogenDraftMutationPolicy.CanMutateInRepair(candidate)
                                             && !CanShareAcrossGroups(candidate.LessonTypeId)
                                             && !excludedTypeIds.Contains(candidate.LessonTypeId))
                         .Select(candidate => new
@@ -7721,7 +11217,7 @@ public sealed class TeacherDraftsAutogenService
                             Draft = candidate,
                             Order = GetSlotOrder(candidate.StartTime, candidate.EndTime)
                         })
-                        .Where(entry => entry.Order > 0 && entry.Order < firstLectureOrder)
+                        .Where(entry => entry.Order > 0 && entry.Order < lastLectureOrder)
                         .OrderByDescending(entry => entry.Order)
                         .ThenBy(entry => entry.Draft.StartTime)
                         .ToList();
@@ -7754,36 +11250,17 @@ public sealed class TeacherDraftsAutogenService
                                     targetGap,
                                     out var oldStart,
                                     out var oldEnd,
+                                    out _,
                                     out var oldBusySlot,
                                     out _)
                                 && oldBusySlot is not null)
                             {
+                                RefreshMovedDraftValidationWarnings(earlyEntry.Draft);
                                 warnings.Add($"[{date:yyyy-MM-dd}] {grp.Name}: лекційний repair-pass пересунув заняття {earlyEntry.Draft.ModuleId} зі слоту {oldStart:HH\\:mm}-{oldEnd:HH\\:mm} після лекційного блоку у слот {targetGap.Start:HH\\:mm}-{targetGap.End:HH\\:mm}.");
                                 return true;
                             }
                         }
 
-                        var removedStart = earlyEntry.Draft.StartTime;
-                        var removedEnd = earlyEntry.Draft.EndTime;
-                        var removedBusySlot = FindBusySlotForDraft(earlyEntry.Draft, removedStart, removedEnd);
-                        if (removedBusySlot is not null)
-                        {
-                            RemoveBusySlot(removedBusySlot);
-                        }
-                        movableDrafts.Remove(earlyEntry.Draft);
-                        createdDrafts.Remove(earlyEntry.Draft);
-                        if (allCreatedDrafts.Remove(earlyEntry.Draft))
-                        {
-                            if (created > 0)
-                            {
-                                created--;
-                            }
-                            Dec(earlyEntry.Draft.GroupId, earlyEntry.Draft.Date);
-                        }
-                        RemoveDraftEntity(earlyEntry.Draft);
-                        InvalidateGapResourceCaches();
-                        warnings.Add($"[{date:yyyy-MM-dd}] {grp.Name}: лекційний repair-pass прибрав заняття {earlyEntry.Draft.ModuleId} зі слоту {removedStart:HH\\:mm}-{removedEnd:HH\\:mm}, бо його не вдалося безпечно пересунути після лекційного блоку.");
-                        return true;
                     }
 
                     return false;
@@ -7834,14 +11311,12 @@ public sealed class TeacherDraftsAutogenService
                         return false;
                     }
 
+                    var finalSearchBudget = ResolveGroupDateSearchBudget();
                     var bestGapCount = initialGaps;
                     var improved = false;
-                    var optimizationStartedAt = Stopwatch.GetTimestamp();
-                    var optimizationBudget = TimeSpan.FromSeconds(softFill ? 8 : 2);
-                    bool HasOptimizationBudget()
-                        => Stopwatch.GetElapsedTime(optimizationStartedAt) < optimizationBudget;
-                    for (var cycle = 0; cycle < Math.Max(1, slots.Count) && HasOptimizationBudget(); cycle++)
+                    while (finalSearchBudget.TryVisitNode())
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         var beforeGaps = CountDayGaps();
                         if (beforeGaps == 0)
                         {
@@ -7849,23 +11324,44 @@ public sealed class TeacherDraftsAutogenService
                         }
 
                         bool progressed = false;
-                        if (CountFor(grp.Id, date) < maxPerDay && await TryTargetedRepairAnyGapAsync())
+                        if (!finalSearchBudget.TryVisitNode())
+                        {
+                            break;
+                        }
+                        if (CountFor(grp.Id, date) < maxPerDay
+                            && await TryTargetedRepairAnyGapAsync())
                         {
                             progressed = true;
                         }
-                        if (CountFor(grp.Id, date) < maxPerDay && await TryExhaustiveGapFillAsync())
+                        if (!finalSearchBudget.TryVisitNode())
+                        {
+                            break;
+                        }
+                        if (CountFor(grp.Id, date) < maxPerDay
+                            && await TryExhaustiveGapFillAsync())
                         {
                             progressed = true;
+                        }
+                        if (!finalSearchBudget.TryVisitNode())
+                        {
+                            break;
                         }
                         if (TryShiftGaps(date))
                         {
                             progressed = true;
                         }
-                        if (CountFor(grp.Id, date) < maxPerDay && await TryExhaustiveGapFillAsync())
+                        if (!finalSearchBudget.TryVisitNode())
+                        {
+                            break;
+                        }
+                        if (CountFor(grp.Id, date) < maxPerDay
+                            && await TryExhaustiveGapFillAsync())
                         {
                             progressed = true;
                         }
-                        for (var lectureCycle = 0; lectureCycle < slots.Count; lectureCycle++)
+                        for (var lectureCycle = 0;
+                             lectureCycle < slots.Count && finalSearchBudget.TryVisitNode();
+                             lectureCycle++)
                         {
                             if (!TryRepairLectureOrder())
                             {
@@ -7886,6 +11382,20 @@ public sealed class TeacherDraftsAutogenService
                         }
                     }
 
+                    if (finalSearchBudget.SearchLimitReached)
+                    {
+                        RecordSearchLimit(
+                            grp.Id,
+                            date,
+                            "final-repair",
+                            finalSearchBudget.VisitedNodes,
+                            finalSearchBudget.MaxNodes,
+                            finalSearchBudget.EmergencyLimitReached);
+                        var limitKind = finalSearchBudget.EmergencyLimitReached
+                            ? "аварійну часову межу"
+                            : $"детерміновану межу {finalSearchBudget.MaxNodes} вузлів";
+                        warnings.Add($"[{date:yyyy-MM-dd}] {grp.Name}: [search-limit] фінальний repair-pass досягнув {limitKind}; збережено найкращий валідний результат із {bestGapCount} порожніми слотами.");
+                    }
                     if (improved)
                     {
                         warnings.Add($"[{date:yyyy-MM-dd}] {grp.Name}: фінальний repair-pass зменшив кількість порожніх слотів з {initialGaps} до {bestGapCount}.");
@@ -7914,6 +11424,2806 @@ public sealed class TeacherDraftsAutogenService
                         progressed = true;
                     }
                     return progressed;
+                }
+
+                void ChangeDraftRoomUsage(
+                    TeacherDraftItem draft,
+                    int? previousRoomId,
+                    int? roomId)
+                {
+                    if (previousRoomId == roomId)
+                    {
+                        return;
+                    }
+
+                    if (previousRoomId is int oldRoomId
+                        && roomUsageByGroup.TryGetValue(draft.GroupId, out var oldUsage)
+                        && oldUsage.TryGetValue(oldRoomId, out var oldCount))
+                    {
+                        if (oldCount <= 1)
+                        {
+                            oldUsage.Remove(oldRoomId);
+                        }
+                        else
+                        {
+                            oldUsage[oldRoomId] = oldCount - 1;
+                        }
+                    }
+
+                    if (roomId is int newRoomId)
+                    {
+                        if (!roomUsageByGroup.TryGetValue(draft.GroupId, out var newUsage))
+                        {
+                            newUsage = new Dictionary<int, int>();
+                            roomUsageByGroup[draft.GroupId] = newUsage;
+                        }
+                        newUsage[newRoomId] = newUsage.TryGetValue(newRoomId, out var newCount)
+                            ? newCount + 1
+                            : 1;
+                    }
+
+                    if (createdDraftAccounting.TryGetValue(draft, out var accounting))
+                    {
+                        accounting.RoomUsageGroupId = roomId is int ? draft.GroupId : null;
+                        accounting.RoomUsageRoomId = roomId;
+                    }
+                }
+
+                async Task<AppliedDraftCalendarMove?> TryMoveGeneratedDraftAcrossCalendarAsync(
+                    Group moveGroup,
+                    TeacherDraftItem candidate,
+                    DateOnly targetDate,
+                    TimeSlot targetSlot,
+                    int maxModuleSegmentsAllowed,
+                    bool preserveAssignedResources)
+                {
+                    if (candidate.GroupId != moveGroup.Id
+                        || !AutogenDraftMutationPolicy.CanMutateInRepair(candidate)
+                        || candidate.IsSelfStudy
+                        || CanShareAcrossGroups(candidate.LessonTypeId)
+                        || excludedTypeIds.Contains(candidate.LessonTypeId)
+                        || candidate.ModuleTopicId is not int topicId
+                        || !topicById.TryGetValue(topicId, out var topic)
+                        || !movableDrafts.Contains(candidate)
+                        || !IsWorking(targetDate, moveGroup)
+                        || SlotFilledForGroup(moveGroup.Id, targetDate, targetSlot))
+                    {
+                        return null;
+                    }
+
+                    var previousState = CaptureMovableDraftTrialState(candidate);
+                    var previousBusySlot = FindBusySlotForDraft(candidate, candidate.StartTime, candidate.EndTime);
+                    if (previousBusySlot is null || !RemoveBusySlot(previousBusySlot))
+                    {
+                        return null;
+                    }
+
+                    var moveApplied = false;
+                    try
+                    {
+                        // Під час перестановки в межах того самого дня поточна пара
+                        // вже прибрана з busy, але ще врахована у perDayCount.
+                        // Не трактуємо її власне місце як переповнення дня.
+                        var targetDayLoadWithoutCandidate = CountFor(moveGroup.Id, targetDate)
+                                                            - (candidate.Date == targetDate ? 1 : 0);
+                        var targetDayFull = targetDayLoadWithoutCandidate
+                                            >= SharedSlotsForDate(moveGroup.CourseId, targetDate).Count;
+                        var targetSegmentViolation = ViolatesAnyModuleDayBlock(
+                                moveGroup.Id,
+                                targetDate,
+                                candidate.ModuleId,
+                                targetSlot.Start,
+                                targetSlot.End,
+                                out _,
+                                maxModuleSegmentsAllowed);
+                        var targetTopicOrderViolation = ViolatesTopicCalendarOrder(
+                                moveGroup.Id,
+                                candidate.ModuleId,
+                                topic,
+                                targetDate,
+                                targetSlot.Start,
+                                targetSlot.End);
+                        if (targetDayFull || targetSegmentViolation || targetTopicOrderViolation)
+                        {
+                            return null;
+                        }
+
+                        if (ViolatesLectureBlockOrderForPlacement(
+                                moveGroup.Id,
+                                targetDate,
+                                targetSlot.Start,
+                                targetSlot.End,
+                                candidate.LessonTypeId))
+                        {
+                            return null;
+                        }
+
+                        var slotGroupLimit = SlotGroupLimitForPlacement(
+                            moveGroup.CourseId,
+                            candidate.LessonTypeId,
+                            candidate.IsSelfStudy);
+                        if (CountGroupsWithModuleInSlot(
+                                candidate.ModuleId,
+                                targetDate,
+                                targetSlot.Start,
+                                targetSlot.End) >= slotGroupLimit)
+                        {
+                            return null;
+                        }
+
+                        var requiresTeacher = (typeById.TryGetValue(candidate.LessonTypeId, out var typeMeta)
+                            ? typeMeta.RequiresTeacher
+                            : (bool?)null) ?? true;
+                        var requiresRoom = (typeById.TryGetValue(candidate.LessonTypeId, out typeMeta)
+                            ? typeMeta.RequiresRoom
+                            : (bool?)null) ?? true;
+                        var teacherCandidates = PreferredOrExplicitTeacherPool(
+                                teachersForModule
+                                    .Where(entry => entry.ModuleId == candidate.ModuleId)
+                                    .Select(entry => entry.TeacherId)
+                                    .Where(teacherId => TeacherFitsWorkingHours(
+                                        teacherId,
+                                        targetDate,
+                                        targetSlot.Start,
+                                        targetSlot.End)),
+                                topic)
+                            .Select(teacherId => (int?)teacherId)
+                            .OrderBy(teacherId => teacherId is int resolvedTeacherId
+                                ? TeacherDepartmentPriority(resolvedTeacherId, topic)
+                                : 0)
+                            .ThenBy(teacherId => teacherId == candidate.TeacherId ? 0 : 1)
+                            .ThenBy(teacherId => teacherId is int resolvedTeacherId ? TeacherLoadPenalty(resolvedTeacherId) : 0)
+                            .ThenBy(teacherId => teacherId)
+                            .ToList();
+                        if (!requiresTeacher)
+                        {
+                            teacherCandidates.Insert(0, candidate.TeacherId);
+                            teacherCandidates.Add(null);
+                            teacherCandidates = teacherCandidates.Distinct().ToList();
+                        }
+                        if (preserveAssignedResources)
+                        {
+                            teacherCandidates = teacherCandidates
+                                .Where(teacherId => teacherId == candidate.TeacherId)
+                                .ToList();
+                        }
+                        if (requiresTeacher && teacherCandidates.Count == 0)
+                        {
+                            return null;
+                        }
+
+                        var roomCandidates = requiresRoom
+                            ? CandidateRoomsForGroup(
+                                    moveGroup.Id,
+                                    candidate.ModuleId,
+                                    moveGroup.StudentsCount,
+                                    ignoreGroupPreference: softFill)
+                                .Cast<Room?>()
+                                .OrderBy(room => room?.Id == candidate.RoomId ? 0 : 1)
+                                .ThenBy(room => room?.Capacity ?? int.MaxValue)
+                                .ThenBy(room => room?.Id)
+                                .ToList()
+                            : new List<Room?>
+                            {
+                                candidate.RoomId is int currentRoomId
+                                    ? roomsAll.FirstOrDefault(room => room.Id == currentRoomId)
+                                    : null,
+                                null
+                            };
+                        if (preserveAssignedResources)
+                        {
+                            roomCandidates = roomCandidates
+                                .Where(room => room?.Id == candidate.RoomId)
+                                .ToList();
+                        }
+                        if (requiresRoom && roomCandidates.Count == 0)
+                        {
+                            return null;
+                        }
+
+                        foreach (var teacherId in teacherCandidates)
+                        {
+                            if (teacherId is int resolvedTeacherId
+                                && !TeacherFitsWorkingHours(
+                                    resolvedTeacherId,
+                                    targetDate,
+                                    targetSlot.Start,
+                                    targetSlot.End))
+                            {
+                                continue;
+                            }
+
+                            foreach (var room in roomCandidates)
+                            {
+                                if (!TryValidatePlacementAgainstBusy(
+                                        candidate.ModuleId,
+                                        candidate.LessonTypeId,
+                                        topic.Id,
+                                        teacherId,
+                                        room,
+                                        targetDate,
+                                        targetSlot.Start,
+                                        targetSlot.End,
+                                        new[] { moveGroup.Id },
+                                        out _))
+                                {
+                                    continue;
+                                }
+                                if (ViolatesTravelFeasibility(
+                                        existing => existing.GroupId == moveGroup.Id,
+                                        room,
+                                        targetDate,
+                                        targetSlot.Start,
+                                        targetSlot.End,
+                                        $"групи {moveGroup.Name}",
+                                        out _))
+                                {
+                                    continue;
+                                }
+                                if (teacherId is int teacherForTravel
+                                    && ViolatesTravelFeasibility(
+                                        existing => existing.TeacherId == teacherForTravel,
+                                        room,
+                                        targetDate,
+                                        targetSlot.Start,
+                                        targetSlot.End,
+                                        $"викладача {TeacherLabel(teacherForTravel)}",
+                                        out _))
+                                {
+                                    continue;
+                                }
+
+                                var persistedConflictReason = await FindPersistedPlacementConflictAsync(
+                                    candidate.ModuleId,
+                                    candidate.LessonTypeId,
+                                    topic.Id,
+                                    teacherId,
+                                    room,
+                                    targetDate,
+                                    targetSlot.Start,
+                                    targetSlot.End,
+                                    new[] { moveGroup.Id });
+                                if (!string.IsNullOrWhiteSpace(persistedConflictReason))
+                                {
+                                    continue;
+                                }
+
+                                var previousAccountingRoomId = createdDraftAccounting.TryGetValue(candidate, out var accounting)
+                                    ? accounting.RoomUsageRoomId
+                                    : candidate.RoomId;
+                                var previousRoomId = candidate.RoomId;
+                                candidate.Date = targetDate;
+                                candidate.DayOfWeek = targetDate.ToDateTime(TimeOnly.MinValue).DayOfWeek;
+                                candidate.StartTime = targetSlot.Start;
+                                candidate.EndTime = targetSlot.End;
+                                candidate.TeacherId = teacherId;
+                                candidate.RoomId = room?.Id;
+                                if (typeById.TryGetValue(candidate.LessonTypeId, out var lessonType))
+                                {
+                                    candidate.ValidationWarnings = BuildIncompleteDraftWarningJson(
+                                        lessonType.RequiresTeacher && candidate.TeacherId is null,
+                                        lessonType.RequiresRoom && candidate.RoomId is null);
+                                }
+                                candidate.UpdatedAt = DateTime.UtcNow;
+                                // EF може відкласти автоматичне виявлення змін до SaveChanges.
+                                // Позначаємо перенесену наявну чернетку одразу, щоб наступні
+                                // пробні знімки та фінальна перевірка бачили її нову позицію.
+                                var candidateEntry = _db.Entry(candidate);
+                                if (candidate.Id > 0 && candidateEntry.State == EntityState.Unchanged)
+                                {
+                                    candidateEntry.State = EntityState.Modified;
+                                }
+                                var currentBusySlot = new BusySlot(
+                                    candidate.GroupId,
+                                    teacherId,
+                                    room?.Id,
+                                    targetDate,
+                                    targetSlot.Start,
+                                    targetSlot.End,
+                                    room?.BuildingId,
+                                    candidate.ModuleId,
+                                    candidate.LessonTypeId,
+                                    topic.Id,
+                                    true);
+                                AddBusySlot(currentBusySlot);
+                                if (previousState.Date != targetDate)
+                                {
+                                    Dec(candidate.GroupId, previousState.Date);
+                                    Inc(candidate.GroupId, targetDate);
+                                }
+                                ChangeDraftRoomUsage(candidate, previousRoomId, room?.Id);
+                                InvalidateGapResourceCaches();
+                                moveApplied = true;
+                                return new AppliedDraftCalendarMove(
+                                    candidate,
+                                    previousState,
+                                    previousBusySlot,
+                                    currentBusySlot,
+                                    previousAccountingRoomId);
+                            }
+                        }
+                        return null;
+                    }
+                    finally
+                    {
+                        if (!moveApplied)
+                        {
+                            AddBusySlot(previousBusySlot);
+                            InvalidateGapResourceCaches();
+                        }
+                    }
+                }
+
+                void RollbackDraftCalendarMove(AppliedDraftCalendarMove move)
+                {
+                    RemoveBusySlot(move.CurrentBusySlot);
+                    if (move.PreviousState.Date != move.Draft.Date)
+                    {
+                        Dec(move.Draft.GroupId, move.Draft.Date);
+                        Inc(move.Draft.GroupId, move.PreviousState.Date);
+                    }
+                    ChangeDraftRoomUsage(move.Draft, move.Draft.RoomId, move.PreviousAccountingRoomId);
+                    RestoreMovableDraftTrialState(move.Draft, move.PreviousState);
+                    AddBusySlot(move.PreviousBusySlot);
+                    InvalidateGapResourceCaches();
+                }
+
+                bool MutableDraftProjectionMatchesBusyState()
+                {
+                    var draftProjection = movableDrafts
+                        .Where(draft => AutogenDraftMutationPolicy.CanSynchronizeMovedDraft(
+                            draft,
+                            selectedGroupIdSet,
+                            rangeStartDate,
+                            rangeEndDateExclusive))
+                        .Select(draft => new MutableDraftProjection(
+                            draft.GroupId,
+                            draft.Date,
+                            draft.StartTime,
+                            draft.EndTime,
+                            draft.ModuleId,
+                            draft.LessonTypeId,
+                            draft.ModuleTopicId,
+                            draft.TeacherId,
+                            draft.RoomId))
+                        .GroupBy(item => item)
+                        .ToDictionary(group => group.Key, group => group.Count());
+                    var busyProjection = busy
+                        .Where(slot => slot.JoinableDraft
+                                       && selectedGroupIdSet.Contains(slot.GroupId)
+                                       && slot.Date >= rangeStartDate
+                                       && slot.Date < rangeEndDateExclusive)
+                        .Select(slot => new MutableDraftProjection(
+                            slot.GroupId,
+                            slot.Date,
+                            slot.StartTime,
+                            slot.EndTime,
+                            slot.ModuleId,
+                            slot.LessonTypeId,
+                            slot.ModuleTopicId,
+                            slot.TeacherId,
+                            slot.RoomId))
+                        .GroupBy(item => item)
+                        .ToDictionary(group => group.Key, group => group.Count());
+                    return draftProjection.Count == busyProjection.Count
+                           && draftProjection.All(entry =>
+                               busyProjection.TryGetValue(entry.Key, out var count)
+                               && count == entry.Value);
+                }
+
+                async Task<bool> TryCrossDateChronologyCompactionAsync()
+                {
+                    // Міжденний repair працює для поточної групи, але приймає зміну
+                    // лише після глобальної перевірки всіх вибраних груп.
+                    if (!softFill || generationDates.Count < 2)
+                    {
+                        return false;
+                    }
+
+                    var compactionSnapshot = CaptureTrialState();
+                    var maxSegmentsAllowed = softFill ? 2 : maxModuleSegmentsPerDay;
+                    var totalSlotCount = generationDates.Sum(day =>
+                        resolvedByDay.TryGetValue(day.DayOfWeek, out var resolved)
+                            ? resolved.Slots.Count
+                            : 0);
+                    var moveBudget = Math.Max(8, totalSlotCount * 2);
+                    var moveTrials = 0;
+                    bool HasHardOverlapAfterRepair()
+                    {
+                        static bool Overlaps(BusySlot left, BusySlot right)
+                            => left.Date == right.Date
+                               && left.StartTime < right.EndTime
+                               && right.StartTime < left.EndTime;
+                        static bool GroupHasOverlap(IEnumerable<BusySlot> slotsToCheck)
+                        {
+                            var ordered = slotsToCheck
+                                .OrderBy(slot => slot.Date)
+                                .ThenBy(slot => slot.StartTime)
+                                .ThenBy(slot => slot.EndTime)
+                                .ToList();
+                            for (var leftIndex = 0; leftIndex < ordered.Count; leftIndex++)
+                            {
+                                for (var rightIndex = leftIndex + 1; rightIndex < ordered.Count; rightIndex++)
+                                {
+                                    if (ordered[rightIndex].Date > ordered[leftIndex].Date
+                                        || ordered[rightIndex].Date == ordered[leftIndex].Date
+                                        && ordered[rightIndex].StartTime >= ordered[leftIndex].EndTime)
+                                    {
+                                        break;
+                                    }
+                                    if (Overlaps(ordered[leftIndex], ordered[rightIndex]))
+                                    {
+                                        return true;
+                                    }
+                                }
+                            }
+                            return false;
+                        }
+
+                        // Repair спочатку змінює індекс зайнятості, а чернетки
+                        // синхронізуються пізніше, тому guard перевіряє саме цільовий стан.
+                        var occupyingRows = busy
+                            .Where(slot => selectedGroupIdSet.Contains(slot.GroupId)
+                                           && slot.Date >= rangeStartDate
+                                           && slot.Date < rangeEndDateExclusive
+                                           && !IsNonOccupyingBusySlot(slot))
+                            .ToList();
+                        if (occupyingRows
+                            .GroupBy(slot => slot.GroupId)
+                            .Any(group => GroupHasOverlap(group)))
+                        {
+                            return true;
+                        }
+                        var lectureBlockIsSplit = occupyingRows
+                            .Where(slot => !excludedTypeIds.Contains(slot.LessonTypeId))
+                            .GroupBy(slot => new { slot.GroupId, slot.Date })
+                            .Any(group =>
+                            {
+                                var nonLectureStarted = false;
+                                foreach (var slot in group
+                                             .OrderBy(item => item.StartTime)
+                                             .ThenBy(item => item.EndTime))
+                                {
+                                    if (CanShareAcrossGroups(slot.LessonTypeId))
+                                    {
+                                        if (nonLectureStarted)
+                                        {
+                                            return true;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        nonLectureStarted = true;
+                                    }
+                                }
+                                return false;
+                            });
+                        if (lectureBlockIsSplit)
+                        {
+                            return true;
+                        }
+                        var topicOrderIsInvalid = topicOrderSlots
+                            .Where(slot => selectedGroupIdSet.Contains(slot.GroupId)
+                                           && slot.Date >= rangeStartDate
+                                           && slot.Date < rangeEndDateExclusive)
+                            .Where(slot => slot.ModuleTopicId is int
+                                           && !excludedTypeIds.Contains(slot.LessonTypeId))
+                            .GroupBy(slot => new { slot.GroupId, slot.ModuleId })
+                            .Any(group =>
+                            {
+                                int? highestTopicOrder = null;
+                                foreach (var slot in group
+                                             .OrderBy(item => item.Date)
+                                             .ThenBy(item => item.StartTime)
+                                             .ThenBy(item => item.EndTime)
+                                             .ThenBy(item => item.ModuleTopicId))
+                                {
+                                    if (slot.ModuleTopicId is not int topicId
+                                        || !topicById.TryGetValue(topicId, out var topic))
+                                    {
+                                        continue;
+                                    }
+                                    if (highestTopicOrder is int highestOrder && topic.Order < highestOrder)
+                                    {
+                                        return true;
+                                    }
+                                    highestTopicOrder = highestTopicOrder is int currentHighest
+                                        ? Math.Max(currentHighest, topic.Order)
+                                        : topic.Order;
+                                }
+                                return false;
+                            });
+                        if (topicOrderIsInvalid)
+                        {
+                            return true;
+                        }
+
+                        var logicalResourceRows = occupyingRows
+                            .GroupBy(slot => new
+                            {
+                                slot.Date,
+                                slot.StartTime,
+                                slot.EndTime,
+                                slot.ModuleId,
+                                slot.LessonTypeId,
+                                slot.ModuleTopicId,
+                                slot.TeacherId,
+                                slot.RoomId,
+                                IndependentGroupId = CanShareAcrossGroups(slot.LessonTypeId) ? 0 : slot.GroupId
+                            })
+                            .Select(group => group.First())
+                            .ToList();
+                        return logicalResourceRows
+                                   .Where(slot => slot.TeacherId is int && BlocksTeacherSlot(slot.LessonTypeId))
+                                   .GroupBy(slot => slot.TeacherId!.Value)
+                                   .Any(group => GroupHasOverlap(group))
+                               || logicalResourceRows
+                                   .Where(slot => slot.RoomId is int && BlocksRoomSlot(slot.LessonTypeId))
+                                   .GroupBy(slot => slot.RoomId!.Value)
+                                   .Any(group => GroupHasOverlap(group));
+                    }
+                    int CountGlobalWorkingGaps()
+                    {
+                        var count = 0;
+                        foreach (var group in generationGroups)
+                        {
+                            if (!sharedSlotsByCourse.TryGetValue(group.CourseId, out var courseSlots))
+                            {
+                                continue;
+                            }
+                            foreach (var workingDate in DatesBetween(rangeStartDate, rangeEndDateExclusive))
+                            {
+                                if (!IsWorking(workingDate, group)
+                                    || !courseSlots.TryGetValue(workingDate.DayOfWeek, out var resolved))
+                                {
+                                    continue;
+                                }
+                                count += resolved.Slots.Count(slot =>
+                                    !SlotFilledForGroup(group.Id, workingDate, slot));
+                            }
+                        }
+                        return count;
+                    }
+
+                    int? completedModuleId = null;
+                    async Task<bool> TryRotateBlockingTopicIntoGapAsync(
+                        TeacherDraftItem blocker,
+                        DateOnly gapDate,
+                        TimeSlot gapSlot,
+                        int maxSegmentsAllowed)
+                    {
+                        // Перемаркування коректне лише тоді, коли прогалина розташована
+                        // раніше за наявну тему: попередня тема переходить у прогалину,
+                        // а наступна лишається у пізнішому занятті.
+                        if (CompareSlotPosition(
+                                gapDate,
+                                gapSlot.Start,
+                                gapSlot.End,
+                                blocker.Date,
+                                blocker.StartTime,
+                                blocker.EndTime) >= 0
+                            || blocker.ModuleTopicId is not int blockingTopicId
+                            || !topicById.TryGetValue(blockingTopicId, out var blockingTopic)
+                            || SelectNextTopicInOrder(grp.Id, blocker.ModuleId) is not { } pendingTopic
+                            || blockingTopic.Order >= pendingTopic.Order
+                            || blockingTopic.LessonTypeId != pendingTopic.LessonTypeId
+                            || CanShareAcrossGroups(blockingTopic.LessonTypeId))
+                        {
+                            return false;
+                        }
+                        // Якщо попередня тема має кілька повторів, не підвищуємо
+                        // один із них до наступної теми раніше за останній повтор.
+                        if (ViolatesTopicCalendarOrder(
+                                grp.Id,
+                                blocker.ModuleId,
+                                pendingTopic,
+                                blocker.Date,
+                                blocker.StartTime,
+                                blocker.EndTime))
+                        {
+                            return false;
+                        }
+
+                        var previousBusySlot = FindBusySlotForDraft(
+                            blocker,
+                            blocker.StartTime,
+                            blocker.EndTime);
+                        if (previousBusySlot is null || !RemoveBusySlot(previousBusySlot))
+                        {
+                            return false;
+                        }
+
+                        blocker.ModuleTopicId = pendingTopic.Id;
+                        UnmarkTopicUsed(grp.Id, blocker.ModuleId, blockingTopic.Id);
+                        MarkTopicUsed(grp.Id, blocker.ModuleId, pendingTopic);
+                        var relabeledBusySlot = new BusySlot(
+                            blocker.GroupId,
+                            blocker.TeacherId,
+                            blocker.RoomId,
+                            blocker.Date,
+                            blocker.StartTime,
+                            blocker.EndTime,
+                            blocker.RoomId is int blockerRoomId
+                                ? roomsAll.FirstOrDefault(room => room.Id == blockerRoomId)?.BuildingId
+                                : null,
+                            blocker.ModuleId,
+                            blocker.LessonTypeId,
+                            pendingTopic.Id,
+                            true);
+                        AddBusySlot(relabeledBusySlot);
+
+                        var placed = await TryPlaceModuleAsync(
+                            blocker.ModuleId,
+                            gapDate,
+                            isPrimary: false,
+                            allowRepeatPreviousDay: true,
+                            allowExtraSameDay: true,
+                            relaxed: true,
+                            forcedSlot: gapSlot,
+                            bypassCatchUpHold: false,
+                            maxModuleSegmentsOverride: maxSegmentsAllowed);
+                        if (placed)
+                        {
+                            blocker.UpdatedAt = DateTime.UtcNow;
+                            var blockerEntry = _db.Entry(blocker);
+                            if (blocker.Id > 0 && blockerEntry.State == EntityState.Unchanged)
+                            {
+                                blockerEntry.State = EntityState.Modified;
+                            }
+                            completedModuleId = blocker.ModuleId;
+                            warnings.Add($"[{gapDate:yyyy-MM-dd}] {grp.Name}: repair-pass переніс попередню тему {blockingTopic.TopicCode} у слот {gapSlot.Start:HH\\:mm}-{gapSlot.End:HH\\:mm} та зберіг наступну тему {pendingTopic.TopicCode} у пізнішому занятті того самого типу.");
+                            return true;
+                        }
+
+                        RemoveBusySlot(relabeledBusySlot);
+                        UnmarkTopicUsed(grp.Id, blocker.ModuleId, pendingTopic.Id);
+                        MarkTopicUsed(grp.Id, blocker.ModuleId, blockingTopic);
+                        blocker.ModuleTopicId = blockingTopic.Id;
+                        AddBusySlot(previousBusySlot);
+                        return false;
+                    }
+
+                    async Task<bool> TrySwapPeerEventsAndFillGapAsync(
+                        DateOnly gapDate,
+                        TimeSlot gapSlot,
+                        int maxSegmentsAllowed)
+                    {
+                        if (!softFill)
+                        {
+                            return false;
+                        }
+
+                        var pendingModuleIds = remainingByGroupModule
+                            .Where(entry => entry.Key.GroupId == grp.Id && entry.Value > 0)
+                            .Select(entry => entry.Key.ModuleId)
+                            .Distinct()
+                            .OrderByDescending(moduleId => PlacementRemainingFor(grp.Id, moduleId))
+                            .ThenBy(moduleId => moduleId)
+                            .ToList();
+                        if (pendingModuleIds.Count == 0)
+                        {
+                            return false;
+                        }
+
+                        var peerDraftsAtGap = movableDrafts
+                            .Where(draft => draft.GroupId != grp.Id
+                                            && selectedGroupsById.TryGetValue(draft.GroupId, out var peerGroup)
+                                            && peerGroup.CourseId == grp.CourseId
+                                            && AutogenDraftMutationPolicy.CanMutateInRepair(draft)
+                                            && !draft.IsSelfStudy
+                                            && !CanShareAcrossGroups(draft.LessonTypeId)
+                                            && draft.ModuleTopicId is int
+                                            && draft.Date == gapDate
+                                            && draft.StartTime == gapSlot.Start
+                                            && draft.EndTime == gapSlot.End)
+                            .OrderBy(draft => draft.GroupId)
+                            .ThenBy(draft => draft.ModuleId)
+                            .ThenBy(draft => draft.ModuleTopicId)
+                            .ThenBy(draft => draft.TeacherId)
+                            .ThenBy(draft => draft.RoomId)
+                            .Take(12)
+                            .ToList();
+
+                        foreach (var peerDraftAtGap in peerDraftsAtGap)
+                        {
+                            if (!selectedGroupsById.TryGetValue(peerDraftAtGap.GroupId, out var peerGroup)
+                                || !sharedSlotsByCourse.TryGetValue(peerGroup.CourseId, out var peerSlotsByDay)
+                                || !peerSlotsByDay.TryGetValue(gapDate.DayOfWeek, out var peerResolvedDay))
+                            {
+                                continue;
+                            }
+
+                            var alternatePeerDrafts = movableDrafts
+                                .Where(draft => draft.GroupId == peerDraftAtGap.GroupId
+                                                && !ReferenceEquals(draft, peerDraftAtGap)
+                                                && AutogenDraftMutationPolicy.CanMutateInRepair(draft)
+                                                && !draft.IsSelfStudy
+                                                && !CanShareAcrossGroups(draft.LessonTypeId)
+                                                && draft.ModuleTopicId is int
+                                                && draft.Date == gapDate
+                                                && (draft.StartTime != gapSlot.Start || draft.EndTime != gapSlot.End))
+                                .Select(draft => new
+                                {
+                                    Draft = draft,
+                                    Slot = peerResolvedDay.Slots.FirstOrDefault(slot =>
+                                        slot.Start == draft.StartTime && slot.End == draft.EndTime)
+                                })
+                                .Where(entry => entry.Slot is not null)
+                                .OrderByDescending(entry => entry.Draft.StartTime < gapSlot.Start)
+                                .ThenBy(entry => Math.Abs(
+                                    entry.Draft.StartTime.Hour * 60
+                                    + entry.Draft.StartTime.Minute
+                                    - gapSlot.Start.Hour * 60
+                                    - gapSlot.Start.Minute))
+                                .ThenBy(entry => entry.Draft.StartTime)
+                                .ThenBy(entry => entry.Draft.ModuleId)
+                                .ThenBy(entry => entry.Draft.ModuleTopicId)
+                                .Take(12)
+                                .ToList();
+
+                            foreach (var alternateEntry in alternatePeerDrafts)
+                            {
+                                var alternatePeerDraft = alternateEntry.Draft;
+                                var alternateSlot = alternateEntry.Slot!;
+                                var firstPreviousState = CaptureMovableDraftTrialState(peerDraftAtGap);
+                                var secondPreviousState = CaptureMovableDraftTrialState(alternatePeerDraft);
+                                var firstPreviousBusy = FindBusySlotForDraft(
+                                    peerDraftAtGap,
+                                    peerDraftAtGap.StartTime,
+                                    peerDraftAtGap.EndTime);
+                                var secondPreviousBusy = FindBusySlotForDraft(
+                                    alternatePeerDraft,
+                                    alternatePeerDraft.StartTime,
+                                    alternatePeerDraft.EndTime);
+                                if (firstPreviousBusy is null
+                                    || secondPreviousBusy is null
+                                    || !RemoveBusySlot(firstPreviousBusy))
+                                {
+                                    continue;
+                                }
+                                if (!RemoveBusySlot(secondPreviousBusy))
+                                {
+                                    AddBusySlot(firstPreviousBusy);
+                                    continue;
+                                }
+
+                                BusySlot? firstSwappedBusy = null;
+                                BusySlot? secondSwappedBusy = null;
+                                var swapAccepted = false;
+                                try
+                                {
+                                    BusySlot? TryApplyPeerDraftAt(TeacherDraftItem draft, TimeSlot targetSlot)
+                                    {
+                                        if (draft.ModuleTopicId is not int topicId
+                                            || !topicById.TryGetValue(topicId, out var topic)
+                                            || !IsWorking(gapDate, peerGroup)
+                                            || SlotFilledForGroup(draft.GroupId, gapDate, targetSlot)
+                                            || ViolatesAnyModuleDayBlock(
+                                                draft.GroupId,
+                                                gapDate,
+                                                draft.ModuleId,
+                                                targetSlot.Start,
+                                                targetSlot.End,
+                                                out _,
+                                                maxSegmentsAllowed)
+                                            || ViolatesTopicCalendarOrder(
+                                                draft.GroupId,
+                                                draft.ModuleId,
+                                                topic,
+                                                gapDate,
+                                                targetSlot.Start,
+                                                targetSlot.End)
+                                            || CountGroupsWithModuleInSlot(
+                                                draft.ModuleId,
+                                                gapDate,
+                                                targetSlot.Start,
+                                                targetSlot.End) >= ResourceBoundedSlotGroupLimitForPlacement(
+                                                peerGroup.CourseId,
+                                                draft.ModuleId,
+                                                draft.LessonTypeId,
+                                                topic,
+                                                draft.IsSelfStudy))
+                                        {
+                                            return null;
+                                        }
+
+                                        var lessonType = typeById.TryGetValue(draft.LessonTypeId, out var resolvedType)
+                                            ? resolvedType
+                                            : null;
+                                        var requiresTeacher = lessonType?.RequiresTeacher ?? true;
+                                        var requiresRoom = lessonType?.RequiresRoom ?? true;
+                                        var teacherCandidates = PreferredOrExplicitTeacherPool(
+                                                (draft.IsSelfStudy
+                                                ? supervisorsForModule
+                                                    .Where(link => link.ModuleId == draft.ModuleId)
+                                                    .Select(link => link.TeacherId)
+                                                : teachersForModule
+                                                    .Where(link => link.ModuleId == draft.ModuleId)
+                                                    .Select(link => link.TeacherId))
+                                                .Where(teacherId => TeacherFitsWorkingHours(
+                                                    teacherId,
+                                                    gapDate,
+                                                    targetSlot.Start,
+                                                    targetSlot.End)),
+                                                topic)
+                                            .Select(teacherId => (int?)teacherId)
+                                            .OrderBy(teacherId => teacherId is int resolvedTeacherId
+                                                ? TeacherDepartmentPriority(resolvedTeacherId, topic)
+                                                : 0)
+                                            .ThenBy(teacherId => teacherId == draft.TeacherId ? 0 : 1)
+                                            .ThenBy(teacherId => teacherId is int resolvedTeacherId
+                                                ? TeacherLoadPenalty(resolvedTeacherId)
+                                                : 0)
+                                            .ThenBy(teacherId => teacherId)
+                                            .ToList();
+                                        if (!requiresTeacher)
+                                        {
+                                            teacherCandidates.Insert(0, draft.TeacherId);
+                                            teacherCandidates.Add(null);
+                                            teacherCandidates = teacherCandidates.Distinct().ToList();
+                                        }
+                                        else if (allowIncompleteDrafts)
+                                        {
+                                            // Тимчасово дозволяємо порожнє призначення лише всередині
+                                            // атомарного repair-обміну; фінальний matching перепризначить
+                                            // увесь ресурсний набір слоту або відхилить транзакцію.
+                                            teacherCandidates.Add(null);
+                                        }
+                                        if (requiresTeacher && teacherCandidates.Count == 0)
+                                        {
+                                            return null;
+                                        }
+
+                                        var roomCandidates = requiresRoom
+                                            ? CandidateRoomsForGroup(
+                                                    draft.GroupId,
+                                                    draft.ModuleId,
+                                                    peerGroup.StudentsCount,
+                                                    ignoreGroupPreference: softFill)
+                                                .Cast<Room?>()
+                                                .OrderBy(room => room?.Id == draft.RoomId ? 0 : 1)
+                                                .ThenBy(room => room?.Capacity ?? int.MaxValue)
+                                                .ThenBy(room => room?.Id)
+                                                .ToList()
+                                            : new List<Room?>
+                                            {
+                                                draft.RoomId is int currentRoomId
+                                                    ? roomsAll.FirstOrDefault(room => room.Id == currentRoomId)
+                                                    : null,
+                                                null
+                                            };
+                                        if (requiresRoom && roomCandidates.Count == 0)
+                                        {
+                                            return null;
+                                        }
+
+                                        foreach (var teacherId in teacherCandidates)
+                                        {
+                                            if (teacherId is int resolvedTeacherId
+                                                && !TeacherFitsWorkingHours(
+                                                    resolvedTeacherId,
+                                                    gapDate,
+                                                    targetSlot.Start,
+                                                    targetSlot.End))
+                                            {
+                                                continue;
+                                            }
+                                            foreach (var room in roomCandidates)
+                                            {
+                                                if (!TryValidatePlacementAgainstBusy(
+                                                        draft.ModuleId,
+                                                        draft.LessonTypeId,
+                                                        topicId,
+                                                        teacherId,
+                                                        room,
+                                                        gapDate,
+                                                        targetSlot.Start,
+                                                        targetSlot.End,
+                                                        new[] { draft.GroupId },
+                                                        out _)
+                                                    || ViolatesTravelFeasibility(
+                                                        existing => existing.GroupId == draft.GroupId,
+                                                        room,
+                                                        gapDate,
+                                                        targetSlot.Start,
+                                                        targetSlot.End,
+                                                        $"групи {peerGroup.Name}",
+                                                        out _)
+                                                    || teacherId is int teacherForTravel
+                                                    && ViolatesTravelFeasibility(
+                                                        existing => existing.TeacherId == teacherForTravel,
+                                                        room,
+                                                        gapDate,
+                                                        targetSlot.Start,
+                                                        targetSlot.End,
+                                                        $"викладача {TeacherLabel(teacherForTravel)}",
+                                                        out _))
+                                                {
+                                                    continue;
+                                                }
+
+                                                var previousRoomId = draft.RoomId;
+                                                draft.Date = gapDate;
+                                                draft.DayOfWeek = gapDate.ToDateTime(TimeOnly.MinValue).DayOfWeek;
+                                                draft.StartTime = targetSlot.Start;
+                                                draft.EndTime = targetSlot.End;
+                                                draft.TeacherId = teacherId;
+                                                draft.RoomId = room?.Id;
+                                                draft.UpdatedAt = DateTime.UtcNow;
+                                                draft.ValidationWarnings = BuildIncompleteDraftWarningJson(
+                                                    requiresTeacher && teacherId is null,
+                                                    requiresRoom && room is null);
+                                                var entry = _db.Entry(draft);
+                                                if (draft.Id > 0 && entry.State == EntityState.Unchanged)
+                                                {
+                                                    entry.State = EntityState.Modified;
+                                                }
+                                                ChangeDraftRoomUsage(draft, previousRoomId, room?.Id);
+                                                var swappedBusy = new BusySlot(
+                                                    draft.GroupId,
+                                                    teacherId,
+                                                    room?.Id,
+                                                    gapDate,
+                                                    targetSlot.Start,
+                                                    targetSlot.End,
+                                                    room?.BuildingId,
+                                                    draft.ModuleId,
+                                                    draft.LessonTypeId,
+                                                    draft.ModuleTopicId,
+                                                    true);
+                                                AddBusySlot(swappedBusy);
+                                                return swappedBusy;
+                                            }
+                                        }
+                                        return null;
+                                    }
+
+                                    firstSwappedBusy = TryApplyPeerDraftAt(peerDraftAtGap, alternateSlot);
+                                    if (firstSwappedBusy is null)
+                                    {
+                                        continue;
+                                    }
+                                    secondSwappedBusy = TryApplyPeerDraftAt(alternatePeerDraft, gapSlot);
+                                    if (secondSwappedBusy is null)
+                                    {
+                                        continue;
+                                    }
+
+                                    foreach (var pendingModuleId in pendingModuleIds)
+                                    {
+                                        if (!await TryPlaceModuleAsync(
+                                                pendingModuleId,
+                                                gapDate,
+                                                isPrimary: false,
+                                                allowRepeatPreviousDay: true,
+                                                allowExtraSameDay: true,
+                                                relaxed: true,
+                                                forcedSlot: gapSlot,
+                                                bypassCatchUpHold: false,
+                                                maxModuleSegmentsOverride: maxSegmentsAllowed))
+                                        {
+                                            continue;
+                                        }
+
+                                        completedModuleId = pendingModuleId;
+                                        swapAccepted = true;
+                                        warnings.Add($"[{gapDate:yyyy-MM-dd}] {grp.Name}: repair-pass поміняв місцями заняття модулів <{ModuleTitleLabel(peerDraftAtGap.ModuleId)}> і <{ModuleTitleLabel(alternatePeerDraft.ModuleId)}> у групі {peerGroup.Name}, щоб звільнити ресурс для слоту {gapSlot.Start:HH\\:mm}-{gapSlot.End:HH\\:mm}.");
+                                        return true;
+                                    }
+                                }
+                                finally
+                                {
+                                    if (!swapAccepted)
+                                    {
+                                        if (secondSwappedBusy is not null)
+                                        {
+                                            RemoveBusySlot(secondSwappedBusy);
+                                        }
+                                        if (firstSwappedBusy is not null)
+                                        {
+                                            RemoveBusySlot(firstSwappedBusy);
+                                        }
+                                        ChangeDraftRoomUsage(
+                                            peerDraftAtGap,
+                                            peerDraftAtGap.RoomId,
+                                            firstPreviousState.RoomId);
+                                        ChangeDraftRoomUsage(
+                                            alternatePeerDraft,
+                                            alternatePeerDraft.RoomId,
+                                            secondPreviousState.RoomId);
+                                        RestoreMovableDraftTrialState(peerDraftAtGap, firstPreviousState);
+                                        RestoreMovableDraftTrialState(alternatePeerDraft, secondPreviousState);
+                                        AddBusySlot(firstPreviousBusy);
+                                        AddBusySlot(secondPreviousBusy);
+                                        InvalidateGapResourceCaches();
+                                    }
+                                }
+                            }
+                        }
+
+                        return false;
+                    }
+
+                    async Task<bool> TryPushGapForwardAsync(
+                        int? constrainedModuleId,
+                        bool preserveAssignedResources,
+                        DateOnly gapDate,
+                        TimeSlot gapSlot,
+                        HashSet<TeacherDraftItem> movedDrafts,
+                        int depth)
+                    {
+                        if (depth > Math.Min(16, totalSlotCount)
+                            || moveTrials >= moveBudget)
+                        {
+                            return false;
+                        }
+
+                        ApplySlotsForDate(gapDate);
+                        var canonicalGap = slots.FirstOrDefault(slot =>
+                            slot.Start == gapSlot.Start && slot.End == gapSlot.End);
+                        if (canonicalGap is null || SlotFilledForGroup(grp.Id, gapDate, canonicalGap))
+                        {
+                            return false;
+                        }
+
+                        var directModules = remainingByGroupModule
+                            .Where(entry => entry.Key.GroupId == grp.Id && entry.Value > 0)
+                            .Select(entry => entry.Key.ModuleId)
+                            .Distinct()
+                            .Where(moduleId => constrainedModuleId is null || moduleId == constrainedModuleId.Value)
+                            .Select(moduleId => new
+                            {
+                                ModuleId = moduleId,
+                                PendingTopic = SelectPendingOrOverflowTopicForRepair(grp.Id, moduleId)
+                            })
+                            .Where(entry => entry.PendingTopic is not null
+                                            && !CanShareAcrossGroups(entry.PendingTopic.LessonTypeId))
+                            .OrderByDescending(entry => PlacementRemainingFor(grp.Id, entry.ModuleId))
+                            .ThenBy(entry => entry.PendingTopic!.Order)
+                            .ThenBy(entry => entry.ModuleId)
+                            .Select(entry => entry.ModuleId)
+                            .ToList();
+                        foreach (var moduleId in directModules)
+                        {
+                            if (await TryPlaceModuleAsync(
+                                    moduleId,
+                                    gapDate,
+                                    isPrimary: false,
+                                    allowRepeatPreviousDay: true,
+                                    allowExtraSameDay: true,
+                                    relaxed: true,
+                                    forcedSlot: canonicalGap,
+                                    bypassCatchUpHold: false,
+                                    maxModuleSegmentsOverride: maxSegmentsAllowed))
+                            {
+                                completedModuleId = moduleId;
+                                return true;
+                            }
+                        }
+
+                        if (constrainedModuleId is null
+                            && depth == 0
+                            && await TrySwapPeerEventsAndFillGapAsync(
+                                gapDate,
+                                canonicalGap,
+                                maxSegmentsAllowed))
+                        {
+                            return true;
+                        }
+
+                        // На верхньому загальному кроці дозволяємо також підтягнути заняття
+                        // з раннього слоту в пізню прогалину. Рекурсія одразу заповнює звільнений
+                        // ранній слот, тому приймається лише ланцюжок зі зменшенням числа прогалин.
+                        var allowEarlierTopLevelBlocker = constrainedModuleId is null && depth == 0;
+                        var blockers = movableDrafts
+                            .Where(candidate => candidate.GroupId == grp.Id
+                                                && (constrainedModuleId is null || candidate.ModuleId == constrainedModuleId.Value)
+                                                && AutogenDraftMutationPolicy.CanMutateInRepair(candidate)
+                                                && !candidate.IsSelfStudy
+                                                && !CanShareAcrossGroups(candidate.LessonTypeId)
+                                                && candidate.ModuleTopicId is int
+                                                && !movedDrafts.Contains(candidate)
+                                                && (CompareSlotPosition(
+                                                        candidate.Date,
+                                                        candidate.StartTime,
+                                                        candidate.EndTime,
+                                                        gapDate,
+                                                        canonicalGap.Start,
+                                                        canonicalGap.End) > 0
+                                                    || allowEarlierTopLevelBlocker
+                                                    && CompareSlotPosition(
+                                                        candidate.Date,
+                                                        candidate.StartTime,
+                                                        candidate.EndTime,
+                                                        gapDate,
+                                                        canonicalGap.Start,
+                                                        canonicalGap.End) < 0))
+                            .Select(candidate => new
+                            {
+                                Draft = candidate,
+                                Topic = topicById.TryGetValue(candidate.ModuleTopicId!.Value, out var candidateTopic)
+                                    ? candidateTopic
+                                    : null
+                            })
+                            .Where(entry => entry.Topic is not null
+                                            && (constrainedModuleId is null
+                                                 || SelectPendingOrOverflowTopicForRepair(grp.Id, constrainedModuleId.Value) is { } pendingTopic
+                                                && entry.Topic.Order <= pendingTopic.Order))
+                            .OrderBy(entry => allowEarlierTopLevelBlocker
+                                              && CompareSlotPosition(
+                                                  entry.Draft.Date,
+                                                  entry.Draft.StartTime,
+                                                  entry.Draft.EndTime,
+                                                  gapDate,
+                                                  canonicalGap.Start,
+                                                  canonicalGap.End) < 0
+                                ? 0
+                                : 1)
+                            .ThenBy(entry => Math.Abs(
+                                (entry.Draft.Date.DayNumber - gapDate.DayNumber) * 24 * 60
+                                + entry.Draft.StartTime.Hour * 60
+                                + entry.Draft.StartTime.Minute
+                                - canonicalGap.Start.Hour * 60
+                                - canonicalGap.Start.Minute))
+                            .ThenBy(entry => entry.Draft.Date)
+                            .ThenBy(entry => entry.Draft.StartTime)
+                            .ThenBy(entry => entry.Draft.EndTime)
+                            .ThenBy(entry => entry.Topic!.Order)
+                            .ThenBy(entry => entry.Draft.ModuleTopicId)
+                            .ThenBy(entry => entry.Draft.TeacherId)
+                            .ThenBy(entry => entry.Draft.RoomId)
+                            .Take(12)
+                            .Select(entry => entry.Draft)
+                            .ToList();
+
+                        foreach (var blocker in blockers)
+                        {
+                            if (moveTrials++ >= moveBudget)
+                            {
+                                break;
+                            }
+
+                            var oldDate = blocker.Date;
+                            if (!resolvedByDay.TryGetValue(oldDate.DayOfWeek, out var oldDaySlots))
+                            {
+                                continue;
+                            }
+                            var oldSlot = oldDaySlots.Slots.FirstOrDefault(slot =>
+                                slot.Start == blocker.StartTime && slot.End == blocker.EndTime);
+                            if (oldSlot is null)
+                            {
+                                continue;
+                            }
+
+                            if (await TryRotateBlockingTopicIntoGapAsync(
+                                    blocker,
+                                    gapDate,
+                                    canonicalGap,
+                                    maxSegmentsAllowed))
+                            {
+                                return true;
+                            }
+
+                            var move = await TryMoveGeneratedDraftAcrossCalendarAsync(
+                                grp,
+                                blocker,
+                                gapDate,
+                                canonicalGap,
+                                maxSegmentsAllowed,
+                                preserveAssignedResources);
+                            if (move is null)
+                            {
+                                continue;
+                            }
+
+                            movedDrafts.Add(blocker);
+                            if (await TryPushGapForwardAsync(
+                                    constrainedModuleId,
+                                    preserveAssignedResources,
+                                    oldDate,
+                                    oldSlot,
+                                    movedDrafts,
+                                    depth + 1))
+                            {
+                                return true;
+                            }
+
+                            movedDrafts.Remove(blocker);
+                            RollbackDraftCalendarMove(move);
+                        }
+
+                        return false;
+                    }
+
+                    var anyImproved = false;
+                    for (var cycle = 0; cycle < Math.Max(1, totalSlotCount); cycle++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var gaps = generationDates
+                            .Where(day => IsWorking(day, grp))
+                            .SelectMany(day => resolvedByDay.TryGetValue(day.DayOfWeek, out var resolved)
+                                ? resolved.Slots
+                                    .Where(slot => !SlotFilledForGroup(grp.Id, day, slot))
+                                    .Select(slot => (Date: day, Slot: slot))
+                                : Enumerable.Empty<(DateOnly Date, TimeSlot Slot)>())
+                            .OrderBy(entry => entry.Date)
+                            .ThenBy(entry => entry.Slot.Start)
+                            .ThenBy(entry => entry.Slot.End)
+                            .ToList();
+                        if (gaps.Count == 0)
+                        {
+                            break;
+                        }
+
+                        var improvedThisCycle = false;
+                        foreach (var gap in gaps)
+                        {
+                            var gapCountBefore = CountGlobalWorkingGaps();
+                            var repairSnapshot = CaptureTrialState();
+                            completedModuleId = null;
+                            var sameModuleCandidates = remainingByGroupModule
+                                .Where(entry => entry.Key.GroupId == grp.Id && entry.Value > 0)
+                                .Select(entry => entry.Key.ModuleId)
+                                .Distinct()
+                                .Select(moduleId => new
+                                {
+                                    ModuleId = moduleId,
+                                    PendingTopic = SelectPendingOrOverflowTopicForRepair(grp.Id, moduleId),
+                                    BlockerCount = movableDrafts.Count(candidate =>
+                                        candidate.GroupId == grp.Id
+                                        && candidate.ModuleId == moduleId
+                                        && AutogenDraftMutationPolicy.CanMutateInRepair(candidate)
+                                        && !candidate.IsSelfStudy
+                                        && !CanShareAcrossGroups(candidate.LessonTypeId)
+                                        && CompareSlotPosition(
+                                            candidate.Date,
+                                            candidate.StartTime,
+                                            candidate.EndTime,
+                                            gap.Date,
+                                            gap.Slot.Start,
+                                            gap.Slot.End) > 0)
+                                })
+                                .Where(entry => entry.PendingTopic is not null
+                                                && !CanShareAcrossGroups(entry.PendingTopic.LessonTypeId)
+                                                && entry.BlockerCount > 0)
+                                .OrderByDescending(entry => entry.BlockerCount)
+                                .ThenByDescending(entry => PlacementRemainingFor(grp.Id, entry.ModuleId))
+                                .ThenBy(entry => entry.PendingTopic!.Order)
+                                .ThenBy(entry => entry.ModuleId)
+                                .Select(entry => entry.ModuleId)
+                                .ToList();
+                            var chainApplied = false;
+                            foreach (var moduleId in sameModuleCandidates)
+                            {
+                                chainApplied = await TryPushGapForwardAsync(
+                                    moduleId,
+                                    false,
+                                    gap.Date,
+                                    gap.Slot,
+                                    new HashSet<TeacherDraftItem>(),
+                                    depth: 0);
+                                if (chainApplied)
+                                {
+                                    break;
+                                }
+                            }
+                            if (!chainApplied)
+                            {
+                                chainApplied = await TryPushGapForwardAsync(
+                                    null,
+                                    false,
+                                    gap.Date,
+                                    gap.Slot,
+                                    new HashSet<TeacherDraftItem>(),
+                                    depth: 0);
+                            }
+                            if (chainApplied)
+                            {
+                                var gapCountAfter = CountGlobalWorkingGaps();
+                                if (gapCountAfter < gapCountBefore
+                                    && !HasHardOverlapAfterRepair()
+                                    && MutableDraftProjectionMatchesBusyState())
+                                {
+                                    var moduleLabel = completedModuleId is int moduleId
+                                        ? $" модуля <{ModuleTitleLabel(moduleId)}>"
+                                        : string.Empty;
+                                    warnings.Add($"[{gap.Date:yyyy-MM-dd}] {grp.Name}: міжденний repair-pass безпечно ущільнив ланцюжок занять{moduleLabel} і заповнив ранній порожній слот {gap.Slot.Start:HH\\:mm}-{gap.Slot.End:HH\\:mm}.");
+                                    anyImproved = true;
+                                    improvedThisCycle = true;
+                                }
+                            }
+
+                            if (!improvedThisCycle)
+                            {
+                                RestoreTrialState(repairSnapshot);
+                                completedModuleId = null;
+                            }
+
+                            if (improvedThisCycle)
+                            {
+                                break;
+                            }
+                        }
+
+                        if (!improvedThisCycle)
+                        {
+                            break;
+                        }
+                    }
+
+                    if (HasHardOverlapAfterRepair()
+                        || HasSelectedGroupEmptyCanonicalLectureSlotViolation()
+                        || !MutableDraftProjectionMatchesBusyState())
+                    {
+                        RestoreTrialState(compactionSnapshot);
+                        return false;
+                    }
+                    return anyImproved;
+                }
+
+                async Task<int> MergeSplitSharedLectureOccurrencesAsync()
+                {
+                    if (!hasModuleHourOverrides || generationGroups.Count <= 1)
+                    {
+                        return 0;
+                    }
+
+                    var mergedRows = 0;
+                    var safetyBudget = Math.Max(1, generationGroups.Count * 4);
+                    while (safetyBudget-- > 0)
+                    {
+                        var mergedOneOccurrence = false;
+                        foreach (var courseEntry in selectedGroupsByCourse.OrderBy(entry => entry.Key))
+                        {
+                            var courseGroups = courseEntry.Value
+                                .Where(group => generationGroups.Any(selected => selected.Id == group.Id))
+                                .OrderBy(group => group.Id)
+                                .ToList();
+                            if (courseGroups.Count <= 1)
+                            {
+                                continue;
+                            }
+                            var courseGroupIds = courseGroups
+                                .Select(group => group.Id)
+                                .ToHashSet();
+                            var splitTopics = movableDrafts
+                                .Where(draft =>
+                                    courseGroupIds.Contains(draft.GroupId)
+                                    && AutogenDraftMutationPolicy.CanMutateInRepair(draft)
+                                    && !draft.IsSelfStudy
+                                    && draft.ModuleTopicId is int topicId
+                                    && topicById.TryGetValue(topicId, out var topic)
+                                    && GetTopicUsageLimit(topic) == 1
+                                    && CanShareAcrossGroups(draft.LessonTypeId)
+                                    && !excludedTypeIds.Contains(draft.LessonTypeId))
+                                .GroupBy(draft => new
+                                {
+                                    draft.ModuleId,
+                                    draft.LessonTypeId,
+                                    draft.ModuleTopicId
+                                })
+                                .Select(topicGroup => new
+                                {
+                                    topicGroup.Key,
+                                    Drafts = topicGroup.ToList(),
+                                    Occurrences = topicGroup
+                                        .GroupBy(draft => new
+                                        {
+                                            draft.Date,
+                                            draft.StartTime,
+                                            draft.EndTime,
+                                            draft.TeacherId,
+                                            draft.RoomId
+                                        })
+                                        .Select(occurrence => new
+                                        {
+                                            occurrence.Key,
+                                            Drafts = occurrence
+                                                .OrderBy(draft => draft.GroupId)
+                                                .ThenBy(draft => draft.Id)
+                                                .ToList()
+                                        })
+                                        .ToList()
+                                })
+                                .Where(entry =>
+                                    entry.Occurrences.Count > 1
+                                    && entry.Drafts.Count == courseGroups.Count
+                                    && entry.Drafts
+                                        .GroupBy(draft => draft.GroupId)
+                                        .All(group => group.Count() == 1)
+                                    && entry.Drafts
+                                        .Select(draft => draft.GroupId)
+                                        .ToHashSet()
+                                        .SetEquals(courseGroupIds))
+                                .OrderBy(entry => entry.Key.ModuleId)
+                                .ThenBy(entry => entry.Key.ModuleTopicId)
+                                .ToList();
+
+                            foreach (var splitTopic in splitTopics)
+                            {
+                                if (splitTopic.Key.ModuleTopicId is not int topicId
+                                    || !topicById.TryGetValue(topicId, out var topic)
+                                    || !typeById.TryGetValue(splitTopic.Key.LessonTypeId, out var lessonType))
+                                {
+                                    continue;
+                                }
+
+                                foreach (var targetOccurrence in splitTopic.Occurrences
+                                             .OrderByDescending(occurrence => occurrence.Drafts.Count)
+                                             .ThenBy(occurrence => occurrence.Key.Date)
+                                             .ThenBy(occurrence => occurrence.Key.StartTime))
+                                {
+                                    var sourceDrafts = splitTopic.Occurrences
+                                        .Where(occurrence => !ReferenceEquals(occurrence, targetOccurrence))
+                                        .SelectMany(occurrence => occurrence.Drafts)
+                                        .OrderBy(draft => draft.GroupId)
+                                        .ToList();
+                                    var sourceGroupIds = sourceDrafts
+                                        .Select(draft => draft.GroupId)
+                                        .ToList();
+                                    if (sourceGroupIds.Count == 0
+                                        || sourceGroupIds.Count != sourceGroupIds.Distinct().Count()
+                                        || sourceGroupIds.Any(groupId => targetOccurrence.Drafts
+                                            .Any(draft => draft.GroupId == groupId))
+                                        || targetOccurrence.Drafts
+                                            .Select(draft => draft.GroupId)
+                                            .Concat(sourceGroupIds)
+                                            .ToHashSet()
+                                            .SetEquals(courseGroupIds) == false
+                                        || targetOccurrence.Key.TeacherId is not int targetTeacherId
+                                        || targetOccurrence.Key.RoomId is not int targetRoomId)
+                                    {
+                                        continue;
+                                    }
+                                    var targetRoom = roomsAll.FirstOrDefault(room => room.Id == targetRoomId);
+                                    if (targetRoom is null
+                                        || targetRoom.Capacity < courseGroups.Sum(group => group.StudentsCount)
+                                        || !TeacherFitsWorkingHours(
+                                            targetTeacherId,
+                                            targetOccurrence.Key.Date,
+                                            targetOccurrence.Key.StartTime,
+                                            targetOccurrence.Key.EndTime)
+                                        || sourceGroupIds.Any(groupId =>
+                                            !selectedGroupsById.TryGetValue(groupId, out var sourceGroup)
+                                            || !IsWorking(targetOccurrence.Key.Date, sourceGroup)
+                                            || !RoomMatchesGroupPreferenceFor(groupId, targetRoom)))
+                                    {
+                                        continue;
+                                    }
+                                    allowedRoomsByModule.TryGetValue(splitTopic.Key.ModuleId, out var allowedRooms);
+                                    allowedBuildingsByModule.TryGetValue(splitTopic.Key.ModuleId, out var allowedBuildings);
+                                    if (allowedRooms is { Count: > 0 } && !allowedRooms.Contains(targetRoom.Id)
+                                        || allowedBuildings is { Count: > 0 }
+                                        && !allowedBuildings.Contains(targetRoom.BuildingId))
+                                    {
+                                        continue;
+                                    }
+
+                                    var targetSlots = SharedSlotsForDate(
+                                        courseEntry.Key,
+                                        targetOccurrence.Key.Date);
+                                    var targetSlotIndex = targetSlots
+                                        .Select((slot, index) => new { slot, index })
+                                        .Where(entry =>
+                                            entry.slot.Start == targetOccurrence.Key.StartTime
+                                            && entry.slot.End == targetOccurrence.Key.EndTime)
+                                        .Select(entry => entry.index)
+                                        .DefaultIfEmpty(-1)
+                                        .First();
+                                    if (targetSlotIndex < 0
+                                        || IsBlockedLateLectureSlot(
+                                            splitTopic.Key.LessonTypeId,
+                                            targetSlotIndex + 1,
+                                            preferredFirstMaxSlotOrder)
+                                        || courseGroups.Count > SlotGroupLimitForPlacement(
+                                            courseEntry.Key,
+                                            splitTopic.Key.LessonTypeId,
+                                            isSelfStudyPlacement: false))
+                                    {
+                                        continue;
+                                    }
+
+                                    var sourceBusySlots = new List<BusySlot>();
+                                    var sourceProjectionIsComplete = true;
+                                    foreach (var sourceDraft in sourceDrafts)
+                                    {
+                                        var sourceBusySlot = FindBusySlotForDraft(
+                                            sourceDraft,
+                                            sourceDraft.StartTime,
+                                            sourceDraft.EndTime);
+                                        if (sourceBusySlot is null
+                                            || !sourceBusySlot.JoinableDraft
+                                            || !string.IsNullOrWhiteSpace(sourceBusySlot.BatchKey))
+                                        {
+                                            sourceProjectionIsComplete = false;
+                                            break;
+                                        }
+                                        sourceBusySlots.Add(sourceBusySlot);
+                                    }
+                                    if (!sourceProjectionIsComplete)
+                                    {
+                                        continue;
+                                    }
+
+                                    var trialSnapshot = CaptureTrialState();
+                                    if (sourceBusySlots.Any(sourceBusySlot => !RemoveBusySlot(sourceBusySlot)))
+                                    {
+                                        RestoreTrialState(trialSnapshot);
+                                        continue;
+                                    }
+
+                                    var placementIsValid = sourceGroupIds.All(groupId =>
+                                            !HasScheduledGroupOverlap(
+                                                groupId,
+                                                targetOccurrence.Key.Date,
+                                                targetOccurrence.Key.StartTime,
+                                                targetOccurrence.Key.EndTime)
+                                            && !ViolatesLectureBlockOrderForPlacement(
+                                                groupId,
+                                                targetOccurrence.Key.Date,
+                                                targetOccurrence.Key.StartTime,
+                                                targetOccurrence.Key.EndTime,
+                                                splitTopic.Key.LessonTypeId)
+                                            && !ViolatesAnyModuleDayBlock(
+                                                groupId,
+                                                targetOccurrence.Key.Date,
+                                                splitTopic.Key.ModuleId,
+                                                targetOccurrence.Key.StartTime,
+                                                targetOccurrence.Key.EndTime,
+                                                out _)
+                                            && !ViolatesTopicCalendarOrder(
+                                                groupId,
+                                                splitTopic.Key.ModuleId,
+                                                topic,
+                                                targetOccurrence.Key.Date,
+                                                targetOccurrence.Key.StartTime,
+                                                targetOccurrence.Key.EndTime)
+                                            && !ViolatesSharedLectureTravel(
+                                                existing => existing.GroupId == groupId,
+                                                targetRoom,
+                                                targetOccurrence.Key.Date,
+                                                targetOccurrence.Key.StartTime,
+                                                targetOccurrence.Key.EndTime))
+                                        && !ViolatesSharedLectureTravel(
+                                            existing => existing.TeacherId == targetTeacherId,
+                                            targetRoom,
+                                            targetOccurrence.Key.Date,
+                                            targetOccurrence.Key.StartTime,
+                                            targetOccurrence.Key.EndTime)
+                                        && TryValidatePlacementAgainstBusy(
+                                            splitTopic.Key.ModuleId,
+                                            splitTopic.Key.LessonTypeId,
+                                            topic.Id,
+                                            targetTeacherId,
+                                            targetRoom,
+                                            targetOccurrence.Key.Date,
+                                            targetOccurrence.Key.StartTime,
+                                            targetOccurrence.Key.EndTime,
+                                            sourceGroupIds,
+                                            out _);
+                                    if (placementIsValid)
+                                    {
+                                        var persistedConflictReason = await FindPersistedPlacementConflictAsync(
+                                            splitTopic.Key.ModuleId,
+                                            splitTopic.Key.LessonTypeId,
+                                            topic.Id,
+                                            targetTeacherId,
+                                            targetRoom,
+                                            targetOccurrence.Key.Date,
+                                            targetOccurrence.Key.StartTime,
+                                            targetOccurrence.Key.EndTime,
+                                            sourceGroupIds);
+                                        placementIsValid = string.IsNullOrWhiteSpace(persistedConflictReason);
+                                    }
+                                    if (!placementIsValid)
+                                    {
+                                        RestoreTrialState(trialSnapshot);
+                                        continue;
+                                    }
+
+                                    var updatedAt = DateTime.UtcNow;
+                                    for (var sourceIndex = 0; sourceIndex < sourceDrafts.Count; sourceIndex++)
+                                    {
+                                        var sourceDraft = sourceDrafts[sourceIndex];
+                                        var sourceBusySlot = sourceBusySlots[sourceIndex];
+                                        var previousDate = sourceDraft.Date;
+                                        var previousRoomId = sourceDraft.RoomId;
+                                        sourceDraft.Date = targetOccurrence.Key.Date;
+                                        sourceDraft.DayOfWeek = targetOccurrence.Key.Date
+                                            .ToDateTime(TimeOnly.MinValue)
+                                            .DayOfWeek;
+                                        sourceDraft.StartTime = targetOccurrence.Key.StartTime;
+                                        sourceDraft.EndTime = targetOccurrence.Key.EndTime;
+                                        sourceDraft.TeacherId = targetTeacherId;
+                                        sourceDraft.RoomId = targetRoom.Id;
+                                        if (typeById.TryGetValue(sourceDraft.LessonTypeId, out var movedLessonType))
+                                        {
+                                            sourceDraft.ValidationWarnings = BuildIncompleteDraftWarningJson(
+                                                movedLessonType.RequiresTeacher && sourceDraft.TeacherId is null,
+                                                movedLessonType.RequiresRoom && sourceDraft.RoomId is null);
+                                        }
+                                        sourceDraft.UpdatedAt = updatedAt;
+                                        var sourceEntry = _db.Entry(sourceDraft);
+                                        if (sourceDraft.Id > 0 && sourceEntry.State == EntityState.Unchanged)
+                                        {
+                                            sourceEntry.State = EntityState.Modified;
+                                        }
+                                        if (previousDate != sourceDraft.Date)
+                                        {
+                                            Dec(sourceDraft.GroupId, previousDate);
+                                            Inc(sourceDraft.GroupId, sourceDraft.Date);
+                                        }
+                                        ChangeDraftRoomUsage(sourceDraft, previousRoomId, targetRoom.Id);
+                                        AddBusySlot(new BusySlot(
+                                            sourceDraft.GroupId,
+                                            targetTeacherId,
+                                            targetRoom.Id,
+                                            sourceDraft.Date,
+                                            sourceDraft.StartTime,
+                                            sourceDraft.EndTime,
+                                            targetRoom.BuildingId,
+                                            sourceDraft.ModuleId,
+                                            sourceDraft.LessonTypeId,
+                                            sourceDraft.ModuleTopicId,
+                                            sourceBusySlot.JoinableDraft,
+                                            sourceBusySlot.BatchKey));
+                                    }
+                                    InvalidateGapResourceCaches();
+                                    if (!MutableDraftProjectionMatchesBusyState()
+                                        || HasSelectedGroupEmptyCanonicalLectureSlotViolation()
+                                        || HasSelectedGroupTopicOrderViolation())
+                                    {
+                                        RestoreTrialState(trialSnapshot);
+                                        continue;
+                                    }
+
+                                    mergedRows += sourceDrafts.Count;
+                                    mergedOneOccurrence = true;
+                                    warnings.Add(
+                                        $"[{targetOccurrence.Key.Date:yyyy-MM-dd}] Атомарний repair-pass об'єднав розділену лекцію {topic.TopicCode} для {courseGroups.Count} груп у слоті {targetOccurrence.Key.StartTime:HH\\:mm}-{targetOccurrence.Key.EndTime:HH\\:mm}.");
+                                    break;
+                                }
+                                if (mergedOneOccurrence)
+                                {
+                                    break;
+                                }
+                            }
+                            if (mergedOneOccurrence)
+                            {
+                                break;
+                            }
+                        }
+                        if (!mergedOneOccurrence)
+                        {
+                            break;
+                        }
+                    }
+                    return mergedRows;
+                }
+
+                async Task<int> RotateSharedLectureOccurrencesTowardPendingTailsAsync()
+                {
+                    if (!hasModuleHourOverrides
+                        || generationGroups.Count <= 1)
+                    {
+                        return 0;
+                    }
+
+                    // Рідкісний міжденний repair перевіряє багато комбінацій ресурсів.
+                    // Один знімок прибирає N+1 запити, а змінені tracked-чернетки
+                    // відсіюються під час кожної перевірки за актуальним станом EF.
+                    var persistedConflictSnapshot = await _db.TeacherDraftItems
+                        .AsNoTracking()
+                        .Where(draft => draft.Status == DraftStatus.Draft
+                                        && draft.Date >= rangeStartDate
+                                        && draft.Date < rangeEndDateExclusive)
+                        .Select(draft => new PersistedDraftConflictRow(
+                            draft.Id,
+                            draft.GroupId,
+                            draft.ModuleId,
+                            draft.LessonTypeId,
+                            draft.ModuleTopicId,
+                            draft.TeacherId,
+                            draft.RoomId,
+                            draft.Date,
+                            draft.StartTime,
+                            draft.EndTime))
+                        .ToListAsync(cancellationToken);
+                    var movedRows = 0;
+                    var movedDrafts = new HashSet<TeacherDraftItem>();
+                    var moveBudget = Math.Max(4, generationGroups.Count);
+                    while (moveBudget-- > 0)
+                    {
+                        var movedOneOccurrence = false;
+                        foreach (var courseEntry in selectedGroupsByCourse.OrderBy(entry => entry.Key))
+                        {
+                            var courseGroups = courseEntry.Value
+                                .Where(group => generationGroups.Any(selected => selected.Id == group.Id))
+                                .OrderBy(group => group.Id)
+                                .ToList();
+                            if (courseGroups.Count <= 1)
+                            {
+                                continue;
+                            }
+                            var courseGroupIds = courseGroups.Select(group => group.Id).ToHashSet();
+                            var pendingSharedTopics = remainingByGroupModule
+                                .Where(entry => entry.Value > 0 && courseGroupIds.Contains(entry.Key.GroupId))
+                                .Select(entry => entry.Key.ModuleId)
+                                .Distinct()
+                                .SelectMany(moduleId =>
+                                    topicsByModule.TryGetValue(moduleId, out var moduleTopics)
+                                        ? moduleTopics
+                                            .Where(topic => CanShareAcrossGroups(topic.LessonTypeId))
+                                            .Select(topic => (ModuleId: moduleId, Topic: topic))
+                                        : Enumerable.Empty<(int ModuleId, ModuleTopic Topic)>())
+                                .Where(entry =>
+                                {
+                                    var pendingGroups = courseGroups
+                                        .Where(group => PlacementRemainingFor(group.Id, entry.ModuleId) > 0
+                                                        && IsTopicStillPendingForGroup(
+                                                            group.Id,
+                                                            entry.ModuleId,
+                                                            entry.Topic))
+                                        .ToList();
+                                    return pendingGroups.Count > 1
+                                           && pendingGroups.All(group => CanAssignSpecificTopic(
+                                               group.Id,
+                                               entry.ModuleId,
+                                               entry.Topic));
+                                })
+                                .ToList();
+                            if (!pendingSharedTopics.Any(entry =>
+                                    courseGroups.Count(group =>
+                                        PlacementRemainingFor(group.Id, entry.ModuleId) > 0
+                                        && IsTopicStillPendingForGroup(
+                                            group.Id,
+                                            entry.ModuleId,
+                                            entry.Topic)) == courseGroups.Count))
+                            {
+                                continue;
+                            }
+
+                            bool IsDirectPendingTarget(DateOnly targetDate, TimeSlot targetSlot)
+                                => pendingSharedTopics.Any(entry =>
+                                {
+                                    var pendingGroups = courseGroups
+                                        .Where(group => PlacementRemainingFor(group.Id, entry.ModuleId) > 0
+                                                        && IsTopicStillPendingForGroup(
+                                                            group.Id,
+                                                            entry.ModuleId,
+                                                            entry.Topic))
+                                        .ToList();
+                                    return pendingGroups.Count > 1
+                                           && pendingGroups.All(group =>
+                                               !HasScheduledGroupOverlap(
+                                                   group.Id,
+                                                   targetDate,
+                                                   targetSlot.Start,
+                                                   targetSlot.End)
+                                               && !ViolatesTopicCalendarOrder(
+                                                   group.Id,
+                                                   entry.ModuleId,
+                                                   entry.Topic,
+                                                   targetDate,
+                                                   targetSlot.Start,
+                                                   targetSlot.End)
+                                               && !ViolatesLectureBlockOrderForPlacement(
+                                                   group.Id,
+                                                   targetDate,
+                                                   targetSlot.Start,
+                                                   targetSlot.End,
+                                                   entry.Topic.LessonTypeId));
+                                });
+
+                            var targetSlots = DatesBetween(rangeStartDate, rangeEndDateExclusive)
+                                .Where(targetDate => courseGroups.All(group => IsWorking(targetDate, group)))
+                                .SelectMany(targetDate =>
+                                    SharedSlotsForDate(courseEntry.Key, targetDate)
+                                        .Select((targetSlot, targetIndex) => new
+                                        {
+                                            Date = targetDate,
+                                            Slot = targetSlot,
+                                            Index = targetIndex,
+                                            OccupiedGroups = courseGroups
+                                                .Where(group => HasScheduledGroupOverlap(
+                                                    group.Id,
+                                                    targetDate,
+                                                    targetSlot.Start,
+                                                    targetSlot.End))
+                                                .ToList()
+                                        }))
+                                .Where(target => target.OccupiedGroups.Count < courseGroups.Count
+                                                 && target.OccupiedGroups.Count <= 1)
+                                .Where(target => target.OccupiedGroups.Count > 0
+                                                 || target.Date != generationDates[^1]
+                                                 || !IsDirectPendingTarget(target.Date, target.Slot))
+                                .OrderBy(target => target.OccupiedGroups.Count)
+                                .ThenBy(target => target.Date)
+                                .ThenBy(target => target.Slot.Start)
+                                .ToList();
+
+                            var occurrences = movableDrafts
+                                .Where(draft => courseGroupIds.Contains(draft.GroupId)
+                                                && !movedDrafts.Contains(draft)
+                                                && AutogenDraftMutationPolicy.CanMutateInRepair(draft)
+                                                && !draft.IsSelfStudy
+                                                && draft.ModuleTopicId is int
+                                                && CanShareAcrossGroups(draft.LessonTypeId)
+                                                && !excludedTypeIds.Contains(draft.LessonTypeId))
+                                .GroupBy(draft => new
+                                {
+                                    draft.Date,
+                                    draft.StartTime,
+                                    draft.EndTime,
+                                    draft.ModuleId,
+                                    draft.LessonTypeId,
+                                    draft.ModuleTopicId,
+                                    draft.TeacherId,
+                                    draft.RoomId
+                                })
+                                .Select(group => new
+                                {
+                                    group.Key,
+                                    Drafts = group
+                                        .OrderBy(draft => draft.GroupId)
+                                        .ThenBy(draft => draft.Id)
+                                        .ToList()
+                                })
+                                .Where(entry => entry.Drafts
+                                    .Select(draft => draft.GroupId)
+                                    .ToHashSet()
+                                    .SetEquals(courseGroupIds))
+                                .OrderBy(entry => pendingSharedTopics.Any(pending =>
+                                {
+                                    var pendingGroups = courseGroups
+                                        .Where(group => PlacementRemainingFor(
+                                                            group.Id,
+                                                            pending.ModuleId) > 0
+                                                        && IsTopicStillPendingForGroup(
+                                                            group.Id,
+                                                            pending.ModuleId,
+                                                            pending.Topic))
+                                        .ToList();
+                                    return pendingGroups.Count == courseGroups.Count
+                                           && pendingGroups.All(group =>
+                                               !ViolatesTopicCalendarOrder(
+                                                   group.Id,
+                                                   pending.ModuleId,
+                                                   pending.Topic,
+                                                   entry.Key.Date,
+                                                   entry.Key.StartTime,
+                                                   entry.Key.EndTime));
+                                }) ? 0 : 1)
+                                .ThenBy(entry => pendingSharedTopics.Any(pending =>
+                                    pending.ModuleId == entry.Key.ModuleId) ? 0 : 1)
+                                .ThenBy(entry => entry.Key.Date)
+                                .ThenBy(entry => entry.Key.StartTime)
+                                .ThenBy(entry => entry.Key.ModuleId)
+                                .ThenBy(entry => entry.Key.ModuleTopicId)
+                                .ToList();
+
+                            foreach (var target in targetSlots)
+                            {
+                                foreach (var occurrence in occurrences
+                                             .Where(entry =>
+                                                 CompareSlotPosition(
+                                                     entry.Key.Date,
+                                                     entry.Key.StartTime,
+                                                     entry.Key.EndTime,
+                                                     target.Date,
+                                                     target.Slot.Start,
+                                                     target.Slot.End) > 0)
+                                             .Where(entry =>
+                                                 entry.Key.ModuleTopicId is int topicId
+                                                 && topicById.TryGetValue(topicId, out var topic)
+                                                 && courseGroups.All(group =>
+                                                     IsWorking(target.Date, group)
+                                                     && !ViolatesTopicCalendarOrder(
+                                                         group.Id,
+                                                         entry.Key.ModuleId,
+                                                         topic,
+                                                         target.Date,
+                                                         target.Slot.Start,
+                                                         target.Slot.End)
+                                                     && !ViolatesLectureBlockOrderForPlacement(
+                                                         group.Id,
+                                                         target.Date,
+                                                         target.Slot.Start,
+                                                         target.Slot.End,
+                                                         entry.Key.LessonTypeId)
+                                                     && !ViolatesAnyModuleDayBlock(
+                                                         group.Id,
+                                                         target.Date,
+                                                         entry.Key.ModuleId,
+                                                         target.Slot.Start,
+                                                         target.Slot.End,
+                                                         out _,
+                                                         softFill
+                                                             ? 2
+                                                             : maxModuleSegmentsPerDay)))
+                                             .Take(16))
+                                {
+                                    if (occurrence.Key.ModuleTopicId is not int topicId
+                                        || !topicById.TryGetValue(topicId, out var topic)
+                                        || !typeById.TryGetValue(occurrence.Key.LessonTypeId, out var lessonType)
+                                        || IsBlockedLateLectureSlot(
+                                            occurrence.Key.LessonTypeId,
+                                            target.Index + 1,
+                                            preferredFirstMaxSlotOrder))
+                                    {
+                                        continue;
+                                    }
+
+                                    var trialSnapshot = CaptureTrialState();
+                                    var targetEvicted = true;
+                                    foreach (var occupiedGroup in target.OccupiedGroups)
+                                    {
+                                        var occupyingSlots = BusyForGroupDate(occupiedGroup.Id, target.Date)
+                                            .Where(slot => !IsNonOccupyingBusySlot(slot)
+                                                           && SlotOverlaps(
+                                                               slot,
+                                                               target.Date,
+                                                               target.Slot.Start,
+                                                               target.Slot.End))
+                                            .ToList();
+                                        var occupantDrafts = occupyingSlots.Count == 1
+                                            ? movableDrafts
+                                                .Where(draft => SlotMatches(
+                                                    occupyingSlots[0],
+                                                    draft.GroupId,
+                                                    draft.Date,
+                                                    draft.StartTime,
+                                                    draft.EndTime,
+                                                    draft.ModuleId,
+                                                    draft.TeacherId,
+                                                    draft.RoomId,
+                                                    draft.ModuleTopicId))
+                                                .ToList()
+                                            : new List<TeacherDraftItem>();
+                                        if (occupantDrafts.Count != 1
+                                            || occupantDrafts[0].IsSelfStudy
+                                            || CanShareAcrossGroups(occupantDrafts[0].LessonTypeId)
+                                            || !AutogenDraftMutationPolicy.CanMutateInRepair(occupantDrafts[0]))
+                                        {
+                                            targetEvicted = false;
+                                            break;
+                                        }
+
+                                        var occupant = occupantDrafts[0];
+                                        var sourcePosition = occupant.Date.DayNumber * 24 * 60
+                                                             + occupant.StartTime.Hour * 60
+                                                             + occupant.StartTime.Minute;
+                                        AppliedDraftCalendarMove? evictionMove = null;
+                                        var evictionTargets = DatesBetween(
+                                                rangeStartDate,
+                                                rangeEndDateExclusive)
+                                            .Where(targetDate => IsWorking(targetDate, occupiedGroup))
+                                            .SelectMany(targetDate =>
+                                                SharedSlotsForDate(occupiedGroup.CourseId, targetDate)
+                                                    .Select(targetSlot => new
+                                                    {
+                                                        Date = targetDate,
+                                                        Slot = targetSlot,
+                                                        Position = targetDate.DayNumber * 24 * 60
+                                                                   + targetSlot.Start.Hour * 60
+                                                                   + targetSlot.Start.Minute
+                                                    }))
+                                            .Where(destination =>
+                                                (destination.Date != target.Date
+                                                 || destination.Slot.Start != target.Slot.Start
+                                                 || destination.Slot.End != target.Slot.End)
+                                                && !HasGroupOverlap(
+                                                    occupiedGroup.Id,
+                                                    destination.Date,
+                                                    destination.Slot.Start,
+                                                    destination.Slot.End))
+                                            .OrderBy(destination =>
+                                                Math.Abs(destination.Position - sourcePosition))
+                                            .ThenByDescending(destination => destination.Position)
+                                            .ToList();
+                                        foreach (var destination in evictionTargets)
+                                        {
+                                            evictionMove = await TryMoveGeneratedDraftAcrossCalendarAsync(
+                                                occupiedGroup,
+                                                occupant,
+                                                destination.Date,
+                                                destination.Slot,
+                                                softFill ? 2 : maxModuleSegmentsPerDay,
+                                                preserveAssignedResources: false);
+                                            if (evictionMove is not null)
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        if (evictionMove is null)
+                                        {
+                                            targetEvicted = false;
+                                            break;
+                                        }
+                                    }
+                                    if (!targetEvicted)
+                                    {
+                                        RestoreTrialState(trialSnapshot);
+                                        continue;
+                                    }
+
+                                    var sourceBusySlots = occurrence.Drafts
+                                        .Select(draft => FindBusySlotForDraft(
+                                            draft,
+                                            draft.StartTime,
+                                            draft.EndTime))
+                                        .ToList();
+                                    if (sourceBusySlots.Any(slot =>
+                                            slot is null
+                                            || !slot.JoinableDraft
+                                            || !string.IsNullOrWhiteSpace(slot.BatchKey))
+                                        || sourceBusySlots.Any(slot => !RemoveBusySlot(slot!)))
+                                    {
+                                        RestoreTrialState(trialSnapshot);
+                                        continue;
+                                    }
+
+                                    var requiredCapacity = courseGroups.Sum(group => group.StudentsCount);
+                                    allowedRoomsByModule.TryGetValue(
+                                        occurrence.Key.ModuleId,
+                                        out var allowedRooms);
+                                    allowedBuildingsByModule.TryGetValue(
+                                        occurrence.Key.ModuleId,
+                                        out var allowedBuildings);
+                                    var roomCandidates = roomsAll
+                                        .Where(room => room.Capacity >= requiredCapacity
+                                                       && (allowedRooms is not { Count: > 0 }
+                                                           || allowedRooms.Contains(room.Id))
+                                                       && (allowedBuildings is not { Count: > 0 }
+                                                           || allowedBuildings.Contains(room.BuildingId))
+                                                       && courseGroups.All(group =>
+                                                           RoomMatchesGroupPreferenceFor(group.Id, room)))
+                                        .OrderBy(room => room.Id == occurrence.Key.RoomId ? 0 : 1)
+                                        .ThenByDescending(room => room.Capacity)
+                                        .ThenBy(room => room.Id)
+                                        .ToList();
+                                    var teacherCandidates = lessonType.RequiresTeacher
+                                        ? PreferredOrExplicitTeacherPool(
+                                                teachersForModule
+                                                    .Where(link =>
+                                                        link.ModuleId == occurrence.Key.ModuleId)
+                                                    .Select(link => link.TeacherId),
+                                                topic)
+                                            .OrderBy(teacherId =>
+                                                teacherId == occurrence.Key.TeacherId ? 0 : 1)
+                                            .ThenBy(teacherId =>
+                                                TeacherDepartmentPriority(teacherId, topic))
+                                            .ThenBy(teacherId => TeacherLoadPenalty(teacherId))
+                                            .ThenBy(teacherId => teacherId)
+                                            .Cast<int?>()
+                                            .ToList()
+                                        : new List<int?> { null };
+                                    var placementApplied = false;
+                                    foreach (var teacherId in teacherCandidates)
+                                    {
+                                        if (teacherId is int resolvedTeacherId
+                                            && !TeacherFitsWorkingHours(
+                                                resolvedTeacherId,
+                                                target.Date,
+                                                target.Slot.Start,
+                                                target.Slot.End))
+                                        {
+                                            continue;
+                                        }
+                                        foreach (var room in roomCandidates)
+                                        {
+                                            var placementIsValid = courseGroups.All(group =>
+                                                    !HasScheduledGroupOverlap(
+                                                        group.Id,
+                                                        target.Date,
+                                                        target.Slot.Start,
+                                                        target.Slot.End)
+                                                    && !ViolatesLectureBlockOrderForPlacement(
+                                                        group.Id,
+                                                        target.Date,
+                                                        target.Slot.Start,
+                                                        target.Slot.End,
+                                                        occurrence.Key.LessonTypeId)
+                                                    && !ViolatesAnyModuleDayBlock(
+                                                        group.Id,
+                                                        target.Date,
+                                                        occurrence.Key.ModuleId,
+                                                        target.Slot.Start,
+                                                        target.Slot.End,
+                                                        out _,
+                                                        softFill ? 2 : maxModuleSegmentsPerDay)
+                                                    && !ViolatesTopicCalendarOrder(
+                                                        group.Id,
+                                                        occurrence.Key.ModuleId,
+                                                        topic,
+                                                        target.Date,
+                                                        target.Slot.Start,
+                                                        target.Slot.End)
+                                                    && !ViolatesSharedLectureTravel(
+                                                        existing => existing.GroupId == group.Id,
+                                                        room,
+                                                        target.Date,
+                                                        target.Slot.Start,
+                                                        target.Slot.End))
+                                                && (teacherId is not int teacherForTravel
+                                                    || !ViolatesSharedLectureTravel(
+                                                        existing =>
+                                                            existing.TeacherId == teacherForTravel,
+                                                        room,
+                                                        target.Date,
+                                                        target.Slot.Start,
+                                                        target.Slot.End))
+                                                && TryValidatePlacementAgainstBusy(
+                                                    occurrence.Key.ModuleId,
+                                                    occurrence.Key.LessonTypeId,
+                                                    topic.Id,
+                                                    teacherId,
+                                                    room,
+                                                    target.Date,
+                                                    target.Slot.Start,
+                                                    target.Slot.End,
+                                                    courseGroupIds,
+                                                    out _);
+                                            if (!placementIsValid)
+                                            {
+                                                continue;
+                                            }
+                                            var persistedConflictReason =
+                                                await FindPersistedPlacementConflictAsync(
+                                                    occurrence.Key.ModuleId,
+                                                    occurrence.Key.LessonTypeId,
+                                                    topic.Id,
+                                                    teacherId,
+                                                    room,
+                                                    target.Date,
+                                                    target.Slot.Start,
+                                                    target.Slot.End,
+                                                    courseGroupIds,
+                                                    persistedConflictSnapshot);
+                                            if (!string.IsNullOrWhiteSpace(persistedConflictReason))
+                                            {
+                                                continue;
+                                            }
+
+                                            var updatedAt = DateTime.UtcNow;
+                                            for (var draftIndex = 0;
+                                                 draftIndex < occurrence.Drafts.Count;
+                                                 draftIndex++)
+                                            {
+                                                var draft = occurrence.Drafts[draftIndex];
+                                                var sourceBusySlot = sourceBusySlots[draftIndex]!;
+                                                var previousDate = draft.Date;
+                                                var previousRoomId = draft.RoomId;
+                                                draft.Date = target.Date;
+                                                draft.DayOfWeek = target.Date
+                                                    .ToDateTime(TimeOnly.MinValue)
+                                                    .DayOfWeek;
+                                                draft.StartTime = target.Slot.Start;
+                                                draft.EndTime = target.Slot.End;
+                                                draft.TeacherId = teacherId;
+                                                draft.RoomId = room.Id;
+                                                draft.UpdatedAt = updatedAt;
+                                                draft.ValidationWarnings = null;
+                                                var draftEntry = _db.Entry(draft);
+                                                if (draft.Id > 0
+                                                    && draftEntry.State == EntityState.Unchanged)
+                                                {
+                                                    draftEntry.State = EntityState.Modified;
+                                                }
+                                                if (previousDate != draft.Date)
+                                                {
+                                                    Dec(draft.GroupId, previousDate);
+                                                    Inc(draft.GroupId, draft.Date);
+                                                }
+                                                ChangeDraftRoomUsage(
+                                                    draft,
+                                                    previousRoomId,
+                                                    room.Id);
+                                                AddBusySlot(new BusySlot(
+                                                    draft.GroupId,
+                                                    teacherId,
+                                                    room.Id,
+                                                    target.Date,
+                                                    target.Slot.Start,
+                                                    target.Slot.End,
+                                                    room.BuildingId,
+                                                    draft.ModuleId,
+                                                    draft.LessonTypeId,
+                                                    draft.ModuleTopicId,
+                                                    sourceBusySlot.JoinableDraft,
+                                                    sourceBusySlot.BatchKey));
+                                            }
+                                            InvalidateGapResourceCaches();
+                                            placementApplied = true;
+                                            break;
+                                        }
+                                        if (placementApplied)
+                                        {
+                                            break;
+                                        }
+                                    }
+
+                                    if (!placementApplied
+                                        || HasSelectedGroupTopicOrderViolation()
+                                        || HasSelectedGroupEmptyCanonicalLectureSlotViolation(
+                                            onlyDate: target.Date,
+                                            onlyGroupIds: courseGroupIds)
+                                        || !MutableDraftProjectionMatchesBusyState())
+                                    {
+                                        RestoreTrialState(trialSnapshot);
+                                        continue;
+                                    }
+
+                                    foreach (var draft in occurrence.Drafts)
+                                    {
+                                        movedDrafts.Add(draft);
+                                    }
+                                    movedRows += occurrence.Drafts.Count;
+                                    movedOneOccurrence = true;
+                                    warnings.Add(
+                                        $"[{target.Date:yyyy-MM-dd}] Атомарний repair-pass переніс спільну лекцію {topic.TopicCode} у слот {target.Slot.Start:HH\\:mm}-{target.Slot.End:HH\\:mm}, щоб посунути вільний лекційний слот ближче до незавершеного плану.");
+                                    break;
+                                }
+                                if (movedOneOccurrence)
+                                {
+                                    break;
+                                }
+                            }
+                            if (movedOneOccurrence)
+                            {
+                                break;
+                            }
+                        }
+                        if (!movedOneOccurrence)
+                        {
+                            break;
+                        }
+                    }
+                    return movedRows;
+                }
+
+                async Task<int> TryPlacePendingSharedLectureTailsAsync()
+                {
+                    if (!hasModuleHourOverrides
+                        || generationGroups.Count <= 1)
+                    {
+                        return 0;
+                    }
+
+                    var placedRows = 0;
+                    static int CompareTopics(ModuleTopic left, ModuleTopic right)
+                    {
+                        var orderComparison = left.Order.CompareTo(right.Order);
+                        if (orderComparison != 0)
+                        {
+                            return orderComparison;
+                        }
+                        return TeacherDraftsHelpers.CompareTopicCodes(
+                            left.TopicCode?.Trim() ?? string.Empty,
+                            right.TopicCode?.Trim() ?? string.Empty);
+                    }
+
+                    async Task<bool> TryMovePendingTopicPredecessorsBeforeTargetAsync(
+                        IReadOnlyList<Group> pendingGroups,
+                        int moduleId,
+                        ModuleTopic pendingTopic,
+                        DateOnly targetDate,
+                        TimeSlot targetSlot)
+                    {
+                        var blockers = movableDrafts
+                            .Where(draft => pendingGroups.Any(group => group.Id == draft.GroupId)
+                                            && draft.ModuleId == moduleId
+                                            && AutogenDraftMutationPolicy.CanMutateInRepair(draft)
+                                            && !draft.IsSelfStudy
+                                            && !CanShareAcrossGroups(draft.LessonTypeId)
+                                            && draft.ModuleTopicId is int topicId
+                                            && topicById.TryGetValue(topicId, out var existingTopic)
+                                            && CompareTopics(existingTopic, pendingTopic) < 0
+                                            && CompareSlotPosition(
+                                                draft.Date,
+                                                draft.StartTime,
+                                                draft.EndTime,
+                                                targetDate,
+                                                targetSlot.Start,
+                                                targetSlot.End) > 0)
+                            .OrderBy(draft => draft.GroupId)
+                            .ThenBy(draft => draft.Date)
+                            .ThenBy(draft => draft.StartTime)
+                            .ThenBy(draft => draft.Id)
+                            .ToList();
+                        foreach (var blocker in blockers)
+                        {
+                            if (!selectedGroupsById.TryGetValue(blocker.GroupId, out var blockerGroup))
+                            {
+                                return false;
+                            }
+
+                            var blockerMoved = false;
+                            var directTargets = DatesBetween(rangeStartDate, rangeEndDateExclusive)
+                                .Where(date => IsWorking(date, blockerGroup)
+                                               && CompareSlotPosition(
+                                                   date,
+                                                   TimeOnly.MinValue,
+                                                   TimeOnly.MinValue,
+                                                   targetDate,
+                                                   targetSlot.Start,
+                                                   targetSlot.End) < 0)
+                                .SelectMany(date =>
+                                    SharedSlotsForDate(blockerGroup.CourseId, date)
+                                        .Where(slot => CompareSlotPosition(
+                                            date,
+                                            slot.Start,
+                                            slot.End,
+                                            targetDate,
+                                            targetSlot.Start,
+                                            targetSlot.End) < 0)
+                                        .Select(slot => new
+                                        {
+                                            Date = date,
+                                            Slot = slot,
+                                            Position = date.DayNumber * 24 * 60
+                                                       + slot.Start.Hour * 60
+                                                       + slot.Start.Minute
+                                        }))
+                                .Where(target => !HasGroupOverlap(
+                                    blocker.GroupId,
+                                    target.Date,
+                                    target.Slot.Start,
+                                    target.Slot.End))
+                                .OrderByDescending(target => target.Position)
+                                .Take(12)
+                                .ToList();
+                            foreach (var directTarget in directTargets)
+                            {
+                                var directMove = await TryMoveGeneratedDraftAcrossCalendarAsync(
+                                    blockerGroup,
+                                    blocker,
+                                    directTarget.Date,
+                                    directTarget.Slot,
+                                    softFill ? 2 : maxModuleSegmentsPerDay,
+                                    preserveAssignedResources: false);
+                                if (directMove is not null)
+                                {
+                                    blockerMoved = true;
+                                    break;
+                                }
+                            }
+                            if (blockerMoved)
+                            {
+                                continue;
+                            }
+
+                            var donorCandidates = movableDrafts
+                                .Where(donor => donor.GroupId == blocker.GroupId
+                                                && !ReferenceEquals(donor, blocker)
+                                                && !blockers.Contains(donor)
+                                                && AutogenDraftMutationPolicy.CanMutateInRepair(donor)
+                                                && !donor.IsSelfStudy
+                                                && !CanShareAcrossGroups(donor.LessonTypeId)
+                                                && donor.ModuleTopicId is int
+                                                && CompareSlotPosition(
+                                                    donor.Date,
+                                                    donor.StartTime,
+                                                    donor.EndTime,
+                                                    targetDate,
+                                                    targetSlot.Start,
+                                                    targetSlot.End) < 0)
+                                .OrderByDescending(donor => donor.Date)
+                                .ThenByDescending(donor => donor.StartTime)
+                                .ThenByDescending(donor => donor.EndTime)
+                                .ThenBy(donor => donor.Id)
+                                .Take(16)
+                                .ToList();
+                            foreach (var donor in donorCandidates)
+                            {
+                                if (!resolvedByDay.TryGetValue(
+                                        donor.Date.DayOfWeek,
+                                        out var donorResolvedDay))
+                                {
+                                    continue;
+                                }
+                                var donorSourceSlot = donorResolvedDay.Slots.FirstOrDefault(slot =>
+                                    slot.Start == donor.StartTime && slot.End == donor.EndTime);
+                                if (donorSourceSlot is null)
+                                {
+                                    continue;
+                                }
+
+                                var donorPosition = donor.Date.DayNumber * 24 * 60
+                                                    + donor.StartTime.Hour * 60
+                                                    + donor.StartTime.Minute;
+                                var donorTargets = DatesBetween(rangeStartDate, rangeEndDateExclusive)
+                                    .Where(date => IsWorking(date, blockerGroup))
+                                    .SelectMany(date =>
+                                        SharedSlotsForDate(blockerGroup.CourseId, date)
+                                            .Select(slot => new
+                                            {
+                                                Date = date,
+                                                Slot = slot,
+                                                Position = date.DayNumber * 24 * 60
+                                                           + slot.Start.Hour * 60
+                                                           + slot.Start.Minute
+                                            }))
+                                    .Where(destination =>
+                                        CompareSlotPosition(
+                                            destination.Date,
+                                            destination.Slot.Start,
+                                            destination.Slot.End,
+                                            targetDate,
+                                            targetSlot.Start,
+                                            targetSlot.End) > 0
+                                        && !HasGroupOverlap(
+                                            blocker.GroupId,
+                                            destination.Date,
+                                            destination.Slot.Start,
+                                            destination.Slot.End))
+                                    .OrderBy(destination =>
+                                        Math.Abs(destination.Position - donorPosition))
+                                    .ThenBy(destination => destination.Position)
+                                    .ToList();
+                                foreach (var donorTarget in donorTargets)
+                                {
+                                    var swapSnapshot = CaptureTrialState();
+                                    var donorMove = await TryMoveGeneratedDraftAcrossCalendarAsync(
+                                        blockerGroup,
+                                        donor,
+                                        donorTarget.Date,
+                                        donorTarget.Slot,
+                                        softFill ? 2 : maxModuleSegmentsPerDay,
+                                        preserveAssignedResources: false);
+                                    if (donorMove is null)
+                                    {
+                                        RestoreTrialState(swapSnapshot);
+                                        continue;
+                                    }
+                                    var blockerMove = await TryMoveGeneratedDraftAcrossCalendarAsync(
+                                        blockerGroup,
+                                        blocker,
+                                        donor.Date,
+                                        donorSourceSlot,
+                                        softFill ? 2 : maxModuleSegmentsPerDay,
+                                        preserveAssignedResources: false);
+                                    if (blockerMove is null)
+                                    {
+                                        RestoreTrialState(swapSnapshot);
+                                        continue;
+                                    }
+
+                                    blockerMoved = true;
+                                    warnings.Add(
+                                        $"[{targetDate:yyyy-MM-dd}] {blockerGroup.Name}: атомарний repair-pass переніс попередню тему модуля <{ModuleTitleLabel(moduleId)}> перед спільною лекцією та посунув завершальне заняття у звільнений пізній слот.");
+                                    break;
+                                }
+                                if (blockerMoved)
+                                {
+                                    break;
+                                }
+                            }
+                            if (!blockerMoved)
+                            {
+                                return false;
+                            }
+                        }
+
+                        return pendingGroups.All(group =>
+                            !ViolatesTopicCalendarOrder(
+                                group.Id,
+                                moduleId,
+                                pendingTopic,
+                                targetDate,
+                                targetSlot.Start,
+                                targetSlot.End));
+                    }
+
+                    foreach (var courseEntry in selectedGroupsByCourse.OrderBy(entry => entry.Key))
+                    {
+                        var courseGroups = courseEntry.Value
+                            .Where(group => generationGroups.Any(selected => selected.Id == group.Id))
+                            .OrderBy(group => group.Id)
+                            .ToList();
+                        if (courseGroups.Count <= 1)
+                        {
+                            continue;
+                        }
+
+                        var pendingTopics = remainingByGroupModule
+                            .Where(entry => entry.Value > 0
+                                            && selectedGroupsById.TryGetValue(entry.Key.GroupId, out var group)
+                                            && group.CourseId == courseEntry.Key)
+                            .Select(entry => entry.Key.ModuleId)
+                            .Distinct()
+                            .SelectMany(moduleId =>
+                                topicsByModule.TryGetValue(moduleId, out var moduleTopics)
+                                    ? moduleTopics
+                                        .Where(topic => GetTopicUsageLimit(topic) > 0
+                                                        && CanShareAcrossGroups(topic.LessonTypeId))
+                                        .Select(topic => (ModuleId: moduleId, Topic: topic))
+                                    : Enumerable.Empty<(int ModuleId, ModuleTopic Topic)>())
+                            .Where(entry =>
+                            {
+                                var pendingGroups = courseGroups
+                                    .Where(group => PlacementRemainingFor(group.Id, entry.ModuleId) > 0
+                                                    && IsTopicStillPendingForGroup(
+                                                        group.Id,
+                                                        entry.ModuleId,
+                                                        entry.Topic))
+                                    .ToList();
+                                return pendingGroups.Count > 1
+                                       && pendingGroups.All(group => CanAssignSpecificTopic(
+                                           group.Id,
+                                           entry.ModuleId,
+                                           entry.Topic));
+                            })
+                            .OrderBy(entry => entry.Topic.Order)
+                            .ThenBy(entry => entry.ModuleId)
+                            .ThenBy(entry => entry.Topic.Id)
+                            .ToList();
+
+                        foreach (var pendingEntry in pendingTopics)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            var pendingGroups = courseGroups
+                                .Where(group => PlacementRemainingFor(group.Id, pendingEntry.ModuleId) > 0
+                                                && IsTopicStillPendingForGroup(
+                                                    group.Id,
+                                                    pendingEntry.ModuleId,
+                                                    pendingEntry.Topic))
+                                .OrderBy(group => group.Id)
+                                .ToList();
+                            if (pendingGroups.Count <= 1
+                                || pendingGroups.Count > SlotGroupLimitForPlacement(
+                                    courseEntry.Key,
+                                    pendingEntry.Topic.LessonTypeId,
+                                    isSelfStudyPlacement: false))
+                            {
+                                continue;
+                            }
+
+                            var targetCandidates = DatesBetween(rangeStartDate, rangeEndDateExclusive)
+                                .Where(targetDate => pendingGroups.All(group => IsWorking(targetDate, group)))
+                                .SelectMany(targetDate =>
+                                    SharedSlotsForDate(courseEntry.Key, targetDate)
+                                        .Select((targetSlot, targetIndex) => new
+                                        {
+                                            Date = targetDate,
+                                            Slot = targetSlot,
+                                            Index = targetIndex,
+                                            Position = targetDate.DayNumber * 24 * 60
+                                                       + targetSlot.Start.Hour * 60
+                                                       + targetSlot.Start.Minute
+                                        }))
+                                .Where(target => !IsBlockedLateLectureSlot(
+                                    pendingEntry.Topic.LessonTypeId,
+                                    target.Index + 1,
+                                    preferredFirstMaxSlotOrder))
+                                .Select(target => new
+                                {
+                                    target.Date,
+                                    target.Slot,
+                                    target.Index,
+                                    target.Position,
+                                    OccupiedCount = pendingGroups.Count(group =>
+                                        HasScheduledGroupOverlap(
+                                            group.Id,
+                                            target.Date,
+                                            target.Slot.Start,
+                                            target.Slot.End))
+                                })
+                                .OrderBy(target => target.OccupiedCount)
+                                .ThenByDescending(target => target.Position)
+                                .ToList();
+
+                            var topicPlaced = false;
+                            foreach (var target in targetCandidates)
+                            {
+                                cancellationToken.ThrowIfCancellationRequested();
+                                var trialSnapshot = CaptureTrialState();
+                                var hasTopicOrderBlocker = pendingGroups.Any(group =>
+                                    ViolatesTopicCalendarOrder(
+                                        group.Id,
+                                        pendingEntry.ModuleId,
+                                        pendingEntry.Topic,
+                                        target.Date,
+                                        target.Slot.Start,
+                                        target.Slot.End));
+                                if (hasTopicOrderBlocker
+                                    && (pendingGroups.Count != courseGroups.Count
+                                        || !await TryMovePendingTopicPredecessorsBeforeTargetAsync(
+                                            pendingGroups,
+                                            pendingEntry.ModuleId,
+                                            pendingEntry.Topic,
+                                            target.Date,
+                                            target.Slot)))
+                                {
+                                    RestoreTrialState(trialSnapshot);
+                                    continue;
+                                }
+                                var occupants = new List<(Group Group, TeacherDraftItem Draft)>();
+                                var targetCanBeEvicted = true;
+                                foreach (var pendingGroup in pendingGroups)
+                                {
+                                    var occupyingSlots = BusyForGroupDate(pendingGroup.Id, target.Date)
+                                        .Where(slot => !IsNonOccupyingBusySlot(slot)
+                                                       && SlotOverlaps(
+                                                           slot,
+                                                           target.Date,
+                                                           target.Slot.Start,
+                                                           target.Slot.End))
+                                        .ToList();
+                                    if (occupyingSlots.Count == 0)
+                                    {
+                                        continue;
+                                    }
+                                    if (occupyingSlots.Count != 1)
+                                    {
+                                        targetCanBeEvicted = false;
+                                        break;
+                                    }
+                                    var occupantSlot = occupyingSlots[0];
+                                    var occupantDrafts = movableDrafts
+                                        .Where(draft => SlotMatches(
+                                            occupantSlot,
+                                            draft.GroupId,
+                                            draft.Date,
+                                            draft.StartTime,
+                                            draft.EndTime,
+                                            draft.ModuleId,
+                                            draft.TeacherId,
+                                            draft.RoomId,
+                                            draft.ModuleTopicId))
+                                        .ToList();
+                                    if (occupantDrafts.Count != 1
+                                        || occupantDrafts[0].GroupId != pendingGroup.Id
+                                        || occupantDrafts[0].IsSelfStudy
+                                        || CanShareAcrossGroups(occupantDrafts[0].LessonTypeId)
+                                        || !AutogenDraftMutationPolicy.CanMutateInRepair(occupantDrafts[0]))
+                                    {
+                                        targetCanBeEvicted = false;
+                                        break;
+                                    }
+                                    occupants.Add((pendingGroup, occupantDrafts[0]));
+                                }
+                                if (!targetCanBeEvicted)
+                                {
+                                    RestoreTrialState(trialSnapshot);
+                                    continue;
+                                }
+
+                                var evictionSucceeded = true;
+                                foreach (var occupant in occupants)
+                                {
+                                    var sourcePosition = occupant.Draft.Date.DayNumber * 24 * 60
+                                                         + occupant.Draft.StartTime.Hour * 60
+                                                         + occupant.Draft.StartTime.Minute;
+                                    var gapCandidates = DatesBetween(rangeStartDate, rangeEndDateExclusive)
+                                        .Where(gapDate => IsWorking(gapDate, occupant.Group))
+                                        .SelectMany(gapDate =>
+                                            SharedSlotsForDate(occupant.Group.CourseId, gapDate)
+                                                .Select(gapSlot => new
+                                                {
+                                                    Date = gapDate,
+                                                    Slot = gapSlot,
+                                                    Position = gapDate.DayNumber * 24 * 60
+                                                               + gapSlot.Start.Hour * 60
+                                                               + gapSlot.Start.Minute
+                                                }))
+                                        .Where(gap => (gap.Date != target.Date
+                                                       || gap.Slot.Start != target.Slot.Start
+                                                       || gap.Slot.End != target.Slot.End)
+                                                      && !HasGroupOverlap(
+                                                          occupant.Group.Id,
+                                                          gap.Date,
+                                                          gap.Slot.Start,
+                                                          gap.Slot.End))
+                                        .OrderBy(gap => Math.Abs(gap.Position - sourcePosition))
+                                        .ThenByDescending(gap => gap.Position)
+                                        .ToList();
+                                    AppliedDraftCalendarMove? appliedMove = null;
+                                    foreach (var gap in gapCandidates)
+                                    {
+                                        appliedMove = await TryMoveGeneratedDraftAcrossCalendarAsync(
+                                            occupant.Group,
+                                            occupant.Draft,
+                                            gap.Date,
+                                            gap.Slot,
+                                            softFill ? 2 : maxModuleSegmentsPerDay,
+                                            preserveAssignedResources: false);
+                                        if (appliedMove is not null)
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    if (appliedMove is null)
+                                    {
+                                        evictionSucceeded = false;
+                                        break;
+                                    }
+                                }
+
+                                if (!evictionSucceeded
+                                    || pendingGroups.Any(group => HasScheduledGroupOverlap(
+                                        group.Id,
+                                        target.Date,
+                                        target.Slot.Start,
+                                        target.Slot.End)))
+                                {
+                                    RestoreTrialState(trialSnapshot);
+                                    continue;
+                                }
+
+                                futureSharedCheckpointReservations.RemoveAll(item =>
+                                    item.ModuleId == pendingEntry.ModuleId
+                                    && item.TopicId == pendingEntry.Topic.Id);
+                                foreach (var pendingGroup in pendingGroups)
+                                {
+                                    futureSharedCheckpointReservations.Add((
+                                        pendingGroup.Id,
+                                        pendingEntry.ModuleId,
+                                        pendingEntry.Topic.Id,
+                                        target.Date,
+                                        target.Slot.Start,
+                                        target.Slot.End));
+                                }
+                                var remainingBefore = pendingGroups.Sum(group =>
+                                    PlacementRemainingFor(group.Id, pendingEntry.ModuleId));
+                                var placed = TryPreplaceSharedLectureTopic(
+                                    courseEntry.Key,
+                                    pendingEntry.ModuleId,
+                                    pendingEntry.Topic);
+                                var remainingAfter = pendingGroups.Sum(group =>
+                                    PlacementRemainingFor(group.Id, pendingEntry.ModuleId));
+                                var expectedDecrease = pendingGroups.Count;
+                                if (!placed
+                                    || remainingBefore - remainingAfter != expectedDecrease
+                                    || !MutableDraftProjectionMatchesBusyState()
+                                    || HasSelectedGroupEmptyCanonicalLectureSlotViolation()
+                                    || HasSelectedGroupTopicOrderViolation()
+                                    || pendingGroups.Any(group => !BusyForGroupDate(group.Id, target.Date)
+                                        .Any(slot => slot.StartTime == target.Slot.Start
+                                                     && slot.EndTime == target.Slot.End
+                                                     && slot.ModuleId == pendingEntry.ModuleId
+                                                     && slot.ModuleTopicId == pendingEntry.Topic.Id)))
+                                {
+                                    RestoreTrialState(trialSnapshot);
+                                    continue;
+                                }
+
+                                placedRows += expectedDecrease;
+                                topicPlaced = true;
+                                warnings.Add(
+                                    $"[{target.Date:yyyy-MM-dd}] Атомарний repair-pass звільнив спільний слот {target.Slot.Start:HH\\:mm}-{target.Slot.End:HH\\:mm} і розмістив тему {pendingEntry.Topic.TopicCode} для {expectedDecrease} груп.");
+                                break;
+                            }
+
+                            if (topicPlaced)
+                            {
+                                continue;
+                            }
+                        }
+                    }
+                    return placedRows;
+                }
+
+                async Task<int> TryRotateAndPlacePendingSharedLectureTailsAsync()
+                {
+                    var trialSnapshot = CaptureTrialState();
+                    var remainingBefore = remainingByGroupModule.Values
+                        .Sum(value => Math.Max(0, value));
+                    var movedRows = await RotateSharedLectureOccurrencesTowardPendingTailsAsync();
+                    var placedRows = await TryPlacePendingSharedLectureTailsAsync();
+                    var remainingAfter = remainingByGroupModule.Values
+                        .Sum(value => Math.Max(0, value));
+                    if (movedRows > 0
+                        && (placedRows <= 0
+                            || remainingAfter >= remainingBefore
+                            || HasSelectedGroupTopicOrderViolation()
+                            || HasSelectedGroupEmptyCanonicalLectureSlotViolation()
+                            || !MutableDraftProjectionMatchesBusyState()))
+                    {
+                        RestoreTrialState(trialSnapshot);
+                        return await TryPlacePendingSharedLectureTailsAsync();
+                    }
+                    return placedRows;
                 }
 
                 IReadOnlyList<int> OrderModulesForDayPass(IEnumerable<int> moduleIds, int passMode, bool deferCatchUpModules)
@@ -7985,67 +14295,17 @@ public sealed class TeacherDraftsAutogenService
 
                 void UndoCreatedDraft(TeacherDraftItem item)
                 {
-                    var busySlot = FindBusySlotForDraft(item, item.StartTime, item.EndTime);
-                    if (busySlot is not null)
-                    {
-                        RemoveBusySlot(busySlot);
-                    }
-
-                    RemoveDraftEntity(item);
-                    allCreatedDrafts.Remove(item);
-                    movableDrafts.Remove(item);
-                    createdDrafts.Remove(item);
-                    if (!excludedTypeIds.Contains(item.LessonTypeId))
-                    {
-                        Dec(item.GroupId, item.Date);
-                        RemoveCurrentRangeFact(item.GroupId, item.ModuleId);
-                        var remainingKey = (item.GroupId, item.ModuleId);
-                        if (remainingByGroupModule.ContainsKey(remainingKey))
-                        {
-                            remainingByGroupModule[remainingKey]++;
-                        }
-                        if (item.IsSelfStudy)
-                        {
-                            selfStudyRemainingByGroupModule[remainingKey] = SelfStudyRemaining(item.GroupId, item.ModuleId) + 1;
-                            if (item.ModuleTopicId is int selfStudyTopicId)
+                    if (!RemoveCreatedUnlockedDraft(
+                            item,
+                            createdDrafts,
+                            () =>
                             {
-                                var topicKey = (item.GroupId, item.ModuleId, selfStudyTopicId);
-                                selfStudyTopicRemaining[topicKey] = selfStudyTopicRemaining.TryGetValue(topicKey, out var topicLeft)
-                                    ? topicLeft + 1
-                                    : 1;
-                            }
-                        }
-                        else if (item.ModuleTopicId is int topicId)
-                        {
-                            UnmarkTopicUsed(item.GroupId, item.ModuleId, topicId);
-                        }
-                    }
-
-                    if (item.RoomId is int roomId && groupRoomUsage.TryGetValue(roomId, out var usedRoomCount))
+                                RestoreFirstMainMarker();
+                                InvalidateGapResourceCaches();
+                            }))
                     {
-                        if (usedRoomCount <= 1)
-                        {
-                            groupRoomUsage.Remove(roomId);
-                        }
-                        else
-                        {
-                            groupRoomUsage[roomId] = usedRoomCount - 1;
-                        }
+                        throw new InvalidOperationException("Не вдалося повністю відкотити створену чернетку автогенерації.");
                     }
-
-                    if (preferredFirstTypeId != 0 && item.LessonTypeId == preferredFirstTypeId)
-                    {
-                        if (!BusyForGroup(item.GroupId).Any(slot =>
-                                slot.ModuleId == item.ModuleId
-                                && slot.LessonTypeId == preferredFirstTypeId
-                                && !excludedTypeIds.Contains(slot.LessonTypeId)))
-                        {
-                            hasPreferred.Remove((item.GroupId, item.ModuleId));
-                        }
-                    }
-
-                    RestoreFirstMainMarker();
-                    InvalidateGapResourceCaches();
                 }
 
                 HashSet<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End)> CopyGapWarnings()
@@ -8053,6 +14313,73 @@ public sealed class TeacherDraftsAutogenService
 
                 Dictionary<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End), HashSet<string>> CopySlotFailureReasons()
                     => slotFailureReasons.ToDictionary(entry => entry.Key, entry => entry.Value.ToHashSet());
+
+                AutogenTrialSnapshot CaptureTrialState()
+                {
+                    // Частина локальних оптимізаторів змінює поля сутності напряму.
+                    // Перед знімком фіксуємо ці зміни у ChangeTracker, щоб відновлення
+                    // не перетворило реальне перенесення на стан Unchanged.
+                    _db.ChangeTracker.DetectChanges();
+                    return new(
+                        allCreatedDrafts.ToHashSet(),
+                        movableDrafts
+                            .Distinct()
+                            .ToDictionary(draft => draft, CaptureMovableDraftTrialState),
+                        busy.ToList(),
+                        topicOrderSlots.ToList(),
+                        topicAssignments.ToDictionary(
+                            entry => entry.Key,
+                            entry => entry.Value.ToDictionary(
+                                topicEntry => topicEntry.Key,
+                                topicEntry => topicEntry.Value)),
+                        perDayCount.ToDictionary(entry => entry.Key, entry => entry.Value),
+                        rangeFactMap.ToDictionary(entry => entry.Key, entry => entry.Value),
+                        remainingByGroupModule.ToDictionary(entry => entry.Key, entry => entry.Value),
+                        selfStudyRemainingByGroupModule.ToDictionary(entry => entry.Key, entry => entry.Value),
+                        selfStudyTopicRemaining.ToDictionary(entry => entry.Key, entry => entry.Value),
+                        roomUsageByGroup.ToDictionary(
+                            entry => entry.Key,
+                            entry => entry.Value.ToDictionary(
+                                roomEntry => roomEntry.Key,
+                                roomEntry => roomEntry.Value)),
+                        createdDraftAccounting.ToDictionary(
+                            entry => entry.Key,
+                            entry => new CreatedDraftAccountingState(
+                                entry.Value.CreatedCounterIncremented,
+                                entry.Value.DayCountIncremented,
+                                entry.Value.CurrentRangeFactIncremented,
+                                entry.Value.RemainingDecremented,
+                                entry.Value.SelfStudyRemainingDecremented,
+                                entry.Value.SelfStudyTopicRemainingDecremented,
+                                entry.Value.TopicUsageIncremented,
+                                entry.Value.RoomUsageGroupId,
+                                entry.Value.RoomUsageRoomId,
+                                entry.Value.IncompleteDraftCounted,
+                                entry.Value.MissingTeacherCounted,
+                                entry.Value.MissingRoomCounted,
+                                entry.Value.MissingBothCounted,
+                                entry.Value.EmergencySingletonCounted)),
+                        hasPreferred.ToHashSet(),
+                        futureSharedCheckpointReservations.ToList(),
+                        warnings.Count,
+                        gapDetails.Count,
+                        CopyGapWarnings(),
+                        CopySlotFailureReasons(),
+                        CopySearchLimitDiagnostics(),
+                        modulesAttemptedToday.ToHashSet(),
+                        topicsExhaustedNotified.ToHashSet(),
+                        overflowTopicNotified.ToHashSet(),
+                        missingModulesNotified.ToHashSet(),
+                        created,
+                        skipped,
+                        incompleteDraftsCreated,
+                        incompleteMissingTeacherCount,
+                        incompleteMissingRoomCount,
+                        incompleteMissingBothCount,
+                        emergencySingletonSharedLecturesCreated,
+                        lastPrimaryModuleId,
+                        ltIndex);
+                }
 
                 int CountModuleTransitionsForDay()
                 {
@@ -8108,66 +14435,151 @@ public sealed class TeacherDraftsAutogenService
                            - transitions * 40;
                 }
 
-                void RestoreTrialState(
-                    HashSet<TeacherDraftItem> createdSnapshot,
-                    int warningsCount,
-                    int gapDetailsCount,
-                    HashSet<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End)> gapWarningSnapshot,
-                    Dictionary<(int GroupId, DateOnly Date, TimeOnly Start, TimeOnly End), HashSet<string>> slotFailureSnapshot,
-                    HashSet<int> attemptedModulesSnapshot,
-                    int createdSnapshotCount,
-                    int skippedSnapshotCount,
-                    int incompleteDraftsSnapshot,
-                    int incompleteMissingTeacherSnapshot,
-                    int incompleteMissingRoomSnapshot,
-                    int incompleteMissingBothSnapshot,
-                    int emergencySingletonSnapshot,
-                    int? lastPrimarySnapshot)
+                void RestoreTrialState(AutogenTrialSnapshot snapshot)
                 {
                     foreach (var item in allCreatedDrafts
-                                 .Where(item => !createdSnapshot.Contains(item) && !item.IsLocked)
+                                 .Where(item => !snapshot.CreatedDrafts.Contains(item) && !item.IsLocked)
                                  .ToList())
                     {
                         UndoCreatedDraft(item);
                     }
+                    foreach (var (draft, draftSnapshot) in snapshot.MovableDrafts)
+                    {
+                        RestoreMovableDraftTrialState(draft, draftSnapshot);
+                        if (!movableDrafts.Contains(draft))
+                        {
+                            movableDrafts.Add(draft);
+                        }
+                        if (snapshot.CreatedDrafts.Contains(draft)
+                            && !allCreatedDrafts.Contains(draft))
+                        {
+                            allCreatedDrafts.Add(draft);
+                        }
+                    }
+                    RestoreBusyState(snapshot.BusySlots, snapshot.TopicOrderSlots);
+                    topicAssignments.Clear();
+                    foreach (var entry in snapshot.TopicAssignments)
+                    {
+                        topicAssignments[entry.Key] = entry.Value.ToDictionary(
+                            topicEntry => topicEntry.Key,
+                            topicEntry => topicEntry.Value);
+                    }
+                    perDayCount.Clear();
+                    foreach (var entry in snapshot.PerDayCount)
+                    {
+                        perDayCount[entry.Key] = entry.Value;
+                    }
+                    rangeFactMap.Clear();
+                    foreach (var entry in snapshot.RangeFact)
+                    {
+                        rangeFactMap[entry.Key] = entry.Value;
+                    }
+                    remainingByGroupModule.Clear();
+                    foreach (var entry in snapshot.Remaining)
+                    {
+                        remainingByGroupModule[entry.Key] = entry.Value;
+                    }
+                    selfStudyRemainingByGroupModule.Clear();
+                    foreach (var entry in snapshot.SelfStudyRemaining)
+                    {
+                        selfStudyRemainingByGroupModule[entry.Key] = entry.Value;
+                    }
+                    selfStudyTopicRemaining.Clear();
+                    foreach (var entry in snapshot.SelfStudyTopicRemaining)
+                    {
+                        selfStudyTopicRemaining[entry.Key] = entry.Value;
+                    }
+                    roomUsageByGroup.Clear();
+                    foreach (var entry in snapshot.RoomUsage)
+                    {
+                        roomUsageByGroup[entry.Key] = entry.Value.ToDictionary(
+                            roomEntry => roomEntry.Key,
+                            roomEntry => roomEntry.Value);
+                    }
+                    createdDraftAccounting.Clear();
+                    foreach (var entry in snapshot.CreatedDraftAccounting)
+                    {
+                        createdDraftAccounting[entry.Key] = new CreatedDraftAccounting
+                        {
+                            CreatedCounterIncremented = entry.Value.CreatedCounterIncremented,
+                            DayCountIncremented = entry.Value.DayCountIncremented,
+                            CurrentRangeFactIncremented = entry.Value.CurrentRangeFactIncremented,
+                            RemainingDecremented = entry.Value.RemainingDecremented,
+                            SelfStudyRemainingDecremented = entry.Value.SelfStudyRemainingDecremented,
+                            SelfStudyTopicRemainingDecremented = entry.Value.SelfStudyTopicRemainingDecremented,
+                            TopicUsageIncremented = entry.Value.TopicUsageIncremented,
+                            RoomUsageGroupId = entry.Value.RoomUsageGroupId,
+                            RoomUsageRoomId = entry.Value.RoomUsageRoomId,
+                            IncompleteDraftCounted = entry.Value.IncompleteDraftCounted,
+                            MissingTeacherCounted = entry.Value.MissingTeacherCounted,
+                            MissingRoomCounted = entry.Value.MissingRoomCounted,
+                            MissingBothCounted = entry.Value.MissingBothCounted,
+                            EmergencySingletonCounted = entry.Value.EmergencySingletonCounted
+                        };
+                    }
+                    hasPreferred.Clear();
+                    foreach (var entry in snapshot.HasPreferred)
+                    {
+                        hasPreferred.Add(entry);
+                    }
+                    futureSharedCheckpointReservations.Clear();
+                    futureSharedCheckpointReservations.AddRange(snapshot.FutureSharedCheckpointReservations);
 
-                    while (warnings.Count > warningsCount)
+                    while (warnings.Count > snapshot.WarningCount)
                     {
                         warnings.RemoveAt(warnings.Count - 1);
                     }
-                    while (gapDetails.Count > gapDetailsCount)
+                    while (gapDetails.Count > snapshot.GapDetailCount)
                     {
                         gapDetails.RemoveAt(gapDetails.Count - 1);
                     }
                     gapWarnings.Clear();
-                    foreach (var warningKey in gapWarningSnapshot)
+                    foreach (var warningKey in snapshot.GapWarnings)
                     {
                         gapWarnings.Add(warningKey);
                     }
                     slotFailureReasons.Clear();
-                    foreach (var entry in slotFailureSnapshot)
+                    foreach (var entry in snapshot.SlotFailureReasons)
                     {
                         slotFailureReasons[entry.Key] = entry.Value.ToHashSet();
                     }
+                    RestoreSearchLimitDiagnostics(snapshot.SearchLimitDiagnostics);
                     modulesAttemptedToday.Clear();
-                    foreach (var moduleId in attemptedModulesSnapshot)
+                    foreach (var moduleId in snapshot.AttemptedModules)
                     {
                         modulesAttemptedToday.Add(moduleId);
                     }
-                    created = createdSnapshotCount;
-                    skipped = skippedSnapshotCount;
-                    incompleteDraftsCreated = incompleteDraftsSnapshot;
-                    incompleteMissingTeacherCount = incompleteMissingTeacherSnapshot;
-                    incompleteMissingRoomCount = incompleteMissingRoomSnapshot;
-                    incompleteMissingBothCount = incompleteMissingBothSnapshot;
-                    emergencySingletonSharedLecturesCreated = emergencySingletonSnapshot;
-                    lastPrimaryModuleId = lastPrimarySnapshot;
+                    topicsExhaustedNotified.Clear();
+                    foreach (var notificationKey in snapshot.ExhaustedTopics)
+                    {
+                        topicsExhaustedNotified.Add(notificationKey);
+                    }
+                    overflowTopicNotified.Clear();
+                    foreach (var notificationKey in snapshot.OverflowTopics)
+                    {
+                        overflowTopicNotified.Add(notificationKey);
+                    }
+                    missingModulesNotified.Clear();
+                    foreach (var moduleId in snapshot.MissingModules)
+                    {
+                        missingModulesNotified.Add(moduleId);
+                    }
+                    created = snapshot.CreatedCount;
+                    skipped = snapshot.SkippedCount;
+                    incompleteDraftsCreated = snapshot.IncompleteDraftCount;
+                    incompleteMissingTeacherCount = snapshot.IncompleteMissingTeacherCount;
+                    incompleteMissingRoomCount = snapshot.IncompleteMissingRoomCount;
+                    incompleteMissingBothCount = snapshot.IncompleteMissingBothCount;
+                    emergencySingletonSharedLecturesCreated = snapshot.EmergencySingletonCount;
+                    lastPrimaryModuleId = snapshot.LastPrimaryModuleId;
+                    ltIndex = snapshot.LessonTypeIndex;
                     RestoreFirstMainMarker();
                     InvalidateGapResourceCaches();
                 }
 
-                async Task RunDayGenerationPassAsync(int passMode)
+                async Task RunDayGenerationPassAsync(int passMode, bool enableBoundedSearch)
                 {
+                    boundedSearchEnabledForCurrentPass = enableBoundedSearch;
                     // Основний модуль дня (пріоритетний у логіці курсу).
                     var primaryModuleId = ResolvePrimaryModule(moduleIds =>
                         OrderModulesForDayPass(moduleIds, passMode, deferCatchUpModules: false));
@@ -8233,6 +14645,7 @@ public sealed class TeacherDraftsAutogenService
                         int fillerAttempts = 0;
                         while (CountFor(grp.Id, date) < maxPerDay)
                         {
+                            cancellationToken.ThrowIfCancellationRequested();
                             if (fillerQueue.Count == 0) break;
                             var fillerModuleId = fillerQueue.Dequeue();
                             if (RemainingFor(grp.Id, fillerModuleId) <= 0)
@@ -8328,6 +14741,7 @@ public sealed class TeacherDraftsAutogenService
                     var maxGapCompactionCycles = 3;
                     for (var cycle = 0; cycle < maxGapCompactionCycles; cycle++)
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         var progressed = await RunGapCompactionCycleAsync();
                         if (!progressed || CountFor(grp.Id, date) >= maxPerDay || !DayHasGaps(date, out _))
                         {
@@ -8336,28 +14750,19 @@ public sealed class TeacherDraftsAutogenService
                     }
                     for (var repairCycle = 0; repairCycle < slots.Count; repairCycle++)
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         if (!TryRepairLectureOrder())
                         {
                             break;
                         }
                     }
-                    await RunFinalGapOptimizationAsync();
+                    if (enableBoundedSearch)
+                    {
+                        await RunFinalGapOptimizationAsync();
+                    }
                 }
 
-                var trialCreatedSnapshot = allCreatedDrafts.ToHashSet();
-                var trialWarningsCount = warnings.Count;
-                var trialGapDetailsCount = gapDetails.Count;
-                var trialGapWarnings = CopyGapWarnings();
-                var trialSlotFailureReasons = CopySlotFailureReasons();
-                var trialAttemptedModules = modulesAttemptedToday.ToHashSet();
-                var trialCreatedCount = created;
-                var trialSkippedCount = skipped;
-                var trialIncompleteDrafts = incompleteDraftsCreated;
-                var trialIncompleteMissingTeacher = incompleteMissingTeacherCount;
-                var trialIncompleteMissingRoom = incompleteMissingRoomCount;
-                var trialIncompleteMissingBoth = incompleteMissingBothCount;
-                var trialEmergencySingleton = emergencySingletonSharedLecturesCreated;
-                var trialLastPrimary = lastPrimaryModuleId;
+                var trialSnapshot = CaptureTrialState();
 
                 var enableDayRollbackOptimizer = softFill || hasModuleHourOverrides;
                 var passModes = enableDayRollbackOptimizer
@@ -8370,7 +14775,9 @@ public sealed class TeacherDraftsAutogenService
                 var bestRemainingNeed = int.MaxValue;
                 foreach (var passMode in passModes)
                 {
-                    await RunDayGenerationPassAsync(passMode);
+                    // Пробні проходи не витрачають спільний бюджет пошуку: після відновлення стану
+                    // обраний режим має відтворити базовий результат перед фінальною оптимізацією.
+                    await RunDayGenerationPassAsync(passMode, enableBoundedSearch: false);
                     var score = ScoreCurrentDay();
                     var gapCount = CountDayGaps();
                     var filledSlots = CountFor(grp.Id, date);
@@ -8389,103 +14796,2098 @@ public sealed class TeacherDraftsAutogenService
                         bestFilledSlots = filledSlots;
                         bestRemainingNeed = remainingNeed;
                     }
-                    RestoreTrialState(
-                        trialCreatedSnapshot,
-                        trialWarningsCount,
-                        trialGapDetailsCount,
-                        trialGapWarnings,
-                        trialSlotFailureReasons,
-                        trialAttemptedModules,
-                        trialCreatedCount,
-                        trialSkippedCount,
-                        trialIncompleteDrafts,
-                        trialIncompleteMissingTeacher,
-                        trialIncompleteMissingRoom,
-                        trialIncompleteMissingBoth,
-                        trialEmergencySingleton,
-                        trialLastPrimary);
+                    RestoreTrialState(trialSnapshot);
                     if (bestGapCount == 0 && bestScore > 0)
                     {
                         break;
                     }
                 }
 
-                await RunDayGenerationPassAsync(bestMode);
+                await RunDayGenerationPassAsync(bestMode, enableBoundedSearch: true);
                 if (bestMode != 0)
                 {
                     warnings.Add($"[{date:yyyy-MM-dd}] {grp.Name}: оптимізатор перебудував день зі стратегією #{bestMode}, щоб зменшити прогалини та дефіцит модулів.");
                 }
+                var atomicSharedTailRepairRan = false;
+                if (date == generationDates[^1])
+                {
+                    await TryCrossDateChronologyCompactionAsync();
+                    if (grp.Id == generationGroups[^1].Id
+                        && atomicSharedTailRepairRequested)
+                    {
+                        await MergeSplitSharedLectureOccurrencesAsync();
+                        await TryRotateAndPlacePendingSharedLectureTailsAsync();
+                        atomicSharedTailRepairRan = true;
+                    }
+                    ApplySlotsForDate(date);
+                }
+                var dayRepairMustBeRolledBack = HasSelectedGroupTopicOrderViolation()
+                    || HasSelectedGroupEmptyCanonicalLectureSlotViolation(
+                        onlyDate: date,
+                        onlyGroupIds: new[] { grp.Id })
+                    || !MutableDraftProjectionMatchesBusyState();
+                if (dayRepairMustBeRolledBack)
+                {
+                    // Дозаповнення може пробувати довгі міжденні ланцюжки, але
+                    // жодна локальна оптимізація не має змінювати порядок тем або
+                    // розсинхронізовувати EF-чернетки з індексом зайнятості.
+                    RestoreTrialState(trialSnapshot);
+                    ApplySlotsForDate(date);
+                    warnings.Add(
+                        $"[{date:yyyy-MM-dd}] {grp.Name}: пробний repair-pass відкочено, тому що він змінював хронологічний порядок тем.");
+                }
+                else if (atomicSharedTailRepairRan)
+                {
+                    atomicSharedTailRepairRequested = false;
+                    atomicSharedTailRepairAttempted = true;
+                }
                 WarnRemainingGaps(date);
             }
-        }
-        int RunFinalLectureOrderCleanup()
-        {
-            var removedCount = 0;
-            var safetyBudget = Math.Max(1, movableDrafts.Count);
-            while (safetyBudget-- > 0)
+            }
+
+            // Повторний глобальний прохід повертає ранні групи до роботи після того,
+            // як пізні групи відкрили спільну тему для повного потоку.
+            PreplaceAvailableSharedLectureTopics();
+            var compactedSharedLectureEvents = CompactSharedLecturePrefixes();
+            var sharedLecturesPlacedAfterCompaction = compactedSharedLectureEvents > 0
+                ? PreplaceAvailableSharedLectureTopics()
+                : 0;
+            remainingAfterGlobalCatchUp = remainingByGroupModule.Values.Sum(value => Math.Max(0, value));
+            var sharedBarrierProgressAfter = MeasureSharedBarrierProgress();
+            var hasPendingInterleavedDateRound = r.ClearExisting
+                                                 && generationGroups.Count > 1
+                                                 && globalCatchUpRound < maxInterleavedDateRounds;
+            // Будь-яке зменшення незапланованого залишку виправдовує ще один
+            // обмежений глобальний прохід. Це дає repair-ланцюжкам використати
+            // позиції, звільнені попередньою групою, навіть без нової спільної лекції.
+            // Порожній ранній день не повинен завершувати генерацію всього діапазону:
+            // спочатку гарантовано пробуємо кожен робочий день хоча б один раз.
+            globalCatchUpProgress = hasPendingInterleavedDateRound
+                                    || remainingAfterGlobalCatchUp < remainingBeforeGlobalCatchUp
+                                    || sharedBarrierProgressAfter.AssignedHours > sharedBarrierProgressBefore.AssignedHours
+                                    || sharedBarrierProgressAfter.ReadyGroups > sharedBarrierProgressBefore.ReadyGroups
+                                    || sharedLecturesPlacedAfterCompaction > 0;
+            if (!globalCatchUpProgress
+                && remainingAfterGlobalCatchUp > 0
+                && !atomicSharedTailRepairAttempted)
             {
-                TeacherDraftItem? conflict = null;
-                foreach (var dayGroup in movableDrafts
-                             .Where(draft => draft.Status == DraftStatus.Draft
-                                             && !draft.IsLocked
-                                             && selectedGroupIdSet.Contains(draft.GroupId)
-                                             && draft.Date >= rangeStartDate
-                                             && draft.Date < rangeEndDateExclusive)
-                             .GroupBy(draft => new { draft.GroupId, draft.Date }))
+                // Атомарне об'єднання часткових потоків запускаємо лише після
+                // вичерпання звичайних проходів, щоб воно не змінювало успішну
+                // траєкторію генерації та працювало з остаточним набором прогалин.
+                atomicSharedTailRepairRequested = true;
+                globalCatchUpProgress = true;
+            }
+            if (!globalCatchUpProgress
+                && !unusedFutureSharedCheckpointReservationsReleased
+                && futureSharedCheckpointReservations.Count > 0)
+            {
+                // Якщо контрольна лекція так і не стала доступною, останній repair-прохід
+                // звільняє її тимчасові слоти для інших коректних занять.
+                futureSharedCheckpointReservations.Clear();
+                unusedFutureSharedCheckpointReservationsReleased = true;
+                globalCatchUpProgress = true;
+            }
+        }
+        while (generationGroups.Count > 1
+               && globalCatchUpProgress
+               && remainingAfterGlobalCatchUp > 0
+               && globalCatchUpRound < maxGlobalCatchUpRounds);
+        int SynchronizeUniqueMovedDraftsWithBusyState()
+        {
+            var availableDraftSlots = busy
+                .Where(slot => slot.JoinableDraft
+                               && selectedGroupIdSet.Contains(slot.GroupId)
+                               && slot.Date >= rangeStartDate
+                               && slot.Date < rangeEndDateExclusive)
+                .ToList();
+            var unmatchedDrafts = new List<TeacherDraftItem>();
+            foreach (var draft in movableDrafts
+                         .Where(draft => AutogenDraftMutationPolicy.CanSynchronizeMovedDraft(
+                             draft,
+                             selectedGroupIdSet,
+                             rangeStartDate,
+                             rangeEndDateExclusive))
+                         .Distinct()
+                         .OrderBy(draft => draft.Date)
+                         .ThenBy(draft => draft.StartTime)
+                         .ThenBy(draft => draft.GroupId)
+                         .ThenBy(draft => draft.Id))
+            {
+                var exactIndex = availableDraftSlots.FindIndex(slot => SlotMatches(
+                    slot,
+                    draft.GroupId,
+                    draft.Date,
+                    draft.StartTime,
+                    draft.EndTime,
+                    draft.ModuleId,
+                    draft.TeacherId,
+                    draft.RoomId,
+                    draft.ModuleTopicId));
+                if (exactIndex >= 0)
                 {
-                    var latestLectureStart = BusyForGroupDate(dayGroup.Key.GroupId, dayGroup.Key.Date)
-                        .Where(slot => CanShareAcrossGroups(slot.LessonTypeId)
-                                       && !excludedTypeIds.Contains(slot.LessonTypeId))
-                        .Select(slot => (TimeOnly?)slot.StartTime)
-                        .OrderByDescending(start => start)
-                        .FirstOrDefault();
-                    if (latestLectureStart is null)
+                    availableDraftSlots.RemoveAt(exactIndex);
+                    continue;
+                }
+                unmatchedDrafts.Add(draft);
+            }
+
+            var synchronized = 0;
+            void ChangeSynchronizedRoomUsage(
+                TeacherDraftItem draft,
+                int? previousRoomId,
+                int? roomId)
+            {
+                if (previousRoomId == roomId)
+                {
+                    return;
+                }
+                if (previousRoomId is int oldRoomId
+                    && roomUsageByGroup.TryGetValue(draft.GroupId, out var oldUsage)
+                    && oldUsage.TryGetValue(oldRoomId, out var oldCount))
+                {
+                    if (oldCount <= 1)
+                    {
+                        oldUsage.Remove(oldRoomId);
+                    }
+                    else
+                    {
+                        oldUsage[oldRoomId] = oldCount - 1;
+                    }
+                }
+                if (roomId is int newRoomId)
+                {
+                    if (!roomUsageByGroup.TryGetValue(draft.GroupId, out var newUsage))
+                    {
+                        newUsage = new Dictionary<int, int>();
+                        roomUsageByGroup[draft.GroupId] = newUsage;
+                    }
+                    newUsage[newRoomId] = newUsage.TryGetValue(newRoomId, out var newCount)
+                        ? newCount + 1
+                        : 1;
+                }
+                if (createdDraftAccounting.TryGetValue(draft, out var accounting))
+                {
+                    accounting.RoomUsageGroupId = roomId is int ? draft.GroupId : null;
+                    accounting.RoomUsageRoomId = roomId;
+                }
+            }
+
+            void SynchronizeDraftWithSlot(TeacherDraftItem draft, BusySlot intendedSlot)
+            {
+                var previousAccountingRoomId = createdDraftAccounting.TryGetValue(draft, out var accounting)
+                    ? accounting.RoomUsageRoomId
+                    : draft.RoomId;
+                draft.Date = intendedSlot.Date;
+                draft.DayOfWeek = intendedSlot.Date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
+                draft.StartTime = intendedSlot.StartTime;
+                draft.EndTime = intendedSlot.EndTime;
+                draft.TeacherId = intendedSlot.TeacherId;
+                draft.RoomId = intendedSlot.RoomId;
+                if (typeById.TryGetValue(draft.LessonTypeId, out var lessonType))
+                {
+                    draft.ValidationWarnings = BuildIncompleteDraftWarningJson(
+                        lessonType.RequiresTeacher && draft.TeacherId is null,
+                        lessonType.RequiresRoom && draft.RoomId is null);
+                }
+                ChangeSynchronizedRoomUsage(draft, previousAccountingRoomId, draft.RoomId);
+                draft.UpdatedAt = DateTime.UtcNow;
+                var draftEntry = _db.Entry(draft);
+                if (draft.Id > 0 && draftEntry.State == EntityState.Unchanged)
+                {
+                    draftEntry.State = EntityState.Modified;
+                }
+                synchronized++;
+            }
+
+            foreach (var draftGroup in unmatchedDrafts
+                         .GroupBy(draft => new
+                         {
+                             draft.GroupId,
+                             draft.ModuleId,
+                             draft.LessonTypeId,
+                             draft.ModuleTopicId
+                         })
+                         .OrderBy(group => group.Key.GroupId)
+                         .ThenBy(group => group.Key.ModuleId)
+                         .ThenBy(group => group.Key.LessonTypeId)
+                         .ThenBy(group => group.Key.ModuleTopicId))
+            {
+                var draftsForKey = draftGroup
+                    .OrderBy(draft => draft.Date)
+                    .ThenBy(draft => draft.StartTime)
+                    .ThenBy(draft => draft.EndTime)
+                    .ThenBy(draft => draft.Id)
+                    .ToList();
+                var slotsForKey = availableDraftSlots
+                    .Where(slot => slot.GroupId == draftGroup.Key.GroupId
+                                   && slot.ModuleId == draftGroup.Key.ModuleId
+                                   && slot.LessonTypeId == draftGroup.Key.LessonTypeId
+                                   && slot.ModuleTopicId == draftGroup.Key.ModuleTopicId)
+                    .OrderBy(slot => slot.Date)
+                    .ThenBy(slot => slot.StartTime)
+                    .ThenBy(slot => slot.EndTime)
+                    .ThenBy(slot => slot.TeacherId)
+                    .ThenBy(slot => slot.RoomId)
+                    .ToList();
+                // Повтори однієї теми взаємозамінні, тому синхронізуємо їх
+                // хронологічно лише за наявності повної взаємно-однозначної пари.
+                if (draftsForKey.Count != slotsForKey.Count)
+                {
+                    continue;
+                }
+                for (var index = 0; index < draftsForKey.Count; index++)
+                {
+                    SynchronizeDraftWithSlot(draftsForKey[index], slotsForKey[index]);
+                    availableDraftSlots.Remove(slotsForKey[index]);
+                }
+            }
+
+            return synchronized;
+        }
+        var rotatedSharedBoundaryDates = new HashSet<DateOnly>();
+        int RunFinalSharedBoundaryRotation()
+        {
+            var requiredIncompleteDrafts = movableDrafts
+                .Where(draft => (allCreatedDrafts.Contains(draft)
+                                 || _db.Entry(draft).State == EntityState.Modified)
+                                && draft.Status == DraftStatus.Draft
+                                && !draft.IsLocked
+                                && string.IsNullOrWhiteSpace(draft.BatchKey)
+                                && selectedGroupIdSet.Contains(draft.GroupId)
+                                && draft.Date >= rangeStartDate
+                                && draft.Date < rangeEndDateExclusive
+                                && typeById.TryGetValue(draft.LessonTypeId, out var lessonType)
+                                && (lessonType.RequiresTeacher && draft.TeacherId is null
+                                    || lessonType.RequiresRoom && draft.RoomId is null))
+                .ToList();
+            if (requiredIncompleteDrafts.Count == 0)
+            {
+                return 0;
+            }
+
+            var buildingIds = roomsAll
+                .Where(room => room.BuildingId != 0)
+                .Select(room => room.BuildingId)
+                .Distinct()
+                .OrderBy(buildingId => buildingId)
+                .ToArray();
+            var maximumTravelMinutes = buildingIds.Length == 0
+                ? 0
+                : buildingIds
+                    .SelectMany(fromBuildingId => buildingIds.Select(toBuildingId =>
+                        TravelMinutes(fromBuildingId, toBuildingId)))
+                    .DefaultIfEmpty(0)
+                    .Max();
+            var rotatedDraftCount = 0;
+
+            foreach (var incompleteSlot in requiredIncompleteDrafts
+                         .GroupBy(draft => new { draft.Date, draft.StartTime, draft.EndTime })
+                         .OrderBy(group => group.Key.Date)
+                         .ThenBy(group => group.Key.StartTime)
+                         .ThenBy(group => group.Key.EndTime))
+            {
+                var date = incompleteSlot.Key.Date;
+                var firstIncompleteDraft = incompleteSlot.First();
+                if (rotatedSharedBoundaryDates.Contains(date)
+                    || !selectedGroupsById.TryGetValue(firstIncompleteDraft.GroupId, out var incompleteGroup))
+                {
+                    continue;
+                }
+                var daySlots = SharedSlotsForDate(incompleteGroup.CourseId, date).ToList();
+                var slotPositionByTime = daySlots
+                    .Select((slot, position) => new { slot, position })
+                    .ToDictionary(entry => (entry.slot.Start, entry.slot.End), entry => entry.position);
+                if (daySlots.Count == 0
+                    || !slotPositionByTime.TryGetValue(
+                        (incompleteSlot.Key.StartTime, incompleteSlot.Key.EndTime),
+                        out var incompletePosition)
+                    || incompletePosition <= 0)
+                {
+                    continue;
+                }
+
+                var pivotPosition = incompletePosition - 1;
+                var pivotSlot = daySlots[pivotPosition];
+                var incompleteGroupIds = incompleteSlot
+                    .Select(draft => draft.GroupId)
+                    .ToHashSet();
+                var pivotOccurrence = movableDrafts
+                    .Where(draft => allCreatedDrafts.Contains(draft)
+                                    && draft.Status == DraftStatus.Draft
+                                    && !draft.IsLocked
+                                    && draft.Date == date
+                                    && draft.StartTime == pivotSlot.Start
+                                    && draft.EndTime == pivotSlot.End
+                                    && !draft.IsSelfStudy
+                                    && CanShareAcrossGroups(draft.LessonTypeId))
+                    .GroupBy(draft => new
+                    {
+                        draft.ModuleId,
+                        draft.LessonTypeId,
+                        draft.ModuleTopicId,
+                        draft.TeacherId,
+                        draft.RoomId
+                    })
+                    .Select(group => group
+                        .OrderBy(draft => draft.GroupId)
+                        .ThenBy(draft => draft.Id)
+                        .ToList())
+                    .Where(group => group.Count > 1
+                                    && incompleteGroupIds.IsSubsetOf(group.Select(draft => draft.GroupId)))
+                    .OrderByDescending(group => group.Count)
+                    .ThenBy(group => group[0].ModuleId)
+                    .ThenBy(group => group[0].ModuleTopicId)
+                    .FirstOrDefault();
+                if (pivotOccurrence is null)
+                {
+                    continue;
+                }
+
+                var pivotGroupIds = pivotOccurrence
+                    .Select(draft => draft.GroupId)
+                    .ToHashSet();
+                if (!selectedGroupsById.TryGetValue(pivotOccurrence[0].GroupId, out var pivotGroup))
+                {
+                    continue;
+                }
+                var tailDrafts = movableDrafts
+                    .Where(draft => allCreatedDrafts.Contains(draft)
+                                    && draft.Status == DraftStatus.Draft
+                                    && !draft.IsLocked
+                                    && draft.Date == date
+                                    && pivotGroupIds.Contains(draft.GroupId)
+                                    && slotPositionByTime.TryGetValue((draft.StartTime, draft.EndTime), out var position)
+                                    && position >= pivotPosition
+                                    && !excludedTypeIds.Contains(draft.LessonTypeId))
+                    .OrderBy(draft => draft.GroupId)
+                    .ThenBy(draft => draft.StartTime)
+                    .ThenBy(draft => draft.EndTime)
+                    .ThenBy(draft => draft.Id)
+                    .ToList();
+                var expectedTailPositions = daySlots.Count - pivotPosition;
+                var completeTail = pivotGroupIds.All(groupId =>
+                {
+                    var groupTail = tailDrafts.Where(draft => draft.GroupId == groupId).ToList();
+                    return groupTail.Count == expectedTailPositions
+                           && groupTail
+                               .Select(draft => slotPositionByTime[(draft.StartTime, draft.EndTime)])
+                               .Distinct()
+                               .Count() == expectedTailPositions;
+                });
+                if (!completeTail
+                    || tailDrafts.Any(draft => !string.IsNullOrWhiteSpace(draft.BatchKey)))
+                {
+                    continue;
+                }
+
+                var pivotSet = pivotOccurrence.ToHashSet();
+                var hasOtherCrossGroupPackage = tailDrafts
+                    .Where(draft => !pivotSet.Contains(draft) && CanShareAcrossGroups(draft.LessonTypeId))
+                    .GroupBy(draft => new
+                    {
+                        draft.StartTime,
+                        draft.EndTime,
+                        draft.ModuleId,
+                        draft.LessonTypeId,
+                        draft.ModuleTopicId,
+                        draft.TeacherId,
+                        draft.RoomId
+                    })
+                    .Any(group => group.Select(draft => draft.GroupId).Distinct().Count() > 1);
+                if (hasOtherCrossGroupPackage)
+                {
+                    continue;
+                }
+
+                mainSequenceByCourse.TryGetValue(pivotGroup.CourseId, out var courseSequence);
+                var moduleGroupOrder = (courseSequence ?? new List<SequenceItem>())
+                    .GroupBy(item => item.ModuleId)
+                    .ToDictionary(group => group.Key, group => group.First().GroupOrder);
+                fillerByCourse.TryGetValue(pivotGroup.CourseId, out var courseFillers);
+                var fillerModuleIds = courseFillers ?? new HashSet<int>();
+
+                var itemByPlannerId = tailDrafts
+                    .Select((draft, index) => new { PlannerId = index + 1, Draft = draft })
+                    .ToDictionary(entry => entry.PlannerId, entry => entry.Draft);
+                var plannerItems = itemByPlannerId
+                    .Select(entry => new LogicalEventRotationItem(
+                        entry.Key,
+                        entry.Value.GroupId,
+                        entry.Value.ModuleId,
+                        slotPositionByTime[(entry.Value.StartTime, entry.Value.EndTime)],
+                        pivotSet.Contains(entry.Value)))
+                    .ToList();
+
+                foreach (var targetPosition in Enumerable.Range(
+                             pivotPosition + 1,
+                             daySlots.Count - pivotPosition - 1))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var availableBefore = (daySlots[targetPosition].Start.ToTimeSpan()
+                                           - daySlots[targetPosition - 1].End.ToTimeSpan()).TotalMinutes;
+                    var availableAfter = targetPosition + 1 >= daySlots.Count
+                        ? double.MaxValue
+                        : (daySlots[targetPosition + 1].Start.ToTimeSpan()
+                           - daySlots[targetPosition].End.ToTimeSpan()).TotalMinutes;
+                    if (availableBefore < maximumTravelMinutes
+                        || availableAfter < maximumTravelMinutes
+                        || !LogicalEventRotationPlanner.TryPlan(
+                            plannerItems,
+                            targetPosition,
+                            moduleGroupOrder,
+                            fillerModuleIds,
+                            50_000,
+                            out var positionByPlannerId,
+                            cancellationToken))
                     {
                         continue;
                     }
+                    cancellationToken.ThrowIfCancellationRequested();
 
-                    conflict = dayGroup
-                        .Where(draft => draft.StartTime < latestLectureStart.Value
-                                        && !CanShareAcrossGroups(draft.LessonTypeId)
-                                        && !excludedTypeIds.Contains(draft.LessonTypeId))
-                        .OrderBy(draft => draft.StartTime)
-                        .FirstOrDefault();
-                    if (conflict is not null)
+                    var busySnapshot = busy.ToList();
+                    var topicOrderSnapshot = topicOrderSlots.ToList();
+                    var draftTimeSnapshot = tailDrafts.ToDictionary(
+                        draft => draft,
+                        draft => (draft.StartTime, draft.EndTime, draft.DayOfWeek, draft.UpdatedAt));
+                    var allBusySlotsFound = true;
+                    foreach (var draft in tailDrafts)
                     {
+                        var previousBusy = FindBusySlotForDraft(draft, draft.StartTime, draft.EndTime);
+                        if (previousBusy is null || !RemoveBusySlot(previousBusy))
+                        {
+                            allBusySlotsFound = false;
+                            break;
+                        }
+                    }
+                    if (!allBusySlotsFound)
+                    {
+                        RestoreBusyState(busySnapshot, topicOrderSnapshot);
+                        continue;
+                    }
+                    var hasExternalSharedSibling = tailDrafts
+                        .Where(draft => CanShareAcrossGroups(draft.LessonTypeId))
+                        .Any(draft => BusyForDate(draft.Date).Any(slot => IsSameShareableBusySlot(
+                            slot,
+                            draft.ModuleId,
+                            draft.LessonTypeId,
+                            draft.ModuleTopicId,
+                            draft.TeacherId,
+                            draft.RoomId,
+                            draft.Date,
+                            draft.StartTime,
+                            draft.EndTime)));
+                    if (hasExternalSharedSibling)
+                    {
+                        RestoreBusyState(busySnapshot, topicOrderSnapshot);
+                        continue;
+                    }
+
+                    foreach (var assignment in positionByPlannerId)
+                    {
+                        var draft = itemByPlannerId[assignment.Key];
+                        var targetSlot = daySlots[assignment.Value];
+                        draft.StartTime = targetSlot.Start;
+                        draft.EndTime = targetSlot.End;
+                        draft.DayOfWeek = date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
+                        draft.UpdatedAt = DateTime.UtcNow;
+                    }
+
+                    var pivotTargetSlot = daySlots[targetPosition];
+                    var allMovedTeachersFit = tailDrafts.All(draft =>
+                        draft.TeacherId is not int teacherId
+                        || TeacherFitsWorkingHours(teacherId, date, draft.StartTime, draft.EndTime));
+                    if (!allMovedTeachersFit)
+                    {
+                        foreach (var snapshot in draftTimeSnapshot)
+                        {
+                            snapshot.Key.StartTime = snapshot.Value.StartTime;
+                            snapshot.Key.EndTime = snapshot.Value.EndTime;
+                            snapshot.Key.DayOfWeek = snapshot.Value.DayOfWeek;
+                            snapshot.Key.UpdatedAt = snapshot.Value.UpdatedAt;
+                        }
+                        RestoreBusyState(busySnapshot, topicOrderSnapshot);
+                        continue;
+                    }
+
+                    foreach (var draft in tailDrafts)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var buildingId = draft.RoomId is int roomId
+                                         && roomBuildingById.TryGetValue(roomId, out var resolvedBuildingId)
+                            ? resolvedBuildingId
+                            : (int?)null;
+                        AddBusySlot(new BusySlot(
+                            draft.GroupId,
+                            draft.TeacherId,
+                            draft.RoomId,
+                            draft.Date,
+                            draft.StartTime,
+                            draft.EndTime,
+                            buildingId,
+                            draft.ModuleId,
+                            draft.LessonTypeId,
+                            draft.ModuleTopicId,
+                            true));
+                        var entry = _db.Entry(draft);
+                        if (draft.Id > 0 && entry.State == EntityState.Unchanged)
+                        {
+                            entry.State = EntityState.Modified;
+                        }
+                    }
+
+                    rotatedSharedBoundaryDates.Add(date);
+                    rotatedDraftCount += tailDrafts.Count;
+                    warnings.Add(
+                        $"[{date:yyyy-MM-dd}] Фінальний repair переніс спільний потік зі слоту {pivotSlot.Start:HH\\:mm}-{pivotSlot.End:HH\\:mm} "
+                        + $"у слот {pivotTargetSlot.Start:HH\\:mm}-{pivotTargetSlot.End:HH\\:mm} та зберіг порядок логічних занять {pivotGroupIds.Count} груп.");
+                    break;
+                }
+            }
+
+            return rotatedDraftCount;
+        }
+        bool RotatedDatesPassHardResourceGuard()
+        {
+            bool ViolatesTravel(
+                Func<BusySlot, bool> ownerMatch,
+                Room? room,
+                DateOnly date,
+                TimeOnly start,
+                TimeOnly end)
+            {
+                if (room is null)
+                {
+                    return false;
+                }
+                foreach (var existing in BusyForDate(date).Where(existing =>
+                             RequiresPhysicalRoom(existing) && ownerMatch(existing)))
+                {
+                    if (existing.RoomId is not int sourceRoomId)
+                    {
+                        continue;
+                    }
+                    var neededMinutes = TransitionMinutes(
+                        sourceRoomId,
+                        existing.BuildingId!.Value,
+                        room.Id,
+                        room.BuildingId);
+                    var gapBefore = (start.ToTimeSpan() - existing.EndTime.ToTimeSpan()).TotalMinutes;
+                    var gapAfter = (existing.StartTime.ToTimeSpan() - end.ToTimeSpan()).TotalMinutes;
+                    if (existing.EndTime <= start && gapBefore < neededMinutes
+                        || end <= existing.StartTime && gapAfter < neededMinutes)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            foreach (var date in rotatedSharedBoundaryDates.OrderBy(date => date))
+            {
+                var lectureOrderIsInvalid = movableDrafts
+                    .Where(draft => draft.Status == DraftStatus.Draft
+                                    && draft.Date == date
+                                    && selectedGroupIdSet.Contains(draft.GroupId)
+                                    && _db.Entry(draft).State is not EntityState.Deleted and not EntityState.Detached
+                                    && !excludedTypeIds.Contains(draft.LessonTypeId))
+                    .GroupBy(draft => draft.GroupId)
+                    .Any(group =>
+                    {
+                        var nonLectureStarted = false;
+                        foreach (var draft in group
+                                     .OrderBy(item => item.StartTime)
+                                     .ThenBy(item => item.EndTime))
+                        {
+                            if (CanShareAcrossGroups(draft.LessonTypeId))
+                            {
+                                if (nonLectureStarted)
+                                {
+                                    return true;
+                                }
+                            }
+                            else
+                            {
+                                nonLectureStarted = true;
+                            }
+                        }
+                        return false;
+                    });
+                if (lectureOrderIsInvalid)
+                {
+                    return false;
+                }
+
+                var placements = movableDrafts
+                    .Where(draft => draft.Status == DraftStatus.Draft
+                                    && draft.Date == date
+                                    && selectedGroupIdSet.Contains(draft.GroupId)
+                                    && _db.Entry(draft).State is not EntityState.Deleted and not EntityState.Detached)
+                    .GroupBy(draft => new
+                    {
+                        draft.StartTime,
+                        draft.EndTime,
+                        draft.ModuleId,
+                        draft.LessonTypeId,
+                        draft.ModuleTopicId,
+                        draft.TeacherId,
+                        draft.RoomId,
+                        IndependentGroupId = CanShareAcrossGroups(draft.LessonTypeId) ? 0 : draft.GroupId
+                    })
+                    .OrderBy(group => group.Key.StartTime)
+                    .ThenBy(group => group.Key.EndTime)
+                    .ThenBy(group => group.Key.ModuleId)
+                    .ThenBy(group => group.Key.ModuleTopicId)
+                    .ThenBy(group => group.Key.IndependentGroupId)
+                    .ToList();
+                foreach (var placement in placements)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var logicalDrafts = placement.ToList();
+                    var removedBusySlots = new List<BusySlot>();
+                    var removedAll = true;
+                    foreach (var draft in logicalDrafts)
+                    {
+                        var currentBusy = FindBusySlotForDraft(draft, draft.StartTime, draft.EndTime);
+                        if (currentBusy is null || !RemoveBusySlot(currentBusy))
+                        {
+                            removedAll = false;
+                            break;
+                        }
+                        removedBusySlots.Add(currentBusy);
+                    }
+                    if (!removedAll)
+                    {
+                        foreach (var removedBusy in removedBusySlots)
+                        {
+                            AddBusySlot(removedBusy);
+                        }
+                        return false;
+                    }
+
+                    var first = logicalDrafts[0];
+                    var room = first.RoomId is int roomId
+                        ? roomsAll.FirstOrDefault(candidate => candidate.Id == roomId)
+                        : null;
+                    var groupIds = logicalDrafts.Select(draft => draft.GroupId).Distinct().ToList();
+                    var valid = typeById.TryGetValue(first.LessonTypeId, out var lessonType)
+                                && (!lessonType.RequiresTeacher || first.TeacherId is not null)
+                                && (!lessonType.RequiresRoom || room is not null)
+                                && (first.TeacherId is not int teacherId
+                                    || TeacherFitsWorkingHours(
+                                        teacherId,
+                                        first.Date,
+                                        first.StartTime,
+                                        first.EndTime))
+                                && TryValidatePlacementAgainstBusy(
+                                    first.ModuleId,
+                                    first.LessonTypeId,
+                                    first.ModuleTopicId,
+                                    first.TeacherId,
+                                    room,
+                                    first.Date,
+                                    first.StartTime,
+                                    first.EndTime,
+                                    groupIds,
+                                    out _)
+                                && !groupIds.Any(groupId => ViolatesTravel(
+                                    existing => existing.GroupId == groupId,
+                                    room,
+                                    first.Date,
+                                    first.StartTime,
+                                    first.EndTime))
+                                && (first.TeacherId is not int teacherForTravel
+                                    || !ViolatesTravel(
+                                        existing => existing.TeacherId == teacherForTravel,
+                                        room,
+                                        first.Date,
+                                        first.StartTime,
+                                        first.EndTime));
+                    foreach (var removedBusy in removedBusySlots)
+                    {
+                        AddBusySlot(removedBusy);
+                    }
+                    if (!valid)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+        int RunFinalAdjacentRoomPairRematch(IReadOnlySet<TeacherDraftItem> rematchScope)
+        {
+            bool CanTravelBetween(Room fromRoom, Room toRoom, double availableMinutes)
+                => availableMinutes >= TransitionMinutes(
+                    fromRoom.Id,
+                    fromRoom.BuildingId,
+                    toRoom.Id,
+                    toRoom.BuildingId);
+
+            bool ViolatesFixedTravel(
+                Func<BusySlot, bool> ownerMatch,
+                Room room,
+                DateOnly date,
+                TimeOnly start,
+                TimeOnly end)
+            {
+                foreach (var existing in BusyForDate(date).Where(existing =>
+                             RequiresPhysicalRoom(existing) && ownerMatch(existing)))
+                {
+                    if (existing.RoomId is not int sourceRoomId)
+                    {
+                        continue;
+                    }
+                    var neededMinutes = TransitionMinutes(
+                        sourceRoomId,
+                        existing.BuildingId!.Value,
+                        room.Id,
+                        room.BuildingId);
+                    var beforeMinutes = (start.ToTimeSpan() - existing.EndTime.ToTimeSpan()).TotalMinutes;
+                    var afterMinutes = (existing.StartTime.ToTimeSpan() - end.ToTimeSpan()).TotalMinutes;
+                    if (existing.EndTime <= start && beforeMinutes < neededMinutes
+                        || end <= existing.StartTime && afterMinutes < neededMinutes)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            List<Room> RoomsForDraft(TeacherDraftItem draft, Group group)
+            {
+                allowedRoomsByModule.TryGetValue(draft.ModuleId, out var allowedRooms);
+                allowedBuildingsByModule.TryGetValue(draft.ModuleId, out var allowedBuildings);
+                return roomsAll
+                    .Where(room => room.Capacity >= group.StudentsCount
+                                   && (allowedRooms == null || allowedRooms.Count == 0 || allowedRooms.Contains(room.Id))
+                                   && (allowedBuildings == null || allowedBuildings.Count == 0 || allowedBuildings.Contains(room.BuildingId))
+                                   && (softFill || RoomMatchesGroupPreferenceFor(draft.GroupId, room)))
+                    .OrderBy(room => room.Id == draft.RoomId ? 0 : 1)
+                    .ThenBy(room => room.Capacity)
+                    .ThenBy(room => room.Id)
+                    .ToList();
+            }
+
+            void ApplyRoom(TeacherDraftItem draft, Room room)
+            {
+                var previousRoomId = draft.RoomId;
+                draft.RoomId = room.Id;
+                if (typeById.TryGetValue(draft.LessonTypeId, out var lessonType))
+                {
+                    draft.ValidationWarnings = BuildIncompleteDraftWarningJson(
+                        lessonType.RequiresTeacher && draft.TeacherId is null,
+                        lessonType.RequiresRoom && draft.RoomId is null);
+                }
+                draft.UpdatedAt = DateTime.UtcNow;
+                var entry = _db.Entry(draft);
+                if (draft.Id > 0 && entry.State == EntityState.Unchanged)
+                {
+                    entry.State = EntityState.Modified;
+                }
+                if (previousRoomId != room.Id)
+                {
+                    if (previousRoomId is int oldRoomId
+                        && roomUsageByGroup.TryGetValue(draft.GroupId, out var oldUsage)
+                        && oldUsage.TryGetValue(oldRoomId, out var oldCount))
+                    {
+                        if (oldCount <= 1)
+                        {
+                            oldUsage.Remove(oldRoomId);
+                        }
+                        else
+                        {
+                            oldUsage[oldRoomId] = oldCount - 1;
+                        }
+                    }
+                    if (!roomUsageByGroup.TryGetValue(draft.GroupId, out var newUsage))
+                    {
+                        newUsage = new Dictionary<int, int>();
+                        roomUsageByGroup[draft.GroupId] = newUsage;
+                    }
+                    newUsage[room.Id] = newUsage.TryGetValue(room.Id, out var newCount)
+                        ? newCount + 1
+                        : 1;
+                }
+                if (createdDraftAccounting.TryGetValue(draft, out var accounting))
+                {
+                    accounting.RoomUsageGroupId = draft.GroupId;
+                    accounting.RoomUsageRoomId = room.Id;
+                    if (accounting.IncompleteDraftCounted
+                        && (!typeById.TryGetValue(draft.LessonTypeId, out var type)
+                            || !type.RequiresTeacher
+                            || draft.TeacherId is not null))
+                    {
+                        if (incompleteDraftsCreated > 0)
+                        {
+                            incompleteDraftsCreated--;
+                        }
+                        if (accounting.MissingRoomCounted && incompleteMissingRoomCount > 0)
+                        {
+                            incompleteMissingRoomCount--;
+                        }
+                        if (accounting.MissingBothCounted && incompleteMissingBothCount > 0)
+                        {
+                            incompleteMissingBothCount--;
+                        }
+                        accounting.IncompleteDraftCounted = false;
+                        accounting.MissingRoomCounted = false;
+                        accounting.MissingBothCounted = false;
+                    }
+                }
+            }
+
+            var assigned = 0;
+            var activeDrafts = movableDrafts
+                .Where(draft => rematchScope.Contains(draft)
+                                && draft.Status == DraftStatus.Draft
+                                && string.IsNullOrWhiteSpace(draft.BatchKey)
+                                && selectedGroupIdSet.Contains(draft.GroupId)
+                                && draft.Date >= rangeStartDate
+                                && draft.Date < rangeEndDateExclusive)
+                .Distinct()
+                .ToList();
+            var roomGapSlots = activeDrafts
+                .Where(draft => typeById.TryGetValue(draft.LessonTypeId, out var lessonType)
+                                && lessonType.RequiresRoom
+                                && draft.RoomId is null)
+                .Select(draft => (draft.Date, draft.StartTime, draft.EndTime))
+                .Distinct()
+                .OrderBy(slot => slot.Date)
+                .ThenBy(slot => slot.StartTime)
+                .ToList();
+
+            foreach (var roomGapSlot in roomGapSlots)
+            {
+                var currentDrafts = activeDrafts
+                    .Where(draft => draft.Date == roomGapSlot.Date
+                                    && draft.StartTime == roomGapSlot.StartTime
+                                    && draft.EndTime == roomGapSlot.EndTime
+                                    && !draft.IsLocked
+                                    && !CanShareAcrossGroups(draft.LessonTypeId)
+                                    && typeById.TryGetValue(draft.LessonTypeId, out var lessonType)
+                                    && lessonType.RequiresRoom)
+                    .OrderBy(draft => draft.GroupId)
+                    .ToList();
+                if (currentDrafts.Count == 0)
+                {
+                    continue;
+                }
+                var previousByCurrent = new Dictionary<TeacherDraftItem, TeacherDraftItem>();
+                foreach (var currentDraft in currentDrafts)
+                {
+                    var previousDraft = activeDrafts
+                        .Where(draft => draft.GroupId == currentDraft.GroupId
+                                        && draft.Date == currentDraft.Date
+                                        && draft.EndTime <= currentDraft.StartTime
+                                        && !ReferenceEquals(draft, currentDraft))
+                        .OrderByDescending(draft => draft.EndTime)
+                        .ThenByDescending(draft => draft.StartTime)
+                        .FirstOrDefault();
+                    if (previousDraft is not null)
+                    {
+                        previousByCurrent[currentDraft] = previousDraft;
+                    }
+                }
+                if (previousByCurrent.Count != currentDrafts.Count)
+                {
+                    continue;
+                }
+                if (previousByCurrent.Values.Any(draft => draft.IsLocked
+                                                         || CanShareAcrossGroups(draft.LessonTypeId)
+                                                         || !typeById.TryGetValue(draft.LessonTypeId, out var lessonType)
+                                                         || !lessonType.RequiresRoom))
+                {
+                    continue;
+                }
+
+                var flexibleDrafts = currentDrafts
+                    .Concat(previousByCurrent.Values)
+                    .Distinct()
+                    .ToList();
+                var previousBusySlots = new List<BusySlot>();
+                var removedAll = true;
+                foreach (var draft in flexibleDrafts)
+                {
+                    var previousBusy = FindBusySlotForDraft(draft, draft.StartTime, draft.EndTime);
+                    if (previousBusy is null || !RemoveBusySlot(previousBusy))
+                    {
+                        removedAll = false;
+                        break;
+                    }
+                    previousBusySlots.Add(previousBusy);
+                }
+                if (!removedAll)
+                {
+                    foreach (var previousBusy in previousBusySlots)
+                    {
+                        AddBusySlot(previousBusy);
+                    }
+                    continue;
+                }
+
+                var optionsByCurrent = new Dictionary<TeacherDraftItem, List<(Room PreviousRoom, Room CurrentRoom)>>();
+                foreach (var currentDraft in currentDrafts)
+                {
+                    var previousDraft = previousByCurrent[currentDraft];
+                    var group = selectedGroupsById[currentDraft.GroupId];
+                    var availableMinutes = (currentDraft.StartTime.ToTimeSpan() - previousDraft.EndTime.ToTimeSpan()).TotalMinutes;
+                    var previousRooms = RoomsForDraft(previousDraft, group)
+                        .Where(room => !HasRoomOverlap(room.Id, previousDraft.LessonTypeId, previousDraft.Date, previousDraft.StartTime, previousDraft.EndTime)
+                                       && !ViolatesFixedTravel(
+                                           existing => existing.GroupId == previousDraft.GroupId,
+                                           room,
+                                           previousDraft.Date,
+                                           previousDraft.StartTime,
+                                           previousDraft.EndTime)
+                                       && (previousDraft.TeacherId is not int teacherId
+                                           || !ViolatesFixedTravel(
+                                               existing => existing.TeacherId == teacherId,
+                                               room,
+                                               previousDraft.Date,
+                                               previousDraft.StartTime,
+                                               previousDraft.EndTime)))
+                        .ToList();
+                    var currentRooms = RoomsForDraft(currentDraft, group)
+                        .Where(room => !HasRoomOverlap(room.Id, currentDraft.LessonTypeId, currentDraft.Date, currentDraft.StartTime, currentDraft.EndTime)
+                                       && !ViolatesFixedTravel(
+                                           existing => existing.GroupId == currentDraft.GroupId,
+                                           room,
+                                           currentDraft.Date,
+                                           currentDraft.StartTime,
+                                           currentDraft.EndTime)
+                                       && (currentDraft.TeacherId is not int teacherId
+                                           || !ViolatesFixedTravel(
+                                               existing => existing.TeacherId == teacherId,
+                                               room,
+                                               currentDraft.Date,
+                                               currentDraft.StartTime,
+                                               currentDraft.EndTime)))
+                        .ToList();
+                    var options = previousRooms
+                        .SelectMany(previousRoom => currentRooms
+                            .Where(currentRoom => CanTravelBetween(previousRoom, currentRoom, availableMinutes))
+                            .Where(currentRoom => previousDraft.TeacherId != currentDraft.TeacherId
+                                                  || CanTravelBetween(previousRoom, currentRoom, availableMinutes))
+                            .Select(currentRoom => (PreviousRoom: previousRoom, CurrentRoom: currentRoom)))
+                        .OrderBy(option => option.PreviousRoom.Id == previousDraft.RoomId ? 0 : 1)
+                        .ThenBy(option => option.CurrentRoom.Id == currentDraft.RoomId ? 0 : 1)
+                        .ThenBy(option => option.PreviousRoom.Id)
+                        .ThenBy(option => option.CurrentRoom.Id)
+                        .ToList();
+                    optionsByCurrent[currentDraft] = options;
+                }
+
+                if (optionsByCurrent.Values.Any(options => options.Count == 0))
+                {
+                    foreach (var previousBusy in previousBusySlots)
+                    {
+                        AddBusySlot(previousBusy);
+                    }
+                    continue;
+                }
+
+                var orderedCurrents = currentDrafts
+                    .OrderBy(draft => optionsByCurrent[draft].Count)
+                    .ThenBy(draft => draft.GroupId)
+                    .ToList();
+                var chosen = new Dictionary<TeacherDraftItem, (Room PreviousRoom, Room CurrentRoom)>();
+                bool TeacherTransitionIsValid(
+                    TeacherDraftItem firstDraft,
+                    Room firstRoom,
+                    TeacherDraftItem secondDraft,
+                    Room secondRoom)
+                {
+                    if (firstDraft.TeacherId is not int firstTeacherId
+                        || secondDraft.TeacherId != firstTeacherId)
+                    {
+                        return true;
+                    }
+                    if (firstDraft.EndTime <= secondDraft.StartTime)
+                    {
+                        var availableMinutes = (secondDraft.StartTime.ToTimeSpan() - firstDraft.EndTime.ToTimeSpan()).TotalMinutes;
+                        return CanTravelBetween(firstRoom, secondRoom, availableMinutes);
+                    }
+                    if (secondDraft.EndTime <= firstDraft.StartTime)
+                    {
+                        var availableMinutes = (firstDraft.StartTime.ToTimeSpan() - secondDraft.EndTime.ToTimeSpan()).TotalMinutes;
+                        return CanTravelBetween(secondRoom, firstRoom, availableMinutes);
+                    }
+                    return false;
+                }
+                const int maxRoomPairSearchNodes = 100_000;
+                var roomPairSearchNodes = 0;
+                var roomPairSearchLimitReached = false;
+                bool SearchRoomPairs(int index)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (index >= orderedCurrents.Count)
+                    {
+                        return true;
+                    }
+                    if (++roomPairSearchNodes > maxRoomPairSearchNodes)
+                    {
+                        roomPairSearchLimitReached = true;
+                        return false;
+                    }
+                    var currentDraft = orderedCurrents[index];
+                    var previousDraft = previousByCurrent[currentDraft];
+                    foreach (var option in optionsByCurrent[currentDraft])
+                    {
+                        var roomConflict = chosen.Any(existingChoice =>
+                        {
+                            var existingPreviousDraft = previousByCurrent[existingChoice.Key];
+                            var previousSlotsOverlap = previousDraft.StartTime < existingPreviousDraft.EndTime
+                                                       && existingPreviousDraft.StartTime < previousDraft.EndTime;
+                            var currentSlotsOverlap = currentDraft.StartTime < existingChoice.Key.EndTime
+                                                      && existingChoice.Key.StartTime < currentDraft.EndTime;
+                            return previousSlotsOverlap
+                                   && BlocksRoomSlot(previousDraft.LessonTypeId)
+                                   && BlocksRoomSlot(existingPreviousDraft.LessonTypeId)
+                                   && option.PreviousRoom.Id == existingChoice.Value.PreviousRoom.Id
+                                   || currentSlotsOverlap
+                                   && BlocksRoomSlot(currentDraft.LessonTypeId)
+                                   && BlocksRoomSlot(existingChoice.Key.LessonTypeId)
+                                   && option.CurrentRoom.Id == existingChoice.Value.CurrentRoom.Id;
+                        });
+                        if (roomConflict)
+                        {
+                            continue;
+                        }
+                        var teacherTransitionValid = true;
+                        foreach (var existingChoice in chosen)
+                        {
+                            var existingPreviousDraft = previousByCurrent[existingChoice.Key];
+                            if (!TeacherTransitionIsValid(
+                                    previousDraft,
+                                    option.PreviousRoom,
+                                    existingPreviousDraft,
+                                    existingChoice.Value.PreviousRoom)
+                                || !TeacherTransitionIsValid(
+                                    previousDraft,
+                                    option.PreviousRoom,
+                                    existingChoice.Key,
+                                    existingChoice.Value.CurrentRoom)
+                                || !TeacherTransitionIsValid(
+                                    currentDraft,
+                                    option.CurrentRoom,
+                                    existingPreviousDraft,
+                                    existingChoice.Value.PreviousRoom)
+                                || !TeacherTransitionIsValid(
+                                    currentDraft,
+                                    option.CurrentRoom,
+                                    existingChoice.Key,
+                                    existingChoice.Value.CurrentRoom))
+                            {
+                                teacherTransitionValid = false;
+                                break;
+                            }
+                        }
+                        if (!teacherTransitionValid)
+                        {
+                            continue;
+                        }
+                        chosen[currentDraft] = option;
+                        if (SearchRoomPairs(index + 1))
+                        {
+                            return true;
+                        }
+                        chosen.Remove(currentDraft);
+                        if (roomPairSearchLimitReached)
+                        {
+                            return false;
+                        }
+                    }
+                    return false;
+                }
+
+                if (!SearchRoomPairs(0))
+                {
+                    foreach (var previousBusy in previousBusySlots)
+                    {
+                        AddBusySlot(previousBusy);
+                    }
+                    if (roomPairSearchLimitReached)
+                    {
+                        warnings.Add($"[{roomGapSlot.Date:yyyy-MM-dd} {roomGapSlot.StartTime:HH\\:mm}-{roomGapSlot.EndTime:HH\\:mm}] Фінальний matching суміжних аудиторій зупинено після досягнення безпечної межі пошуку {maxRoomPairSearchNodes} вузлів.");
+                    }
+                    continue;
+                }
+
+                foreach (var currentDraft in currentDrafts)
+                {
+                    var previousDraft = previousByCurrent[currentDraft];
+                    var option = chosen[currentDraft];
+                    var previousChanged = previousDraft.RoomId != option.PreviousRoom.Id;
+                    var currentChanged = currentDraft.RoomId != option.CurrentRoom.Id;
+                    ApplyRoom(previousDraft, option.PreviousRoom);
+                    ApplyRoom(currentDraft, option.CurrentRoom);
+                    if (previousChanged)
+                    {
+                        assigned++;
+                    }
+                    if (currentChanged)
+                    {
+                        assigned++;
+                    }
+                    AddBusySlot(new BusySlot(
+                        previousDraft.GroupId,
+                        previousDraft.TeacherId,
+                        previousDraft.RoomId,
+                        previousDraft.Date,
+                        previousDraft.StartTime,
+                        previousDraft.EndTime,
+                        option.PreviousRoom.BuildingId,
+                        previousDraft.ModuleId,
+                        previousDraft.LessonTypeId,
+                        previousDraft.ModuleTopicId,
+                        true));
+                    AddBusySlot(new BusySlot(
+                        currentDraft.GroupId,
+                        currentDraft.TeacherId,
+                        currentDraft.RoomId,
+                        currentDraft.Date,
+                        currentDraft.StartTime,
+                        currentDraft.EndTime,
+                        option.CurrentRoom.BuildingId,
+                        currentDraft.ModuleId,
+                        currentDraft.LessonTypeId,
+                        currentDraft.ModuleTopicId,
+                        true));
+                }
+            }
+
+            return assigned;
+        }
+        int RunFinalDayWideRoomRematch(IReadOnlySet<TeacherDraftItem> rematchScope)
+        {
+            bool ViolatesFixedTravel(
+                Func<BusySlot, bool> ownerMatch,
+                Room room,
+                DateOnly date,
+                TimeOnly start,
+                TimeOnly end)
+            {
+                foreach (var existing in BusyForDate(date).Where(existing =>
+                             RequiresPhysicalRoom(existing) && ownerMatch(existing)))
+                {
+                    var sourceBuildingId = existing.BuildingId!.Value;
+                    if (existing.RoomId is not int sourceRoomId)
+                    {
+                        continue;
+                    }
+                    var neededMinutes = TransitionMinutes(
+                        sourceRoomId,
+                        sourceBuildingId,
+                        room.Id,
+                        room.BuildingId);
+                    var gapBefore = (start.ToTimeSpan() - existing.EndTime.ToTimeSpan()).TotalMinutes;
+                    var gapAfter = (existing.StartTime.ToTimeSpan() - end.ToTimeSpan()).TotalMinutes;
+                    if (existing.EndTime <= start && gapBefore < neededMinutes
+                        || end <= existing.StartTime && gapAfter < neededMinutes)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            bool TransitionIsValid(
+                TeacherDraftItem leftDraft,
+                Room leftRoom,
+                TeacherDraftItem rightDraft,
+                Room rightRoom)
+            {
+                if (leftDraft.StartTime < rightDraft.EndTime
+                    && rightDraft.StartTime < leftDraft.EndTime)
+                {
+                    return false;
+                }
+                if (leftDraft.EndTime <= rightDraft.StartTime)
+                {
+                    var available = (rightDraft.StartTime.ToTimeSpan() - leftDraft.EndTime.ToTimeSpan()).TotalMinutes;
+                    return available >= TransitionMinutes(
+                        leftRoom.Id,
+                        leftRoom.BuildingId,
+                        rightRoom.Id,
+                        rightRoom.BuildingId);
+                }
+                if (rightDraft.EndTime <= leftDraft.StartTime)
+                {
+                    var available = (leftDraft.StartTime.ToTimeSpan() - rightDraft.EndTime.ToTimeSpan()).TotalMinutes;
+                    return available >= TransitionMinutes(
+                        rightRoom.Id,
+                        rightRoom.BuildingId,
+                        leftRoom.Id,
+                        leftRoom.BuildingId);
+                }
+                return false;
+            }
+
+            void UpdateRoomUsage(TeacherDraftItem draft, int? previousRoomId, int roomId)
+            {
+                if (previousRoomId == roomId)
+                {
+                    return;
+                }
+                if (previousRoomId is int oldRoomId
+                    && roomUsageByGroup.TryGetValue(draft.GroupId, out var oldUsage)
+                    && oldUsage.TryGetValue(oldRoomId, out var oldCount))
+                {
+                    if (oldCount <= 1)
+                    {
+                        oldUsage.Remove(oldRoomId);
+                    }
+                    else
+                    {
+                        oldUsage[oldRoomId] = oldCount - 1;
+                    }
+                }
+                if (!roomUsageByGroup.TryGetValue(draft.GroupId, out var newUsage))
+                {
+                    newUsage = new Dictionary<int, int>();
+                    roomUsageByGroup[draft.GroupId] = newUsage;
+                }
+                newUsage[roomId] = newUsage.TryGetValue(roomId, out var newCount)
+                    ? newCount + 1
+                    : 1;
+                if (createdDraftAccounting.TryGetValue(draft, out var accounting))
+                {
+                    accounting.RoomUsageGroupId = draft.GroupId;
+                    accounting.RoomUsageRoomId = roomId;
+                }
+            }
+
+            void MarkResourceState(TeacherDraftItem draft)
+            {
+                var lessonType = typeById[draft.LessonTypeId];
+                var missingTeacher = lessonType.RequiresTeacher && draft.TeacherId is null;
+                var missingRoom = lessonType.RequiresRoom && draft.RoomId is null;
+                draft.ValidationWarnings = BuildIncompleteDraftWarningJson(missingTeacher, missingRoom);
+                draft.UpdatedAt = DateTime.UtcNow;
+                var entry = _db.Entry(draft);
+                if (draft.Id > 0 && entry.State == EntityState.Unchanged)
+                {
+                    entry.State = EntityState.Modified;
+                }
+                if (!missingTeacher
+                    && !missingRoom
+                    && createdDraftAccounting.TryGetValue(draft, out var accounting))
+                {
+                    if (accounting.IncompleteDraftCounted && incompleteDraftsCreated > 0)
+                    {
+                        incompleteDraftsCreated--;
+                    }
+                    if (accounting.MissingTeacherCounted && incompleteMissingTeacherCount > 0)
+                    {
+                        incompleteMissingTeacherCount--;
+                    }
+                    if (accounting.MissingRoomCounted && incompleteMissingRoomCount > 0)
+                    {
+                        incompleteMissingRoomCount--;
+                    }
+                    if (accounting.MissingBothCounted && incompleteMissingBothCount > 0)
+                    {
+                        incompleteMissingBothCount--;
+                    }
+                    accounting.IncompleteDraftCounted = false;
+                    accounting.MissingTeacherCounted = false;
+                    accounting.MissingRoomCounted = false;
+                    accounting.MissingBothCounted = false;
+                }
+            }
+
+            var activeDrafts = movableDrafts
+                .Where(draft => rematchScope.Contains(draft)
+                                && draft.Status == DraftStatus.Draft
+                                && string.IsNullOrWhiteSpace(draft.BatchKey)
+                                && selectedGroupIdSet.Contains(draft.GroupId)
+                                && draft.Date >= rangeStartDate
+                                && draft.Date < rangeEndDateExclusive)
+                .Distinct()
+                .ToList();
+            var affectedDates = activeDrafts
+                .Where(draft => typeById.TryGetValue(draft.LessonTypeId, out var lessonType)
+                                && (lessonType.RequiresTeacher && draft.TeacherId is null
+                                    || lessonType.RequiresRoom && draft.RoomId is null))
+                .Select(draft => draft.Date)
+                .Distinct()
+                .OrderBy(date => date)
+                .ToList();
+            var assignedRooms = 0;
+
+            foreach (var date in affectedDates)
+            {
+                var dayDrafts = activeDrafts
+                    .Where(draft => draft.Date == date
+                                    && !draft.IsLocked
+                                    && !CanShareAcrossGroups(draft.LessonTypeId)
+                                    && typeById.TryGetValue(draft.LessonTypeId, out var lessonType)
+                                    && lessonType.RequiresRoom)
+                    .OrderBy(draft => draft.StartTime)
+                    .ThenBy(draft => draft.EndTime)
+                    .ThenBy(draft => draft.GroupId)
+                    .ThenBy(draft => draft.ModuleId)
+                    .ThenBy(draft => draft.ModuleTopicId)
+                    .ThenBy(draft => draft.Id)
+                    .ToList();
+                if (dayDrafts.Count == 0)
+                {
+                    continue;
+                }
+
+                var removedBusySlots = new List<BusySlot>();
+                var allBusyRemoved = true;
+                foreach (var draft in dayDrafts)
+                {
+                    var previousBusy = FindBusySlotForDraft(draft, draft.StartTime, draft.EndTime);
+                    if (previousBusy is null || !RemoveBusySlot(previousBusy))
+                    {
+                        allBusyRemoved = false;
+                        break;
+                    }
+                    removedBusySlots.Add(previousBusy);
+                }
+                if (!allBusyRemoved)
+                {
+                    foreach (var previousBusy in removedBusySlots)
+                    {
+                        AddBusySlot(previousBusy);
+                    }
+                    continue;
+                }
+
+                var optionIdsByEvent = new Dictionary<int, IReadOnlyList<int>>();
+                var optionById = new Dictionary<int, (int? TeacherId, int RoomId)>();
+                var nextOptionId = 1;
+                for (var eventIndex = 0; eventIndex < dayDrafts.Count; eventIndex++)
+                {
+                    var draft = dayDrafts[eventIndex];
+                    if (!selectedGroupsById.TryGetValue(draft.GroupId, out var group)
+                        || !typeById.TryGetValue(draft.LessonTypeId, out var lessonType))
+                    {
+                        optionIdsByEvent[eventIndex] = Array.Empty<int>();
+                        continue;
+                    }
+                    var topic = draft.ModuleTopicId is int topicId
+                                && topicById.TryGetValue(topicId, out var resolvedTopic)
+                        ? resolvedTopic
+                        : null;
+                    var teacherCandidates = lessonType.RequiresTeacher
+                        ? PreferredOrExplicitTeacherPool(
+                                (draft.IsSelfStudy
+                                ? supervisorsForModule
+                                    .Where(link => link.ModuleId == draft.ModuleId)
+                                    .Select(link => link.TeacherId)
+                                : teachersForModule
+                                    .Where(link => link.ModuleId == draft.ModuleId)
+                                    .Select(link => link.TeacherId))
+                                .Where(teacherId => TeacherFitsWorkingHours(
+                                    teacherId,
+                                    date,
+                                    draft.StartTime,
+                                    draft.EndTime))
+                                .Where(teacherId => !BlocksTeacherSlot(draft.LessonTypeId)
+                                                    || !HasTeacherOverlap(
+                                                        teacherId,
+                                                        draft.LessonTypeId,
+                                                        date,
+                                                        draft.StartTime,
+                                                        draft.EndTime)),
+                                topic)
+                            .OrderBy(teacherId => TeacherDepartmentPriority(teacherId, topic))
+                            .ThenBy(teacherId => teacherId == draft.TeacherId ? 0 : 1)
+                            .ThenBy(teacherId => TeacherLoadScore(teacherId, group.CourseId) * teacherLoadPenaltyWeight)
+                            .ThenBy(teacherId => teacherId)
+                            .Select(teacherId => (int?)teacherId)
+                            .ToList()
+                        : new List<int?> { draft.TeacherId };
+                    allowedRoomsByModule.TryGetValue(draft.ModuleId, out var allowedRooms);
+                    allowedBuildingsByModule.TryGetValue(draft.ModuleId, out var allowedBuildings);
+                    var options = teacherCandidates
+                        .SelectMany(teacherId => roomsAll
+                            .Where(room => room.Capacity >= group.StudentsCount
+                                           && (allowedRooms == null || allowedRooms.Count == 0 || allowedRooms.Contains(room.Id))
+                                           && (allowedBuildings == null || allowedBuildings.Count == 0 || allowedBuildings.Contains(room.BuildingId))
+                                           && (softFill || RoomMatchesGroupPreferenceFor(draft.GroupId, room))
+                                           && (!BlocksRoomSlot(draft.LessonTypeId)
+                                               || !HasRoomOverlap(room.Id, draft.LessonTypeId, date, draft.StartTime, draft.EndTime))
+                                           && !ViolatesFixedTravel(
+                                               existing => existing.GroupId == draft.GroupId,
+                                               room,
+                                               date,
+                                               draft.StartTime,
+                                               draft.EndTime)
+                                           && (teacherId is not int resolvedTeacherId
+                                               || !ViolatesFixedTravel(
+                                                   existing => existing.TeacherId == resolvedTeacherId,
+                                                   room,
+                                                   date,
+                                                   draft.StartTime,
+                                                   draft.EndTime))
+                                           && TryValidatePlacementAgainstBusy(
+                                               draft.ModuleId,
+                                               draft.LessonTypeId,
+                                               draft.ModuleTopicId,
+                                               teacherId,
+                                               room,
+                                               date,
+                                               draft.StartTime,
+                                               draft.EndTime,
+                                               new[] { draft.GroupId },
+                                               out _))
+                            .Select(room => (TeacherId: teacherId, Room: room)))
+                        .OrderBy(option => option.TeacherId == draft.TeacherId ? 0 : 1)
+                        .ThenBy(option => option.Room.Id == draft.RoomId ? 0 : 1)
+                        .ThenBy(option => option.TeacherId is int teacherId
+                            ? TeacherLoadScore(teacherId, group.CourseId) * teacherLoadPenaltyWeight
+                            : 0)
+                        .ThenBy(option => roomUsageByGroup.TryGetValue(draft.GroupId, out var usage)
+                                              && usage.TryGetValue(option.Room.Id, out var used)
+                            ? used
+                            : 0)
+                        .ThenBy(option => option.Room.Capacity)
+                        .ThenBy(option => option.TeacherId)
+                        .ThenBy(option => option.Room.Id)
+                        .ToList();
+                    var optionIds = new List<int>(options.Count);
+                    foreach (var option in options)
+                    {
+                        var optionId = nextOptionId++;
+                        optionById[optionId] = (option.TeacherId, option.Room.Id);
+                        optionIds.Add(optionId);
+                    }
+                    optionIdsByEvent[eventIndex] = optionIds;
+                }
+
+                var roomById = roomsAll.ToDictionary(room => room.Id);
+                var solved = DeterministicResourceMatcher.TrySolveConstrained(
+                    optionIdsByEvent,
+                    (eventIndex, optionId, partialAssignment) =>
+                    {
+                        var draft = dayDrafts[eventIndex];
+                        var option = optionById[optionId];
+                        var room = roomById[option.RoomId];
+                        foreach (var assigned in partialAssignment)
+                        {
+                            var otherDraft = dayDrafts[assigned.Key];
+                            var otherOption = optionById[assigned.Value];
+                            var otherRoom = roomById[otherOption.RoomId];
+                            var overlaps = draft.StartTime < otherDraft.EndTime
+                                           && otherDraft.StartTime < draft.EndTime;
+                            if (overlaps
+                                && BlocksRoomSlot(draft.LessonTypeId)
+                                && BlocksRoomSlot(otherDraft.LessonTypeId)
+                                && option.RoomId == otherOption.RoomId)
+                            {
+                                return false;
+                            }
+                            if (overlaps
+                                && option.TeacherId is int teacherId
+                                && otherOption.TeacherId == teacherId
+                                && BlocksTeacherSlot(draft.LessonTypeId)
+                                && BlocksTeacherSlot(otherDraft.LessonTypeId))
+                            {
+                                return false;
+                            }
+                            if (draft.GroupId == otherDraft.GroupId
+                                && !TransitionIsValid(draft, room, otherDraft, otherRoom))
+                            {
+                                return false;
+                            }
+                            if (option.TeacherId is int transitionTeacherId
+                                && otherOption.TeacherId == transitionTeacherId
+                                && !TransitionIsValid(draft, room, otherDraft, otherRoom))
+                            {
+                                return false;
+                            }
+                        }
+                        return true;
+                    },
+                    Math.Min(
+                        500_000,
+                        Math.Max(
+                            50_000,
+                            dayDrafts.Count * Math.Max(1, optionIdsByEvent.Values.Sum(options => options.Count) / Math.Max(1, dayDrafts.Count)) * 250)),
+                    out var resourceAssignment,
+                    out var resourceSearchLimitReached,
+                    cancellationToken);
+                if (!solved)
+                {
+                    foreach (var previousBusy in removedBusySlots)
+                    {
+                        AddBusySlot(previousBusy);
+                    }
+                    var candidateCounts = optionIdsByEvent.Values.Select(candidates => candidates.Count).ToList();
+                    var candidateSummary = candidateCounts.Count == 0
+                        ? "кандидатів немає"
+                        : $"мінімум={candidateCounts.Min()}, максимум={candidateCounts.Max()}, порожніх={candidateCounts.Count(count => count == 0)}, різних викладачів={optionById.Values.Select(option => option.TeacherId).Where(teacherId => teacherId is not null).Distinct().Count()}, різних аудиторій={optionById.Values.Select(option => option.RoomId).Distinct().Count()}";
+                    var limitSummary = resourceSearchLimitReached
+                        ? " Досягнуто межі пошуку."
+                        : string.Empty;
+                    warnings.Add($"[{date:yyyy-MM-dd}] Денний matching ресурсів не знайшов повного безпечного призначення для {dayDrafts.Count} занять ({candidateSummary}).{limitSummary}");
+                    continue;
+                }
+
+                for (var eventIndex = 0; eventIndex < dayDrafts.Count; eventIndex++)
+                {
+                    var draft = dayDrafts[eventIndex];
+                    var option = optionById[resourceAssignment[eventIndex]];
+                    var roomId = option.RoomId;
+                    var room = roomById[roomId];
+                    var previousTeacherId = draft.TeacherId;
+                    var previousRoomId = draft.RoomId;
+                    draft.TeacherId = option.TeacherId;
+                    draft.RoomId = roomId;
+                    if (previousTeacherId != draft.TeacherId)
+                    {
+                        assignedRooms++;
+                    }
+                    if (previousRoomId != roomId)
+                    {
+                        assignedRooms++;
+                        UpdateRoomUsage(draft, previousRoomId, roomId);
+                    }
+                    MarkResourceState(draft);
+                    AddBusySlot(new BusySlot(
+                        draft.GroupId,
+                        draft.TeacherId,
+                        roomId,
+                        draft.Date,
+                        draft.StartTime,
+                        draft.EndTime,
+                        room.BuildingId,
+                        draft.ModuleId,
+                        draft.LessonTypeId,
+                        draft.ModuleTopicId,
+                        true));
+                }
+            }
+
+            return assignedRooms;
+        }
+        int RunFinalRequiredResourceRematch(IReadOnlySet<TeacherDraftItem> rematchScope)
+        {
+            bool ViolatesFinalTravel(
+                Func<BusySlot, bool> ownerMatch,
+                Room? room,
+                DateOnly date,
+                TimeOnly start,
+                TimeOnly end)
+            {
+                if (room is null)
+                {
+                    return false;
+                }
+                foreach (var existing in BusyForDate(date).Where(existing =>
+                             RequiresPhysicalRoom(existing) && ownerMatch(existing)))
+                {
+                    var sourceBuildingId = existing.BuildingId!.Value;
+                    if (existing.RoomId is not int sourceRoomId)
+                    {
+                        continue;
+                    }
+                    var neededMinutes = TransitionMinutes(
+                        sourceRoomId,
+                        sourceBuildingId,
+                        room.Id,
+                        room.BuildingId);
+                    var gapBefore = (start.ToTimeSpan() - existing.EndTime.ToTimeSpan()).TotalMinutes;
+                    var gapAfter = (existing.StartTime.ToTimeSpan() - end.ToTimeSpan()).TotalMinutes;
+                    if (existing.EndTime <= start && gapBefore < neededMinutes
+                        || end <= existing.StartTime && gapAfter < neededMinutes)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            void UpdateFinalRoomUsage(TeacherDraftItem draft, int? previousRoomId, int? roomId)
+            {
+                if (previousRoomId == roomId)
+                {
+                    return;
+                }
+                if (previousRoomId is int oldRoomId
+                    && roomUsageByGroup.TryGetValue(draft.GroupId, out var oldUsage)
+                    && oldUsage.TryGetValue(oldRoomId, out var oldCount))
+                {
+                    if (oldCount <= 1)
+                    {
+                        oldUsage.Remove(oldRoomId);
+                    }
+                    else
+                    {
+                        oldUsage[oldRoomId] = oldCount - 1;
+                    }
+                }
+                if (roomId is int newRoomId)
+                {
+                    if (!roomUsageByGroup.TryGetValue(draft.GroupId, out var newUsage))
+                    {
+                        newUsage = new Dictionary<int, int>();
+                        roomUsageByGroup[draft.GroupId] = newUsage;
+                    }
+                    newUsage[newRoomId] = newUsage.TryGetValue(newRoomId, out var newCount)
+                        ? newCount + 1
+                        : 1;
+                }
+                if (createdDraftAccounting.TryGetValue(draft, out var accounting))
+                {
+                    accounting.RoomUsageGroupId = roomId is int ? draft.GroupId : null;
+                    accounting.RoomUsageRoomId = roomId;
+                }
+            }
+
+            var assignedResources = 0;
+            var activeDrafts = movableDrafts
+                .Where(draft => rematchScope.Contains(draft)
+                                && draft.Status == DraftStatus.Draft
+                                && string.IsNullOrWhiteSpace(draft.BatchKey)
+                                && selectedGroupIdSet.Contains(draft.GroupId)
+                                && draft.Date >= rangeStartDate
+                                && draft.Date < rangeEndDateExclusive)
+                .Distinct()
+                .ToList();
+            var targetSlots = activeDrafts
+                .Where(draft => typeById.TryGetValue(draft.LessonTypeId, out var lessonType)
+                                && (lessonType.RequiresTeacher && draft.TeacherId is null
+                                    || lessonType.RequiresRoom && draft.RoomId is null))
+                .Select(draft => (draft.Date, draft.StartTime, draft.EndTime))
+                .Distinct()
+                .OrderBy(slot => slot.Date)
+                .ThenBy(slot => slot.StartTime)
+                .ThenBy(slot => slot.EndTime)
+                .ToList();
+
+            foreach (var targetSlot in targetSlots)
+            {
+                var slotDrafts = activeDrafts
+                    .Where(draft => draft.Date == targetSlot.Date
+                                    && draft.StartTime == targetSlot.StartTime
+                                    && draft.EndTime == targetSlot.EndTime
+                                    && !draft.IsLocked
+                                    && !CanShareAcrossGroups(draft.LessonTypeId))
+                    .OrderBy(draft => draft.GroupId)
+                    .ThenBy(draft => draft.ModuleId)
+                    .ThenBy(draft => draft.ModuleTopicId)
+                    .ThenBy(draft => draft.Id)
+                    .ToList();
+                // Потокові та заблоковані події мають спільну семантику ресурсу.
+                // Їх не перебудовуємо цим консервативним непотоковим matching-проходом.
+                if (slotDrafts.Count == 0)
+                {
+                    continue;
+                }
+                var needsTeacherRematch = slotDrafts.Any(draft =>
+                    typeById.TryGetValue(draft.LessonTypeId, out var lessonType)
+                    && lessonType.RequiresTeacher
+                    && draft.TeacherId is null);
+                var needsRoomRematch = slotDrafts.Any(draft =>
+                    typeById.TryGetValue(draft.LessonTypeId, out var lessonType)
+                    && lessonType.RequiresRoom
+                    && draft.RoomId is null);
+
+                var previousBusySlots = new List<BusySlot>();
+                var allBusyRemoved = true;
+                foreach (var draft in slotDrafts)
+                {
+                    var previousBusy = FindBusySlotForDraft(draft, draft.StartTime, draft.EndTime);
+                    if (previousBusy is null || !RemoveBusySlot(previousBusy))
+                    {
+                        allBusyRemoved = false;
+                        break;
+                    }
+                    previousBusySlots.Add(previousBusy);
+                }
+                if (!allBusyRemoved)
+                {
+                    foreach (var previousBusy in previousBusySlots)
+                    {
+                        AddBusySlot(previousBusy);
+                    }
+                    continue;
+                }
+
+                var preferredTeacherCandidatesByEvent = new Dictionary<int, IReadOnlyList<int>>();
+                var allTeacherCandidatesByEvent = new Dictionary<int, IReadOnlyList<int>>();
+                var roomCandidatesByEvent = new Dictionary<int, IReadOnlyList<int>>();
+                var preferredIndependentTeacherCandidates = new Dictionary<int, IReadOnlyList<int>>();
+                var allIndependentTeacherCandidates = new Dictionary<int, IReadOnlyList<int>>();
+                var independentRoomCandidates = new Dictionary<int, IReadOnlyList<int>>();
+                var resourcesFeasible = true;
+                for (var eventIndex = 0; eventIndex < slotDrafts.Count; eventIndex++)
+                {
+                    var draft = slotDrafts[eventIndex];
+                    if (!typeById.TryGetValue(draft.LessonTypeId, out var lessonType)
+                        || !selectedGroupsById.TryGetValue(draft.GroupId, out var draftGroup))
+                    {
+                        resourcesFeasible = false;
+                        break;
+                    }
+                    var topic = draft.ModuleTopicId is int topicId
+                                && topicById.TryGetValue(topicId, out var resolvedTopic)
+                        ? resolvedTopic
+                        : null;
+
+                    if (needsTeacherRematch && lessonType.RequiresTeacher)
+                    {
+                        var allTeacherCandidates = (draft.IsSelfStudy
+                                ? supervisorsForModule
+                                    .Where(link => link.ModuleId == draft.ModuleId)
+                                    .Select(link => link.TeacherId)
+                                : teachersForModule
+                                    .Where(link => link.ModuleId == draft.ModuleId)
+                                    .Select(link => link.TeacherId))
+                            .Distinct()
+                            .Where(teacherId => TeacherFitsWorkingHours(
+                                teacherId,
+                                targetSlot.Date,
+                                targetSlot.StartTime,
+                                targetSlot.EndTime))
+                            .Where(teacherId => !BlocksTeacherSlot(draft.LessonTypeId)
+                                                || !HasTeacherOverlap(
+                                                    teacherId,
+                                                    draft.LessonTypeId,
+                                                    targetSlot.Date,
+                                                    targetSlot.StartTime,
+                                                    targetSlot.EndTime))
+                            .Where(teacherId => draft.RoomId is not int roomId
+                                                || roomsAll.FirstOrDefault(room => room.Id == roomId) is not { } room
+                                                || !ViolatesFinalTravel(
+                                                    existing => existing.TeacherId == teacherId,
+                                                    room,
+                                                    targetSlot.Date,
+                                                    targetSlot.StartTime,
+                                                    targetSlot.EndTime))
+                            .OrderBy(teacherId => teacherId == draft.TeacherId ? 0 : 1)
+                            .ThenBy(teacherId => TeacherDepartmentPriority(teacherId, topic))
+                            .ThenBy(teacherId => TeacherLoadScore(teacherId, draftGroup.CourseId) * teacherLoadPenaltyWeight)
+                            .ThenBy(teacherId => teacherId)
+                            .ToList();
+                        if (allTeacherCandidates.Count == 0)
+                        {
+                            resourcesFeasible = false;
+                            break;
+                        }
+                        var preferredTeacherCandidates = allTeacherCandidates
+                            .Where(teacherId => IsPreferredTeacherForTopic(teacherId, topic))
+                            .ToList();
+                        if (BlocksTeacherSlot(draft.LessonTypeId))
+                        {
+                            preferredTeacherCandidatesByEvent[eventIndex] = preferredTeacherCandidates;
+                            allTeacherCandidatesByEvent[eventIndex] = allTeacherCandidates;
+                        }
+                        else
+                        {
+                            preferredIndependentTeacherCandidates[eventIndex] = preferredTeacherCandidates;
+                            allIndependentTeacherCandidates[eventIndex] = allTeacherCandidates;
+                        }
+                    }
+
+                    if (needsRoomRematch && lessonType.RequiresRoom)
+                    {
+                        allowedRoomsByModule.TryGetValue(draft.ModuleId, out var allowedRooms);
+                        allowedBuildingsByModule.TryGetValue(draft.ModuleId, out var allowedBuildings);
+                        var roomCandidates = roomsAll
+                            .Where(room => room.Capacity >= draftGroup.StudentsCount
+                                           && (allowedRooms == null || allowedRooms.Count == 0 || allowedRooms.Contains(room.Id))
+                                           && (allowedBuildings == null || allowedBuildings.Count == 0 || allowedBuildings.Contains(room.BuildingId))
+                                           && (softFill || RoomMatchesGroupPreferenceFor(draft.GroupId, room))
+                                           && (!BlocksRoomSlot(draft.LessonTypeId)
+                                               || !HasRoomOverlap(
+                                                   room.Id,
+                                                   draft.LessonTypeId,
+                                                   targetSlot.Date,
+                                                   targetSlot.StartTime,
+                                                   targetSlot.EndTime))
+                                           && !ViolatesFinalTravel(
+                                               existing => existing.GroupId == draft.GroupId,
+                                               room,
+                                               targetSlot.Date,
+                                               targetSlot.StartTime,
+                                               targetSlot.EndTime)
+                                           && (draft.TeacherId is not int teacherId
+                                               || !ViolatesFinalTravel(
+                                                   existing => existing.TeacherId == teacherId,
+                                                   room,
+                                                   targetSlot.Date,
+                                                   targetSlot.StartTime,
+                                                   targetSlot.EndTime)))
+                            .OrderBy(room => room.Id == draft.RoomId ? 0 : 1)
+                            .ThenBy(room => room.Capacity)
+                            .ThenBy(room => room.Id)
+                            .Select(room => room.Id)
+                            .ToList();
+                        if (roomCandidates.Count == 0)
+                        {
+                            resourcesFeasible = false;
+                            break;
+                        }
+                        if (BlocksRoomSlot(draft.LessonTypeId))
+                        {
+                            roomCandidatesByEvent[eventIndex] = roomCandidates;
+                        }
+                        else
+                        {
+                            independentRoomCandidates[eventIndex] = roomCandidates;
+                        }
+                    }
+                }
+
+                IReadOnlyDictionary<int, int> matchedTeachers = new Dictionary<int, int>();
+                IReadOnlyDictionary<int, int> matchedRooms = new Dictionary<int, int>();
+                var strictTeachersMatched = resourcesFeasible
+                                            && DeterministicResourceMatcher.TryMatchAll(
+                                                preferredTeacherCandidatesByEvent,
+                                                out matchedTeachers);
+                var fallbackTeacherCount = 0;
+                var teacherFallbackSearchLimitReached = false;
+                var teachersMatched = strictTeachersMatched;
+                if (resourcesFeasible && !strictTeachersMatched)
+                {
+                    teachersMatched = DeterministicResourceMatcher.TryMatchAllMinimizeFallback(
+                        preferredTeacherCandidatesByEvent,
+                        allTeacherCandidatesByEvent,
+                        100_000,
+                        out matchedTeachers,
+                        out fallbackTeacherCount,
+                        out teacherFallbackSearchLimitReached,
+                        cancellationToken);
+                }
+                var roomsMatched = resourcesFeasible
+                                   && DeterministicResourceMatcher.TryMatchAll(
+                                       roomCandidatesByEvent,
+                                       out matchedRooms);
+                if (!resourcesFeasible || !teachersMatched || !roomsMatched)
+                {
+                    foreach (var previousBusy in previousBusySlots)
+                    {
+                        AddBusySlot(previousBusy);
+                    }
+                    var bottlenecks = new List<string>();
+                    if (!teachersMatched)
+                    {
+                        var teacherDemand = allTeacherCandidatesByEvent.Count;
+                        var distinctTeachers = allTeacherCandidatesByEvent.Values
+                            .SelectMany(candidates => candidates)
+                            .Distinct()
+                            .Count();
+                        var limitSuffix = teacherFallbackSearchLimitReached
+                            ? "; пошук зупинено після досягнення безпечного ліміту"
+                            : string.Empty;
+                        bottlenecks.Add($"для {teacherDemand} одночасних занять сукупно доступно {distinctTeachers} різних викладачів, але взаємно однозначне призначення відсутнє{limitSuffix}");
+                    }
+                    if (!roomsMatched)
+                    {
+                        var roomDemand = roomCandidatesByEvent.Count;
+                        var distinctRooms = roomCandidatesByEvent.Values
+                            .SelectMany(candidates => candidates)
+                            .Distinct()
+                            .Count();
+                        bottlenecks.Add($"для {roomDemand} одночасних занять після перевірки переходів сукупно доступно {distinctRooms} різних аудиторій, але взаємно однозначне призначення відсутнє");
+                    }
+                    var bottleneckSuffix = bottlenecks.Count == 0
+                        ? string.Empty
+                        : $" Причина: {string.Join("; ", bottlenecks)}.";
+                    warnings.Add($"[{targetSlot.Date:yyyy-MM-dd} {targetSlot.StartTime:HH\\:mm}-{targetSlot.EndTime:HH\\:mm}] Фінальний matching не знайшов повного набору обов'язкових ресурсів (кандидати={resourcesFeasible}, викладачі={teachersMatched}, аудиторії={roomsMatched}).{bottleneckSuffix}");
+                    continue;
+                }
+
+                var assignedTeachers = matchedTeachers.ToDictionary(entry => entry.Key, entry => entry.Value);
+                foreach (var entry in allIndependentTeacherCandidates)
+                {
+                    if (preferredIndependentTeacherCandidates.TryGetValue(entry.Key, out var preferredCandidates)
+                        && preferredCandidates.Count > 0)
+                    {
+                        assignedTeachers[entry.Key] = preferredCandidates[0];
+                    }
+                    else
+                    {
+                        assignedTeachers[entry.Key] = entry.Value[0];
+                        fallbackTeacherCount++;
+                    }
+                }
+                var assignedRooms = matchedRooms.ToDictionary(entry => entry.Key, entry => entry.Value);
+                foreach (var entry in independentRoomCandidates)
+                {
+                    assignedRooms[entry.Key] = entry.Value[0];
+                }
+
+                var pairFeasible = true;
+                for (var eventIndex = 0; eventIndex < slotDrafts.Count; eventIndex++)
+                {
+                    var draft = slotDrafts[eventIndex];
+                    var teacherId = assignedTeachers.TryGetValue(eventIndex, out var assignedTeacherId)
+                        ? assignedTeacherId
+                        : draft.TeacherId;
+                    var room = assignedRooms.TryGetValue(eventIndex, out var assignedRoomId)
+                        ? roomsAll.FirstOrDefault(candidate => candidate.Id == assignedRoomId)
+                        : draft.RoomId is int currentRoomId
+                            ? roomsAll.FirstOrDefault(candidate => candidate.Id == currentRoomId)
+                            : null;
+                    if (!TryValidatePlacementAgainstBusy(
+                            draft.ModuleId,
+                            draft.LessonTypeId,
+                            draft.ModuleTopicId,
+                            teacherId,
+                            room,
+                            targetSlot.Date,
+                            targetSlot.StartTime,
+                            targetSlot.EndTime,
+                            new[] { draft.GroupId },
+                            out _)
+                        || ViolatesFinalTravel(
+                            existing => existing.GroupId == draft.GroupId,
+                            room,
+                            targetSlot.Date,
+                            targetSlot.StartTime,
+                            targetSlot.EndTime)
+                        || teacherId is int teacherForTravel
+                        && ViolatesFinalTravel(
+                            existing => existing.TeacherId == teacherForTravel,
+                            room,
+                            targetSlot.Date,
+                            targetSlot.StartTime,
+                            targetSlot.EndTime)
+                        )
+                    {
+                        pairFeasible = false;
                         break;
                     }
                 }
-
-                if (conflict is null)
+                if (!pairFeasible)
                 {
-                    break;
-                }
-
-                var removedStart = conflict.StartTime;
-                var removedEnd = conflict.EndTime;
-                var removedBusySlot = FindBusySlotForDraft(conflict, removedStart, removedEnd);
-                if (removedBusySlot is not null)
-                {
-                    RemoveBusySlot(removedBusySlot);
-                }
-                movableDrafts.Remove(conflict);
-                if (allCreatedDrafts.Remove(conflict))
-                {
-                    if (created > 0)
+                    foreach (var previousBusy in previousBusySlots)
                     {
-                        created--;
+                        AddBusySlot(previousBusy);
                     }
-                    Dec(conflict.GroupId, conflict.Date);
+                    warnings.Add($"[{targetSlot.Date:yyyy-MM-dd} {targetSlot.StartTime:HH\\:mm}-{targetSlot.EndTime:HH\\:mm}] Фінальний matching відхилив комбінацію ресурсів через зайнятість або зміну аудиторії.");
+                    continue;
                 }
-                RemoveDraftEntity(conflict);
-                removedCount++;
-                var groupLabel = selectedGroupsById.TryGetValue(conflict.GroupId, out var conflictGroup)
-                    ? conflictGroup.Name
-                    : $"#{conflict.GroupId}";
-                warnings.Add($"[{conflict.Date:yyyy-MM-dd}] {groupLabel}: фінальний лекційний cleanup прибрав заняття {conflict.ModuleId} зі слоту {removedStart:HH\\:mm}-{removedEnd:HH\\:mm}, бо воно лишалося перед лекційним блоком.");
+
+                for (var eventIndex = 0; eventIndex < slotDrafts.Count; eventIndex++)
+                {
+                    var draft = slotDrafts[eventIndex];
+                    var previousTeacherId = draft.TeacherId;
+                    var previousRoomId = draft.RoomId;
+                    if (assignedTeachers.TryGetValue(eventIndex, out var assignedTeacherId))
+                    {
+                        draft.TeacherId = assignedTeacherId;
+                    }
+                    if (assignedRooms.TryGetValue(eventIndex, out var assignedRoomId))
+                    {
+                        draft.RoomId = assignedRoomId;
+                    }
+                    if (previousTeacherId != draft.TeacherId)
+                    {
+                        assignedResources++;
+                    }
+                    if (previousRoomId != draft.RoomId)
+                    {
+                        assignedResources++;
+                        if (draft.RoomId is int)
+                        {
+                            UpdateFinalRoomUsage(draft, previousRoomId, draft.RoomId);
+                        }
+                    }
+                    var lessonType = typeById[draft.LessonTypeId];
+                    var missingTeacher = lessonType.RequiresTeacher && draft.TeacherId is null;
+                    var missingRoom = lessonType.RequiresRoom && draft.RoomId is null;
+                    draft.ValidationWarnings = BuildIncompleteDraftWarningJson(missingTeacher, missingRoom);
+                    draft.UpdatedAt = DateTime.UtcNow;
+                    var entry = _db.Entry(draft);
+                    if (draft.Id > 0 && entry.State == EntityState.Unchanged)
+                    {
+                        entry.State = EntityState.Modified;
+                    }
+                    if (createdDraftAccounting.TryGetValue(draft, out var accounting)
+                        && !missingTeacher
+                        && !missingRoom)
+                    {
+                        if (accounting.IncompleteDraftCounted && incompleteDraftsCreated > 0)
+                        {
+                            incompleteDraftsCreated--;
+                        }
+                        if (accounting.MissingTeacherCounted && incompleteMissingTeacherCount > 0)
+                        {
+                            incompleteMissingTeacherCount--;
+                        }
+                        if (accounting.MissingRoomCounted && incompleteMissingRoomCount > 0)
+                        {
+                            incompleteMissingRoomCount--;
+                        }
+                        if (accounting.MissingBothCounted && incompleteMissingBothCount > 0)
+                        {
+                            incompleteMissingBothCount--;
+                        }
+                        accounting.IncompleteDraftCounted = false;
+                        accounting.MissingTeacherCounted = false;
+                        accounting.MissingRoomCounted = false;
+                        accounting.MissingBothCounted = false;
+                    }
+                    var roomBuildingId = draft.RoomId is int roomId
+                        ? roomsAll.FirstOrDefault(room => room.Id == roomId)?.BuildingId
+                        : null;
+                    AddBusySlot(new BusySlot(
+                        draft.GroupId,
+                        draft.TeacherId,
+                        draft.RoomId,
+                        draft.Date,
+                        draft.StartTime,
+                        draft.EndTime,
+                        roomBuildingId,
+                        draft.ModuleId,
+                        draft.LessonTypeId,
+                        draft.ModuleTopicId,
+                        true));
+                }
             }
 
-            return removedCount;
+            return assignedResources;
+        }
+        int RunFinalLectureOrderCleanup()
+        {
+            var conflictCount = 0;
+            foreach (var dayGroup in allCreatedDrafts
+                         .Where(draft => draft.Status == DraftStatus.Draft
+                                         && !draft.IsLocked
+                                         && selectedGroupIdSet.Contains(draft.GroupId)
+                                         && draft.Date >= rangeStartDate
+                                         && draft.Date < rangeEndDateExclusive)
+                         .GroupBy(draft => new { draft.GroupId, draft.Date }))
+            {
+                var latestLectureStart = BusyForGroupDate(dayGroup.Key.GroupId, dayGroup.Key.Date)
+                    .Where(slot => CanShareAcrossGroups(slot.LessonTypeId)
+                                   && !excludedTypeIds.Contains(slot.LessonTypeId))
+                    .Select(slot => (TimeOnly?)slot.StartTime)
+                    .OrderByDescending(start => start)
+                    .FirstOrDefault();
+                if (latestLectureStart is null)
+                {
+                    continue;
+                }
+
+                var conflicts = dayGroup
+                    .Where(draft => draft.StartTime < latestLectureStart.Value
+                                    && !CanShareAcrossGroups(draft.LessonTypeId)
+                                    && !excludedTypeIds.Contains(draft.LessonTypeId))
+                    .OrderBy(draft => draft.StartTime)
+                    .ToList();
+                if (conflicts.Count == 0)
+                {
+                    continue;
+                }
+
+                conflictCount += conflicts.Count;
+                var groupLabel = selectedGroupsById.TryGetValue(dayGroup.Key.GroupId, out var conflictGroup)
+                    ? conflictGroup.Name
+                    : $"#{dayGroup.Key.GroupId}";
+                warnings.Add($"[{dayGroup.Key.Date:yyyy-MM-dd}] {groupLabel}: {conflicts.Count} заняття залишено перед лекційним блоком, оскільки порядок лекцій є м'яким побажанням і не повинен створювати порожні слоти.");
+            }
+
+            return conflictCount;
         }
         int RunFinalResourceConflictCleanup()
         {
@@ -8493,6 +16895,7 @@ public sealed class TeacherDraftsAutogenService
             var safetyBudget = Math.Max(1, allCreatedDrafts.Count);
             while (safetyBudget-- > 0)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 TeacherDraftItem? conflict = null;
                 string conflictReason = string.Empty;
                 foreach (var draft in allCreatedDrafts
@@ -8529,6 +16932,7 @@ public sealed class TeacherDraftsAutogenService
                     var slotLabel = $"{draft.Date:yyyy-MM-dd} {draft.StartTime:HH\\:mm}-{draft.EndTime:HH\\:mm}";
                     if (BusyForGroupDate(draft.GroupId, draft.Date).Any(slot =>
                             SlotOverlaps(slot, draft.Date, draft.StartTime, draft.EndTime)
+                            && !IsNonOccupyingBusySlot(slot)
                             && !SameDraftBusySlot(slot)))
                     {
                         conflict = draft;
@@ -8592,22 +16996,11 @@ public sealed class TeacherDraftsAutogenService
                     break;
                 }
 
-                var removedBusySlot = FindBusySlotForDraft(conflict, conflict.StartTime, conflict.EndTime);
-                if (removedBusySlot is not null)
+                if (!RemoveCreatedUnlockedDraft(conflict))
                 {
-                    RemoveBusySlot(removedBusySlot);
+                    warnings.Add($"[{conflict.Date:yyyy-MM-dd} {conflict.StartTime:HH\\:mm}-{conflict.EndTime:HH\\:mm}] Не вдалося повністю прибрати небезпечну створену чернетку під час фінальної перевірки ресурсів.");
+                    break;
                 }
-
-                movableDrafts.Remove(conflict);
-                if (allCreatedDrafts.Remove(conflict))
-                {
-                    if (created > 0)
-                    {
-                        created--;
-                    }
-                    Dec(conflict.GroupId, conflict.Date);
-                }
-                RemoveDraftEntity(conflict);
                 removedCount++;
                 var removedGroupName = selectedGroupsById.TryGetValue(conflict.GroupId, out var removedGroup)
                     ? removedGroup.Name
@@ -8630,12 +17023,303 @@ public sealed class TeacherDraftsAutogenService
 
             return removedCount;
         }
+        void ReconcileFinalGapReport()
+        {
+            AutoGenGapDetail StructureFinalDetail(AutoGenGapDetail detail)
+            {
+                var structuredDetail = AutoGenGapReasonClassifier.EnsureStructured(detail);
+                if (!searchLimitedGroupDates.TryGetValue((detail.GroupId, detail.Date), out var searchDiagnostics))
+                {
+                    return structuredDetail;
+                }
+
+                var diagnostics = structuredDetail.Diagnostics is null
+                    ? new Dictionary<string, string>(StringComparer.Ordinal)
+                    : new Dictionary<string, string>(structuredDetail.Diagnostics, StringComparer.Ordinal);
+                diagnostics["searchScopes"] = string.Join(",", searchDiagnostics.Scopes);
+                diagnostics["visitedNodes"] = searchDiagnostics.VisitedNodes.ToString();
+                diagnostics["maxNodes"] = searchDiagnostics.MaxNodes.ToString();
+                diagnostics["limitKind"] = searchDiagnostics.EmergencyTimeLimitReached
+                    ? "emergency-time-limit"
+                    : "deterministic-node-limit";
+                var hasPreciseRootCause = structuredDetail.ReasonCode is not null
+                                          && structuredDetail.ReasonCode != AutoGenGapReasonCodes.Unknown
+                                          && structuredDetail.ReasonCode != AutoGenGapReasonCodes.Other
+                                          && structuredDetail.ReasonCode != AutoGenGapReasonCodes.SearchLimit;
+                return AutoGenGapReasonClassifier.EnsureStructured(structuredDetail with
+                {
+                    ReasonCode = hasPreciseRootCause
+                        ? structuredDetail.ReasonCode
+                        : AutoGenGapReasonCodes.SearchLimit,
+                    ConstraintCode = hasPreciseRootCause
+                        ? structuredDetail.ConstraintCode
+                        : searchDiagnostics.EmergencyTimeLimitReached
+                            ? "time-limit"
+                            : "node-budget",
+                    SearchLimitReached = true,
+                    Diagnostics = diagnostics
+                });
+            }
+
+            var previousBySlot = gapDetails
+                .GroupBy(detail => (detail.GroupId, detail.Date, detail.Start, detail.End))
+                .ToDictionary(group => group.Key, group => group.Last());
+            var finalDetails = new List<AutoGenGapDetail>();
+
+            foreach (var group in generationGroups)
+            {
+                if (!sharedSlotsByCourse.TryGetValue(group.CourseId, out var resolvedByDay))
+                {
+                    continue;
+                }
+
+                foreach (var date in DatesBetween(rangeStartDate, rangeEndDateExclusive))
+                {
+                    if (!IsWorking(date, group)
+                        || !resolvedByDay.TryGetValue(date.DayOfWeek, out var resolved)
+                        || resolved.Slots.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    foreach (var slot in resolved.Slots)
+                    {
+                        var key = (group.Id, date, slot.Start, slot.End);
+                        var isFilled = HasGroupOverlap(group.Id, date, slot.Start, slot.End);
+                        if (isFilled)
+                        {
+                            continue;
+                        }
+
+                        if (previousBySlot.TryGetValue(key, out var previousDetail))
+                        {
+                            finalDetails.Add(StructureFinalDetail(previousDetail));
+                            continue;
+                        }
+
+                        var moduleIds = remainingByGroupModule
+                            .Where(entry => entry.Key.GroupId == group.Id && entry.Value > 0)
+                            .Select(entry => entry.Key.ModuleId)
+                            .Distinct()
+                            .OrderBy(moduleId => moduleId)
+                            .ToList();
+                        var reason = slotFailureReasons.TryGetValue(key, out var reasons) && reasons.Count > 0
+                            ? SummarizeSlotFailureReasons(reasons)
+                            : moduleIds.Count == 0
+                                ? $"Для групи {group.Name} не лишилось модулів із невикористаними годинами."
+                                : "Після фінальної перевірки не вдалося підібрати безпечну комбінацію модуля, викладача та аудиторії.";
+                        int? moduleId = moduleIds.Count == 1 ? moduleIds[0] : null;
+                        var moduleName = moduleId is int singleModuleId
+                            ? ModuleTitleLabel(singleModuleId)
+                            : moduleIds.Count > 1
+                                ? $"Кілька модулів: {string.Join(", ", moduleIds.Take(3).Select(ModuleTitleLabel))}"
+                                : null;
+                        finalDetails.Add(StructureFinalDetail(new AutoGenGapDetail(
+                            GroupId: group.Id,
+                            GroupName: group.Name,
+                            Date: date,
+                            Start: slot.Start,
+                            End: slot.End,
+                            SlotLabel: $"{slot.Start:HH\\:mm}-{slot.End:HH\\:mm}",
+                            Reason: reason,
+                            ModuleId: moduleId,
+                            ModuleName: moduleName)));
+                    }
+                }
+            }
+
+            gapDetails.Clear();
+            gapDetails.AddRange(finalDetails
+                .OrderBy(detail => detail.Date)
+                .ThenBy(detail => detail.Start)
+                .ThenBy(detail => detail.End)
+                .ThenBy(detail => detail.GroupName, StringComparer.Ordinal)
+                .ThenBy(detail => detail.GroupId));
+            gapWarnings.Clear();
+            warnings.RemoveAll(warning => warning.StartsWith("Автогенерація не заповнила слот ", StringComparison.Ordinal));
+            foreach (var detail in gapDetails)
+            {
+                gapWarnings.Add((detail.GroupId, detail.Date, detail.Start, detail.End));
+                var reasonSuffix = string.IsNullOrWhiteSpace(detail.Reason) ? string.Empty : $" Причина: {detail.Reason}";
+                warnings.Add($"Автогенерація не заповнила слот {detail.SlotLabel} для групи {detail.GroupName} на {detail.Date:yyyy-MM-dd}.{reasonSuffix}");
+            }
+        }
+        // Для кількох груп усі repair-перенесення вже змінюють конкретні EF-сутності.
+        // Повторне зіставлення лише за темою є неоднозначним для повторів і може
+        // помилково звести дві різні чернетки в один слот.
+        var synchronizedMovedDrafts = generationGroups.Count == 1
+            ? SynchronizeUniqueMovedDraftsWithBusyState()
+            : 0;
+        if (synchronizedMovedDrafts > 0)
+        {
+            warnings.Add($"Фінальна синхронізація застосувала {synchronizedMovedDrafts} однозначні переміщення чернеток із repair-проходу.");
+        }
+        _db.ChangeTracker.DetectChanges();
+        var finalRematchScope = movableDrafts
+            .Where(draft => (allCreatedDrafts.Contains(draft)
+                             || _db.Entry(draft).State == EntityState.Modified)
+                            && string.IsNullOrWhiteSpace(draft.BatchKey))
+            .ToHashSet();
+
+        Dictionary<DateOnly, int> CountRequiredIncompleteDraftsByDate()
+            => movableDrafts
+                .Where(draft => draft.Status == DraftStatus.Draft
+                                && selectedGroupIdSet.Contains(draft.GroupId)
+                                && draft.Date >= rangeStartDate
+                                && draft.Date < rangeEndDateExclusive
+                                && typeById.TryGetValue(draft.LessonTypeId, out var lessonType)
+                                && (lessonType.RequiresTeacher && draft.TeacherId is null
+                                    || lessonType.RequiresRoom && draft.RoomId is null))
+                .GroupBy(draft => draft.Date)
+                .ToDictionary(group => group.Key, group => group.Count());
+
+        var rotationIncompleteBefore = CountRequiredIncompleteDraftsByDate();
+        var rotationDraftSnapshot = movableDrafts
+            .Distinct()
+            .ToDictionary(draft => draft, CaptureMovableDraftTrialState);
+        var rotationBusySnapshot = busy.ToList();
+        var rotationTopicOrderSnapshot = topicOrderSlots.ToList();
+        var rotationRoomUsageSnapshot = roomUsageByGroup.ToDictionary(
+            entry => entry.Key,
+            entry => entry.Value.ToDictionary(roomEntry => roomEntry.Key, roomEntry => roomEntry.Value));
+        var rotationAccountingSnapshot = createdDraftAccounting.ToDictionary(
+            entry => entry.Key,
+            entry => new CreatedDraftAccountingState(
+                entry.Value.CreatedCounterIncremented,
+                entry.Value.DayCountIncremented,
+                entry.Value.CurrentRangeFactIncremented,
+                entry.Value.RemainingDecremented,
+                entry.Value.SelfStudyRemainingDecremented,
+                entry.Value.SelfStudyTopicRemainingDecremented,
+                entry.Value.TopicUsageIncremented,
+                entry.Value.RoomUsageGroupId,
+                entry.Value.RoomUsageRoomId,
+                entry.Value.IncompleteDraftCounted,
+                entry.Value.MissingTeacherCounted,
+                entry.Value.MissingRoomCounted,
+                entry.Value.MissingBothCounted,
+                entry.Value.EmergencySingletonCounted));
+        var rotationIncompleteDraftsCreated = incompleteDraftsCreated;
+        var rotationIncompleteMissingTeacherCount = incompleteMissingTeacherCount;
+        var rotationIncompleteMissingRoomCount = incompleteMissingRoomCount;
+        var rotationIncompleteMissingBothCount = incompleteMissingBothCount;
+        var rotationWarningCount = warnings.Count;
+
+        void RestoreFinalRotationTrial()
+        {
+            foreach (var snapshot in rotationDraftSnapshot)
+            {
+                RestoreMovableDraftTrialState(snapshot.Key, snapshot.Value);
+            }
+            RestoreBusyState(rotationBusySnapshot, rotationTopicOrderSnapshot);
+            roomUsageByGroup.Clear();
+            foreach (var entry in rotationRoomUsageSnapshot)
+            {
+                roomUsageByGroup[entry.Key] = entry.Value.ToDictionary(
+                    roomEntry => roomEntry.Key,
+                    roomEntry => roomEntry.Value);
+            }
+            foreach (var snapshot in rotationAccountingSnapshot)
+            {
+                if (!createdDraftAccounting.TryGetValue(snapshot.Key, out var accounting))
+                {
+                    continue;
+                }
+                accounting.CreatedCounterIncremented = snapshot.Value.CreatedCounterIncremented;
+                accounting.DayCountIncremented = snapshot.Value.DayCountIncremented;
+                accounting.CurrentRangeFactIncremented = snapshot.Value.CurrentRangeFactIncremented;
+                accounting.RemainingDecremented = snapshot.Value.RemainingDecremented;
+                accounting.SelfStudyRemainingDecremented = snapshot.Value.SelfStudyRemainingDecremented;
+                accounting.SelfStudyTopicRemainingDecremented = snapshot.Value.SelfStudyTopicRemainingDecremented;
+                accounting.TopicUsageIncremented = snapshot.Value.TopicUsageIncremented;
+                accounting.RoomUsageGroupId = snapshot.Value.RoomUsageGroupId;
+                accounting.RoomUsageRoomId = snapshot.Value.RoomUsageRoomId;
+                accounting.IncompleteDraftCounted = snapshot.Value.IncompleteDraftCounted;
+                accounting.MissingTeacherCounted = snapshot.Value.MissingTeacherCounted;
+                accounting.MissingRoomCounted = snapshot.Value.MissingRoomCounted;
+                accounting.MissingBothCounted = snapshot.Value.MissingBothCounted;
+                accounting.EmergencySingletonCounted = snapshot.Value.EmergencySingletonCounted;
+            }
+            incompleteDraftsCreated = rotationIncompleteDraftsCreated;
+            incompleteMissingTeacherCount = rotationIncompleteMissingTeacherCount;
+            incompleteMissingRoomCount = rotationIncompleteMissingRoomCount;
+            incompleteMissingBothCount = rotationIncompleteMissingBothCount;
+            if (warnings.Count > rotationWarningCount)
+            {
+                warnings.RemoveRange(rotationWarningCount, warnings.Count - rotationWarningCount);
+            }
+            rotatedSharedBoundaryDates.Clear();
+        }
+
+        var rotatedSharedBoundaryDrafts = 0;
+        var adjacentRoomAssignments = 0;
+        var dayWideResourceAssignments = 0;
+        var reassignedRequiredResources = 0;
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            rotatedSharedBoundaryDrafts = RunFinalSharedBoundaryRotation();
+            cancellationToken.ThrowIfCancellationRequested();
+            adjacentRoomAssignments = RunFinalAdjacentRoomPairRematch(finalRematchScope);
+            cancellationToken.ThrowIfCancellationRequested();
+            dayWideResourceAssignments = RunFinalDayWideRoomRematch(finalRematchScope);
+            cancellationToken.ThrowIfCancellationRequested();
+            reassignedRequiredResources = RunFinalRequiredResourceRematch(finalRematchScope);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (rotatedSharedBoundaryDrafts > 0)
+            {
+                var rotationIncompleteAfter = CountRequiredIncompleteDraftsByDate();
+                var strictlyImprovedEveryRotatedDate = rotatedSharedBoundaryDates.All(date =>
+                    rotationIncompleteAfter.GetValueOrDefault(date)
+                    < rotationIncompleteBefore.GetValueOrDefault(date));
+                if (!strictlyImprovedEveryRotatedDate || !RotatedDatesPassHardResourceGuard())
+                {
+                    RestoreFinalRotationTrial();
+                    rotatedSharedBoundaryDrafts = 0;
+                    cancellationToken.ThrowIfCancellationRequested();
+                    adjacentRoomAssignments = RunFinalAdjacentRoomPairRematch(finalRematchScope);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    dayWideResourceAssignments = RunFinalDayWideRoomRematch(finalRematchScope);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    reassignedRequiredResources = RunFinalRequiredResourceRematch(finalRematchScope);
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+            }
+        }
+        catch
+        {
+            RestoreFinalRotationTrial();
+            throw;
+        }
+
+        if (rotatedSharedBoundaryDrafts > 0)
+        {
+            warnings.Add($"Фінальний repair безпечної межі потоку переставив {rotatedSharedBoundaryDrafts} чернеток перед matching ресурсів.");
+        }
+        if (adjacentRoomAssignments > 0)
+        {
+            warnings.Add($"Фінальний matching суміжних слотів виконав {adjacentRoomAssignments} призначення або перепризначення аудиторій без порушення переходів.");
+        }
+        if (dayWideResourceAssignments > 0)
+        {
+            warnings.Add($"Денний matching виконав {dayWideResourceAssignments} призначень або перепризначень викладачів та аудиторій без порушення переходів.");
+        }
+        if (reassignedRequiredResources > 0)
+        {
+            warnings.Add($"Фінальний matching виконав {reassignedRequiredResources} призначення або перепризначення обов'язкових ресурсів.");
+        }
         RunFinalLectureOrderCleanup();
         var removedUnsafeDrafts = RunFinalResourceConflictCleanup();
         if (removedUnsafeDrafts > 0)
         {
             warnings.Add($"Фінальна перевірка ресурсів прибрала {removedUnsafeDrafts} небезпечні чернетки перед збереженням.");
         }
+        ReconcileFinalGapReport();
+        // Repair-проходи змінюють уже наявні відстежувані чернетки напряму.
+        // Виявляємо ці зміни до формування винятків для фінальної перевірки,
+        // інакше валідатор порівнює нову пару зі старою версією переміщеної чернетки з БД.
+        _db.ChangeTracker.DetectChanges();
         var modifiedDraftsForValidation = _db.ChangeTracker
             .Entries<TeacherDraftItem>()
             .Where(entry => entry.State == EntityState.Modified)
@@ -8704,6 +17388,9 @@ public sealed class TeacherDraftsAutogenService
                 => typeById.TryGetValue(lessonTypeId, out var lessonType) && lessonType.BlocksTeacher;
             bool BlocksRoom(int lessonTypeId)
                 => typeById.TryGetValue(lessonTypeId, out var lessonType) && lessonType.BlocksRoom;
+            bool OccupiesSlot(int lessonTypeId)
+                => typeById.TryGetValue(lessonTypeId, out var lessonType)
+                   && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(lessonType.Code);
             bool SameShareableOccurrence(
                 int leftGroupId,
                 int leftModuleId,
@@ -8739,12 +17426,16 @@ public sealed class TeacherDraftsAutogenService
             }
 
             var slotCache = new Dictionary<(int CourseId, DayOfWeek Day), List<(TimeOnly Start, TimeOnly End)>>();
-            async Task<List<(TimeOnly Start, TimeOnly End)>> GetSlotsAsync(int courseIdValue, DayOfWeek day)
+            List<(TimeOnly Start, TimeOnly End)> GetSlots(int courseIdValue, DayOfWeek day)
             {
                 var key = (courseIdValue, day);
                 if (!slotCache.TryGetValue(key, out var daySlots))
                 {
-                    var resolved = await TimeSlotsResolver.ResolveForDayAsync(_db, courseIdValue, day);
+                    var resolved = TimeSlotsResolver.ResolveForDay(
+                        sharedTimeSlots,
+                        courseIdValue,
+                        day,
+                        sharedLunches);
                     daySlots = resolved.Slots
                         .Select(s => (s.Start, s.End))
                         .ToList();
@@ -8755,6 +17446,7 @@ public sealed class TeacherDraftsAutogenService
 
             foreach (var draft in changedDraftsForValidation)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var groupLabel = selectedGroupsById.TryGetValue(draft.GroupId, out var group)
                     ? group.Name
                     : $"#{draft.GroupId}";
@@ -8806,7 +17498,7 @@ public sealed class TeacherDraftsAutogenService
                 }
                 if (selectedGroupsById.TryGetValue(draft.GroupId, out var selectedGroup))
                 {
-                    var daySlots = await GetSlotsAsync(selectedGroup.CourseId, draft.DayOfWeek);
+                    var daySlots = GetSlots(selectedGroup.CourseId, draft.DayOfWeek);
                     if (!SlotRangeAllowed(draft.StartTime, draft.EndTime, daySlots))
                     {
                         errors.Add($"Фінальна перевірка: слот {draft.Date:yyyy-MM-dd} {draft.StartTime:HH\\:mm}-{draft.EndTime:HH\\:mm} для групи {groupLabel} не входить у налаштовані слоти.");
@@ -8814,55 +17506,73 @@ public sealed class TeacherDraftsAutogenService
                 }
             }
 
-            for (var i = 0; i < changedDraftsForValidation.Count; i++)
+            foreach (var dayDrafts in changedDraftsForValidation
+                         .GroupBy(draft => draft.Date)
+                         .Select(group => group
+                             .OrderBy(draft => draft.StartTime)
+                             .ThenBy(draft => draft.EndTime)
+                             .ThenBy(draft => draft.GroupId)
+                             .ToList()))
             {
-                var left = changedDraftsForValidation[i];
-                for (var j = i + 1; j < changedDraftsForValidation.Count; j++)
+                cancellationToken.ThrowIfCancellationRequested();
+                for (var i = 0; i < dayDrafts.Count; i++)
                 {
-                    var right = changedDraftsForValidation[j];
-                    if (left.Date != right.Date || !Overlaps(left.StartTime, left.EndTime, right.StartTime, right.EndTime))
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var left = dayDrafts[i];
+                    for (var j = i + 1; j < dayDrafts.Count; j++)
                     {
-                        continue;
-                    }
-                    var label = $"{left.Date:yyyy-MM-dd} {left.StartTime:HH\\:mm}-{left.EndTime:HH\\:mm}";
-                    if (left.GroupId == right.GroupId)
-                    {
-                        errors.Add($"Фінальна перевірка: група #{left.GroupId} має перетин чернеток у слоті {label}.");
-                    }
-                    var sameShareableOccurrence = SameShareableOccurrence(
-                        left.GroupId,
-                        left.ModuleId,
-                        left.LessonTypeId,
-                        left.ModuleTopicId,
-                        left.TeacherId,
-                        left.RoomId,
-                        left.Date,
-                        left.StartTime,
-                        left.EndTime,
-                        right.GroupId,
-                        right.ModuleId,
-                        right.LessonTypeId,
-                        right.ModuleTopicId,
-                        right.TeacherId,
-                        right.RoomId,
-                        right.Date,
-                        right.StartTime,
-                        right.EndTime);
-                    if (left.TeacherId is int leftTeacher
-                        && right.TeacherId == leftTeacher
-                        && BlocksTeacher(left.LessonTypeId)
-                        && BlocksTeacher(right.LessonTypeId)
-                        && !sameShareableOccurrence)
-                    {
-                        errors.Add($"Фінальна перевірка: викладач #{leftTeacher} має перетин чернеток у слоті {label}.");
-                    }
-                    if (left.RoomId is int leftRoom
-                        && right.RoomId == leftRoom
-                        && BlocksRoom(left.LessonTypeId)
-                        && BlocksRoom(right.LessonTypeId)
-                        && !sameShareableOccurrence)
-                    {
-                        errors.Add($"Фінальна перевірка: аудиторія #{leftRoom} має перетин чернеток у слоті {label}.");
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var right = dayDrafts[j];
+                        if (right.StartTime >= left.EndTime)
+                        {
+                            break;
+                        }
+                        if (!Overlaps(left.StartTime, left.EndTime, right.StartTime, right.EndTime))
+                        {
+                            continue;
+                        }
+                        var label = $"{left.Date:yyyy-MM-dd} {left.StartTime:HH\\:mm}-{left.EndTime:HH\\:mm}";
+                        if (left.GroupId == right.GroupId)
+                        {
+                            errors.Add($"Фінальна перевірка: група #{left.GroupId} має перетин чернеток у слоті {label} "
+                                       + $"(чернетки #{left.Id}/модуль #{left.ModuleId}/тема #{left.ModuleTopicId} і "
+                                       + $"#{right.Id}/модуль #{right.ModuleId}/тема #{right.ModuleTopicId}).");
+                        }
+                        var sameShareableOccurrence = SameShareableOccurrence(
+                            left.GroupId,
+                            left.ModuleId,
+                            left.LessonTypeId,
+                            left.ModuleTopicId,
+                            left.TeacherId,
+                            left.RoomId,
+                            left.Date,
+                            left.StartTime,
+                            left.EndTime,
+                            right.GroupId,
+                            right.ModuleId,
+                            right.LessonTypeId,
+                            right.ModuleTopicId,
+                            right.TeacherId,
+                            right.RoomId,
+                            right.Date,
+                            right.StartTime,
+                            right.EndTime);
+                        if (left.TeacherId is int leftTeacher
+                            && right.TeacherId == leftTeacher
+                            && BlocksTeacher(left.LessonTypeId)
+                            && BlocksTeacher(right.LessonTypeId)
+                            && !sameShareableOccurrence)
+                        {
+                            errors.Add($"Фінальна перевірка: викладач #{leftTeacher} має перетин чернеток у слоті {label}.");
+                        }
+                        if (left.RoomId is int leftRoom
+                            && right.RoomId == leftRoom
+                            && BlocksRoom(left.LessonTypeId)
+                            && BlocksRoom(right.LessonTypeId)
+                            && !sameShareableOccurrence)
+                        {
+                            errors.Add($"Фінальна перевірка: аудиторія #{leftRoom} має перетин чернеток у слоті {label}.");
+                        }
                     }
                 }
             }
@@ -8879,7 +17589,7 @@ public sealed class TeacherDraftsAutogenService
                                 || (d.TeacherId != null && teacherIdsForValidation.Contains(d.TeacherId.Value))
                                 || (d.RoomId != null && roomIdsForValidation.Contains(d.RoomId.Value))))
                 .Select(d => new { d.Date, d.StartTime, d.EndTime, d.GroupId, d.ModuleId, d.ModuleTopicId, d.TeacherId, d.RoomId, d.LessonTypeId })
-                .ToListAsync();
+            .ToListAsync(cancellationToken);
             var existingSchedule = await _db.ScheduleItems.AsNoTracking()
                 .Where(d => d.Date >= rangeStartDate
                             && d.Date < rangeEndDateExclusive
@@ -8887,13 +17597,33 @@ public sealed class TeacherDraftsAutogenService
                                 || (d.TeacherId != null && teacherIdsForValidation.Contains(d.TeacherId.Value))
                                 || (d.RoomId != null && roomIdsForValidation.Contains(d.RoomId.Value))))
                 .Select(d => new { d.Date, d.StartTime, d.EndTime, d.GroupId, d.ModuleId, d.ModuleTopicId, d.TeacherId, d.RoomId, d.LessonTypeId })
-                .ToListAsync();
+            .ToListAsync(cancellationToken);
+            var existingPlacementsByDate = existingDrafts
+                .Concat(existingSchedule)
+                .GroupBy(item => item.Date)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group
+                        .OrderBy(item => item.StartTime)
+                        .ThenBy(item => item.EndTime)
+                        .ToList());
 
             foreach (var draft in changedDraftsForValidation)
             {
-                foreach (var existing in existingDrafts.Concat(existingSchedule))
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!existingPlacementsByDate.TryGetValue(draft.Date, out var existingPlacements))
                 {
-                    if (draft.Date != existing.Date || !Overlaps(draft.StartTime, draft.EndTime, existing.StartTime, existing.EndTime))
+                    continue;
+                }
+                foreach (var existing in existingPlacements)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (existing.StartTime >= draft.EndTime)
+                    {
+                        break;
+                    }
+                    if (!OccupiesSlot(existing.LessonTypeId)
+                        || existing.EndTime <= draft.StartTime)
                     {
                         continue;
                     }
@@ -8948,6 +17678,42 @@ public sealed class TeacherDraftsAutogenService
                 .Distinct(StringComparer.Ordinal)
                 .ToList();
         }
+        foreach (var draft in changedDraftsForValidation
+                     .Where(draft => draft.Status == DraftStatus.Draft
+                                     && _db.Entry(draft).State is not EntityState.Deleted and not EntityState.Detached)
+                     .OrderBy(draft => draft.Date)
+                     .ThenBy(draft => draft.StartTime)
+                     .ThenBy(draft => draft.GroupId))
+        {
+            if (draft.TeacherId is not int teacherId
+                || draft.ModuleTopicId is not int topicId
+                || !topicById.TryGetValue(topicId, out var topic)
+                || !IsDepartmentFallbackTeacher(teacherId, topic))
+            {
+                continue;
+            }
+
+            var groupLabel = selectedGroupsById.TryGetValue(draft.GroupId, out var group)
+                ? group.Name
+                : $"#{draft.GroupId}";
+            warnings.Add(
+                $"[{draft.Date:yyyy-MM-dd} {draft.StartTime:HH\\:mm}-{draft.EndTime:HH\\:mm}] Для групи {groupLabel} використано явний зв'язок викладача з модулем поза кафедрою теми, тому що кафедральний викладач не дозволяв скласти повне призначення.");
+        }
+        var normalizedGapDetails = gapDetails
+            .GroupBy(gap => gap.GroupId)
+            .SelectMany(group =>
+            {
+                var missingHours = remainingByGroupModule
+                    .Where(entry => entry.Key.GroupId == group.Key)
+                    .Sum(entry => Math.Max(0, entry.Value));
+                return group
+                    .OrderBy(gap => gap.Date)
+                    .ThenBy(gap => gap.Start)
+                    .Take(missingHours);
+            })
+            .ToList();
+        gapDetails.Clear();
+        gapDetails.AddRange(normalizedGapDetails);
         if (gapDetails.Count > 0)
         {
             var reasonSummary = gapDetails
@@ -8961,12 +17727,47 @@ public sealed class TeacherDraftsAutogenService
             warnings.AddRange(BuildAutoGenRepairSuggestions(gapDetails));
         }
         // Зберігаємо створені чернетки та повертаємо результат.
+        var actualIncompleteDrafts = allCreatedDrafts
+            .Where(draft => draft.Status == DraftStatus.Draft
+                            && _db.Entry(draft).State is not EntityState.Deleted and not EntityState.Detached
+                            && typeById.TryGetValue(draft.LessonTypeId, out var lessonType)
+                            && (lessonType.RequiresTeacher && draft.TeacherId is null
+                                || lessonType.RequiresRoom && draft.RoomId is null))
+            .Select(draft =>
+            {
+                var lessonType = typeById[draft.LessonTypeId];
+                return new
+                {
+                    MissingTeacher = lessonType.RequiresTeacher && draft.TeacherId is null,
+                    MissingRoom = lessonType.RequiresRoom && draft.RoomId is null
+                };
+            })
+            .ToList();
+        incompleteDraftsCreated = actualIncompleteDrafts.Count;
+        incompleteMissingTeacherCount = actualIncompleteDrafts.Count(item => item.MissingTeacher);
+        incompleteMissingRoomCount = actualIncompleteDrafts.Count(item => item.MissingRoom);
+        incompleteMissingBothCount = actualIncompleteDrafts.Count(item => item.MissingTeacher && item.MissingRoom);
         if (incompleteDraftsCreated > 0)
         {
             warnings.Add(
                 $"Створено {incompleteDraftsCreated} неповних чернеток: без викладача — {incompleteMissingTeacherCount}, без аудиторії — {incompleteMissingRoomCount}, без обох призначень — {incompleteMissingBothCount}.");
         }
         var finalValidationErrors = await ValidateGeneratedDraftsAsync();
+        if (hasModuleHourOverrides)
+        {
+            foreach (var group in selectedGroupsById.Values.OrderBy(group => group.Id))
+            {
+                foreach (var moduleHours in moduleHoursByModuleId.OrderBy(entry => entry.Key))
+                {
+                    var actualHours = CurrentRangeScheduledHoursFor(group.Id, moduleHours.Key);
+                    if (actualHours > moduleHours.Value)
+                    {
+                        finalValidationErrors.Add(
+                            $"Фінальна перевірка: для групи {group.Name} модуль <{ModuleTitleLabel(moduleHours.Key)}> має {actualHours} пар при заданій межі {moduleHours.Value}.");
+                    }
+                }
+            }
+        }
         var pendingDraftsForSharedValidation = changedDraftsForValidation
             .Select(draft => new TeacherDraftsAutogenPendingDraft(
                 draft.Date,
@@ -8978,7 +17779,8 @@ public sealed class TeacherDraftsAutogenService
                 draft.ModuleTopicId,
                 draft.TeacherId,
                 draft.RoomId,
-                draft.IsSelfStudy))
+                draft.IsSelfStudy,
+                draft.BatchKey))
             .ToList();
         var sharedHardRuleValidator = new TeacherDraftsAutogenHardRuleValidator(_db);
         foreach (var courseGroup in selectedGroupsByCourse)
@@ -8996,7 +17798,8 @@ public sealed class TeacherDraftsAutogenService
                     r.Days,
                     allowIncompleteDrafts,
                     PendingDrafts: coursePendingDrafts,
-                    ExcludedDraftIds: modifiedDraftIdsForValidation),
+                    ExcludedDraftIds: modifiedDraftIdsForValidation,
+                    MaxParallelGroupsPerModuleInSlot: maxParallelGroupsPerModuleInSlot),
                 cancellationToken);
             finalValidationErrors.AddRange(sharedHardRuleValidation.Violations
                 .Select(error => $"Фінальна перевірка: {error}"));
@@ -9011,22 +17814,37 @@ public sealed class TeacherDraftsAutogenService
             {
                 warnings.Add($"Фінальна перевірка знайшла ще {finalValidationErrors.Count - 50} проблем.");
             }
-            return BadRequest(new AutoGenResult(created, skipped, warnings, gapDetails, BuildAutoGenGapSummary(gapDetails), preflightItems));
+            warnings.Add("Зміни автогенерації повністю відкочено, тому жодної нової чернетки не збережено.");
+            return BadRequest(new AutoGenResult(0, skipped, warnings, gapDetails, BuildAutoGenGapSummary(gapDetails), preflightItems));
         }
         if (r.PreflightOnly)
         {
             warnings.Add("Пробну генерацію завершено без збереження чернеток.");
-            await tx.RollbackAsync(cancellationToken);
+            if (ownedTransaction is not null)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+            }
+            else
+            {
+                await _db.SaveChangesAsync(cancellationToken);
+            }
             return Ok(new AutoGenResult(0, skipped, warnings, gapDetails, BuildAutoGenGapSummary(gapDetails), preflightItems));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
         await _db.SaveChangesAsync(cancellationToken);
-        await tx.CommitAsync(cancellationToken);
+        if (ownedTransaction is not null)
+        {
+            await transaction.CommitAsync(cancellationToken);
+        }
         return Ok(new AutoGenResult(created, skipped, warnings, gapDetails, BuildAutoGenGapSummary(gapDetails), preflightItems));
         }
         finally
         {
+            if (ownedTransaction is not null)
+            {
+                await ownedTransaction.DisposeAsync();
+            }
             GenerationLock.Release();
         }
     }

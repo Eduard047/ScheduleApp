@@ -193,13 +193,27 @@ else
                                                         }
                                                         @foreach (var gap in entry.GapDetails)
                                                         {
+                                                            var classification = AutoGenGapReasonClassifier.Classify(gap);
                                                             <li class="log-issue-item issue-gap">
                                                                 <span class="log-issue-badge">Слот</span>
                                                                 <div>
                                                                     <div>@gap.GroupName — @gap.Date.ToString("dd.MM.yyyy") @gap.Start.ToString("HH:mm")–@gap.End.ToString("HH:mm") (@gap.SlotLabel)</div>
+                                                                    <div class="log-issue-muted">Категорія: @classification.Title (@classification.Code)</div>
                                                                     @if (!string.IsNullOrWhiteSpace(gap.Reason))
                                                                     {
                                                                         <div class="log-issue-muted">Причина: @gap.Reason</div>
+                                                                    }
+                                                                    @if (!string.IsNullOrWhiteSpace(gap.ConstraintCode))
+                                                                    {
+                                                                        <div class="log-issue-muted">Обмеження: @gap.ConstraintCode</div>
+                                                                    }
+                                                                    @if (gap.SearchLimitReached)
+                                                                    {
+                                                                        <div class="log-issue-muted">Пошук досяг безпечної межі.</div>
+                                                                    }
+                                                                    @if (gap.Diagnostics is { Count: > 0 })
+                                                                    {
+                                                                        <div class="log-issue-muted">Діагностика: @FormatGapDiagnostics(gap.Diagnostics)</div>
                                                                     }
                                                                 </div>
                                                             </li>
@@ -429,7 +443,14 @@ else
         {
             return true;
         }
-        if (entry.GapDetails.Any(gap => Contains(gap.GroupName, needle) || Contains(gap.SlotLabel, needle) || Contains(gap.Reason, needle)))
+        if (entry.GapDetails.Any(gap =>
+                Contains(gap.GroupName, needle)
+                || Contains(gap.SlotLabel, needle)
+                || Contains(gap.Reason, needle)
+                || Contains(gap.ReasonCode, needle)
+                || Contains(gap.ConstraintCode, needle)
+                || Contains(AutoGenGapReasonClassifier.Classify(gap).Title, needle)
+                || gap.Diagnostics?.Any(item => Contains(item.Key, needle) || Contains(item.Value, needle)) == true))
         {
             return true;
         }
@@ -463,7 +484,7 @@ else
             return new();
         }
         return gapDetails
-            .GroupBy(gap => ClassifyGapReason(gap.Reason))
+            .GroupBy(AutoGenGapReasonClassifier.Classify)
             .OrderByDescending(group => group.Count())
             .ThenBy(group => group.Key.Title, StringComparer.Ordinal)
             .Select(group => new AutoGenGapSummaryItem(
@@ -484,49 +505,18 @@ else
         return $"{gap.Date:yyyy-MM-dd} {gap.SlotLabel}, {gap.GroupName}: {reason}";
     }
 
-    private static (string Code, string Title) ClassifyGapReason(string? reason)
+    private static string FormatGapDiagnostics(IReadOnlyDictionary<string, string> diagnostics)
+        => string.Join(
+            "; ",
+            diagnostics
+                .OrderBy(item => item.Key, StringComparer.Ordinal)
+                .Take(6)
+                .Select(item => $"{item.Key}={CompactDiagnosticValue(item.Value)}"));
+
+    private static string CompactDiagnosticValue(string? value)
     {
-        if (string.IsNullOrWhiteSpace(reason))
-        {
-            return ("unknown", "Причину не визначено");
-        }
-        var text = reason.ToLowerInvariant();
-        if (text.Contains("немає доступних викладач", StringComparison.Ordinal)
-            || text.Contains("викладач", StringComparison.Ordinal) && (text.Contains("кафедр", StringComparison.Ordinal) || text.Contains("зайнят", StringComparison.Ordinal)))
-        {
-            return ("teacher", "Немає доступного викладача");
-        }
-        if (text.Contains("усі аудитор", StringComparison.Ordinal)
-            || text.Contains("аудитор", StringComparison.Ordinal) && (text.Contains("зайнят", StringComparison.Ordinal) || text.Contains("не належ", StringComparison.Ordinal)))
-        {
-            return ("room", "Немає доступної аудиторії");
-        }
-        if (text.Contains("переход", StringComparison.Ordinal)
-            || text.Contains("корпус", StringComparison.Ordinal) && text.Contains("хв", StringComparison.Ordinal))
-        {
-            return ("travel", "Недостатньо часу на перехід");
-        }
-        if (text.Contains("хронолог", StringComparison.Ordinal)
-            || text.Contains("порядок тем", StringComparison.Ordinal)
-            || text.Contains("відкладено", StringComparison.Ordinal) && text.Contains("порядком тем", StringComparison.Ordinal))
-        {
-            return ("topic-order", "Порядок тем не дозволив слот");
-        }
-        if (text.Contains("суцільним блоком", StringComparison.Ordinal))
-        {
-            return ("module-block", "Модуль має йти суцільним блоком");
-        }
-        if (text.Contains("більше двох", StringComparison.Ordinal)
-            || text.Contains("ліміт", StringComparison.Ordinal)
-            || text.Contains("обмеж", StringComparison.Ordinal))
-        {
-            return ("limit", "Спрацювали денні або слотні ліміти");
-        }
-        if (text.Contains("спільн", StringComparison.Ordinal))
-        {
-            return ("shared-flow", "Спільний потік не готовий");
-        }
-        return ("other", "Інші причини");
+        var normalized = string.IsNullOrWhiteSpace(value) ? "—" : value.Trim();
+        return normalized.Length <= 100 ? normalized : normalized[..100] + "...";
     }
 
     private static string FormatWeek(AdminScheduleLogEntry entry)

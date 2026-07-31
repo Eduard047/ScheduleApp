@@ -6,6 +6,7 @@ public record LookupDto(int Id, string Name)
 {
     public int? CourseId { get; init; }
     public int? DepartmentId { get; init; }
+    public DateOnly? AcademicPeriodStartDate { get; init; }
 }
 // Довідник з кодом та назвою.
 public record IdCodeNameDto(int Id, string Code, string Name)

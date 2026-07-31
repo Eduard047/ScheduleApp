@@ -241,7 +241,7 @@
                         <select class="form-select form-select-sm"
                                 value="@selectedPlanCourseId"
                                 @onchange="OnPlanCourseChanged"
-                                disabled="@(!planCourseIds.Any())">
+                                disabled="@(_plansBusy || !planCourseIds.Any())">
                             @foreach (var cid in planCourseIds)
                             {
                                 <option value="@cid">@NameOfCourse(cid)</option>
@@ -250,15 +250,15 @@
                     </div>
                 </div>
                 <div class="d-flex gap-2">
-                    <button class="btn btn-sm btn-outline-secondary" @onclick="ClosePlans">Закрити</button>
-                    <button class="btn btn-sm btn-primary" @onclick="SavePlans" disabled="@(selectedPlanCourseId <= 0)">Зберегти план</button>
+                    <button class="btn btn-sm btn-outline-secondary" @onclick="ClosePlans" disabled="@_plansBusy">Закрити</button>
+                    <button class="btn btn-sm btn-primary" @onclick="SavePlans" disabled="@(_plansBusy || selectedPlanCourseId <= 0)">@(_plansBusy ? "Зачекайте..." : "Зберегти план")</button>
                 </div>
             </div>
             <div class="plan-modal-body">
                 <div class="row g-3 mt-3">
                     <div class="col-12 col-md-4">
                         <label class="form-label">Обсяг кредитів (за планом)</label>
-                        <input type="number" min="0" step="0.1" class="form-control" @bind="planCourse.Credits" />
+                        <input type="number" min="0" step="0.1" class="form-control" @bind="planCourse.Credits" disabled="@_plansBusy" />
                         <div class="form-text">≈ @Math.Round(planCourse.Credits * 30M) год.</div>
                     </div>
                     <div class="col-12 col-md-4">
@@ -267,7 +267,7 @@
                     </div>
                     <div class="col-12 col-md-4 d-flex align-items-end">
                         <div class="form-check">
-                            <input class="form-check-input" type="checkbox" id="planActive" @bind="planCourse.IsActive" />
+                            <input class="form-check-input" type="checkbox" id="planActive" @bind="planCourse.IsActive" disabled="@_plansBusy" />
                             <label class="form-check-label" for="planActive">Активний</label>
                         </div>
                     </div>
@@ -285,7 +285,7 @@
                         <button type="button"
                                 class="btn btn-sm btn-primary"
                                 @onclick="OpenCreateTopic"
-                                disabled="@(!plansModuleId.HasValue)">
+                                disabled="@(_plansBusy || !plansModuleId.HasValue)">
                             Додати заняття
                         </button>
                     </div>
@@ -323,6 +323,7 @@
                                             <td>@(string.IsNullOrWhiteSpace(topic.DepartmentName) ? "—" : topic.DepartmentName)</td>
                                             <td class="text-center">
                                 <input class="form-check-input" type="checkbox" checked="@topic.IsInterAssembly"
+                                       disabled="@_plansBusy"
                                        @onchange="e => ToggleTopicInterAssembly(topic, e)"
                                        aria-label="Міжзборові заходи" />
                                             </td>
@@ -330,6 +331,7 @@
                                                 <button type="button"
                                                         class="btn btn-sm topic-flag-btn @(topic.SelfStudyBySupervisor ? "btn-success" : "btn-outline-secondary")"
                                                         title="Самостійні години цієї теми ставляться у розклад"
+                                                        disabled="@_plansBusy"
                                                         @onclick="() => ToggleTopicSupervisorSelfStudy(topic)">
                                                     @(topic.SelfStudyBySupervisor ? "У розкладі" : "Не розкладати")
                                                 </button>
@@ -345,8 +347,8 @@
                                             </td>
                                             <td class="module-topics-col-actions text-end text-nowrap">
                                                 <div class="btn-group btn-group-sm me-1 mb-1 mb-sm-0">
-                                                    <button class="btn btn-outline-secondary" @onclick="() => EditTopic(topic)">Редагувати</button>
-                                                    <button class="btn btn-outline-danger" @onclick="() => DeleteTopic(topic.Id)">Видалити</button>
+                                                    <button class="btn btn-outline-secondary" disabled="@_plansBusy" @onclick="() => EditTopic(topic)">Редагувати</button>
+                                                    <button class="btn btn-outline-danger" disabled="@_plansBusy" @onclick="() => DeleteTopic(topic.Id)">Видалити</button>
                                                 </div>
                                             </td>
                                         </tr>
@@ -422,9 +424,9 @@
                                 </div>
                             </div>
                             <div class="editor-actions">
-                                <button type="button" class="btn btn-primary" @onclick="SaveTopic" disabled="@(!plansModuleId.HasValue)">Зберегти заняття</button>
-                                <button type="button" class="btn btn-outline-secondary" @onclick="ClearTopicForm" disabled="@(!plansModuleId.HasValue)">Очистити поля</button>
-                                <button type="button" class="btn btn-outline-secondary" @onclick="CloseTopicEditor">Скасувати</button>
+                                <button type="button" class="btn btn-primary" @onclick="SaveTopic" disabled="@(_plansBusy || !plansModuleId.HasValue)">Зберегти заняття</button>
+                                <button type="button" class="btn btn-outline-secondary" @onclick="ClearTopicForm" disabled="@(_plansBusy || !plansModuleId.HasValue)">Очистити поля</button>
+                                <button type="button" class="btn btn-outline-secondary" @onclick="CloseTopicEditor" disabled="@_plansBusy">Скасувати</button>
                             </div>
                         </div>
                     </div>
@@ -461,6 +463,7 @@ private int selectedPlanCourseId;
 private string plansModuleTitle = "";
 private string plansModuleCode = "";
     private PlanCourseVM planCourse = new();
+    private bool _plansBusy;
 
     private List<ModuleTopicViewDto> moduleTopics = new();
     private ModuleTopicFormVM topicForm = new();
@@ -561,13 +564,22 @@ private string plansModuleCode = "";
     // Викликає повне очищення модулів після підтвердження.
     private async Task ClearAllModules()
     {
+        if (clearBusy)
+        {
+            return;
+        }
+        clearBusy = true;
         clearError = null;
         clearOk = null;
-        var confirm = await JS.InvokeAsync<bool>("confirm", "Видалити всі модулі, плани та теми?");
-        if (!confirm) return;
         try
         {
-            clearBusy = true;
+            var confirmation = await JS.InvokeAsync<string?>(
+                "prompt",
+                "Ця дія назавжди видалить усі модулі, плани, теми та їх налаштування. Введіть ВИДАЛИТИ для підтвердження.");
+            if (!string.Equals(confirmation?.Trim(), "ВИДАЛИТИ", StringComparison.Ordinal))
+            {
+                return;
+            }
             await Admin.ClearModulesAndPlans();
             clearOk = "Усі модулі та плани очищено.";
             await Load();
@@ -760,8 +772,10 @@ private string plansModuleCode = "";
     // Перемикає прапорець міжзборових заходів для теми і зберігає зміни.
     private async Task ToggleTopicInterAssembly(ModuleTopicViewDto topic, ChangeEventArgs e)
     {
-        if (plansModuleId is null) return;
+        if (_plansBusy || plansModuleId is null) return;
         if (e?.Value is null) return;
+        _plansBusy = true;
+        var moduleId = plansModuleId.Value;
         var newValue = e.Value is bool b && b;
         try
         {
@@ -778,8 +792,8 @@ private string plansModuleCode = "";
                 newValue,
                 topic.SelfStudyBySupervisor
             );
-            await Admin.UpsertModuleTopic(plansModuleId.Value, payload);
-            await LoadTopics(plansModuleId.Value);
+            await Admin.UpsertModuleTopic(moduleId, payload);
+            await LoadTopics(moduleId);
             ok = newValue
                 ? "Тему позначено як міжзборову, вона не увійде в автогенерацію."
                 : "Міжзборову позначку знято.";
@@ -788,11 +802,17 @@ private string plansModuleCode = "";
         {
             error = ex.Message;
         }
+        finally
+        {
+            _plansBusy = false;
+        }
     }
     // Перемикає позначку, що самостійні години веде керівник, і виключає їх з розкладу.
     private async Task ToggleTopicSupervisorSelfStudy(ModuleTopicViewDto topic)
     {
-        if (plansModuleId is null) return;
+        if (_plansBusy || plansModuleId is null) return;
+        _plansBusy = true;
+        var moduleId = plansModuleId.Value;
         var newValue = !topic.SelfStudyBySupervisor;
         try
         {
@@ -809,8 +829,8 @@ private string plansModuleCode = "";
                 topic.IsInterAssembly,
                 newValue
             );
-            await Admin.UpsertModuleTopic(plansModuleId.Value, payload);
-            await LoadTopics(plansModuleId.Value);
+            await Admin.UpsertModuleTopic(moduleId, payload);
+            await LoadTopics(moduleId);
             ok = newValue
                 ? "Самостійні години теми будуть розкладатися під керівником."
                 : "Самостійні години теми виключено з розкладу.";
@@ -819,10 +839,16 @@ private string plansModuleCode = "";
         {
             error = ex.Message;
         }
+        finally
+        {
+            _plansBusy = false;
+        }
     }
     // Відкриває панель планів для обраного модуля та завантажує дані.
     private async Task OpenPlans(ModuleEditDto m)
     {
+        if (_plansBusy) return;
+        _plansBusy = true;
         try
         {
             ok = "Дані плану модуля завантажено.";
@@ -854,11 +880,18 @@ private string plansModuleCode = "";
                 await LoadTopics(id);
             }
         }
-        catch (Exception ex) { error = ex.Message; }
+        catch (Exception ex)
+        {
+            selectedPlanCourseId = 0;
+            planCourse = new();
+            error = ex.Message;
+        }
+        finally { _plansBusy = false; }
     }
     // Скидає стан панелі планів і приховує її.
     private void ClosePlans()
     {
+        if (_plansBusy) return;
         plansModuleId = null;
         planCourseIds = new();
         selectedPlanCourseId = 0;
@@ -872,25 +905,35 @@ private string plansModuleCode = "";
     // Зберігає налаштування плану годин для вибраного курсу.
     private async Task SavePlans()
     {
-        if (plansModuleId is null || selectedPlanCourseId <= 0) return;
+        if (_plansBusy || plansModuleId is null || selectedPlanCourseId <= 0) return;
+        _plansBusy = true;
+        var moduleId = plansModuleId.Value;
+        var courseId = selectedPlanCourseId;
+        var credits = planCourse.Credits;
+        var isActive = planCourse.IsActive;
         try
         {
-            var normalizedHours = (int)Math.Round(Math.Max(0m, planCourse.Credits) * 30m);
+            var normalizedHours = (int)Math.Round(Math.Max(0m, credits) * 30m);
             await Admin.UpsertCourseModulePlan(
-                plansModuleId.Value,
-                selectedPlanCourseId,
-                new SaveCourseModulePlanDto(normalizedHours, planCourse.IsActive)
+                moduleId,
+                courseId,
+                new SaveCourseModulePlanDto(normalizedHours, isActive)
             );
+            if (plansModuleId != moduleId || selectedPlanCourseId != courseId)
+            {
+                return;
+            }
             planCourse.TargetHours = normalizedHours;
             ok = "План модуля оновлено.";
-            await LoadPlanDetails(plansModuleId.Value, selectedPlanCourseId, planCourse.Credits);
-            var moduleRow = items.FirstOrDefault(x => x.Id == plansModuleId);
+            await LoadPlanDetails(moduleId, courseId, credits);
+            var moduleRow = items.FirstOrDefault(x => x.Id == moduleId);
             if (moduleRow is not null)
             {
-                moduleRow.Credits = planCourse.Credits;
+                moduleRow.Credits = credits;
             }
         }
         catch (Exception ex) { error = ex.Message; }
+        finally { _plansBusy = false; }
     }
     // Завантажує деталі плану годин для модуля та курсу.
     private async Task LoadPlanDetails(int moduleId, int courseId, decimal fallbackCredits)
@@ -936,17 +979,36 @@ private string plansModuleCode = "";
     // Реагує на зміну курсу у плані та підвантажує його дані.
     private async Task OnPlanCourseChanged(ChangeEventArgs e)
     {
-        if (plansModuleId is null) return;
+        if (_plansBusy || plansModuleId is null) return;
         if (e?.Value is null) return;
         if (!int.TryParse(e.Value.ToString(), out var nextCourseId)) return;
         if (!planCourseIds.Contains(nextCourseId)) return;
         if (nextCourseId <= 0 || nextCourseId == selectedPlanCourseId) return;
+        _plansBusy = true;
+        var moduleId = plansModuleId.Value;
         selectedPlanCourseId = nextCourseId;
-        await EnsurePlanModuleSeparated(plansModuleId.Value, selectedPlanCourseId);
-        var module = items.FirstOrDefault(x => x.Id == plansModuleId);
-        var credits = module?.Credits ?? planCourse.Credits;
-        await LoadPlanDetails(plansModuleId.Value, selectedPlanCourseId, credits);
-        await LoadTopics(plansModuleId.Value);
+        try
+        {
+            await EnsurePlanModuleSeparated(moduleId, nextCourseId);
+            if (plansModuleId is not int currentModuleId || selectedPlanCourseId != nextCourseId)
+            {
+                return;
+            }
+            var module = items.FirstOrDefault(x => x.Id == currentModuleId);
+            var credits = module?.Credits ?? planCourse.Credits;
+            await LoadPlanDetails(currentModuleId, nextCourseId, credits);
+            await LoadTopics(currentModuleId);
+        }
+        catch (Exception ex)
+        {
+            selectedPlanCourseId = 0;
+            planCourse = new();
+            error = ex.Message;
+        }
+        finally
+        {
+            _plansBusy = false;
+        }
     }
     // За потреби розділяє модуль між курсами та перемикає модальне вікно на курсо-специфічний запис.
     private async Task EnsurePlanModuleSeparated(int currentModuleId, int courseId)
@@ -1069,7 +1131,8 @@ private string plansModuleCode = "";
     // Валідує та зберігає тему модуля, оновлює список.
     private async Task SaveTopic()
     {
-        if (plansModuleId is null) return;
+        if (_plansBusy || plansModuleId is null) return;
+        _plansBusy = true;
         try
         {
             var moduleId = plansModuleId.Value;
@@ -1122,24 +1185,34 @@ private string plansModuleCode = "";
         {
             error = ex.Message;
         }
+        finally
+        {
+            _plansBusy = false;
+        }
     }
     // Видаляє тему модуля та перезавантажує дані.
     private async Task DeleteTopic(int topicId)
     {
-        if (plansModuleId is null) return;
+        if (_plansBusy || plansModuleId is null) return;
+        _plansBusy = true;
+        var moduleId = plansModuleId.Value;
         try
         {
             var topic = moduleTopics.FirstOrDefault(t => t.Id == topicId);
             var caption = topic is null ? $"#{topicId}" : $"{topic.TopicCode} ({topic.LessonTypeName})";
             var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити тему {caption}? Дію не можна скасувати.");
             if (!confirmed) return;
-            await Admin.DeleteModuleTopic(plansModuleId.Value, topicId);
+            await Admin.DeleteModuleTopic(moduleId, topicId);
             ok = "Тему видалено.";
-            await LoadTopics(plansModuleId.Value);
+            await LoadTopics(moduleId);
         }
         catch (Exception ex)
         {
             error = ex.Message;
+        }
+        finally
+        {
+            _plansBusy = false;
         }
     }
     // Фільтрує перелік модулів за введеним рядком.

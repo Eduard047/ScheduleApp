@@ -12,7 +12,7 @@ public interface IScheduleApi
     // Створює або оновлює пару.
     Task<int> Upsert(UpsertScheduleItemRequest request);
     // Видаляє пару з розкладу.
-    Task Delete(int id);
+    Task Delete(int id, Guid expectedRevision);
     // Очищає розклад тижня.
     Task<int> ClearWeek(ClearWeekRequest req);
 }

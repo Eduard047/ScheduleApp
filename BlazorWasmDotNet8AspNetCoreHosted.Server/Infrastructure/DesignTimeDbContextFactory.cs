@@ -24,10 +24,11 @@ public class DesignTimeDbContextFactory : IDesignTimeDbContextFactory<AppDbConte
         var cs = configuration.GetConnectionString("Default");
         if (string.IsNullOrWhiteSpace(cs))
         {
-            throw new InvalidOperationException("Connection string 'Default' is not configured. Provide it via user secrets, environment variables, or appsettings.");
+            throw new InvalidOperationException(
+                "Рядок підключення 'ConnectionStrings:Default' не налаштовано. Додайте його через Secret Manager, змінні середовища або appsettings.");
         }
         // Використовуємо визначену версію MySQL.
-        var serverVersion = new MySqlServerVersion(new Version(8, 0, 0)); 
+        var serverVersion = new MySqlServerVersion(new Version(8, 0, 13));
         // Готуємо параметри контексту.
         var options = new DbContextOptionsBuilder<AppDbContext>()
             .UseMySql(cs, serverVersion)

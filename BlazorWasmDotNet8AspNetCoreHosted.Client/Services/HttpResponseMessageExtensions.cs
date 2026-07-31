@@ -11,16 +11,24 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services;
 // Виняток для обробки детальних помилок від API
 public sealed class ApiErrorException : Exception
 {
-    public ApiErrorException(HttpStatusCode statusCode, string message, IReadOnlyList<string>? errors = null, IReadOnlyList<string>? warnings = null, Exception? innerException = null)
+    public ApiErrorException(
+        HttpStatusCode statusCode,
+        string message,
+        IReadOnlyList<string>? errors = null,
+        IReadOnlyList<string>? warnings = null,
+        string? traceId = null,
+        Exception? innerException = null)
         : base(string.IsNullOrWhiteSpace(message) ? $"{(int)statusCode} {statusCode}" : message, innerException)
     {
         StatusCode = statusCode;
         Errors = errors ?? Array.Empty<string>();
         Warnings = warnings ?? Array.Empty<string>();
+        TraceId = traceId;
     }
     public HttpStatusCode StatusCode { get; }
     public IReadOnlyList<string> Errors { get; }
     public IReadOnlyList<string> Warnings { get; }
+    public string? TraceId { get; }
 }
 
 public static class HttpResponseMessageExtensions
@@ -43,41 +51,76 @@ public static class HttpResponseMessageExtensions
             {
             }
         }
-        var (message, errors, warnings) = ParseErrorPayload(payload);
-        throw new ApiErrorException(response.StatusCode, message ?? response.ReasonPhrase ?? string.Empty, errors, warnings);
+        var (message, errors, warnings, traceId) = ParseErrorPayload(payload);
+        throw new ApiErrorException(
+            response.StatusCode,
+            message ?? BuildFallbackMessage(response.StatusCode, response.ReasonPhrase),
+            errors,
+            warnings,
+            traceId);
     }
     // Розбирає JSON-помилку в узгоджений формат повідомлення.
-    private static (string? Message, IReadOnlyList<string>? Errors, IReadOnlyList<string>? Warnings) ParseErrorPayload(string? payload)
+    private static (string? Message, IReadOnlyList<string>? Errors, IReadOnlyList<string>? Warnings, string? TraceId) ParseErrorPayload(string? payload)
     {
         if (string.IsNullOrWhiteSpace(payload))
         {
-            return (null, null, null);
+            return (null, null, null, null);
         }
         try
         {
             using var document = JsonDocument.Parse(payload);
             var root = document.RootElement;
             string? message = TryGetString(root, "message")
-                               ?? TryGetString(root, "title")
-                               ?? TryGetString(root, "detail");
-            var errors = root.TryGetProperty("errors", out var errorsElement) ? ExtractStrings(errorsElement) : null;
-            var warnings = root.TryGetProperty("warnings", out var warningsElement) ? ExtractStrings(warningsElement) : null;
-            return (message ?? payload, errors, warnings);
+                               ?? TryGetString(root, "detail")
+                               ?? TryGetString(root, "title");
+            var errors = TryGetProperty(root, "errors", out var errorsElement) ? ExtractStrings(errorsElement) : null;
+            var warnings = TryGetProperty(root, "warnings", out var warningsElement) ? ExtractStrings(warningsElement) : null;
+            var traceId = TryGetString(root, "traceId");
+            return (message ?? payload, errors, warnings, traceId);
         }
         catch (JsonException)
         {
-            return (payload, null, null);
+            return (payload, null, null, null);
         }
     }
     // Безпечно читає рядкове поле з JSON.
     private static string? TryGetString(JsonElement root, string propertyName)
     {
-        if (root.TryGetProperty(propertyName, out var element) && element.ValueKind == JsonValueKind.String)
+        if (TryGetProperty(root, propertyName, out var element) && element.ValueKind == JsonValueKind.String)
         {
             return element.GetString();
         }
         return null;
     }
+    // Шукає поле JSON без залежності від регістру імені.
+    private static bool TryGetProperty(JsonElement root, string propertyName, out JsonElement value)
+    {
+        if (root.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in root.EnumerateObject())
+            {
+                if (string.Equals(property.Name, propertyName, StringComparison.OrdinalIgnoreCase))
+                {
+                    value = property.Value;
+                    return true;
+                }
+            }
+        }
+        value = default;
+        return false;
+    }
+    // Повертає зрозуміле повідомлення, якщо сервер не надав ProblemDetails.
+    private static string BuildFallbackMessage(HttpStatusCode statusCode, string? reasonPhrase)
+        => statusCode switch
+        {
+            HttpStatusCode.BadRequest => "Запит має некоректні параметри.",
+            HttpStatusCode.Conflict => "Операцію не виконано через конфлікт даних.",
+            HttpStatusCode.TooManyRequests => "Забагато одночасних операцій. Дочекайтеся завершення поточної задачі та повторіть спробу.",
+            HttpStatusCode.ServiceUnavailable => "Сервіс тимчасово недоступний. Повторіть спробу пізніше.",
+            _ => string.IsNullOrWhiteSpace(reasonPhrase)
+                ? $"HTTP {(int)statusCode}."
+                : reasonPhrase
+        };
     // Витягує список рядків з масиву/об'єкта JSON.
     private static IReadOnlyList<string>? ExtractStrings(JsonElement element)
     {

@@ -22,6 +22,140 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
 
             MySqlModelBuilderExtensions.AutoIncrementColumns(modelBuilder);
 
+            modelBuilder.Entity("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.AutoGenDraftPlan", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    MySqlPropertyBuilderExtensions.UseMySqlIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<int>("AddCount")
+                        .HasColumnType("int");
+
+                    b.Property<bool>("AllowIncompleteDrafts")
+                        .HasColumnType("tinyint(1)");
+
+                    b.Property<DateTime?>("AppliedAtUtc")
+                        .HasColumnType("datetime(6)");
+
+                    b.Property<Guid?>("AppliedScopeRevision")
+                        .HasColumnType("char(36)");
+
+                    b.Property<int>("AutoGenJobRunId")
+                        .HasColumnType("int");
+
+                    b.Property<Guid>("BeforeScopeRevision")
+                        .HasColumnType("char(36)");
+
+                    b.Property<int>("CourseId")
+                        .HasColumnType("int");
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("datetime(6)");
+
+                    b.Property<int>("Days")
+                        .HasColumnType("int");
+
+                    b.Property<int>("DeleteCount")
+                        .HasColumnType("int");
+
+                    b.Property<DateTime>("ExpiresAtUtc")
+                        .HasColumnType("datetime(6)");
+
+                    b.Property<string>("GroupIdsJson")
+                        .IsRequired()
+                        .HasColumnType("longtext");
+
+                    b.Property<string>("InputFingerprint")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)");
+
+                    b.Property<string>("PlanId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)");
+
+                    b.Property<DateOnly>("RangeEndDate")
+                        .HasColumnType("date");
+
+                    b.Property<DateOnly>("RangeStartDate")
+                        .HasColumnType("date");
+
+                    b.Property<DateTime?>("RolledBackAtUtc")
+                        .HasColumnType("datetime(6)");
+
+                    b.Property<int>("State")
+                        .HasColumnType("int");
+
+                    b.Property<int>("UpdateCount")
+                        .HasColumnType("int");
+
+                    b.Property<long>("Version")
+                        .IsConcurrencyToken()
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AutoGenJobRunId")
+                        .IsUnique();
+
+                    b.HasIndex("CourseId");
+
+                    b.HasIndex("PlanId")
+                        .IsUnique();
+
+                    b.HasIndex("State", "ExpiresAtUtc");
+
+                    b.ToTable("AutoGenDraftPlans");
+                });
+
+            modelBuilder.Entity("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.AutoGenDraftPlanMutation", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    MySqlPropertyBuilderExtensions.UseMySqlIdentityColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("AfterJson")
+                        .HasColumnType("longtext");
+
+                    b.Property<int?>("AppliedDraftId")
+                        .HasColumnType("int");
+
+                    b.Property<Guid?>("AppliedRevision")
+                        .HasColumnType("char(36)");
+
+                    b.Property<int>("AutoGenDraftPlanId")
+                        .HasColumnType("int");
+
+                    b.Property<string>("BeforeJson")
+                        .HasColumnType("longtext");
+
+                    b.Property<Guid?>("BeforeRevision")
+                        .HasColumnType("char(36)");
+
+                    b.Property<int>("Operation")
+                        .HasColumnType("int");
+
+                    b.Property<int>("Ordinal")
+                        .HasColumnType("int");
+
+                    b.Property<int?>("SourceDraftId")
+                        .HasColumnType("int");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AppliedDraftId");
+
+                    b.HasIndex("AutoGenDraftPlanId", "Ordinal")
+                        .IsUnique();
+
+                    b.ToTable("AutoGenDraftPlanMutations");
+                });
+
             modelBuilder.Entity("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.AutoGenJobRun", b =>
                 {
                     b.Property<int>("Id")
@@ -29,6 +163,9 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                         .HasColumnType("int");
 
                     MySqlPropertyBuilderExtensions.UseMySqlIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<int>("Attempt")
+                        .HasColumnType("int");
 
                     b.Property<bool>("CancellationRequested")
                         .HasColumnType("tinyint(1)");
@@ -83,6 +220,13 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                         .HasMaxLength(1024)
                         .HasColumnType("varchar(1024)");
 
+                    b.Property<DateTime?>("LeaseExpiresAtUtc")
+                        .HasColumnType("datetime(6)");
+
+                    b.Property<string>("OwnerInstanceId")
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)");
+
                     b.Property<int>("Percent")
                         .HasColumnType("int");
 
@@ -94,6 +238,11 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
 
                     b.Property<string>("ReportJson")
                         .HasColumnType("longtext");
+
+                    b.Property<string>("RequestHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)");
 
                     b.Property<string>("RequestJson")
                         .IsRequired()
@@ -128,6 +277,10 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                     b.Property<DateTime>("UpdatedAtUtc")
                         .HasColumnType("datetime(6)");
 
+                    b.Property<long>("Version")
+                        .IsConcurrencyToken()
+                        .HasColumnType("bigint");
+
                     b.Property<int>("WarningCount")
                         .HasColumnType("int");
 
@@ -141,6 +294,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                     b.HasIndex("State");
 
                     b.HasIndex("UpdatedAtUtc");
+
+                    b.HasIndex("State", "LeaseExpiresAtUtc");
 
                     b.ToTable("AutoGenJobRuns");
                 });
@@ -236,12 +391,16 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
 
                     MySqlPropertyBuilderExtensions.UseMySqlIdentityColumn(b.Property<int>("Id"));
 
+                    b.Property<DateOnly?>("AcademicPeriodStartDate")
+                        .HasColumnType("date");
+
                     b.Property<int>("DurationWeeks")
                         .HasColumnType("int");
 
                     b.Property<string>("Name")
                         .IsRequired()
-                        .HasColumnType("longtext");
+                        .HasMaxLength(256)
+                        .HasColumnType("varchar(256)");
 
                     b.HasKey("Id");
 
@@ -315,7 +474,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
 
                     b.Property<string>("Code")
                         .IsRequired()
-                        .HasColumnType("longtext");
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)");
 
                     b.Property<bool>("CountInLoad")
                         .HasColumnType("tinyint(1)");
@@ -324,7 +484,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                         .HasColumnType("tinyint(1)");
 
                     b.Property<string>("CssKey")
-                        .HasColumnType("longtext");
+                        .HasMaxLength(32)
+                        .HasColumnType("varchar(32)");
 
                     b.Property<bool>("IsActive")
                         .HasColumnType("tinyint(1)");
@@ -343,6 +504,12 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                         .HasColumnType("tinyint(1)");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("Code")
+                        .IsUnique();
+
+                    b.HasIndex("CssKey")
+                        .IsUnique();
 
                     b.ToTable("LessonTypes", (string)null);
                 });
@@ -366,6 +533,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
 
                     b.HasKey("Id");
 
+                    b.HasIndex("CourseId");
+
                     b.ToTable("LunchConfigs");
                 });
 
@@ -379,7 +548,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
 
                     b.Property<string>("Code")
                         .IsRequired()
-                        .HasColumnType("longtext");
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)");
 
                     b.Property<int>("CourseId")
                         .HasColumnType("int");
@@ -395,7 +565,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("CourseId");
+                    b.HasIndex("CourseId", "Code")
+                        .IsUnique();
 
                     b.ToTable("Modules");
                 });
@@ -678,6 +849,10 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
 
                     MySqlPropertyBuilderExtensions.UseMySqlIdentityColumn(b.Property<int>("Id"));
 
+                    b.Property<string>("BatchKey")
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)");
+
                     b.Property<DateOnly>("Date")
                         .HasColumnType("date");
 
@@ -707,6 +882,12 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                     b.Property<int?>("ModuleTopicId")
                         .HasColumnType("int");
 
+                    b.Property<Guid>("Revision")
+                        .IsConcurrencyToken()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("char(36)")
+                        .HasDefaultValueSql("(UUID())");
+
                     b.Property<int?>("RoomId")
                         .HasColumnType("int");
 
@@ -717,6 +898,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                         .HasColumnType("int");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("BatchKey");
 
                     b.HasIndex("GroupId");
 
@@ -820,6 +1003,10 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                     b.Property<TimeOnly>("EndTime")
                         .HasColumnType("time(6)");
 
+                    b.Property<string>("GenerationJobId")
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)");
+
                     b.Property<int>("GroupId")
                         .HasColumnType("int");
 
@@ -843,6 +1030,12 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                     b.Property<int?>("PublishedItemId")
                         .HasColumnType("int");
 
+                    b.Property<Guid>("Revision")
+                        .IsConcurrencyToken()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("char(36)")
+                        .HasDefaultValueSql("(UUID())");
+
                     b.Property<int?>("RoomId")
                         .HasColumnType("int");
 
@@ -862,6 +1055,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                         .HasColumnType("longtext");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("GenerationJobId");
 
                     b.HasIndex("GroupId");
 
@@ -964,6 +1159,36 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                     b.ToTable("TimeSlots");
                 });
 
+            modelBuilder.Entity("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.AutoGenDraftPlan", b =>
+                {
+                    b.HasOne("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.AutoGenJobRun", "AutoGenJobRun")
+                        .WithMany()
+                        .HasForeignKey("AutoGenJobRunId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.Course", "Course")
+                        .WithMany()
+                        .HasForeignKey("CourseId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("AutoGenJobRun");
+
+                    b.Navigation("Course");
+                });
+
+            modelBuilder.Entity("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.AutoGenDraftPlanMutation", b =>
+                {
+                    b.HasOne("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.AutoGenDraftPlan", "Plan")
+                        .WithMany("Mutations")
+                        .HasForeignKey("AutoGenDraftPlanId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Plan");
+                });
+
             modelBuilder.Entity("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.BuildingTravel", b =>
                 {
                     b.HasOne("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.Building", "From")
@@ -1009,6 +1234,14 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                         .IsRequired();
 
                     b.Navigation("Course");
+                });
+
+            modelBuilder.Entity("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.LunchConfig", b =>
+                {
+                    b.HasOne("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.Course", null)
+                        .WithMany()
+                        .HasForeignKey("CourseId")
+                        .OnDelete(DeleteBehavior.Cascade);
                 });
 
             modelBuilder.Entity("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.Module", b =>
@@ -1365,6 +1598,11 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                         .OnDelete(DeleteBehavior.Cascade);
 
                     b.Navigation("Course");
+                });
+
+            modelBuilder.Entity("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.AutoGenDraftPlan", b =>
+                {
+                    b.Navigation("Mutations");
                 });
 
             modelBuilder.Entity("BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.Course", b =>

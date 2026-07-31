@@ -16,24 +16,95 @@ public sealed class RulesService(AppDbContext db)
         => TimeOnly.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out time);
 
     // Перевіряє правила для створення/оновлення опублікованої пари.
-    public async Task<(List<string> errors, List<string> warnings)> ValidateUpsertAsync(UpsertScheduleItemRequest r)
+    public async Task<(List<string> errors, List<string> warnings)> ValidateUpsertAsync(
+        UpsertScheduleItemRequest r,
+        IReadOnlyCollection<int>? excludedScheduleItemIds = null,
+        int? projectedModuleTopicId = null)
     {
         var errors = new List<string>();
         var warnings = new List<string>();
+        if (!DateHelpers.IsSupportedScheduleDate(r.Date))
+        {
+            errors.Add(DateHelpers.SupportedScheduleDateMessage);
+            return (errors, warnings);
+        }
         var group = await db.Groups.AsNoTracking().Include(g => g.Course).FirstOrDefaultAsync(x => x.Id == r.GroupId);
         if (group is null) errors.Add("Групу не знайдено.");
         var module = await db.Modules
             .AsNoTracking()
             .Include(m => m.AllowedRooms)
             .Include(m => m.AllowedBuildings)
+            .Include(m => m.ModuleCourses)
             .FirstOrDefaultAsync(x => x.Id == r.ModuleId);
         if (module is null) errors.Add("Модуль не знайдено.");
         var ltype = await db.LessonTypes.AsNoTracking().FirstOrDefaultAsync(x => x.Id == r.LessonTypeId);
         if (ltype is null) errors.Add("Тип заняття не знайдено.");
+        if (group is not null
+            && module is not null
+            && module.CourseId != group.CourseId
+            && !module.ModuleCourses.Any(link => link.CourseId == group.CourseId))
+        {
+            errors.Add($"Модуль {module.Title} не належить курсу групи {group.Name}.");
+        }
+        if (r.TeacherId is int providedTeacherId
+            && !await db.Teachers.AsNoTracking().AnyAsync(teacher => teacher.Id == providedTeacherId))
+        {
+            errors.Add($"Викладача з ідентифікатором {providedTeacherId} не знайдено.");
+        }
+        var effectiveTopicId = projectedModuleTopicId;
+        if (effectiveTopicId is null && r.Id is int persistedItemId && persistedItemId > 0)
+        {
+            effectiveTopicId = await db.ScheduleItems
+                .AsNoTracking()
+                .Where(item => item.Id == persistedItemId)
+                .Select(item => item.ModuleTopicId)
+                .FirstOrDefaultAsync();
+        }
+        if (effectiveTopicId is int topicId)
+        {
+            var topic = await db.ModuleTopics
+                .AsNoTracking()
+                .Where(item => item.Id == topicId)
+                .Select(item => new { item.ModuleId, item.LessonTypeId })
+                .FirstOrDefaultAsync();
+            if (topic is null)
+            {
+                errors.Add($"Тему з ідентифікатором {topicId} не знайдено.");
+            }
+            else
+            {
+                if (topic.ModuleId != r.ModuleId)
+                {
+                    errors.Add($"Тема #{topicId} не належить модулю #{r.ModuleId}.");
+                }
+                var preservesOriginalTopic = string.Equals(
+                                                 ltype?.Code,
+                                                 "CANCELED",
+                                                 StringComparison.OrdinalIgnoreCase)
+                                             || string.Equals(
+                                                 ltype?.Code,
+                                                 "RESCHEDULED",
+                                                 StringComparison.OrdinalIgnoreCase);
+                if (topic.LessonTypeId != r.LessonTypeId && !preservesOriginalTopic)
+                {
+                    errors.Add($"Тип заняття #{r.LessonTypeId} не відповідає темі #{topicId}.");
+                }
+            }
+        }
+        if (module is not null
+            && ltype?.CountInPlan == true
+            && effectiveTopicId is null
+            && await db.ModuleTopics.AsNoTracking().AnyAsync(topic =>
+                topic.ModuleId == module.Id && topic.AuditoriumHours > 0))
+        {
+            errors.Add("Для модуля налаштовано тематичний план. Створіть заняття через чернетки викладачів, щоб обрати тему та правильно врахувати години.");
+        }
         var requiresRoom = ltype?.RequiresRoom ?? true;
         var requiresTeacher = ltype?.RequiresTeacher ?? true;
         var blocksRoom = ltype?.BlocksRoom ?? true;
         var blocksTeacher = ltype?.BlocksTeacher ?? true;
+        var occupiesSlot = ltype is not null
+                           && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(ltype.Code);
         Room? room = null;
         if (requiresRoom && r.RoomId is null)
         {
@@ -65,15 +136,16 @@ public sealed class RulesService(AppDbContext db)
             var effectiveSlots = resolved.Slots
                 .Select(s => (s.Start, s.End))
                 .ToList();
-            if (effectiveSlots.Count > 0 && !IsSlotRangeAllowed(start, end, effectiveSlots))
+            if (effectiveSlots.Count == 0)
+                errors.Add("Для курсу немає активних часових слотів у цей день.");
+            else if (!IsSlotRangeAllowed(start, end, effectiveSlots))
                 errors.Add("Обраний часовий проміжок не входить до дозволених слотів.");
         }
-        bool isWeekend = dayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday;
         var courseId = group?.CourseId;
         var cal = await FindCalendarExceptionAsync(r.Date, courseId, r.GroupId);
-        bool isWorking = cal?.IsWorkingDay ?? !isWeekend;
+        bool isWorking = cal?.IsWorkingDay ?? true;
         if (!isWorking && !r.OverrideNonWorkingDay)
-            warnings.Add("Увага: заняття потрапляє на вихідний день.");
+            errors.Add("Заняття потрапляє на неробочий день без явного дозволу.");
         if (requiresRoom && room is not null)
         {
             if (room!.Capacity < group!.StudentsCount)
@@ -86,43 +158,69 @@ public sealed class RulesService(AppDbContext db)
                 errors.Add($"Аудиторія {room.Name} не входить до дозволених для цього модуля.");
         }
         var currentId = r.Id ?? 0;
-        var canCheckTravel = requiresRoom && blocksRoom && r.RoomId is int;
-        List<ScheduleItem>? dayScheduleCandidates = null;
-        bool conflicts;
-        if (canCheckTravel)
+        var canCheckTravel = requiresRoom && room is not null;
+        var currentOfficialItem = currentId > 0
+            ? await db.ScheduleItems.AsNoTracking().FirstOrDefaultAsync(x => x.Id == currentId)
+            : null;
+        var excludedIds = excludedScheduleItemIds?
+            .Where(id => id > 0)
+            .Distinct()
+            .ToList() ?? new List<int>();
+        if (requiresRoom && room is not null && group is not null)
         {
-            dayScheduleCandidates = await db.ScheduleItems
+            var capacityQuery = db.ScheduleItems
                 .AsNoTracking()
-                .Include(x => x.Room).ThenInclude(rm => rm!.Building)
-                .Where(x => x.Id != currentId
-                            && x.Date == r.Date
-                            && (
-                                x.GroupId == r.GroupId
-                                || (r.TeacherId != null && x.TeacherId == r.TeacherId)
-                                || (r.RoomId != null && x.RoomId == r.RoomId)
-                            ))
+                .Where(item => item.Id != currentId
+                               && item.Date == r.Date
+                               && item.StartTime == start
+                               && item.EndTime == end
+                               && item.RoomId == room.Id
+                               && item.LessonType.RequiresRoom);
+            if (excludedIds.Count > 0)
+            {
+                capacityQuery = capacityQuery.Where(item => !excludedIds.Contains(item.Id));
+            }
+
+            var occupiedGroups = await capacityQuery
+                .Select(item => new { item.GroupId, item.Group.StudentsCount })
                 .ToListAsync();
-            conflicts = dayScheduleCandidates.Any(x =>
-                x.StartTime < end && start < x.EndTime
-                && (
-                    x.GroupId == r.GroupId
-                    || (blocksRoom && r.RoomId != null && x.RoomId == r.RoomId)
-                    || (blocksTeacher && r.TeacherId != null && x.TeacherId == r.TeacherId)
-                ));
+            var projectedStudentsByGroup = occupiedGroups
+                .GroupBy(item => item.GroupId)
+                .ToDictionary(items => items.Key, items => items.First().StudentsCount);
+            projectedStudentsByGroup[group.Id] = group.StudentsCount;
+            var projectedStudents = projectedStudentsByGroup.Values.Sum();
+            if (projectedStudents > room.Capacity)
+            {
+                errors.Add(
+                    $"Аудиторія {room.Name} має {room.Capacity} місць, але спільне заняття у слоті {start:HH\\:mm}-{end:HH\\:mm} охоплює {projectedStudents} студентів.");
+            }
         }
-        else
+        var dayScheduleQuery = db.ScheduleItems
+            .AsNoTracking()
+            .Include(x => x.LessonType)
+            .Include(x => x.Room).ThenInclude(rm => rm!.Building)
+            .Where(x => x.Id != currentId
+                        && x.Date == r.Date
+                        && (
+                            x.GroupId == r.GroupId
+                            || (r.TeacherId != null && x.TeacherId == r.TeacherId)
+                            || (r.RoomId != null && x.RoomId == r.RoomId)
+                        ));
+        if (excludedIds.Count > 0)
         {
-            conflicts = await db.ScheduleItems
-                .Where(x => x.Id != currentId
-                            && x.Date == r.Date
-                            && (
-                                x.GroupId == r.GroupId
-                                || (blocksRoom && r.RoomId != null && x.RoomId == r.RoomId)
-                                || (blocksTeacher && r.TeacherId != null && x.TeacherId == r.TeacherId)
-                            )
-                            && x.StartTime < end && start < x.EndTime)
-                .AnyAsync();
+            dayScheduleQuery = dayScheduleQuery.Where(x => !excludedIds.Contains(x.Id));
         }
+        var dayScheduleCandidates = await dayScheduleQuery.ToListAsync();
+        var conflicts = occupiesSlot && dayScheduleCandidates.Any(x =>
+            !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(x.LessonType.Code)
+            &&
+            !IsSamePublishedLogicalEvent(r, currentOfficialItem, x, start, end)
+            && x.StartTime < end && start < x.EndTime
+            && (
+                x.GroupId == r.GroupId
+                || (blocksRoom && r.RoomId != null && x.RoomId == r.RoomId)
+                || (blocksTeacher && r.TeacherId != null && x.TeacherId == r.TeacherId)
+            ));
         if (conflicts)
             errors.Add($"Знайдено конфлікт вже опублікованого розкладу на дату {r.Date:dd.MM.yyyy}.");
         if (canCheckTravel)
@@ -130,13 +228,11 @@ public sealed class RulesService(AppDbContext db)
             var travel = await db.BuildingTravels.AsNoTracking()
                 .ToDictionaryAsync(k => (k.FromBuildingId, k.ToBuildingId), v => v.Minutes);
             int TravelMinutes(int fromId, int toId)
-            {
-                if (fromId == toId) return 0;
-                if (travel.TryGetValue((fromId, toId), out var m)) return m;
-                if (travel.TryGetValue((toId, fromId), out m)) return m;
-                return 10;
-            }
+                => TravelTimePolicy.Resolve(travel, fromId, toId);
             var adj = dayScheduleCandidates!
+                .Where(x => x.LessonType.RequiresRoom
+                            && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(x.LessonType.Code)
+                            && !IsSamePublishedLogicalEvent(r, currentOfficialItem, x, start, end))
                 .Where(x => x.GroupId == r.GroupId || (r.TeacherId != null && x.TeacherId == r.TeacherId))
                 .ToList();
             foreach (var a in adj)
@@ -161,7 +257,7 @@ public sealed class RulesService(AppDbContext db)
             if (windows.Count > 0)
             {
                 bool fits = windows.Any(w => w.Start <= start && end <= w.End);
-                if (!fits) warnings.Add("Заняття виходить за межі робочих годин викладача.");
+                if (!fits) errors.Add("Заняття виходить за межі робочих годин викладача.");
             }
         }
         return (errors, warnings);
@@ -171,6 +267,12 @@ public sealed class RulesService(AppDbContext db)
         List<string> Warnings,
         DraftValidationReportDto Report
     );
+    // Дозволяє режиму без обмежень обходити лише конфлікти розміщення, але не структурні помилки даних.
+    public static bool IsBypassableDraftValidationIssue(DraftValidationIssueDto issue)
+        => string.Equals(issue.Severity, "error", StringComparison.OrdinalIgnoreCase)
+           && (issue.Code.StartsWith("conflict-", StringComparison.Ordinal)
+               || issue.Code.StartsWith("travel-", StringComparison.Ordinal));
+
     // Валідатор чернеток із деталізованим звітом проблем.
     public async Task<DraftValidationResult> ValidateDraftAsync(DraftUpsertRequest r)
     {
@@ -187,6 +289,14 @@ public sealed class RulesService(AppDbContext db)
             warnings.Add(description);
             issues.Add(new DraftValidationIssueDto("warning", code, title, description));
         }
+        if (!DateHelpers.IsSupportedScheduleDate(r.Date))
+        {
+            AddError(
+                "date-out-of-range",
+                "Дата поза підтримуваним діапазоном",
+                DateHelpers.SupportedScheduleDateMessage);
+            return new DraftValidationResult(errors, warnings, new DraftValidationReportDto(DateTimeOffset.UtcNow, issues));
+        }
         var group = await db.Groups.AsNoTracking().Include(g => g.Course).FirstOrDefaultAsync(x => x.Id == r.GroupId);
         if (group is null)
             AddError("group-not-found", "Групу не знайдено", $"Група з ідентифікатором {r.GroupId} відсутня у базі даних.");
@@ -194,16 +304,70 @@ public sealed class RulesService(AppDbContext db)
             .AsNoTracking()
             .Include(m => m.AllowedRooms)
             .Include(m => m.AllowedBuildings)
+            .Include(m => m.ModuleCourses)
             .FirstOrDefaultAsync(x => x.Id == r.ModuleId);
         if (module is null)
             AddError("module-not-found", "Модуль не знайдено", $"Модуль з ідентифікатором {r.ModuleId} відсутній у базі.");
         var ltype = await db.LessonTypes.AsNoTracking().FirstOrDefaultAsync(x => x.Id == r.LessonTypeId);
         if (ltype is null)
             AddError("lesson-type-not-found", "Тип заняття не знайдено", $"Тип заняття {r.LessonTypeId} не існує.");
+        if (group is not null
+            && module is not null
+            && module.CourseId != group.CourseId
+            && !module.ModuleCourses.Any(link => link.CourseId == group.CourseId))
+        {
+            AddError(
+                "module-course-mismatch",
+                "Модуль не належить курсу групи",
+                $"Модуль {module.Title} не належить курсу групи {group.Name}.");
+        }
+        if (r.TeacherId is int providedTeacherId
+            && !await db.Teachers.AsNoTracking().AnyAsync(teacher => teacher.Id == providedTeacherId))
+        {
+            AddError(
+                "teacher-not-found",
+                "Викладача не знайдено",
+                $"Викладач з ідентифікатором {providedTeacherId} відсутній у базі даних.");
+        }
+        if (r.ModuleTopicId is int providedTopicId)
+        {
+            var topic = await db.ModuleTopics
+                .AsNoTracking()
+                .Where(item => item.Id == providedTopicId)
+                .Select(item => new { item.ModuleId, item.LessonTypeId })
+                .FirstOrDefaultAsync();
+            if (topic is null)
+            {
+                AddError(
+                    "module-topic-not-found",
+                    "Тему не знайдено",
+                    $"Тема з ідентифікатором {providedTopicId} відсутня у базі даних.");
+            }
+            else
+            {
+                if (topic.ModuleId != r.ModuleId)
+                {
+                    AddError(
+                        "module-topic-module-mismatch",
+                        "Тема не належить модулю",
+                        $"Тема #{providedTopicId} не належить модулю #{r.ModuleId}.");
+                }
+                if (topic.LessonTypeId != r.LessonTypeId)
+                {
+                    AddError(
+                        "module-topic-lesson-type-mismatch",
+                        "Тип заняття не відповідає темі",
+                        $"Тип заняття #{r.LessonTypeId} не відповідає темі #{providedTopicId}.");
+                }
+            }
+        }
         var requiresRoom = ltype?.RequiresRoom ?? true;
         var requiresTeacher = ltype?.RequiresTeacher ?? true;
         var blocksRoom = ltype?.BlocksRoom ?? true;
         var blocksTeacher = ltype?.BlocksTeacher ?? true;
+        var occupiesSlot = ltype is not null
+                           && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(ltype.Code);
+        var effectiveRoomId = requiresRoom ? r.RoomId : null;
         Room? room = null;
         if (requiresRoom)
         {
@@ -242,16 +406,17 @@ public sealed class RulesService(AppDbContext db)
             var effectiveSlots = resolved.Slots
                 .Select(s => (s.Start, s.End))
                 .ToList();
-            if (effectiveSlots.Count > 0 && !IsSlotRangeAllowed(start, end, effectiveSlots))
+            if (effectiveSlots.Count == 0)
+                AddError("slot-config-missing", "Немає часових слотів", $"Для курсу {group.Course.Name} немає активних часових слотів у цей день.");
+            else if (!IsSlotRangeAllowed(start, end, effectiveSlots))
                 AddError("slot-not-allowed", "Недозволений слот", $"Проміжок {r.TimeStart}-{r.TimeEnd} відсутній серед дозволених для курсу {group.Course.Name}.");
         }
-        bool isWeekend = dayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday;
         var courseId = group?.CourseId;
         var cal = await FindCalendarExceptionAsync(r.Date, courseId, r.GroupId);
-        bool isWorking = cal?.IsWorkingDay ?? !isWeekend;
+        bool isWorking = cal?.IsWorkingDay ?? true;
         if (!isWorking && !r.OverrideNonWorkingDay)
         {
-            var reason = cal is not null ? cal.Name : (isWeekend ? "вихідний день" : "неробочий день");
+            var reason = cal?.Name ?? "неробочий день";
             AddWarning("non-working-day", "Заняття у вихідний", $"Дата {r.Date:yyyy-MM-dd} позначена як {reason}. Для публікації потрібно примусове збереження.");
         }
         if (requiresRoom && room is not null)
@@ -271,6 +436,7 @@ public sealed class RulesService(AppDbContext db)
             .AsNoTracking()
             .Include(x => x.Group)
             .Include(x => x.Module)
+            .Include(x => x.LessonType)
             .Include(x => x.Teacher)
             .Include(x => x.Room).ThenInclude(rm => rm!.Building)
             .Where(x => x.Date == r.Date
@@ -281,7 +447,9 @@ public sealed class RulesService(AppDbContext db)
                         ))
             .ToListAsync();
         foreach (var c in officialCandidates.Where(x =>
-                     x.Id != currentId
+                     occupiesSlot
+                     && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(x.LessonType.Code)
+                     && x.Id != currentId
                      && x.StartTime < end && start < x.EndTime
                      && (
                          x.GroupId == r.GroupId
@@ -307,18 +475,33 @@ public sealed class RulesService(AppDbContext db)
             .AsNoTracking()
             .Include(x => x.Group)
             .Include(x => x.Module)
+            .Include(x => x.LessonType)
             .Include(x => x.Teacher)
             .Include(x => x.Room).ThenInclude(rm => rm!.Building)
             .Where(x => x.Date == r.Date
-                        && x.Status == DraftStatus.Draft
                         && (
                             x.GroupId == r.GroupId
                             || (r.TeacherId != null && x.TeacherId == r.TeacherId)
                             || (r.RoomId != null && x.RoomId == r.RoomId)
                         ))
             .ToListAsync();
+        if (!string.IsNullOrWhiteSpace(r.BatchKey)
+            && draftCandidates.Any(candidate =>
+                candidate.Id != currentId
+                && HasSameDraftEventKeyAndSignature(r, candidate, start, end)
+                && (candidate.RoomId != effectiveRoomId
+                    || candidate.IsSelfStudy != r.IsSelfStudy)))
+        {
+            AddError(
+                "logical-event-resource-mismatch",
+                "Неузгоджені ресурси логічного заняття",
+                "Усі рядки одного логічного заняття мають використовувати однакову аудиторію та однаковий режим самостійної роботи.");
+        }
         foreach (var c in draftCandidates.Where(x =>
-                     x.Id != currentId
+                     occupiesSlot
+                     && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(x.LessonType.Code)
+                     && x.Id != currentId
+                     && !IsSameLogicalDraftEvent(r, x, start, end, effectiveRoomId)
                      && x.StartTime < end && start < x.EndTime
                      && (
                          x.GroupId == r.GroupId
@@ -340,17 +523,12 @@ public sealed class RulesService(AppDbContext db)
                 AddError("conflict-draft-room", "Аудиторія зайнята у чернетці", $"Аудиторія {c.Room.Name}{buildingName} вже використовується для чернетки {c.Module.Title} на {dateLabel} у слоті {slot}.");
             }
         }
-        if (requiresRoom && blocksRoom && room is not null)
+        if (requiresRoom && room is not null)
         {
             var travelMap = await db.BuildingTravels.AsNoTracking()
                 .ToDictionaryAsync(k => (k.FromBuildingId, k.ToBuildingId), v => v.Minutes);
             int TravelMinutes(int fromId, int toId)
-            {
-                if (fromId == toId) return 0;
-                if (travelMap.TryGetValue((fromId, toId), out var m)) return m;
-                if (travelMap.TryGetValue((toId, fromId), out m)) return m;
-                return 10;
-            }
+                => TravelTimePolicy.Resolve(travelMap, fromId, toId);
             void CheckTravel(TimeOnly otherStart, TimeOnly otherEnd, Room? otherRoom, string scope, string label)
             {
                 if (otherRoom is null) return;
@@ -363,11 +541,16 @@ public sealed class RulesService(AppDbContext db)
                     AddError($"travel-{scope}-after", "Недостатньо часу на перехід", $"{label} починається о {otherStart:HH\\:mm} в аудиторії {otherRoom.Name}. Для переходу потрібно {need} хвилин, доступно лише {gapAfter:N0} хв.");
             }
             foreach (var a in officialCandidates.Where(x =>
-                         x.GroupId == r.GroupId
-                         || (r.TeacherId != null && x.TeacherId == r.TeacherId)))
+                         x.LessonType.RequiresRoom
+                         && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(x.LessonType.Code)
+                         && (x.GroupId == r.GroupId
+                             || (r.TeacherId != null && x.TeacherId == r.TeacherId))))
                 CheckTravel(a.StartTime, a.EndTime, a.Room, "official", "Опубліковане заняття");
             foreach (var a in draftCandidates.Where(x =>
                          x.Id != currentId
+                         && x.LessonType.RequiresRoom
+                         && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(x.LessonType.Code)
+                         && !IsSameLogicalDraftEvent(r, x, start, end, effectiveRoomId)
                          && (x.GroupId == r.GroupId || (r.TeacherId != null && x.TeacherId == r.TeacherId))))
                 CheckTravel(a.StartTime, a.EndTime, a.Room, "draft", "Чернетка");
         }
@@ -387,6 +570,58 @@ public sealed class RulesService(AppDbContext db)
         var report = new DraftValidationReportDto(DateTimeOffset.UtcNow, issues);
         return new DraftValidationResult(errors, warnings, report);
     }
+    // Для нових офіційних рядків звіряє BatchKey, а для legacy-даних залишає консервативну евристику теми/викладача.
+    private static bool IsSamePublishedLogicalEvent(
+        UpsertScheduleItemRequest request,
+        ScheduleItem? current,
+        ScheduleItem candidate,
+        TimeOnly start,
+        TimeOnly end)
+        => current is not null
+           && request.Id == current.Id
+           && current.Date == candidate.Date
+           && current.StartTime == candidate.StartTime
+           && current.EndTime == candidate.EndTime
+           && current.GroupId == candidate.GroupId
+           && current.ModuleId == candidate.ModuleId
+           && current.LessonTypeId == candidate.LessonTypeId
+           && request.Date == candidate.Date
+           && start == candidate.StartTime
+           && end == candidate.EndTime
+           && request.GroupId == candidate.GroupId
+           && request.ModuleId == candidate.ModuleId
+           && request.LessonTypeId == candidate.LessonTypeId
+           && request.RoomId == candidate.RoomId
+           && (!string.IsNullOrWhiteSpace(current.BatchKey)
+               ? string.Equals(current.BatchKey, candidate.BatchKey, StringComparison.Ordinal)
+               : string.IsNullOrWhiteSpace(candidate.BatchKey)
+                 && (current.ModuleTopicId != candidate.ModuleTopicId
+                     || current.TeacherId != candidate.TeacherId));
+
+    // Визначає рядки одного логічного заняття, які розділено за темами або співвикладачами.
+    private static bool IsSameLogicalDraftEvent(
+        DraftUpsertRequest request,
+        TeacherDraftItem candidate,
+        TimeOnly start,
+        TimeOnly end,
+        int? effectiveRoomId)
+        => HasSameDraftEventKeyAndSignature(request, candidate, start, end)
+           && effectiveRoomId == candidate.RoomId
+           && request.IsSelfStudy == candidate.IsSelfStudy;
+
+    private static bool HasSameDraftEventKeyAndSignature(
+        DraftUpsertRequest request,
+        TeacherDraftItem candidate,
+        TimeOnly start,
+        TimeOnly end)
+        => !string.IsNullOrWhiteSpace(request.BatchKey)
+           && string.Equals(request.BatchKey, candidate.BatchKey, StringComparison.Ordinal)
+           && request.Date == candidate.Date
+           && start == candidate.StartTime
+           && end == candidate.EndTime
+           && request.GroupId == candidate.GroupId
+           && request.ModuleId == candidate.ModuleId
+           && request.LessonTypeId == candidate.LessonTypeId;
     // Дозволяє проміжок, що складається з послідовних слотів за порядком.
     private static bool IsSlotRangeAllowed(TimeOnly start, TimeOnly end, List<(TimeOnly Start, TimeOnly End)> slots)
     {

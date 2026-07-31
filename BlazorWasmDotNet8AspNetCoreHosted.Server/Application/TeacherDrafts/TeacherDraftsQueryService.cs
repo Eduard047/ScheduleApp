@@ -146,7 +146,8 @@ public sealed class TeacherDraftsQueryService
                 BatchKey: i.BatchKey,
                 TeacherNames: teacherNames,
                 LessonTypeCss: i.LessonType.CssKey,
-                IsSelfStudy: i.IsSelfStudy
+                IsSelfStudy: i.IsSelfStudy,
+                Revision: i.Revision
             );
         }).ToList();
     }

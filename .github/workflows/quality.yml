@@ -1,0 +1,209 @@
+name: ScheduleApp quality
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ConnectionStrings__Default: Server=127.0.0.1;Port=3306;Database=scheduleapp_ci;User=root;Password=scheduleapp_ci;SslMode=None
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: scheduleapp_ci
+          MYSQL_ROOT_HOST: "%"
+          MYSQL_DATABASE: scheduleapp_ci
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pscheduleapp_ci"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore and audit dependencies
+        run: >-
+          dotnet restore BlazorWasmDotNet8AspNetCoreHosted.Server.sln
+          -p:NuGetAudit=true
+          -p:NuGetAuditMode=all
+          -p:NuGetAuditLevel=low
+          -p:WarningsAsErrors=NU1900%3BNU1901%3BNU1902%3BNU1903%3BNU1904%3BNU1905
+
+      - name: Restore repository tools
+        run: dotnet tool restore
+
+      - name: Build
+        run: dotnet build BlazorWasmDotNet8AspNetCoreHosted.Server.sln --configuration Release --no-restore
+
+      - name: Apply migrations to clean MySQL
+        run: >-
+          dotnet ef database update
+          --project BlazorWasmDotNet8AspNetCoreHosted.Server/BlazorWasmDotNet8AspNetCoreHosted.Server.csproj
+          --startup-project BlazorWasmDotNet8AspNetCoreHosted.Server/BlazorWasmDotNet8AspNetCoreHosted.Server.csproj
+          --context AppDbContext
+          --configuration Release
+          --no-build
+
+      - name: Verify EF model has a migration
+        run: >-
+          dotnet ef migrations has-pending-model-changes
+          --project BlazorWasmDotNet8AspNetCoreHosted.Server/BlazorWasmDotNet8AspNetCoreHosted.Server.csproj
+          --startup-project BlazorWasmDotNet8AspNetCoreHosted.Server/BlazorWasmDotNet8AspNetCoreHosted.Server.csproj
+          --context AppDbContext
+          --configuration Release
+          --no-build
+
+      - name: Publish production artifact
+        run: >-
+          dotnet publish
+          BlazorWasmDotNet8AspNetCoreHosted.Server/BlazorWasmDotNet8AspNetCoreHosted.Server.csproj
+          --configuration Release
+          --no-build
+          --no-restore
+          --output "$RUNNER_TEMP/scheduleapp-publish"
+
+      - name: Smoke test production readiness
+        shell: bash
+        run: |
+          (
+            cd "$RUNNER_TEMP/scheduleapp-publish"
+            exec env \
+              ASPNETCORE_URLS=http://127.0.0.1:5080 \
+              ASPNETCORE_ENVIRONMENT=Production \
+              ReverseProxy__KnownProxies__0=127.0.0.1 \
+              dotnet BlazorWasmDotNet8AspNetCoreHosted.Server.dll
+          ) > "$RUNNER_TEMP/scheduleapp.log" 2>&1 &
+          app_pid=$!
+          cleanup() {
+            kill "$app_pid" 2>/dev/null || true
+            wait "$app_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          ready=0
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:5080/health/ready > /dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            cat "$RUNNER_TEMP/scheduleapp.log"
+            exit 1
+          fi
+
+          curl --fail --silent --show-error http://127.0.0.1:5080/health/live > /dev/null
+          curl --fail --silent --show-error \
+            --header "X-Forwarded-Proto: https" \
+            http://127.0.0.1:5080/ > /dev/null
+          curl --fail --silent --show-error \
+            --header "X-Forwarded-Proto: https" \
+            http://127.0.0.1:5080/schedule/unregistered-client-route > /dev/null
+
+          api_status=$(curl --silent --show-error \
+            --output "$RUNNER_TEMP/unknown-api-response.json" \
+            --write-out "%{http_code}" \
+            --header "X-Forwarded-Proto: https" \
+            http://127.0.0.1:5080/api/definitely-missing)
+          test "$api_status" = "404"
+          grep --quiet '"status":404' "$RUNNER_TEMP/unknown-api-response.json"
+
+      - name: Run deterministic autogen quality smoke
+        shell: bash
+        run: |
+          quality_results="$RUNNER_TEMP/autogen-quality-smoke"
+          mkdir -p "$quality_results"
+          dotnet test \
+            BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj \
+            --configuration Release \
+            --no-build \
+            --filter "Category=AutogenQuality" \
+            --results-directory "$quality_results" \
+            --logger "console;verbosity=normal" \
+            --logger "trx;LogFileName=autogen-quality.trx"
+          if ! grep --quiet '<UnitTestResult ' "$quality_results/autogen-quality.trx"; then
+            echo "::error::Фільтр Category=AutogenQuality не знайшов жодного тесту."
+            exit 1
+          fi
+
+      - name: Run production guardrails
+        run: >-
+          dotnet test
+          BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj
+          --configuration Release
+          --no-build
+          --filter "Category!=AutogenQuality"
+          --logger "console;verbosity=normal"
+
+      - name: Report vulnerable NuGet packages
+        run: dotnet list BlazorWasmDotNet8AspNetCoreHosted.Server.sln package --vulnerable --include-transitive
+
+  autogen-quality-nightly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore quality matrix
+        run: >-
+          dotnet restore
+          BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj
+
+      - name: Build quality matrix
+        run: >-
+          dotnet build
+          BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj
+          --configuration Release
+          --no-restore
+
+      - name: Replay deterministic autogen quality matrix
+        shell: bash
+        run: |
+          for replay in 1 2 3; do
+            echo "Autogen quality replay $replay"
+            quality_results="$RUNNER_TEMP/autogen-quality-nightly-$replay"
+            mkdir -p "$quality_results"
+            dotnet test \
+              BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj \
+              --configuration Release \
+              --no-build \
+              --no-restore \
+              --filter "Category=AutogenQuality" \
+              --results-directory "$quality_results" \
+              --logger "console;verbosity=normal" \
+              --logger "trx;LogFileName=autogen-quality.trx"
+            if ! grep --quiet '<UnitTestResult ' "$quality_results/autogen-quality.trx"; then
+              echo "::error::Фільтр Category=AutogenQuality не знайшов жодного тесту під час повтору $replay."
+              exit 1
+            fi
+          done

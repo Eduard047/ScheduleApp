@@ -11,7 +11,7 @@ public static class DefaultLessonTypesSeeder
     private sealed record SeedLessonType(
         string Code,
         string Name,
-        string CssKey,
+        string? CssKey,
         bool IsActive,
         bool RequiresRoom,
         bool RequiresTeacher,
@@ -21,7 +21,7 @@ public static class DefaultLessonTypesSeeder
         bool CountInLoad,
         bool PreferredFirstInWeek);
     // Заповнює довідник типів занять типовими значеннями.
-    public static async Task SeedAsync(IServiceProvider services)
+    public static async Task SeedAsync(IServiceProvider services, CancellationToken cancellationToken = default)
     {
         using var scope = services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -30,15 +30,23 @@ public static class DefaultLessonTypesSeeder
             new SeedLessonType("BREAK", "Перерва", "brk", true, false, false, false, false, false, false, false),
             new SeedLessonType("CANCELED", "Скасовано", "can", true, false, false, false, false, false, false, false),
             new SeedLessonType("RESCHEDULED", "Перенесено", "res", true, false, false, false, false, false, false, false),
-            new SeedLessonType("NONE", "Без типу", "", true, true, true, true, true, false, false, false),
-            new SeedLessonType("EXAM", "Екзамен", "exam", true, true, true, true, true, true, true, false),
-            new SeedLessonType("CREDIT", "Залік", "credit", true, true, true, true, true, true, true, false),
+            new SeedLessonType("NONE", "Без типу", null, true, true, true, true, true, false, false, false),
+            new SeedLessonType("EXAM", "Екзамен", null, true, true, true, true, true, true, true, false),
+            new SeedLessonType("CREDIT", "Залік", null, true, true, true, true, true, true, true, false),
         };
-        var existing = await db.LessonTypes.ToListAsync();
+        var existing = await db.LessonTypes.ToListAsync(cancellationToken);
+        var usedCssKeys = existing
+            .Where(item => !string.IsNullOrWhiteSpace(item.CssKey))
+            .Select(item => item.CssKey!.Trim())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var changed = false;
         foreach (var d in defaults)
         {
             var entity = existing.FirstOrDefault(x => string.Equals(x.Code, d.Code, StringComparison.OrdinalIgnoreCase));
+            var availableCssKey = !string.IsNullOrWhiteSpace(d.CssKey)
+                && !usedCssKeys.Contains(d.CssKey)
+                    ? d.CssKey
+                    : null;
             if (entity is null)
             {
                 // Додаємо новий тип заняття, якщо його ще немає.
@@ -46,7 +54,7 @@ public static class DefaultLessonTypesSeeder
                 {
                     Code = d.Code,
                     Name = d.Name,
-                    CssKey = d.CssKey,
+                    CssKey = availableCssKey,
                     IsActive = d.IsActive,
                     RequiresRoom = d.RequiresRoom,
                     RequiresTeacher = d.RequiresTeacher,
@@ -56,6 +64,10 @@ public static class DefaultLessonTypesSeeder
                     CountInLoad = d.CountInLoad,
                     PreferredFirstInWeek = d.PreferredFirstInWeek
                 });
+                if (availableCssKey is not null)
+                {
+                    usedCssKeys.Add(availableCssKey);
+                }
                 changed = true;
             }
             else
@@ -68,14 +80,18 @@ public static class DefaultLessonTypesSeeder
                 }
                 if (string.IsNullOrWhiteSpace(entity.CssKey))
                 {
-                    entity.CssKey = d.CssKey;
-                    changed = true;
+                    if (availableCssKey is not null)
+                    {
+                        entity.CssKey = availableCssKey;
+                        usedCssKeys.Add(availableCssKey);
+                        changed = true;
+                    }
                 }
             }
         }
         if (changed)
         {
-            await db.SaveChangesAsync();
+            await db.SaveChangesAsync(cancellationToken);
         }
     }
 }

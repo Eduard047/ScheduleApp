@@ -219,7 +219,7 @@
     private async Task RefreshPalette()
     {
         try { palette = await Api.GetLessonColorPalette(); }
-        catch {  }
+        catch (Exception ex) { error = $"Не вдалося оновити палітру кольорів: {ex.Message}"; }
         StateHasChanged();
     }
     // Зберігає тип заняття через API.
