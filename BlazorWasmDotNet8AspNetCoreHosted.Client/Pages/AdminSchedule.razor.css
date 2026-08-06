@@ -15,19 +15,29 @@
         color: #0f172a;
         margin: .1rem 0 0 1.25rem;
     }
-    .btn-autogen-check {
-        border-color: #0f766e;
-        background: #fff;
-        color: #0f5f59;
+    .autogen-plan-toolbar {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(150px, .8fr)) minmax(210px, 1fr) auto;
+        align-items: end;
+        gap: .75rem;
     }
-    .btn-autogen-check:hover,
-    .btn-autogen-check:focus-visible {
-        border-color: #0f5f59;
-        background: #0f766e;
-        color: #fff;
+    .autogen-plan-field {
+        min-width: 0;
     }
-    .btn-autogen-check:focus-visible {
-        box-shadow: 0 0 0 .25rem rgba(15, 118, 110, .25);
+    .autogen-plan-submit {
+        min-height: 38px;
+        white-space: nowrap;
+    }
+    .autogen-secondary-actions {
+        border-top: 1px solid rgba(148, 163, 184, .45);
+        padding-top: .75rem;
+    }
+    .autogen-secondary-actions summary {
+        width: fit-content;
+        cursor: pointer;
+        color: #475569;
+        font-size: .86rem;
+        font-weight: 700;
     }
     .btn-autogen-rollback {
         border-color: #6d28d9;
@@ -250,12 +260,13 @@
         background: linear-gradient(180deg, rgba(248, 250, 252, 0.92), rgba(255, 255, 255, 0.98));
         padding: 1rem;
     }
-    .group-room-preferences__head {
+    .group-room-preferences__summary {
         display: flex;
+        flex-wrap: wrap;
+        align-items: center;
         justify-content: space-between;
-        align-items: flex-start;
-        gap: .75rem;
-        margin-bottom: .75rem;
+        gap: .4rem .75rem;
+        cursor: pointer;
     }
     .group-room-grid {
         display: grid;
@@ -433,26 +444,6 @@
         color: #475569;
         font-size: .86rem;
     }
-    .autogen-outcome__action {
-        flex: 0 1 340px;
-        border: 1px solid rgba(217, 119, 6, .25);
-        border-radius: 8px;
-        background: #fff;
-        padding: .55rem .65rem;
-        font-size: .82rem;
-    }
-    .autogen-outcome__action span {
-        display: block;
-        color: #92400e;
-        font-weight: 800;
-        margin-bottom: .15rem;
-    }
-    .autogen-outcome__action strong {
-        display: block;
-        color: #0f172a;
-        font-weight: 700;
-        line-height: 1.25;
-    }
     .autogen-outcome__metrics {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
@@ -535,11 +526,22 @@
         font-size: .78rem;
     }
     @media (max-width: 767.98px) {
+        .autogen-plan-toolbar,
+        .group-room-grid {
+            grid-template-columns: minmax(0, 1fr);
+        }
+        .autogen-plan-submit {
+            width: 100%;
+        }
         .autogen-outcome__head {
             flex-direction: column;
         }
-        .autogen-outcome__action {
+    }
+    @media (min-width: 768px) and (max-width: 1199.98px) {
+        .autogen-plan-toolbar {
+            grid-template-columns: repeat(2, minmax(180px, 1fr));
+        }
+        .autogen-plan-submit {
             width: 100%;
-            flex-basis: auto;
         }
     }

@@ -1755,12 +1755,22 @@ public sealed class ProductionGuardrailTests
             SoftFill = false,
             PreflightOnly = true
         });
+        var generate = InvokeNormalizeAutoGenJobRequest(valid with
+        {
+            Kind = AutoGenJobKind.Generate,
+            SoftFill = true,
+            PreflightOnly = true,
+            PreviewOnly = true
+        });
 
         Assert.True(preflight.PreflightOnly);
         Assert.False(preflight.ClearExisting);
         Assert.True(fill.SoftFill);
         Assert.False(fill.ClearExisting);
         Assert.False(fill.PreflightOnly);
+        Assert.False(generate.SoftFill);
+        Assert.False(generate.PreflightOnly);
+        Assert.True(generate.PreviewOnly);
     }
 
     [Fact]
@@ -1970,6 +1980,148 @@ public sealed class ProductionGuardrailTests
         Assert.Equal(1, plan.AddCount);
         Assert.Single(plan.Mutations);
         Assert.Equal((int)AutoGenPlanOperation.Add, plan.Mutations.Single().Operation);
+    }
+
+    [Fact]
+    public async Task Autogen_preview_relaxed_repair_rolls_back_when_required_resources_are_missing()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var scenario = await SeedAtomicAutogenScenarioAsync(fixture.Db);
+        var course = await fixture.Db.Courses.SingleAsync(item => item.Id == scenario.Ids.CourseId);
+        course.AcademicPeriodStartDate = scenario.Date;
+        var requiredModule = new Module
+        {
+            Code = "ATM-MISSING",
+            Title = "Модуль без доступних ресурсів",
+            Credits = 1,
+            Course = course
+        };
+        var requiredLessonType = new LessonTypeRef
+        {
+            Code = "ATOMIC_REQUIRED",
+            Name = "Аудиторне заняття з обов'язковими ресурсами",
+            IsActive = true,
+            RequiresTeacher = true,
+            RequiresRoom = true,
+            BlocksTeacher = true,
+            BlocksRoom = true,
+            CountInPlan = true,
+            CountInLoad = true
+        };
+        fixture.Db.AddRange(requiredModule, requiredLessonType);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ModuleTopics.AddRange(
+            new ModuleTopic
+            {
+                ModuleId = scenario.Ids.ModuleId,
+                LessonTypeId = scenario.Ids.LessonTypeId,
+                TopicCode = "ATM.1",
+                Order = 1,
+                TotalHours = 1,
+                AuditoriumHours = 0,
+                SelfStudyHours = 1
+            },
+            new ModuleTopic
+            {
+                ModuleId = requiredModule.Id,
+                LessonTypeId = requiredLessonType.Id,
+                TopicCode = "ATM-MISSING.1",
+                Order = 1,
+                TotalHours = 1,
+                AuditoriumHours = 1,
+                SelfStudyHours = 0
+            });
+        fixture.Db.TimeSlots.Add(new TimeSlot
+        {
+            CourseId = scenario.Ids.CourseId,
+            DayOfWeek = scenario.Date.DayOfWeek,
+            Start = new TimeOnly(9, 10),
+            End = new TimeOnly(10, 10),
+            SortOrder = 2,
+            IsActive = true
+        });
+        fixture.Db.TeacherModules.RemoveRange(await fixture.Db.TeacherModules.ToListAsync());
+        fixture.Db.Rooms.RemoveRange(await fixture.Db.Rooms.ToListAsync());
+        await fixture.Db.SaveChangesAsync();
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(fixture.Options));
+        services.AddScoped<TeacherDraftsAutogenService>();
+        services.AddScoped<TeacherDraftsAutogenPlanService>();
+        await using var provider = services.BuildServiceProvider();
+        var jobService = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
+        var request = new AutoGenJobRequest(
+            AutoGenJobKind.Generate,
+            scenario.Date,
+            scenario.Date,
+            scenario.Ids.CourseId,
+            new List<int> { scenario.Ids.GroupId },
+            new Dictionary<int, int>
+            {
+                [scenario.Ids.ModuleId] = 1,
+                [requiredModule.Id] = 1
+            },
+            WeekPreset.MonFri,
+            true,
+            false,
+            false,
+            AllowIncompleteDrafts: false,
+            ClientJobId: Guid.NewGuid().ToString("N"),
+            PreviewOnly: true);
+
+        var started = jobService.Start(request);
+        AutoGenJobStatus? status = started.Status;
+        for (var attempt = 0;
+             attempt < 200 && status?.State is AutoGenJobState.Queued or AutoGenJobState.Running;
+             attempt++)
+        {
+            await Task.Delay(25);
+            status = jobService.Get(started.JobId);
+        }
+
+        Assert.NotNull(status);
+        Assert.Equal(AutoGenJobState.Succeeded, status.State);
+        Assert.NotNull(status.Result);
+        Assert.Equal(1, status.Result.Created);
+        Assert.Single(status.Result.GapDetails ?? []);
+        Assert.DoesNotContain(
+            status.Result.Warnings,
+            warning => AutoGenWarningClassifier.Classify(warning).Code
+                       == AutoGenWarningCodes.IncompleteDrafts);
+        Assert.NotNull(status.Plan);
+        Assert.Equal(AutoGenPlanState.Ready, status.Plan.State);
+        Assert.Equal(1, status.Plan.AddCount);
+        Assert.Equal(0, status.Plan.UpdateCount);
+        Assert.Equal(0, status.Plan.DeleteCount);
+        await jobService.StopAsync(CancellationToken.None);
+        await using (var previewVerification = new AppDbContext(fixture.Options))
+        {
+            Assert.Empty(await previewVerification.TeacherDraftItems.AsNoTracking().ToListAsync());
+        }
+        var readyPlan = await jobService.GetPlanAsync(started.JobId);
+        Assert.Single(readyPlan.Changes);
+        var appliedPlan = await jobService.ApplyPlanAsync(
+            started.JobId,
+            new AutoGenPlanActionRequest(readyPlan.Summary.Version));
+        Assert.Equal(AutoGenPlanState.Applied, appliedPlan.Summary.State);
+        Assert.Single(appliedPlan.Changes);
+
+        await using var verification = new AppDbContext(fixture.Options);
+        var appliedDraft = Assert.Single(await verification.TeacherDraftItems
+            .AsNoTracking()
+            .ToListAsync());
+        Assert.Equal(scenario.Ids.ModuleId, appliedDraft.ModuleId);
+        Assert.Null(appliedDraft.TeacherId);
+        Assert.Null(appliedDraft.RoomId);
+        var hardRuleValidation = await new TeacherDraftsAutogenHardRuleValidator(verification)
+            .ValidateAsync(
+                new TeacherDraftsAutogenHardRuleValidationRequest(
+                    scenario.Ids.CourseId,
+                    new[] { scenario.Ids.GroupId },
+                    scenario.Date,
+                    scenario.Date,
+                    WeekPreset.MonFri,
+                    AllowIncompleteDrafts: false));
+        Assert.Empty(hardRuleValidation.Violations);
     }
 
     [Theory]

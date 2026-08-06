@@ -34,92 +34,115 @@ else
     <div class="card p-3">
         <div class="row g-3 align-items-end">
             <div class="col-12 col-md-4 col-lg-3">
-                <label class="form-label">Дні тижня:</label>
-                <select class="form-select" @bind="_daysPreset" disabled="@IsAutoGenBusy">
-                    <option value="@WeekPreset.MonFri">Пн–Пт</option>
-                    <option value="@WeekPreset.MonSat">Пн–Сб</option>
-                    <option value="@WeekPreset.MonSun">Пн–Нд</option>
-                </select>
-            </div>
-            <div class="col-12 col-md-4 col-lg-3">
-                <label class="form-label">Дата тижня:</label>
-                <input type="date"
+                <label class="form-label" for="admin-schedule-week-date">Тиждень у таблиці:</label>
+                <input id="admin-schedule-week-date"
+                       type="date"
                        class="form-control"
                        value="@_selectedDate.ToString("yyyy-MM-dd")"
                        @onchange="OnDateChanged"
                        disabled="@IsAutoGenBusy" />
             </div>
-            <div class="col-12 col-md-4 col-lg-3">
-                <label class="form-label">Дії з даними:</label>
-                <div class="d-flex gap-2">
-                    <button class="btn btn-outline-secondary flex-grow-1" @onclick="LoadWeek" disabled="@IsAutoGenBusy">
-                        Оновити таблицю
-                    </button>
-                </div>
-            </div>
+        </div>
+        <div class="small text-muted mt-2">
+            Ця дата змінює лише тиждень у таблиці та тиждень для додаткових дій очищення.
         </div>
         <div class="mt-3 border rounded-3 p-3 bg-light">
-            <div class="d-flex flex-column flex-md-row justify-content-between align-items-start align-items-md-center gap-3">
+            <div>
                 <div>
-                    <div class="fw-semibold mb-1">Генерація у чернетки</div>
-                    <div class="small text-muted">@GetGenerationRangeDescription()</div>
+                    <div class="fw-semibold mb-1">Підготовка плану</div>
+                    <div class="small text-muted">
+                        @GetGenerationRangeDescription(). Чернетки зміняться лише після того, як ви переглянете і приймете план.
+                    </div>
                 </div>
-                <div class="d-flex flex-wrap gap-2 align-items-stretch">
-                    <div style="min-width: 180px;">
-                        <label class="form-label small mb-1">Від дати</label>
-                        <input type="date"
+                <div class="autogen-plan-toolbar mt-3">
+                    <div class="autogen-plan-field">
+                        <label class="form-label small mb-1" for="autogen-from-date">Від дати</label>
+                        <input id="autogen-from-date"
+                               type="date"
                                class="form-control"
                                value="@_generationFromDate.ToString("yyyy-MM-dd")"
                                @onchange="OnGenerationFromDateChanged"
                                disabled="@IsAutoGenBusy" />
                     </div>
-                    <div style="min-width: 180px;">
-                        <label class="form-label small mb-1">До дати</label>
-                        <input type="date"
+                    <div class="autogen-plan-field">
+                        <label class="form-label small mb-1" for="autogen-to-date">До дати</label>
+                        <input id="autogen-to-date"
+                               type="date"
                                class="form-control"
                                value="@_generationToDate.ToString("yyyy-MM-dd")"
                                @onchange="OnGenerationToDateChanged"
                                disabled="@IsAutoGenBusy" />
                     </div>
-                    <select class="form-select flex-grow-1 flex-md-grow-0"
-                            style="min-width: 220px;"
-                            @bind="_selectedCourseId"
-                            @bind:after="OnSelectedCourseChanged"
-                            disabled="@IsAutoGenBusy">
-                        <option value="">Оберіть курс</option>
-                        @foreach (var course in meta.Courses.OrderBy(c => c.Name))
-                        {
-                            <option value="@course.Id">@course.Name</option>
-                        }
-                    </select>
-                    <button class="btn btn-outline-primary" @onclick="AutoGenDrafts" disabled="@(!CanAutoGen || IsAutoGenBusy)">
-                        Автогенерація (у чернетки)
-                    </button>
-                    <button class="btn btn-autogen-check" @onclick="CheckAutoGenResources" disabled="@(!CanAutoGen || IsAutoGenBusy)">
-                        Перевірити ресурси
-                    </button>
-                    <button class="btn btn-outline-secondary" @onclick="FillWeekDrafts" disabled="@(!CanAutoGen || IsAutoGenBusy)">
-                        Дозаповнити відсутні пари
-                    </button>
-                    <button class="btn btn-outline-secondary"
-                            @onclick="RestoreLastAutoGenInputAsync"
-                            disabled="@(_lastAutoGenInput is null || IsAutoGenBusy)"
-                            title="@GetLastAutoGenInputButtonTitle()">
-                        Повернути останнє заповнення
-                    </button>
-                    @if (_latestRollbackableAutoGenPlan?.CanRollback == true)
-                    {
-                        <button class="btn btn-autogen-rollback" @onclick="RollbackLatestAutoGenPlanAsync" disabled="@IsAutoGenBusy">
-                            Відкотити останнє застосування
-                        </button>
-                    }
-                    <button class="btn btn-outline-danger" @onclick="ClearWeekForCurrent" disabled="@IsAutoGenBusy">
-                        Очистити тиждень (чернетки, обраний курс)
-                    </button>
-                    <button class="btn btn-danger" @onclick="ClearWeekOfficial" disabled="@IsAutoGenBusy">
-                        Очистити тиждень (розклад, обраний курс)
+                    <div class="autogen-plan-field">
+                        <label class="form-label small mb-1" for="admin-schedule-days">Навчальні дні</label>
+                        <select id="admin-schedule-days"
+                                class="form-select"
+                                @bind="_daysPreset"
+                                @bind:after="OnAutoGenConfigurationChangedAsync"
+                                disabled="@IsAutoGenBusy">
+                            <option value="@WeekPreset.MonFri">Пн–Пт</option>
+                            <option value="@WeekPreset.MonSat">Пн–Сб</option>
+                            <option value="@WeekPreset.MonSun">Пн–Нд</option>
+                        </select>
+                    </div>
+                    <div class="autogen-plan-field autogen-plan-field--course">
+                        <label class="form-label small mb-1" for="autogen-course">Курс</label>
+                        <select id="autogen-course"
+                                class="form-select"
+                                @bind="_selectedCourseId"
+                                @bind:after="OnSelectedCourseChanged"
+                                disabled="@IsAutoGenBusy">
+                            <option value="">Оберіть курс</option>
+                            @foreach (var course in meta.Courses.OrderBy(c => c.Name))
+                            {
+                                <option value="@course.Id">@course.Name</option>
+                            }
+                        </select>
+                    </div>
+                    <button class="btn btn-primary autogen-plan-submit"
+                            @onclick="AutoGenDrafts"
+                            disabled="@(!CanAutoGen || IsAutoGenBusy)">
+                        Сформувати план
                     </button>
                 </div>
+                <div class="small text-muted mt-2">
+                    Система спочатку побудує розклад, а потім автоматично дозаповнить прогалини за м’якими правилами. Жорсткі обмеження залишаться без змін.
+                </div>
+                @if (GetAutoGenBlockingReason() is { } blockingReason)
+                {
+                    <div class="small text-danger mt-1" role="status">@blockingReason</div>
+                }
+                <details class="autogen-secondary-actions mt-3">
+                    <summary>Додаткові дії</summary>
+                    <div class="d-flex flex-wrap gap-2 mt-2">
+                        <button class="btn btn-sm btn-outline-secondary"
+                                @onclick="RestoreLastAutoGenInputAsync"
+                                disabled="@(_lastAutoGenInput is null || IsAutoGenBusy)"
+                                title="@GetLastAutoGenInputButtonTitle()">
+                            Відновити налаштування останнього запуску
+                        </button>
+                        @if (_latestRollbackableAutoGenPlan?.CanRollback == true)
+                        {
+                            <button class="btn btn-sm btn-autogen-rollback" @onclick="RollbackLatestAutoGenPlanAsync" disabled="@IsAutoGenBusy">
+                                Відкотити останнє застосування
+                            </button>
+                        }
+                        <button class="btn btn-sm btn-outline-danger"
+                                @onclick="ClearWeekForCurrent"
+                                disabled="@(_selectedCourseId is null || IsAutoGenBusy)">
+                            Очистити чернетки обраного курсу за тиждень
+                        </button>
+                        <button class="btn btn-sm btn-outline-danger"
+                                @onclick="ClearWeekOfficial"
+                                disabled="@(_selectedCourseId is null || IsAutoGenBusy)">
+                            Очистити розклад обраного курсу за тиждень
+                        </button>
+                    </div>
+                    <div class="small text-muted mt-2">
+                        Очищення стосується тижня @GetMonday(_selectedDate).ToString("dd.MM.yyyy")–@GetMonday(_selectedDate).AddDays(6).ToString("dd.MM.yyyy"),
+                        а не всього діапазону підготовки плану.
+                    </div>
+                </details>
             </div>
             @if (SelectedAutoGenCourse is { } selectedAutoGenCourse)
             {
@@ -197,45 +220,47 @@ else
                         <input class="form-check-input"
                                type="checkbox"
                                @bind="_useRecommendedAutoGenProfile"
-                               @bind:after="PersistAutoGenConfigAsync"
+                               @bind:after="OnAutoGenConfigurationChangedAsync"
                                disabled="@IsAutoGenBusy" />
                         <span class="form-check-label fw-semibold">Використовувати рекомендований профіль автогенерації</span>
                     </label>
                     <div class="small text-muted">
                         @if (_useRecommendedAutoGenProfile)
                         {
-                            <span>
-                                Активний профіль: <strong>@RecommendedAutoGenProfileName</strong>.
-                                Для автогенерації застосовуються override ліміту "бажано першим" = @RecommendedPreferredFirstMaxSlotOrderOverride
-                                і межа до @RecommendedSoftFillMaxParallelGroupsPerModuleInSlot груп одного модуля одночасно.
-                                Для дозаповнення використовується вікно близьких повторів @RecommendedSoftFillRepeatWindowDays день,
-                                не більше @RecommendedSoftFillMaxParallelGroupsPerModuleInSlot непотокових груп одного модуля одночасно,
-                                межа різних модулів @RecommendedSoftFillPreferredMaxDistinctModulesPerDay/@RecommendedSoftFillMaxDistinctModulesPerDay
-                                і нульові м'які штрафи за навантаження викладача та зміну корпусу.
-                            </span>
+                            <span>Система використовує перевірені налаштування, щоб щільніше заповнювати дні та рідше залишати вікна.</span>
                         }
                         else
                         {
-                            <span>
-                                Профіль вимкнено: сторінка бере налаштування "бажано першим" із БД, а дозаповнення працює без примусових override-параметрів.
-                            </span>
+                            <span>Використовуються лише правила, збережені в довідниках.</span>
                         }
                     </div>
                 </div>
-                <div class="mt-3 pt-3 border-top">
-                    <label class="form-check mb-0">
-                        <input class="form-check-input"
-                               type="checkbox"
-                               @bind="_allowIncompleteDrafts"
-                               @bind:after="PersistAutoGenConfigAsync"
-                               disabled="@IsAutoGenBusy" />
-                        <span class="form-check-label fw-semibold">Створювати неповні чернетки, якщо не знайдено викладача або аудиторію</span>
-                    </label>
-                    <div class="small text-muted mt-2">
-                        Якщо слот неможливо закрити через відсутність вільної аудиторії або викладача, автоген збереже чернетку без призначення.
-                        Потім її можна відкрити у повному редакторі й дозаповнити вручну.
+                <details class="mt-3 pt-3 border-top">
+                    <summary class="fw-semibold">Додаткові налаштування</summary>
+                    <div class="mt-3">
+                        <label class="form-check mb-0">
+                            <input class="form-check-input"
+                                   type="checkbox"
+                                   @bind="_allowIncompleteDrafts"
+                                   @bind:after="OnAutoGenConfigurationChangedAsync"
+                                   disabled="@IsAutoGenBusy" />
+                            <span class="form-check-label fw-semibold">Створювати неповні чернетки без викладача або аудиторії</span>
+                        </label>
+                        <div class="small text-muted mt-2">
+                            Такі чернетки не усувають дефіцит ресурсів: їх потрібно завершити вручну у повному редакторі.
+                        </div>
                     </div>
-                </div>
+                    @if (_useRecommendedAutoGenProfile)
+                    {
+                        <div class="small text-muted mt-3 pt-3 border-top">
+                            Профіль: <strong>@RecommendedAutoGenProfileName</strong>;
+                            «бажано першим» — до слоту @RecommendedPreferredFirstMaxSlotOrderOverride;
+                            паралельні групи модуля — до @RecommendedSoftFillMaxParallelGroupsPerModuleInSlot;
+                            різні модулі на день — @RecommendedSoftFillPreferredMaxDistinctModulesPerDay/@RecommendedSoftFillMaxDistinctModulesPerDay;
+                            вікно повторів — @RecommendedSoftFillRepeatWindowDays дн.
+                        </div>
+                    }
+                </details>
             </div>
             @if (_selectedCourseId is int)
             {
@@ -258,7 +283,7 @@ else
                                 <input class="form-check-input m-0"
                                        type="checkbox"
                                        @bind="row.Selected"
-                                       @bind:after="PersistAutoGenConfigAsync"
+                                       @bind:after="OnAutoGenConfigurationChangedAsync"
                                        disabled="@IsAutoGenBusy" />
                                 <span class="form-check-label">@row.Caption</span>
                             </label>
@@ -271,15 +296,14 @@ else
                     <div class="small text-muted mt-2">
                         Автогенерація створює заняття лише для обраних груп.
                     </div>
-                    <div class="group-room-preferences mt-3">
-                        <div class="group-room-preferences__head">
-                            <div>
-                                <div class="fw-semibold">Аудиторії для вибраних груп</div>
-                                <div class="small text-muted">
-                                    Для кожної активної групи можна задати корпус і, за потреби, конкретні аудиторії.
-                                    Якщо нічого не обирати, автопідбір працюватиме як раніше.
-                                </div>
-                            </div>
+                    <details class="group-room-preferences mt-3">
+                        <summary class="group-room-preferences__summary">
+                            <span class="fw-semibold">Корпуси й аудиторії</span>
+                            <span class="small text-muted">@GetGroupRoomPreferencesOverview()</span>
+                        </summary>
+                        <div class="small text-muted mt-2 mb-3">
+                            За потреби обмежте корпус або виберіть конкретні аудиторії для окремих груп.
+                            Без ручного вибору система підбере їх автоматично.
                         </div>
                         @if (!_roomCatalogLoaded)
                         {
@@ -306,6 +330,7 @@ else
                                             </div>
                                             <button type="button"
                                                     class="btn btn-sm btn-link text-decoration-none p-0"
+                                                    aria-label="Скинути корпуси й аудиторії для групи @row.Caption"
                                                     disabled="@(!row.HasRoomPreferences || IsAutoGenBusy)"
                                                     @onclick="() => ClearGroupRoomPreferenceAsync(row)">
                                                 Скинути
@@ -313,8 +338,9 @@ else
                                         </div>
                                         <div class="group-room-card__body">
                                             <div>
-                                                <label class="form-label form-label-sm mb-1">Корпус</label>
-                                                <select class="form-select form-select-sm"
+                                                <label class="form-label form-label-sm mb-1" for="@($"group-{row.GroupId}-building")">Корпус</label>
+                                                <select id="@($"group-{row.GroupId}-building")"
+                                                        class="form-select form-select-sm"
                                                         value="@(row.PreferredBuildingId?.ToString() ?? string.Empty)"
                                                         @onchange="e => OnGroupBuildingChangedAsync(row, e)"
                                                         disabled="@IsAutoGenBusy">
@@ -341,6 +367,7 @@ else
                                                                 <label class="room-chip @(isSelected ? "room-chip--selected" : null)">
                                                                     <input type="checkbox"
                                                                            checked="@isSelected"
+                                                                           aria-label="Аудиторія @room.Name для групи @row.Caption"
                                                                            @onchange="e => OnGroupRoomToggleAsync(row, roomId, e)"
                                                                            disabled="@IsAutoGenBusy" />
                                                                     <span>@room.Name</span>
@@ -373,7 +400,7 @@ else
                                 Спочатку оберіть хоча б одну групу, щоб налаштувати аудиторії для неї.
                             </div>
                         }
-                    </div>
+                    </details>
                 </div>
                 <div class="mt-3">
                     @{
@@ -387,32 +414,41 @@ else
                         <table class="table table-sm align-middle mb-0">
                             <thead>
                                 <tr>
-                                    <th style="width: 60px;" class="text-center">✓</th>
-                                    <th>Модуль</th>
-                                    <th style="width: 140px;" class="text-center">Пар на групу</th>
-                                    <th style="width: 190px;" class="text-center">У розкладі та чернетках</th>
+                                    <th scope="col" style="width: 60px;" class="text-center">
+                                        <span aria-hidden="true">✓</span>
+                                        <span class="visually-hidden">Вибір модуля</span>
+                                    </th>
+                                    <th scope="col">Модуль</th>
+                                    <th scope="col" style="width: 140px;" class="text-center">Пар на групу</th>
+                                    <th scope="col" style="width: 190px;" class="text-center">У розкладі та чернетках</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 @foreach (var row in _moduleWeekRows)
                                 {
                                     var moduleProgress = GetModuleGeneratedHours(row);
+                                    var moduleSelectionId = $"autogen-module-selected-{row.ModuleId}";
+                                    var moduleHoursId = $"autogen-module-hours-{row.ModuleId}";
                                     <tr>
                                         <td class="text-center">
-                                            <input class="form-check-input"
+                                            <input id="@moduleSelectionId"
+                                                   class="form-check-input"
                                                    type="checkbox"
+                                                   aria-label="@($"Додати модуль «{row.Caption}» до плану")"
                                                    @bind="row.Selected"
-                                                   @bind:after="PersistAutoGenConfigAsync"
+                                                   @bind:after="OnAutoGenConfigurationChangedAsync"
                                                    disabled="@IsAutoGenBusy" />
                                         </td>
-                                        <td>@row.Caption</td>
+                                        <th scope="row" class="fw-normal">@row.Caption</th>
                                         <td class="text-center">
-                                            <input type="number"
+                                            <input id="@moduleHoursId"
+                                                   type="number"
                                                    class="form-control form-control-sm text-center"
                                                    min="0"
                                                    step="1"
+                                                   aria-label="@($"Кількість пар на групу для модуля «{row.Caption}»")"
                                                    @bind="row.Hours"
-                                                   @bind:after="PersistAutoGenConfigAsync"
+                                                   @bind:after="OnAutoGenConfigurationChangedAsync"
                                                    disabled="@(!row.Selected || IsAutoGenBusy)" />
                                         </td>
                                         <td class="text-center">
@@ -469,6 +505,7 @@ else
                 Розклад очищується окремо і не зачіпає закріплені заняття.
             </div>
         </div>
+        <div class="visually-hidden" role="status" aria-live="polite" aria-atomic="true">@ok</div>
         @if (!string.IsNullOrWhiteSpace(ok))
         {
             <div class="alert autogen-result-alert @AutoGenOutcomeAlertCssClass mt-3">
@@ -500,13 +537,6 @@ else
                                     <div class="autogen-outcome__title">@outcome.Headline</div>
                                     <div class="autogen-outcome__message">@outcome.Detail</div>
                                 </div>
-                                @if (!string.IsNullOrWhiteSpace(outcome.PrimaryAction))
-                                {
-                                    <div class="autogen-outcome__action">
-                                        <span>Перший крок:</span>@(" ")
-                                        <strong>@outcome.PrimaryAction</strong>
-                                    </div>
-                                }
                             </div>
                             <div class="autogen-outcome__metrics">
                                 @foreach (var metric in outcome.Metrics)
@@ -535,12 +565,7 @@ else
                     @if (_latestAutoGenPlan is { } latestPlan)
                     {
                         <div class="small border rounded-2 bg-light p-2">
-                            <div class="fw-semibold">План змін: @GetAutoGenPlanStateLabel(latestPlan.State)</div>
-                            <div class="d-flex flex-wrap gap-3 mt-1">
-                                <span>Додано: <strong>@latestPlan.AddCount</strong></span>
-                                <span>Змінено: <strong>@latestPlan.UpdateCount</strong></span>
-                                <span>Видалено: <strong>@latestPlan.DeleteCount</strong></span>
-                            </div>
+                            <div class="fw-semibold">Перелік змін · @GetAutoGenPlanStateLabel(latestPlan.State)</div>
                             @if (latestPlan.DeleteCount > 0)
                             {
                                 <div class="text-danger mt-2">
@@ -682,10 +707,10 @@ else
                     {
                         <div class="border rounded-2 bg-white p-2">
                             <div class="small mb-2">
-                                Перегляньте зміни та всі попередження вище. Застосування виконується окремою атомарною дією.
+                                Перегляньте зміни та попередження. Сервер не прийме план, якщо чернетки вже змінилися.
                             </div>
                             <button class="btn btn-success" @onclick="ApplyLatestAutoGenPlanAsync" disabled="@IsAutoGenBusy">
-                                Застосувати перевірений план
+                                Прийняти план
                             </button>
                         </div>
                     }
@@ -694,7 +719,7 @@ else
         }
         @if (!string.IsNullOrWhiteSpace(error))
         {
-            <div class="alert alert-danger mt-3">@error</div>
+            <div class="alert alert-danger mt-3" role="alert">@error</div>
         }
         @if (_currentConflict is not null)
         {
@@ -746,7 +771,12 @@ else
             <div class="small text-muted">
                 Показано @rows.Count із @tableItems.Count записів.
             </div>
-            <AdminSearchBox @bind-Value="_search" Style="max-width:360px;" Placeholder="Id, група, модуль, викладач, аудиторія..." />
+            <div class="d-flex flex-column flex-sm-row gap-2 justify-content-end">
+                <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="LoadWeek" disabled="@IsAutoGenBusy">
+                    Оновити таблицю
+                </button>
+                <AdminSearchBox @bind-Value="_search" Style="max-width:360px;" Placeholder="Id, група, модуль, викладач, аудиторія..." />
+            </div>
         </div>
         <div class="table-responsive mt-3">
             <table class="table table-sm align-middle">
@@ -990,7 +1020,7 @@ else
     private string _search = string.Empty;
     private string _sortField = SortByDate;
     private bool _sortAsc = true;
-    private bool _useRecommendedAutoGenProfile;
+    private bool _useRecommendedAutoGenProfile = true;
     private bool _allowIncompleteDrafts;
     private ConflictDetails? _currentConflict;
     private Dictionary<string, ConflictDetails> _conflictStorage = new();
@@ -1063,6 +1093,41 @@ else
            && IsAcademicPeriodReadyForAutoGen
            && _moduleWeekRows.Any(row => row.Selected && row.Hours > 0)
            && _courseGroupRows.Any(row => row.Selected);
+    // Пояснює першу умову, через яку план ще не можна сформувати.
+    private string? GetAutoGenBlockingReason()
+    {
+        if (_selectedCourseId is null)
+        {
+            return "Щоб сформувати план, оберіть курс.";
+        }
+        if (SelectedAutoGenCourse is not { } selectedCourse)
+        {
+            return "Щоб сформувати план, оберіть доступний курс.";
+        }
+        if (selectedCourse.AcademicPeriodStartDate is not DateOnly academicPeriodStartDate
+            || _generationFromDate < academicPeriodStartDate)
+        {
+            // Детальне пояснення та посилання на налаштування вже показані в попередженні під панеллю.
+            return null;
+        }
+        if (_courseGroupRows.Count == 0)
+        {
+            return "Для обраного курсу немає доступних груп.";
+        }
+        if (!_courseGroupRows.Any(row => row.Selected))
+        {
+            return "Щоб сформувати план, оберіть хоча б одну групу.";
+        }
+        if (_moduleWeekRows.Count == 0)
+        {
+            return "Для обраного курсу немає доступних модулів.";
+        }
+        if (!_moduleWeekRows.Any(row => row.Selected && row.Hours > 0))
+        {
+            return "Щоб сформувати план, оберіть модуль і вкажіть кількість пар більше нуля.";
+        }
+        return null;
+    }
     private bool IsAutoGenBusy => _autoGenActionStarting || _autoGenProgress is not null;
     private string AutoGenOutcomeAlertCssClass
         => _latestWarningDetails.Any(detail =>
@@ -1171,7 +1236,7 @@ else
         {
             row.Selected = true;
         }
-        await PersistAutoGenConfigAsync();
+        await OnAutoGenConfigurationChangedAsync();
     }
     // Скидає вибір груп поточного курсу.
     private async Task ClearCourseGroupsSelectionAsync()
@@ -1180,7 +1245,7 @@ else
         {
             row.Selected = false;
         }
-        await PersistAutoGenConfigAsync();
+        await OnAutoGenConfigurationChangedAsync();
     }
     // Повертає ідентифікатори вибраних груп для автогенерації.
     private List<int> GetSelectedGroupIds()
@@ -1281,6 +1346,14 @@ else
         }
         return $"Корпус: {buildingName} · аудиторій: {row.PreferredRoomIds.Count}";
     }
+    // Стисло показує стан прихованих ручних обмежень аудиторій.
+    private string GetGroupRoomPreferencesOverview()
+    {
+        var configuredCount = _courseGroupRows.Count(row => row.Selected && row.HasRoomPreferences);
+        return configuredCount == 0
+            ? "автоматичний підбір для всіх груп"
+            : $"ручні обмеження: {configuredCount}";
+    }
     // Повертає підпис для кількості вибраних аудиторій.
     private string GetSelectedRoomCountLabel(CourseGroupRow row)
         => row.PreferredRoomIds.Count == 0
@@ -1314,7 +1387,7 @@ else
         var rawValue = e.Value?.ToString();
         row.PreferredBuildingId = int.TryParse(rawValue, out var buildingId) ? buildingId : null;
         NormalizeGroupRoomPreference(row);
-        await PersistAutoGenConfigAsync();
+        await OnAutoGenConfigurationChangedAsync();
     }
     // Перемикає аудиторію в ручному наборі групи.
     private async Task OnGroupRoomToggleAsync(CourseGroupRow row, int roomId, ChangeEventArgs e)
@@ -1332,26 +1405,42 @@ else
             row.PreferredRoomIds.Remove(roomId);
         }
         NormalizeGroupRoomPreference(row);
-        await PersistAutoGenConfigAsync();
+        await OnAutoGenConfigurationChangedAsync();
     }
     // Скидає ручний вибір корпусу та аудиторій для конкретної групи.
     private async Task ClearGroupRoomPreferenceAsync(CourseGroupRow row)
     {
         row.PreferredBuildingId = null;
         row.PreferredRoomIds.Clear();
-        await PersistAutoGenConfigAsync();
+        await OnAutoGenConfigurationChangedAsync();
     }
     // Формує опис діапазону тижня для генерації.
     private string GetGenerationRangeDescription()
     {
         var (fromDate, toDate) = GetNormalizedGenerationDateRange();
-        var totalWeeks = BuildGenerationWeekStarts().Count;
+        var dayCount = toDate.DayNumber - fromDate.DayNumber + 1;
         var fromWeekStart = GetMonday(fromDate);
-        if (totalWeeks == 1 && fromDate == fromWeekStart && toDate == fromWeekStart.AddDays(6))
+        if (dayCount == 7 && fromDate == fromWeekStart && toDate == fromWeekStart.AddDays(6))
         {
             return $"Тиждень: {fromDate:dd.MM.yyyy} – {toDate:dd.MM.yyyy}";
         }
-        return $"Діапазон: {fromDate:dd.MM.yyyy} – {toDate:dd.MM.yyyy} ({totalWeeks} тижн.)";
+        if (dayCount == 1)
+        {
+            return $"Дата: {fromDate:dd.MM.yyyy} (1 день)";
+        }
+        return $"Діапазон: {fromDate:dd.MM.yyyy} – {toDate:dd.MM.yyyy} ({FormatAutoGenDayCount(dayCount)})";
+    }
+    // Відмінює кількість календарних днів у підписі діапазону.
+    private static string FormatAutoGenDayCount(int dayCount)
+    {
+        var lastTwoDigits = dayCount % 100;
+        var lastDigit = dayCount % 10;
+        var unit = lastDigit == 1 && lastTwoDigits != 11
+            ? "день"
+            : lastDigit is >= 2 and <= 4 && lastTwoDigits is not (>= 12 and <= 14)
+                ? "дні"
+                : "днів";
+        return $"{dayCount} {unit}";
     }
     // Нормалізує межі генерації до стартів тижня (понеділок).
     private (DateOnly FromWeekStart, DateOnly ToWeekStart) GetNormalizedGenerationWeekRange()
@@ -1405,6 +1494,16 @@ else
         {
             await RemovePersistedAutoGenStatusAsync();
         }
+    }
+    // Скидає попередній план після зміни будь-якого параметра та зберігає нові налаштування.
+    private async Task OnAutoGenConfigurationChangedAsync()
+    {
+        if (IsAutoGenBusy)
+        {
+            return;
+        }
+        await ResetStatusAsync();
+        await PersistAutoGenConfigAsync();
     }
     // Запускає візуальний прогрес для довгих операцій автогенерації.
     private async Task StartAutoGenProgressAsync(string title, AutoGenProgressKind kind)
@@ -2070,8 +2169,7 @@ else
             headline,
             detail,
             metrics,
-            BuildAutoGenHotspotText(report, gapSummary, gapDetails),
-            actionItems.FirstOrDefault());
+            BuildAutoGenHotspotText(report, gapSummary, gapDetails));
     }
 
     private static string BuildAutoGenOutcomeHeadline(
@@ -2107,7 +2205,7 @@ else
         }
         if (plan is not null)
         {
-            return $"План підготовлено: {AdminScheduleAutoGenState.BuildPlanChangeSummary(plan)}";
+            return "План готовий до перегляду";
         }
         if (report is not null && report.Created > 0)
         {
@@ -2122,9 +2220,12 @@ else
         var weeksText = report.TotalWeeks == 1 ? "1 тиждень" : $"{report.TotalWeeks} тижнів";
         if (plan is not null)
         {
-            return $"Діапазон {range}: {weeksText}; план — {AdminScheduleAutoGenState.BuildPlanChangeSummary(plan)}; пропущено {report.Skipped}.";
+            return $"Діапазон {range}: {weeksText}. Усі зміни та проблемні місця показано нижче.";
         }
-        return $"Діапазон {range}: {weeksText}, створено {report.Created}, пропущено {report.Skipped}.";
+        var skippedText = report.Skipped > 0
+            ? $", пропущено під час генерації: {report.Skipped}"
+            : string.Empty;
+        return $"Діапазон {range}: {weeksText}, створено {report.Created}{skippedText}.";
     }
 
     private static string BuildAutoGenOutcomeRangeText(DateOnly fromDate, DateOnly toDate)
@@ -2143,26 +2244,41 @@ else
         if (plan is not null)
         {
             metrics.Add(new AutoGenOutcomeMetric("Додати", plan.AddCount.ToString()));
-            metrics.Add(new AutoGenOutcomeMetric("Змінити або перемістити", plan.UpdateCount.ToString()));
-            metrics.Add(new AutoGenOutcomeMetric("Видалити", plan.DeleteCount.ToString()));
+            if (plan.UpdateCount > 0)
+            {
+                metrics.Add(new AutoGenOutcomeMetric("Змінити або перемістити", plan.UpdateCount.ToString()));
+            }
+            if (plan.DeleteCount > 0)
+            {
+                metrics.Add(new AutoGenOutcomeMetric("Видалити", plan.DeleteCount.ToString()));
+            }
             if (report is not null)
             {
-                metrics.Add(new AutoGenOutcomeMetric("Пропущено", report.Skipped.ToString(), "вже існували або були закріплені"));
+                if (report.Skipped > 0)
+                {
+                    metrics.Add(new AutoGenOutcomeMetric("Пропущено під час генерації", report.Skipped.ToString(), "деталі нижче", true));
+                }
                 metrics.Add(new AutoGenOutcomeMetric("Тижнів", report.TotalWeeks.ToString()));
             }
         }
         else if (report is not null)
         {
             metrics.Add(new AutoGenOutcomeMetric("Створено", report.Created.ToString()));
-            metrics.Add(new AutoGenOutcomeMetric("Пропущено", report.Skipped.ToString(), "вже існували або були закріплені"));
+            if (report.Skipped > 0)
+            {
+                metrics.Add(new AutoGenOutcomeMetric("Пропущено під час генерації", report.Skipped.ToString(), "деталі нижче", true));
+            }
             metrics.Add(new AutoGenOutcomeMetric("Тижнів", report.TotalWeeks.ToString()));
         }
         metrics.Add(new AutoGenOutcomeMetric("Не поставлено", gapCount.ToString(), "за останню спробу", gapCount > 0));
-        metrics.Add(new AutoGenOutcomeMetric(
-            "Проблеми в налаштуваннях",
-            deficitCount.ToString(),
-            deficitCount > 0 ? "одна пара може мати кілька причин" : "не знайдено",
-            deficitCount > 0));
+        if (deficitCount > 0)
+        {
+            metrics.Add(new AutoGenOutcomeMetric(
+                "Проблеми в налаштуваннях",
+                deficitCount.ToString(),
+                "одна пара може мати кілька причин",
+                true));
+        }
         if (warningsTotal > 0)
         {
             metrics.Add(new AutoGenOutcomeMetric("Попередження", warningsTotal.ToString(), "деталі нижче", true));
@@ -2898,10 +3014,10 @@ else
                 SelectedCourseId: selectedCourseId,
                 Courses: new Dictionary<int, PersistedCourseAutoGenConfig>()
             );
-            if (weekConfig.SelectedCourseId != selectedCourseId)
+            weekConfig = weekConfig with
             {
-                weekConfig = weekConfig with { SelectedCourseId = selectedCourseId };
-            }
+                SelectedCourseId = selectedCourseId
+            };
             if (selectedCourseId is int courseId)
             {
                 var moduleConfig = _moduleWeekRows
@@ -2972,7 +3088,7 @@ else
         }
         if (!configs.TryGetValue(weekKey, out var weekConfig))
         {
-            _useRecommendedAutoGenProfile = false;
+            _useRecommendedAutoGenProfile = true;
             _allowIncompleteDrafts = false;
             return;
         }
@@ -2987,7 +3103,7 @@ else
         }
         if (_selectedCourseId is not int courseId)
         {
-            _useRecommendedAutoGenProfile = false;
+            _useRecommendedAutoGenProfile = true;
             _allowIncompleteDrafts = false;
             return;
         }
@@ -3001,7 +3117,7 @@ else
         }
         if (!weekConfig.Courses.TryGetValue(courseId, out var courseConfig))
         {
-            _useRecommendedAutoGenProfile = false;
+            _useRecommendedAutoGenProfile = true;
             _allowIncompleteDrafts = false;
             return;
         }
@@ -3216,7 +3332,7 @@ else
         }
         if (!meta.Courses.Any(course => course.Id == state.CourseId))
         {
-            error = "Курс з останнього заповнення більше недоступний.";
+            error = "Курс з останнього запуску більше недоступний.";
             return;
         }
         _selectedDate = state.SelectedDate;
@@ -3251,13 +3367,13 @@ else
         await PersistAutoGenConfigAsync();
         await LoadWeek();
         await RestoreLatestRollbackableAutoGenPlanAsync();
-        ok = $"Останнє заповнення від {state.SavedAt.ToLocalTime():dd.MM.yyyy HH:mm} відновлено.";
+        ok = $"Налаштування останнього запуску від {state.SavedAt.ToLocalTime():dd.MM.yyyy HH:mm} відновлено.";
         error = null;
     }
     private string GetLastAutoGenInputButtonTitle()
         => _lastAutoGenInput is null
-            ? "Кнопка стане доступною після першого запуску автогенерації, перевірки ресурсів або дозаповнення."
-            : $"Збережено {_lastAutoGenInput.SavedAt.ToLocalTime():dd.MM.yyyy HH:mm}";
+            ? "Кнопка стане доступною після першого формування плану."
+            : $"Налаштування збережено {_lastAutoGenInput.SavedAt.ToLocalTime():dd.MM.yyyy HH:mm}";
     // Запускає автогенерацію послідовно для кожного тижня в обраному діапазоні.
     // Формує запит ручних пріоритетів корпусів і аудиторій для вибраних груп.
     private List<GroupRoomPreferenceDto> BuildSelectedGroupRoomPreferences(IReadOnlyCollection<int>? groupIds = null)
@@ -3316,7 +3432,7 @@ else
             Title: previewOnly
                 ? softFill
                     ? "Попередній план дозаповнення відсутніх пар"
-                    : "Попередній план автогенерації"
+                    : "Повний план автогенерації"
                 : preflightOnly
                 ? "Перевірка ресурсів"
                 : softFill
@@ -3490,7 +3606,7 @@ else
             var groupRoomPreferences = BuildSelectedGroupRoomPreferences(selectedGroupIds);
             await PersistAutoGenConfigAsync();
             await PersistLastAutoGenInputAsync();
-            await StartAutoGenProgressAsync("Готуємо план автогенерації", AutoGenProgressKind.Generate);
+            await StartAutoGenProgressAsync("Готуємо повний план автогенерації", AutoGenProgressKind.Generate);
             var (res, rangeStartDate, rangeEndDate, _, finalStatus, plan, planChanges) = await PrepareAutoGenPreviewForRangeAsync(
                 courseId,
                 selectedGroupIds,
@@ -3500,8 +3616,8 @@ else
                 softFill: false);
             var courseName = meta?.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
             var previewSummary = finalStatus.State == AutoGenJobState.Succeeded
-                ? $"Попередній план автогенерації {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} для курсу {courseName} готовий. Перегляньте всі зміни та попередження, після чого застосуйте план окремою кнопкою. Чернетки ще не змінено."
-                : $"Попередній план автогенерації {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} не підготовлено повністю. Чернетки не змінено.";
+                ? $"Повний план автогенерації {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} для курсу {courseName} готовий. Автоматичне дозаповнення вже враховано. Перегляньте зміни та прийміть план. Чернетки ще не змінено."
+                : $"Повний план автогенерації {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} не підготовлено. Чернетки не змінено.";
             _preparedAutoGenPlanLogContext = plan?.CanApply == true
                 ? new PreparedAutoGenPlanLogContext(
                     plan.PlanId,
@@ -3511,160 +3627,6 @@ else
                     courseName,
                     new Dictionary<int, int>(moduleHours),
                     false)
-                : null;
-            await SetOkMessageAsync(
-                previewSummary,
-                res.Warnings,
-                res.GapDetails,
-                res.GapSummary,
-                res.Preflight,
-                finalStatus.Report,
-                res.WarningDetails,
-                plan,
-                planChanges);
-        }
-        catch (OperationCanceledException) when (_componentLifetimeCts.IsCancellationRequested)
-        {
-        }
-        catch (ApiErrorException ex)
-        {
-            await HandleApiError(ex);
-        }
-        catch (Exception ex)
-        {
-            error = ex.Message;
-        }
-        finally
-        {
-            EndAutoGenAction();
-        }
-    }
-    // Перевіряє ресурси для автогенерації без створення чернеток.
-    private async Task CheckAutoGenResources()
-    {
-        if (!TryBeginAutoGenAction())
-        {
-            return;
-        }
-        try
-        {
-            await ResetStatusAsync();
-            if (_selectedCourseId is not int courseId)
-            {
-                error = "Оберіть курс для перевірки ресурсів.";
-                return;
-            }
-            var moduleHours = _moduleWeekRows
-                .Where(row => row.Selected && row.Hours > 0)
-                .GroupBy(row => row.ModuleId)
-                .ToDictionary(g => g.Key, g => g.First().Hours);
-            if (moduleHours.Count == 0)
-            {
-                error = "Оберіть хоча б один модуль і вкажіть години > 0.";
-                return;
-            }
-            var selectedGroupIds = GetSelectedGroupIds();
-            if (selectedGroupIds.Count == 0)
-            {
-                error = "Оберіть хоча б одну групу для перевірки ресурсів.";
-                return;
-            }
-            var groupRoomPreferences = BuildSelectedGroupRoomPreferences(selectedGroupIds);
-            await PersistAutoGenConfigAsync();
-            await PersistLastAutoGenInputAsync();
-            await StartAutoGenProgressAsync("Перевірка ресурсів", AutoGenProgressKind.Preflight);
-            var (res, rangeStartDate, rangeEndDate, _, finalStatus) = await RunAutoGenForRangeAsync(
-                courseId,
-                selectedGroupIds,
-                groupRoomPreferences,
-                moduleHours,
-                clearExisting: true,
-                softFill: false,
-                preflightOnly: true);
-            var courseName = meta?.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
-            var deficitCount = res.Preflight?.Sum(item => item.Count) ?? 0;
-            var gapCount = res.GapDetails?.Count ?? 0;
-            var summary = gapCount > 0 || deficitCount > 0
-                ? $"Перевірка ресурсів {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): не вдалося поставити {gapCount} пар, проблем у налаштуваннях: {deficitCount}. Чернетки не збережено."
-                : $"Перевірка ресурсів {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} (курс: {courseName}, груп: {selectedGroupIds.Count}): усі запитані пари можна поставити, явних проблем у налаштуваннях не знайдено. Чернетки не збережено.";
-            summary = finalStatus.State switch
-            {
-                AutoGenJobState.Canceled => $"Перевірку ресурсів скасовано для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: перевірено {finalStatus.CompletedWeeks}/{finalStatus.TotalWeeks} тижнів.",
-                AutoGenJobState.Failed => $"Перевірка ресурсів завершилась з помилками для діапазону {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}: не вдалося поставити {gapCount} пар, проблем у налаштуваннях {deficitCount}.",
-                _ => summary
-            };
-            await SetOkMessageAsync(summary, res.Warnings, res.GapDetails, res.GapSummary, res.Preflight, finalStatus.Report, res.WarningDetails);
-        }
-        catch (OperationCanceledException) when (_componentLifetimeCts.IsCancellationRequested)
-        {
-        }
-        catch (ApiErrorException ex)
-        {
-            await HandleApiError(ex);
-        }
-        catch (Exception ex)
-        {
-            error = ex.Message;
-        }
-        finally
-        {
-            EndAutoGenAction();
-        }
-    }
-    // Дозаповнює відсутні пари в чернетках обраного діапазону.
-    private async Task FillWeekDrafts()
-    {
-        if (!TryBeginAutoGenAction())
-        {
-            return;
-        }
-        try
-        {
-            await ResetStatusAsync();
-            if (_selectedCourseId is not int courseId)
-            {
-                error = "Оберіть курс для дозаповнення відсутніх пар.";
-                return;
-            }
-            var moduleHours = _moduleWeekRows
-                .Where(row => row.Selected && row.Hours > 0)
-                .GroupBy(row => row.ModuleId)
-                .ToDictionary(g => g.Key, g => g.First().Hours);
-            if (moduleHours.Count == 0)
-            {
-                error = "Оберіть хоча б один модуль і вкажіть години > 0.";
-                return;
-            }
-            var selectedGroupIds = GetSelectedGroupIds();
-            if (selectedGroupIds.Count == 0)
-            {
-                error = "Оберіть хоча б одну групу для дозаповнення відсутніх пар.";
-                return;
-            }
-            var groupRoomPreferences = BuildSelectedGroupRoomPreferences(selectedGroupIds);
-            await PersistAutoGenConfigAsync();
-            await PersistLastAutoGenInputAsync();
-            await StartAutoGenProgressAsync("Готуємо план дозаповнення відсутніх пар", AutoGenProgressKind.Fill);
-            var (res, rangeStartDate, rangeEndDate, _, finalStatus, plan, planChanges) = await PrepareAutoGenPreviewForRangeAsync(
-                courseId,
-                selectedGroupIds,
-                groupRoomPreferences,
-                moduleHours,
-                clearExisting: false,
-                softFill: true);
-            var courseName = meta?.Courses.FirstOrDefault(c => c.Id == courseId)?.Name ?? $"#{courseId}";
-            var previewSummary = finalStatus.State == AutoGenJobState.Succeeded
-                ? $"Попередній план дозаповнення {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} для курсу {courseName} готовий. Перегляньте всі зміни та попередження, після чого застосуйте план окремою кнопкою. Чернетки ще не змінено."
-                : $"Попередній план дозаповнення {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy} не підготовлено повністю. Чернетки не змінено.";
-            _preparedAutoGenPlanLogContext = plan?.CanApply == true
-                ? new PreparedAutoGenPlanLogContext(
-                    plan.PlanId,
-                    rangeStartDate,
-                    rangeEndDate,
-                    courseId,
-                    courseName,
-                    new Dictionary<int, int>(moduleHours),
-                    true)
                 : null;
             await SetOkMessageAsync(
                 previewSummary,
@@ -3704,12 +3666,15 @@ else
         try
         {
             error = null;
-            var confirmed = await JS.InvokeAsync<bool>(
-                "confirm",
-                $"Застосувати готовий план?\n\nДодати: {plan.AddCount}\nЗмінити: {plan.UpdateCount}\nВидалити: {plan.DeleteCount}\n\nСервер відхилить план, якщо чернетки після перегляду змінилися.");
-            if (!confirmed)
+            if (plan.DeleteCount > 0)
             {
-                return;
+                var confirmed = await JS.InvokeAsync<bool>(
+                    "confirm",
+                    $"Прийняти план із видаленням?\n\nБуде видалено незакріплених чернеток: {plan.DeleteCount}.\nДодати: {plan.AddCount}. Змінити: {plan.UpdateCount}.");
+                if (!confirmed)
+                {
+                    return;
+                }
             }
 
             await StartAutoGenProgressAsync("Застосовуємо готовий план", AutoGenProgressKind.Generate);
@@ -4127,7 +4092,6 @@ else
         publishedItems.Clear();
         publishedItems.AddRange(publishedData);
         RebuildTableItems();
-        ok ??= $"Завантажено {draftItems.Count} чернеток та {publishedItems.Count} опублікованих записів.";
         error = null;
     }
     // Завантажує записи всіх тижнів, що перетинають діапазон генерації, для спільного лічильника.
@@ -4542,6 +4506,7 @@ else
         if (DateOnly.TryParse(args.Value?.ToString(), out var value))
         {
             _generationFromDate = value;
+            await ResetStatusAsync();
             await LoadGenerationRangeItemsAsync();
         }
     }
@@ -4551,6 +4516,7 @@ else
         if (DateOnly.TryParse(args.Value?.ToString(), out var value))
         {
             _generationToDate = value;
+            await ResetStatusAsync();
             await LoadGenerationRangeItemsAsync();
         }
     }
@@ -4749,8 +4715,7 @@ else
         string Headline,
         string Detail,
         IReadOnlyList<AutoGenOutcomeMetric> Metrics,
-        string? HotspotText,
-        string? PrimaryAction
+        string? HotspotText
     );
     private sealed record AutoGenOutcomeMetric(
         string Label,
