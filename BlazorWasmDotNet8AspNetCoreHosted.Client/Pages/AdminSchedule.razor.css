@@ -17,7 +17,7 @@
     }
     .autogen-plan-toolbar {
         display: grid;
-        grid-template-columns: repeat(3, minmax(150px, .8fr)) minmax(210px, 1fr) auto;
+        grid-template-columns: repeat(3, minmax(150px, .8fr)) minmax(210px, 1fr);
         align-items: end;
         gap: .75rem;
     }
@@ -27,6 +27,50 @@
     .autogen-plan-submit {
         min-height: 38px;
         white-space: nowrap;
+    }
+    .autogen-submit-panel {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        border: 1px solid rgba(37, 99, 235, .22);
+        border-radius: .65rem;
+        background: #fff;
+        padding: .8rem .9rem;
+    }
+    .autogen-restore-callout {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: .75rem 1rem;
+        border: 1px solid rgba(37, 99, 235, .24);
+        border-radius: .6rem;
+        background: #eff6ff;
+        color: #1e3a8a;
+        padding: .65rem .75rem;
+    }
+    .autogen-restore-callout--restored {
+        border-color: rgba(22, 163, 74, .3);
+        background: #f0fdf4;
+        color: #166534;
+    }
+    .autogen-advanced-options {
+        border: 1px solid rgba(148, 163, 184, .45);
+        border-radius: .65rem;
+        background: #fff;
+    }
+    .autogen-advanced-options__summary {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: .35rem 1rem;
+        cursor: pointer;
+        padding: .8rem .9rem;
+    }
+    .autogen-advanced-options__body {
+        border-top: 1px solid rgba(148, 163, 184, .35);
+        padding: .9rem;
     }
     .autogen-secondary-actions {
         border-top: 1px solid rgba(148, 163, 184, .45);
@@ -38,6 +82,34 @@
         color: #475569;
         font-size: .86rem;
         font-weight: 700;
+    }
+    .schedule-table-header {
+        display: grid;
+        grid-template-columns: minmax(240px, 1fr) minmax(210px, 280px);
+        align-items: end;
+        gap: .75rem 1rem;
+    }
+    .schedule-table-week-field {
+        min-width: 0;
+    }
+    .schedule-table-danger-actions {
+        grid-column: 1 / -1;
+    }
+    .schedule-table-danger-actions summary {
+        width: fit-content;
+        margin-left: auto;
+        cursor: pointer;
+        color: #9f1239;
+        font-size: .86rem;
+        font-weight: 700;
+        padding: .45rem 0;
+    }
+    .schedule-table-danger-panel {
+        border: 1px solid rgba(225, 29, 72, .25);
+        border-radius: .55rem;
+        background: #fff7f8;
+        margin-top: .45rem;
+        padding: .75rem;
     }
     .btn-autogen-rollback {
         border-color: #6d28d9;
@@ -202,6 +274,21 @@
         color: #064e3b;
         border-radius: .35rem;
         padding: .55rem .7rem;
+    }
+    .autogen-review-transition {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: .75rem 1rem;
+        border: 1px solid rgba(37, 99, 235, .3);
+        border-radius: .6rem;
+        background: #eff6ff;
+        color: #1e3a8a;
+        padding: .8rem;
+    }
+    .autogen-review-transition .btn {
+        flex: 0 0 auto;
+        white-space: nowrap;
     }
     .autogen-action-list {
         padding-left: 1.15rem;
@@ -527,11 +614,27 @@
     }
     @media (max-width: 767.98px) {
         .autogen-plan-toolbar,
-        .group-room-grid {
+        .group-room-grid,
+        .schedule-table-header {
             grid-template-columns: minmax(0, 1fr);
         }
-        .autogen-plan-submit {
+        .autogen-submit-panel {
+            align-items: stretch;
+            flex-direction: column;
+        }
+        .autogen-restore-callout,
+        .autogen-review-transition {
+            align-items: stretch;
+            flex-direction: column;
+        }
+        .autogen-plan-submit,
+        .autogen-restore-callout .btn,
+        .autogen-review-transition .btn,
+        .schedule-table-week-field {
             width: 100%;
+        }
+        .schedule-table-danger-actions summary {
+            margin-left: 0;
         }
         .autogen-outcome__head {
             flex-direction: column;
@@ -541,7 +644,7 @@
         .autogen-plan-toolbar {
             grid-template-columns: repeat(2, minmax(180px, 1fr));
         }
-        .autogen-plan-submit {
-            width: 100%;
+        .schedule-table-header {
+            grid-template-columns: minmax(240px, 1fr) minmax(210px, 280px);
         }
     }

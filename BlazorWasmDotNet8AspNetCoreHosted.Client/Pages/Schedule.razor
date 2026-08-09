@@ -7,11 +7,18 @@
 @inject HttpClient Http
 @inject IScheduleApi ScheduleApi
 @inject TimeSlotsApi TimeSlotsApi
+@inject NavigationManager Nav
 
 @code {
 
-    private const string AppVersion = "1.4.16"; // Оновлюйте перед релізом
+    [Parameter, SupplyParameterFromQuery(Name = "weekStart")]
+    public string? QueryWeekStart { get; set; }
+    [Parameter, SupplyParameterFromQuery(Name = "courseId")]
+    public int? QueryCourseId { get; set; }
+
+    private const string AppVersion = "1.4.17"; // Оновлюйте перед релізом
     private MetaResponseDto? _meta;
+    private int? _courseId;
     private int? _groupId;
     private int? _teacherId;
     private int? _roomId;
@@ -20,8 +27,11 @@
     private List<TimeSlotDto> _slots = new();
     private int _scheduleLoadVersion;
     private int _slotLoadVersion;
+    private DateOnly? _loadedWeekStart;
+    private int? _loadedCourseId;
     private bool _scheduleLoading;
     private string? _scheduleError;
+    private bool _scheduleLoadFailed;
     private int? _editItemId;
     private int _editLessonTypeId;
     private bool _editSaving;
@@ -47,6 +57,7 @@
         string ModuleCourse,
         string ColorCss);
     private List<SlotRow> _rows = new();
+    private List<ScheduleItemDto> _visibleItems = new();
     private Dictionary<(int DayNumber, string Start, string End), List<ScheduleCell>> _scheduleCells = new();
     private Dictionary<int, string> _moduleCourseById = new();
     // Формує читабельний діапазон дат для поточного тижня.
@@ -59,7 +70,12 @@
             return $"{from} — {to}";
         }
     }
-    // Початкове завантаження метаданих і розкладу.
+    private bool HasAdditionalFilters => _groupId is not null || _teacherId is not null || _roomId is not null;
+    private bool HasScheduleItemsInContext => _items.Any(ItemMatchesCourse);
+    private IEnumerable<LookupDto> GroupsForSelectedCourse => (_meta?.Groups ?? new List<LookupDto>())
+        .Where(group => _courseId is null || group.CourseId == _courseId)
+        .OrderBy(group => group.Name, StringComparer.CurrentCultureIgnoreCase);
+    // Початкове завантаження метаданих.
     protected override async Task OnInitializedAsync()
     {
         try
@@ -68,14 +84,15 @@
             _moduleCourseById = _meta.Modules
                 .Where(m => !string.IsNullOrWhiteSpace(m.CourseName))
                 .ToDictionary(m => m.Id, m => m.CourseName!);
-            await Reload();
         }
         catch (ApiErrorException ex)
         {
+            _scheduleLoadFailed = true;
             _scheduleError = ex.Errors.FirstOrDefault() ?? ex.Message;
         }
         catch (Exception ex)
         {
+            _scheduleLoadFailed = true;
             _scheduleError = ex.Message;
         }
     }
@@ -84,6 +101,14 @@
     {
         _scheduleLoading = true;
         _scheduleError = null;
+        _scheduleLoadFailed = false;
+        var requestedWeekStart = _weekStart;
+        var requestedCourseId = _courseId;
+        var contextChanged = _loadedWeekStart != requestedWeekStart || _loadedCourseId != requestedCourseId;
+        if (contextChanged)
+        {
+            ClearLoadedScheduleView();
+        }
         var itemsTask = LoadScheduleItemsAsync();
         var reloadVersion = _scheduleLoadVersion;
         var slotsTask = ReloadSlotsAsync(rebuildView: false);
@@ -99,11 +124,15 @@
                 CancelEdit();
             }
             RebuildScheduleCells();
+            _loadedWeekStart = requestedWeekStart;
+            _loadedCourseId = requestedCourseId;
         }
         catch (ApiErrorException ex)
         {
             if (reloadVersion == _scheduleLoadVersion)
             {
+                ClearLoadedScheduleView();
+                _scheduleLoadFailed = true;
                 _scheduleError = ex.Errors.FirstOrDefault() ?? ex.Message;
             }
         }
@@ -111,6 +140,8 @@
         {
             if (reloadVersion == _scheduleLoadVersion)
             {
+                ClearLoadedScheduleView();
+                _scheduleLoadFailed = true;
                 _scheduleError = ex.Message;
             }
         }
@@ -121,6 +152,40 @@
                 _scheduleLoading = false;
             }
         }
+    }
+    // Прибирає попередній розклад, якщо користувач уже перейшов до іншого тижня або курсу.
+    private void ClearLoadedScheduleView()
+    {
+        _items = new List<ScheduleItemDto>();
+        _slots = new List<TimeSlotDto>();
+        _rows = new List<SlotRow>();
+        _visibleItems = new List<ScheduleItemDto>();
+        _scheduleCells = new Dictionary<(int DayNumber, string Start, string End), List<ScheduleCell>>();
+        _loadedWeekStart = null;
+        _loadedCourseId = null;
+    }
+    // Застосовує контекст із посилання після завантаження метаданих.
+    protected override async Task OnParametersSetAsync()
+    {
+        if (_meta is null)
+        {
+            return;
+        }
+
+        _weekStart = DateOnly.TryParse(QueryWeekStart, out var requestedDate)
+            ? FirstMonday(requestedDate)
+            : FirstMonday(DateOnly.FromDateTime(DateTime.Today));
+        _courseId = NormalizeCourseId(QueryCourseId);
+        NormalizeDependentFilters();
+
+        var canonicalUri = BuildContextUri(_weekStart, _courseId);
+        if (!string.Equals(canonicalUri, Nav.Uri, StringComparison.Ordinal))
+        {
+            Nav.NavigateTo(canonicalUri, replace: true);
+            return;
+        }
+
+        await Reload();
     }
     private async Task LoadScheduleItemsAsync()
     {
@@ -141,7 +206,16 @@
         var slotTasks = courseIds
             .Select(courseId => TimeSlotsApi.GetEffectiveAsync(courseId, includeDayOverrides: true))
             .ToList();
-        var slotSets = await Task.WhenAll(slotTasks);
+        List<TimeSlotDto>[] slotSets;
+        try
+        {
+            slotSets = await Task.WhenAll(slotTasks);
+        }
+        catch (Exception) when (loadVersion != _slotLoadVersion)
+        {
+            // Помилка застарілого запиту не повинна перекривати успішний стан новішого фільтра.
+            return;
+        }
 
         // Не дозволяємо повільнішій попередній відповіді повернути сітку іншої групи.
         if (loadVersion != _slotLoadVersion)
@@ -166,6 +240,11 @@
         if (_meta is null)
         {
             return new int?[] { null };
+        }
+
+        if (_courseId is int courseId)
+        {
+            return new int?[] { courseId };
         }
 
         if (_groupId is int groupId)
@@ -206,17 +285,18 @@
     // Оновлює швидкий індекс комірок після завантаження або зміни фільтрів.
     private void RebuildScheduleCells()
     {
-        var visibleItems = _items
+        _visibleItems = _items
             .Where(i =>
+                ItemMatchesCourse(i) &&
                 (_groupId is null || i.GroupId == _groupId) &&
                 (_teacherId is null || i.TeacherId == _teacherId) &&
                 (_roomId is null || i.RoomId == _roomId))
             .ToList();
 
-        _rows = ScheduleOverviewLayoutPlanner.BuildSlotRows(_slots, visibleItems)
+        _rows = ScheduleOverviewLayoutPlanner.BuildSlotRows(_slots, _visibleItems)
             .Select(row => new SlotRow(row.Start, row.End))
             .ToList();
-        _scheduleCells = ScheduleOverviewLayoutPlanner.GroupEvents(visibleItems)
+        _scheduleCells = ScheduleOverviewLayoutPlanner.GroupEvents(_visibleItems)
             .GroupBy(group => (group.Anchor.DayNumber, group.Anchor.TimeStart, group.Anchor.TimeEnd))
             .ToDictionary(
                 group => group.Key,
@@ -242,8 +322,30 @@
     {
         RebuildScheduleCells();
     }
+    // Змінює курс, очищає несумісну групу та зберігає контекст у посиланні.
+    private void OnCourseFilterChanged(ChangeEventArgs args)
+    {
+        var nextCourseId = int.TryParse(args.Value?.ToString(), out var parsedCourseId)
+            ? NormalizeCourseId(parsedCourseId)
+            : null;
+        if (nextCourseId == _courseId)
+        {
+            return;
+        }
+
+        _courseId = nextCourseId;
+        NormalizeDependentFilters();
+        NavigateToContext(_weekStart, _courseId);
+    }
     private async Task OnGroupFilterChangedAsync()
     {
+        RebuildScheduleCells();
+        if (_scheduleLoadFailed)
+        {
+            await Reload();
+            return;
+        }
+
         try
         {
             _scheduleError = null;
@@ -251,15 +353,36 @@
         }
         catch (ApiErrorException ex)
         {
+            _scheduleLoadFailed = true;
             _scheduleError = ex.Errors.FirstOrDefault() ?? ex.Message;
         }
         catch (Exception ex)
         {
+            _scheduleLoadFailed = true;
             _scheduleError = ex.Message;
         }
     }
-    private Task PrevWeek() { _weekStart = _weekStart.AddDays(-7); return Reload(); }
-    private Task NextWeek() { _weekStart = _weekStart.AddDays(+7); return Reload(); }
+
+    private async Task RetryLoadAsync()
+    {
+        if (_meta is null)
+        {
+            Nav.NavigateTo(Nav.Uri, forceLoad: true, replace: true);
+            return;
+        }
+
+        await Reload();
+    }
+    private Task PrevWeek()
+    {
+        NavigateToContext(_weekStart.AddDays(-7), _courseId);
+        return Task.CompletedTask;
+    }
+    private Task NextWeek()
+    {
+        NavigateToContext(_weekStart.AddDays(7), _courseId);
+        return Task.CompletedTask;
+    }
     // Змінює тиждень і одразу завантажує дані для обраної дати.
     private async Task OnWeekChangedAsync(ChangeEventArgs args)
     {
@@ -269,13 +392,72 @@
             _scheduleError = "Оберіть коректну дату.";
             return;
         }
-        _weekStart = FirstMonday(date);
-        await Reload();
+        NavigateToContext(FirstMonday(date), _courseId);
+        await Task.CompletedTask;
     }
     private async Task ResetFiltersAsync()
     {
+        var hadCourseFilter = _courseId is not null;
+        _courseId = null;
         _groupId = _teacherId = _roomId = null;
+        if (hadCourseFilter)
+        {
+            NavigateToContext(_weekStart, null);
+            return;
+        }
         await OnGroupFilterChangedAsync();
+    }
+    // Перевіряє, чи належить заняття поточному курсу через його групу.
+    private bool ItemMatchesCourse(ScheduleItemDto item)
+    {
+        if (_courseId is null || _meta is null)
+        {
+            return true;
+        }
+        return _meta.Groups.FirstOrDefault(group => group.Id == item.GroupId)?.CourseId == _courseId;
+    }
+    private int? NormalizeCourseId(int? courseId)
+        => courseId is > 0 && _meta?.Courses.Any(course => course.Id == courseId) == true ? courseId : null;
+    // Не залишає вибраною групу з іншого курсу.
+    private void NormalizeDependentFilters()
+    {
+        if (_groupId is not int groupId || _courseId is null || _meta is null)
+        {
+            return;
+        }
+        if (_meta.Groups.FirstOrDefault(group => group.Id == groupId)?.CourseId != _courseId)
+        {
+            _groupId = null;
+        }
+    }
+    private string BuildContextUri(DateOnly weekStart, int? courseId)
+        => Nav.GetUriWithQueryParameters(new Dictionary<string, object?>
+        {
+            ["weekStart"] = weekStart.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+            ["courseId"] = courseId,
+            ["groupId"] = null,
+            ["teacherId"] = null,
+            ["roomId"] = null
+        });
+    private void NavigateToContext(DateOnly weekStart, int? courseId)
+    {
+        var uri = BuildContextUri(weekStart, courseId);
+        if (!string.Equals(uri, Nav.Uri, StringComparison.Ordinal))
+        {
+            Nav.NavigateTo(uri, replace: true);
+        }
+    }
+    // Готує послідовність карток дня для мобільного подання.
+    private List<(SlotRow Slot, ScheduleCell Cell)> MobileCellsForDay(int dayNumber)
+        => _rows
+            .SelectMany(slot => _scheduleCells.TryGetValue((dayNumber, slot.Start, slot.End), out var cells)
+                ? cells.Select(cell => (slot, cell))
+                : Enumerable.Empty<(SlotRow, ScheduleCell)>())
+            .ToList();
+    private DateOnly DateForDay(int dayNumber)
+    {
+        var offset = Array.IndexOf(DaysMonFirst, dayNumber);
+        return _weekStart.AddDays(offset < 0 ? 0 : offset);
     }
     // Вмикає режим редагування типу заняття.
     private void BeginEdit(ScheduleItemDto item)
@@ -346,62 +528,146 @@
     }
 }
 
-<div class="app-version">
-    <span>Версія застосунку:</span>
-    <span class="app-version__number">@AppVersion</span>
-</div>
+<PageTitle>Розклад</PageTitle>
 
-<h3 class="page-title">Розклад <span class="weak">(тиждень @_weekStart.ToString("yyyy-MM-dd"))</span></h3>
+<header class="schedule-header">
+    <div>
+        <h1 class="page-title">Розклад</h1>
+        <p class="page-subtitle">Переглядайте опубліковані заняття та за потреби змінюйте їхній тип.</p>
+    </div>
+</header>
 
-@if (!string.IsNullOrWhiteSpace(_scheduleError))
+@if (!string.IsNullOrWhiteSpace(_scheduleError) && !_scheduleLoadFailed)
 {
     <div class="alert alert-danger" role="alert">@_scheduleError</div>
 }
 
-<div class="toolbar">
-
-    <select class="select" @bind="_groupId" @bind:after="OnGroupFilterChangedAsync">
-        <option value="">Обрати групу</option>
-        @if (_meta is not null)
-        {
-            foreach (var g in _meta.Groups)
-            {
-                <option value="@g.Id">@g.Name</option>
-            }
-        }
-    </select>
-    <select class="select select--narrow" @bind="_teacherId" @bind:after="OnFilterChanged">
-        <option value="">Обрати викладача</option>
-        @if (_meta is not null)
-        {
-            foreach (var t in _meta.Teachers)
-            {
-                <option value="@t.Id">@t.Name</option>
-            }
-        }
-    </select>
-    <select class="select" @bind="_roomId" @bind:after="OnFilterChanged">
-        <option value="">Обрати аудиторію</option>
-        @if (_meta is not null)
-        {
-            foreach (var r in _meta.Rooms)
-            {
-                <option value="@r.Id">@r.Name</option>
-            }
-        }
-    </select>
-    <input type="date"
-           class="select"
-           value="@_weekStart.ToString("yyyy-MM-dd")"
-           disabled="@(_scheduleLoading || _editSaving)"
-           @onchange="OnWeekChangedAsync" />
-    <button class="btn btn-primary" disabled="@(_scheduleLoading || _editSaving)" @onclick="Reload">@(_scheduleLoading ? "Завантаження..." : "Оновити")</button>
-    <button class="btn btn-ghost" disabled="@(_scheduleLoading || _editSaving)" @onclick="ResetFiltersAsync">Скинути</button>
+<div class="week-nav week-nav--top" aria-label="Навігація за тижнями">
+    <button class="btn btn-ghost week-nav__button" disabled="@(_scheduleLoading || _editSaving)" @onclick="PrevWeek">
+        <span aria-hidden="true">‹</span><span>Попередній тиждень</span>
+    </button>
+    <div class="week-nav__current">
+        <strong class="week-label">@WeekRangeLabel</strong>
+        <label class="week-date-picker">
+            <span>Перейти до дати</span>
+            <input type="date"
+                   class="select"
+                   value="@_weekStart.ToString("yyyy-MM-dd")"
+                   disabled="@(_scheduleLoading || _editSaving)"
+                   @onchange="OnWeekChangedAsync" />
+        </label>
+    </div>
+    <button class="btn btn-ghost week-nav__button" disabled="@(_scheduleLoading || _editSaving)" @onclick="NextWeek">
+        <span>Наступний тиждень</span><span aria-hidden="true">›</span>
+    </button>
 </div>
 
-@if (_rows.Count == 0)
+<section class="filters-panel" aria-labelledby="schedule-filters-title">
+    <div class="filters-panel__heading">
+        <div>
+            <h2 id="schedule-filters-title">Що показати</h2>
+            <p>Спочатку оберіть курс, потім за потреби уточніть групу, викладача чи аудиторію.</p>
+        </div>
+        <div class="filters-panel__actions">
+            <button class="btn btn-ghost" disabled="@(_scheduleLoading || _editSaving)" @onclick="Reload">
+                @(_scheduleLoading ? "Завантаження..." : "Оновити дані")
+            </button>
+            <button class="btn btn-ghost" disabled="@(_scheduleLoading || _editSaving || (_courseId is null && !HasAdditionalFilters))" @onclick="ResetFiltersAsync">
+                Скинути фільтри
+            </button>
+        </div>
+    </div>
+    <div class="toolbar">
+        <label class="filter-field filter-field--primary">
+            <span>Курс</span>
+            <select class="select" value="@(_courseId?.ToString() ?? string.Empty)" @onchange="OnCourseFilterChanged">
+                <option value="">Усі курси</option>
+                @if (_meta is not null)
+                {
+                    foreach (var course in _meta.Courses.OrderBy(course => course.Name, StringComparer.CurrentCultureIgnoreCase))
+                    {
+                        <option value="@course.Id">@course.Name</option>
+                    }
+                }
+            </select>
+        </label>
+        <label class="filter-field">
+            <span>Група</span>
+            <select class="select" @bind="_groupId" @bind:after="OnGroupFilterChangedAsync">
+                <option value="">Усі групи</option>
+                @foreach (var group in GroupsForSelectedCourse)
+                {
+                    <option value="@group.Id">@group.Name</option>
+                }
+            </select>
+        </label>
+        <label class="filter-field filter-field--wide">
+            <span>Викладач</span>
+            <select class="select" @bind="_teacherId" @bind:after="OnFilterChanged">
+                <option value="">Усі викладачі</option>
+                @if (_meta is not null)
+                {
+                    foreach (var teacher in _meta.Teachers.OrderBy(teacher => teacher.Name, StringComparer.CurrentCultureIgnoreCase))
+                    {
+                        <option value="@teacher.Id">@teacher.Name</option>
+                    }
+                }
+            </select>
+        </label>
+        <label class="filter-field">
+            <span>Аудиторія</span>
+            <select class="select" @bind="_roomId" @bind:after="OnFilterChanged">
+                <option value="">Усі аудиторії</option>
+                @if (_meta is not null)
+                {
+                    foreach (var room in _meta.Rooms.OrderBy(room => room.Name, StringComparer.CurrentCultureIgnoreCase))
+                    {
+                        <option value="@room.Id">@room.Name</option>
+                    }
+                }
+            </select>
+        </label>
+    </div>
+</section>
+
+@if (_scheduleLoading)
 {
-    <div class="empty">Для цього тижня не знайдено визначених тайм-слотів. Додайте їх у конфігурації.</div>
+    <div class="empty-state" role="status">
+        <strong>Завантажуємо розклад…</strong>
+        <span>Це може тривати кілька секунд.</span>
+    </div>
+}
+else if (_scheduleLoadFailed)
+{
+    <div class="load-error-state" role="alert">
+        <strong>Не вдалося завантажити розклад</strong>
+        <span>@(_scheduleError ?? "Сервер тимчасово не відповідає.")</span>
+        <button class="btn btn-ghost" disabled="@(_scheduleLoading || _editSaving)" @onclick="RetryLoadAsync">
+            Спробувати ще раз
+        </button>
+    </div>
+}
+else if (!HasScheduleItemsInContext)
+{
+    <div class="empty-state">
+        <strong>На цей тиждень занять ще немає</strong>
+        <span>Оберіть інший тиждень або курс. Якщо заняття вже сформовані, перевірте, чи їх опубліковано.</span>
+    </div>
+}
+else if (_visibleItems.Count == 0)
+{
+    <div class="empty-state">
+        <strong>За обраними фільтрами нічого не знайдено</strong>
+        <span>Заняття на цьому тижні є, але жодне не відповідає вибраній групі, викладачу чи аудиторії.</span>
+        <button class="btn btn-ghost" disabled="@(_scheduleLoading || _editSaving)" @onclick="ResetFiltersAsync">Скинути фільтри</button>
+    </div>
+}
+else if (_rows.Count == 0)
+{
+    <div class="empty-state">
+        <strong>Не вдалося побудувати часову сітку</strong>
+        <span>Перевірте налаштування слотів часу для вибраного курсу.</span>
+    </div>
 }
 else
 {
@@ -534,48 +800,219 @@ else
         </div>
     </div>
 
-<div class="week-nav">
-        <button class="btn btn-ghost" disabled="@(_scheduleLoading || _editSaving)" @onclick="PrevWeek">‹ Попередній тиждень</button>
-        <div class="week-label">@WeekRangeLabel</div>
-        <button class="btn btn-ghost" disabled="@(_scheduleLoading || _editSaving)" @onclick="NextWeek">Наступний тиждень ›</button>
+    <div class="schedule-mobile" aria-label="Розклад за днями">
+        @foreach (var dayNumber in DaysMonFirst)
+        {
+            var dayCells = MobileCellsForDay(dayNumber);
+            if (dayCells.Count == 0)
+            {
+                continue;
+            }
+            var dayDate = DateForDay(dayNumber);
+            <section class="mobile-day">
+                <header class="mobile-day__header">
+                    <strong>@DayNameUk(dayNumber)</strong>
+                    <span>@dayDate.ToString("d MMMM", UkrainianCulture)</span>
+                </header>
+                <div class="mobile-day__items">
+                    @foreach (var dayCell in dayCells)
+                    {
+                        var cell = dayCell.Cell;
+                        var item = cell.Item;
+                        <article @key="item.Id" class="mobile-lesson">
+                            <div class="mobile-lesson__time">@dayCell.Slot.Label</div>
+                            <div class="card @cell.ColorCss @(cell.IsMergedLecture ? "card--merged-lecture" : string.Empty)">
+                                <div class="card-top">
+                                    <span class="badge">@item.LessonTypeName</span>
+                                    @if (item.IsLocked)
+                                    {
+                                        <span class="lock" title="Зафіксовано">🔒</span>
+                                    }
+                                </div>
+                                @if (!item.IsLocked && _editItemId != item.Id)
+                                {
+                                    <button type="button"
+                                            class="card-edit-trigger"
+                                            @onclick="() => BeginEdit(item)"
+                                            title="Редагувати тип заняття">
+                                        <span class="td-edit-icon" aria-hidden="true">✎</span>
+                                    </button>
+                                }
+                                <div class="title">
+                                    <div>@item.Module</div>
+                                    @if (!string.IsNullOrWhiteSpace(cell.ModuleCourse))
+                                    {
+                                        <div class="title-course text-muted small">@cell.ModuleCourse</div>
+                                    }
+                                </div>
+                                @if (!cell.IsBreak && !string.IsNullOrWhiteSpace(item.Group))
+                                {
+                                    <div class="sub">@item.Group</div>
+                                }
+                                @if (!cell.IsBreak && cell.IsMergedLecture)
+                                {
+                                    <div class="merged-lecture-label">
+                                        Об'єднана лекція (@cell.MergedGroups.Count груп): @string.Join(", ", cell.MergedGroups)
+                                    </div>
+                                }
+                                @if (!cell.IsBreak)
+                                {
+                                    <div class="meta">
+                                        <span class="slot-mode">@LessonModeLabel(item.RequiresRoom)</span>
+                                        @if (!string.IsNullOrWhiteSpace(item.Teacher))
+                                        {
+                                            <span>@item.Teacher</span>
+                                        }
+                                        @if (!string.IsNullOrWhiteSpace(item.Room))
+                                        {
+                                            <span>@item.Room @(!string.IsNullOrWhiteSpace(item.Building) ? $"({item.Building})" : "")</span>
+                                        }
+                                    </div>
+                                }
+                                @if (_editItemId == item.Id)
+                                {
+                                    <div class="card-edit">
+                                        <label class="card-edit-field">
+                                            <span class="card-edit-label">Тип заняття</span>
+                                            <select class="card-edit-select"
+                                                    value="@_editLessonTypeId"
+                                                    @onchange="OnLessonTypeChanged"
+                                                    disabled="@_editSaving">
+                                                @foreach (var lessonType in _meta?.LessonTypes ?? Enumerable.Empty<IdCodeNameDto>())
+                                                {
+                                                    <option value="@lessonType.Id">@lessonType.Name</option>
+                                                }
+                                            </select>
+                                        </label>
+                                        @if (!string.IsNullOrWhiteSpace(_editError))
+                                        {
+                                            <div class="card-edit-error">@_editError</div>
+                                        }
+                                        <div class="card-edit-actions">
+                                            <button type="button"
+                                                    class="btn btn-primary btn-sm"
+                                                    disabled="@_editSaving"
+                                                    @onclick="SaveLessonTypeAsync">
+                                                @if (_editSaving)
+                                                {
+                                                    <span class="spinner-border spinner-border-sm" role="status"></span>
+                                                }
+                                                <span>Зберегти</span>
+                                            </button>
+                                            <button type="button"
+                                                    class="btn btn-ghost btn-sm"
+                                                    disabled="@_editSaving"
+                                                    @onclick="CancelEdit">
+                                                Скасувати
+                                            </button>
+                                        </div>
+                                    </div>
+                                }
+                            </div>
+                        </article>
+                    }
+                </div>
+            </section>
+        }
+    </div>
+
+    <div class="week-nav week-nav--bottom">
+        <button class="btn btn-ghost" disabled="@(_scheduleLoading || _editSaving)" @onclick="PrevWeek">‹ Попередній</button>
+        <span class="week-label">@WeekRangeLabel</span>
+        <button class="btn btn-ghost" disabled="@(_scheduleLoading || _editSaving)" @onclick="NextWeek">Наступний ›</button>
     </div>
 }
 
+<footer class="schedule-footer">Версія застосунку @AppVersion</footer>
+
 <style>
 
-    .page-title {
-        margin: .3rem 0 .8rem;
-    }
-        .page-title .weak {
-            color: #64748b;
-            font-weight: 400;
-        }
-    .toolbar {
+    .schedule-header {
         display: flex;
-        flex-wrap: wrap;
-        gap: .35rem;
-        align-items: center;
-        margin-bottom: 8px;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 1rem;
+        margin: .3rem 0 1rem;
+    }
+    .page-title {
+        margin: 0;
+        font-size: clamp(1.65rem, 3vw, 2.1rem);
+    }
+    .page-subtitle {
+        margin: .35rem 0 0;
+        color: #64748b;
+    }
+    .filters-panel {
+        margin: 1rem 0;
+        padding: 1rem;
+        border: 1px solid #e2e8f0;
+        border-radius: 16px;
+        background: #fff;
+    }
+    .filters-panel__heading {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 1rem;
+        margin-bottom: .8rem;
+    }
+    .filters-panel__heading h2 {
+        margin: 0;
+        font-size: 1rem;
+    }
+    .filters-panel__heading p {
+        margin: .25rem 0 0;
+        color: #64748b;
+        font-size: .88rem;
+    }
+    .filters-panel__actions {
+        display: flex;
+        flex: 0 0 auto;
+        gap: .5rem;
+    }
+    .toolbar {
+        display: grid;
+        grid-template-columns: minmax(150px, .8fr) minmax(150px, .8fr) minmax(220px, 1.25fr) minmax(150px, .8fr);
+        gap: .65rem;
+        align-items: end;
+    }
+    .filter-field {
+        display: grid;
+        gap: .3rem;
+        min-width: 0;
+        color: #334155;
+        font-size: .82rem;
+        font-weight: 700;
+    }
+    .filter-field--primary > span {
+        color: #1d4ed8;
     }
     .select {
+        box-sizing: border-box;
+        width: 100%;
         min-width: 160px;
         padding: .46rem .6rem;
         border: 1px solid #dfe3e8;
         border-radius: 10px;
         background: #fff;
+        color: #0f172a;
     }
-    .toolbar .select {
-        flex: 0 0 auto;
-    }
-    .select--narrow {
-        width: 240px;
-        max-width: 240px;
+    .select:focus-visible,
+    .btn:focus-visible,
+    .card-edit-trigger:focus-visible,
+    .card-edit-select:focus-visible {
+        outline: 3px solid #1d4ed8;
+        outline-offset: 2px;
     }
     .btn {
         padding: .5rem .9rem;
         border-radius: 10px;
         border: 1px solid transparent;
         cursor: pointer;
+    }
+    .btn:disabled {
+        cursor: not-allowed;
+        opacity: .58;
     }
     .btn-primary {
         background: #111827;
@@ -591,8 +1028,41 @@ else
         font-size: .8rem;
         margin-top: .1rem;
     }
-    .empty {
+    .empty-state {
+        display: grid;
+        justify-items: start;
+        gap: .45rem;
+        margin: 1rem 0;
+        padding: 1.25rem;
+        border: 1px dashed #cbd5e1;
+        border-radius: 16px;
+        background: #f8fafc;
         color: #64748b;
+    }
+    .empty-state strong {
+        color: #0f172a;
+        font-size: 1rem;
+    }
+    .empty-state .btn {
+        margin-top: .25rem;
+    }
+    .load-error-state {
+        display: grid;
+        justify-items: start;
+        gap: .45rem;
+        margin: 1rem 0;
+        padding: 1.25rem;
+        border: 1px solid #fca5a5;
+        border-radius: 16px;
+        background: #fff7f7;
+        color: #7f1d1d;
+    }
+    .load-error-state strong {
+        color: #7f1d1d;
+        font-size: 1rem;
+    }
+    .load-error-state .btn {
+        margin-top: .25rem;
     }
     .layout {
         display: flex;
@@ -602,6 +1072,7 @@ else
     .grid-wrap {
         width: 100%;
         overflow: auto;
+        border-radius: 14px;
     }
     table.schedule {
         width: 100%;
@@ -620,7 +1091,7 @@ else
             text-align: center;
             border-bottom: 1px solid #e5e7eb;
             border-right: 1px solid #e5e7eb;
-            border-top: 1px solid #e5e7eb; // Закриваємо верхню лінію шапки
+            border-top: 1px solid #e5e7eb; /* Закриваємо верхню лінію шапки */
         }
             table.schedule thead th:first-child {
                 border-left: 1px solid #e5e7eb;
@@ -792,17 +1263,50 @@ else
     .week-nav {
         display: flex;
         align-items: center;
-        justify-content: center;
+        justify-content: space-between;
         gap: 14px;
-        margin-top: 10px;
-        padding: 10px;
+        padding: .8rem;
         background: #fff;
         border: 1px solid #e5e7eb;
         border-radius: 16px;
     }
+    .week-nav--top {
+        margin-bottom: 1rem;
+    }
+    .week-nav--bottom {
+        justify-content: center;
+        margin-top: 1rem;
+    }
+    .week-nav__button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: .4rem;
+        min-width: 176px;
+    }
+    .week-nav__current {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 1rem;
+        min-width: 0;
+    }
     .week-label {
         color: #475569;
         font-weight: 600;
+        text-align: center;
+    }
+    .week-date-picker {
+        display: grid;
+        gap: .2rem;
+        min-width: 150px;
+        color: #64748b;
+        font-size: .72rem;
+        font-weight: 600;
+    }
+    .week-date-picker .select {
+        min-width: 0;
+        padding: .35rem .5rem;
     }
     .card-edit-trigger {
         position: absolute;
@@ -868,22 +1372,134 @@ else
         font-size: .9rem;
         line-height: 1;
     }
-    .app-version {
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        margin: 6px 0 4px;
-        padding: 6px 8px;
-        border-radius: 10px;
-        background: #f8fafc;
-        color: #6b7280;
-        font-weight: 600;
-        font-size: .85rem;
+    .schedule-mobile {
+        display: none;
     }
-    .app-version__number {
-        color: #0f172a;
-        font-weight: 700;
-        letter-spacing: .01em;
+    .schedule-footer {
+        margin-top: 1.5rem;
+        padding: .75rem 0;
+        color: #64748b;
+        text-align: right;
+        font-size: .8rem;
+    }
+
+    @@media (max-width: 980px) {
+        .toolbar {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .week-nav__current {
+            flex-direction: column;
+            gap: .35rem;
+        }
+    }
+
+    @@media (max-width: 900px) {
+        .schedule-header {
+            margin-bottom: .8rem;
+        }
+        .page-subtitle {
+            font-size: .9rem;
+        }
+        .week-nav--top {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: .6rem;
+        }
+        .week-nav__current {
+            grid-column: 1 / -1;
+            grid-row: 1;
+            align-items: stretch;
+        }
+        .week-nav__button {
+            min-width: 0;
+            width: 100%;
+        }
+        .week-nav__button span:not([aria-hidden="true"]) {
+            font-size: .78rem;
+        }
+        .week-date-picker {
+            width: 100%;
+        }
+        .filters-panel {
+            padding: .85rem;
+        }
+        .filters-panel__heading {
+            display: grid;
+        }
+        .filters-panel__actions {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            width: 100%;
+        }
+        .toolbar {
+            grid-template-columns: 1fr;
+        }
+        .filter-field,
+        .select {
+            min-width: 0;
+            width: 100%;
+        }
+        .layout {
+            display: none;
+        }
+        .schedule-mobile {
+            display: grid;
+            gap: 1rem;
+        }
+        .mobile-day {
+            overflow: hidden;
+            border: 1px solid #e2e8f0;
+            border-radius: 16px;
+            background: #fff;
+        }
+        .mobile-day__header {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: .75rem;
+            padding: .75rem .9rem;
+            background: #f8fafc;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        .mobile-day__header strong {
+            color: #0f172a;
+        }
+        .mobile-day__header span {
+            color: #64748b;
+            font-size: .82rem;
+        }
+        .mobile-day__items {
+            display: grid;
+            gap: .8rem;
+            padding: .8rem;
+        }
+        .mobile-lesson {
+            display: grid;
+            gap: .35rem;
+        }
+        .mobile-lesson__time {
+            color: #475569;
+            font-size: .8rem;
+            font-weight: 800;
+        }
+        .mobile-lesson .card {
+            width: 100%;
+        }
+        .week-nav--bottom {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+        }
+        .week-nav--bottom .week-label {
+            grid-column: 1 / -1;
+            grid-row: 1;
+        }
+        .week-nav--bottom .btn {
+            width: 100%;
+            padding-inline: .45rem;
+        }
+        .schedule-footer {
+            text-align: center;
+        }
     }
 </style>
 
