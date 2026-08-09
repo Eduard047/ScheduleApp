@@ -834,11 +834,11 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
     {
         var violations = new List<string>();
         foreach (var group in placements.GroupBy(row => new
-                 {
-                     row.GroupId,
-                     row.GroupName,
-                     row.Date
-                 }))
+        {
+            row.GroupId,
+            row.GroupName,
+            row.Date
+        }))
         {
             var ordered = CollapseLogicalDraftEventPlacements(group)
                 .Where(row => !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(row.LessonTypeCode))
@@ -901,12 +901,12 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
         var violations = new List<string>();
 
         foreach (var group in activePlacements.GroupBy(row => new
-                 {
-                     row.GroupId,
-                     row.GroupName,
-                     row.CourseId,
-                     row.Date
-                 }))
+        {
+            row.GroupId,
+            row.GroupName,
+            row.CourseId,
+            row.Date
+        }))
         {
             var ordered = CollapseLogicalDraftEventPlacements(group)
                 .OrderBy(row => row.Start)

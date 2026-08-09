@@ -2340,16 +2340,25 @@ public sealed class ProductionGuardrailTests
         try
         {
             var started = service.Start(request);
-            course.AcademicPeriodStartDate = null;
-            await fixture.Db.SaveChangesAsync();
+            var persistenceGate = await HoldAutogenJobServiceGateAsync(service, "_persistenceGate");
+            try
+            {
+                // Оновлення lease працює ще до проходження бар'єра виконання, тому ізолюємо спільне SQLite-з'єднання тесту.
+                course.AcademicPeriodStartDate = null;
+                await fixture.Db.SaveChangesAsync();
 
-            await using var observerProvider = services.BuildServiceProvider();
-            var observer = CreateAutogenJobService(observerProvider.GetRequiredService<IServiceScopeFactory>());
-            var repeated = observer.Start(request with { Title = "Повторне читання" });
+                await using var observerProvider = services.BuildServiceProvider();
+                var observer = CreateAutogenJobService(observerProvider.GetRequiredService<IServiceScopeFactory>());
+                var repeated = observer.Start(request with { Title = "Повторне читання" });
 
-            Assert.Equal(started.JobId, repeated.JobId);
-            Assert.Equal(started.Status.State, repeated.Status.State);
-            Assert.Equal(1, await fixture.Db.AutoGenJobRuns.CountAsync());
+                Assert.Equal(started.JobId, repeated.JobId);
+                Assert.Equal(started.Status.State, repeated.Status.State);
+                Assert.Equal(1, await fixture.Db.AutoGenJobRuns.CountAsync());
+            }
+            finally
+            {
+                persistenceGate.Release();
+            }
         }
         finally
         {

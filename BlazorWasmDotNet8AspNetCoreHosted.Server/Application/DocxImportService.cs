@@ -373,7 +373,7 @@ public sealed class DocxImportService
                 }
                 topics.Add(new DocxImportTopicDto(
                     moduleCodeValue,
-                    topicCode, 
+                    topicCode,
                     lessonTypeName,
                     total,
                     auditorium,

@@ -6,6 +6,7 @@ using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 
@@ -438,7 +439,7 @@ public sealed class AdminControllerGuardrailTests
     [Fact]
     public async Task Module_list_does_not_split_shared_modules()
     {
-        await using var fixture = await TestDatabase.CreateAsync();
+        await using var fixture = await TestDatabase.CreateAsync(throwOnMultipleCollectionWarning: true);
         var firstCourse = new Course { Name = "Перший курс списку", DurationWeeks = 52 };
         var secondCourse = new Course { Name = "Другий курс списку", DurationWeeks = 52 };
         var module = new Module
@@ -1558,13 +1559,18 @@ public sealed class AdminControllerGuardrailTests
 
         public AppDbContext Db { get; }
 
-        public static async Task<TestDatabase> CreateAsync()
+        public static async Task<TestDatabase> CreateAsync(bool throwOnMultipleCollectionWarning = false)
         {
             var connection = new SqliteConnection("Data Source=:memory:");
             await connection.OpenAsync();
-            var options = new DbContextOptionsBuilder<AppDbContext>()
-                .UseSqlite(connection)
-                .Options;
+            var optionsBuilder = new DbContextOptionsBuilder<AppDbContext>()
+                .UseSqlite(connection);
+            if (throwOnMultipleCollectionWarning)
+            {
+                optionsBuilder.ConfigureWarnings(warnings =>
+                    warnings.Throw(RelationalEventId.MultipleCollectionIncludeWarning));
+            }
+            var options = optionsBuilder.Options;
             var db = new AppDbContext(options);
             await db.Database.EnsureCreatedAsync();
             return new TestDatabase(connection, db);

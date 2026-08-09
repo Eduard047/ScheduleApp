@@ -351,14 +351,14 @@ public sealed class TeacherDraftsPublishService
             draft => draft.Id,
             draft => string.IsNullOrWhiteSpace(draft.BatchKey) ? null : draft.BatchKey);
         foreach (var signatureGroup in drafts.GroupBy(draft => new
-                 {
-                     draft.Date,
-                     draft.StartTime,
-                     draft.EndTime,
-                     draft.GroupId,
-                     draft.ModuleId,
-                     draft.LessonTypeId
-                 }))
+        {
+            draft.Date,
+            draft.StartTime,
+            draft.EndTime,
+            draft.GroupId,
+            draft.ModuleId,
+            draft.LessonTypeId
+        }))
         {
             var legacyRows = signatureGroup
                 .Where(draft => string.IsNullOrWhiteSpace(draft.BatchKey))

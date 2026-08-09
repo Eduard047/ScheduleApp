@@ -339,20 +339,20 @@ public sealed class TeacherDraftsAutogenPlanService
                 switch (payload.Operation)
                 {
                     case AutoGenPlanOperation.Add:
-                    {
-                        var entity = new TeacherDraftItem();
-                        ApplySnapshot(entity, payload.After!, plan.PlanId, isNew: true);
-                        _db.TeacherDraftItems.Add(entity);
-                        appliedEntities[payload.Entity.Id] = entity;
-                        break;
-                    }
+                        {
+                            var entity = new TeacherDraftItem();
+                            ApplySnapshot(entity, payload.After!, plan.PlanId, isNew: true);
+                            _db.TeacherDraftItems.Add(entity);
+                            appliedEntities[payload.Entity.Id] = entity;
+                            break;
+                        }
                     case AutoGenPlanOperation.Update:
-                    {
-                        var entity = scopeById[payload.Before!.Id];
-                        ApplySnapshot(entity, payload.After!, plan.PlanId, isNew: false);
-                        appliedEntities[payload.Entity.Id] = entity;
-                        break;
-                    }
+                        {
+                            var entity = scopeById[payload.Before!.Id];
+                            ApplySnapshot(entity, payload.After!, plan.PlanId, isNew: false);
+                            appliedEntities[payload.Entity.Id] = entity;
+                            break;
+                        }
                     case AutoGenPlanOperation.Delete:
                         _db.TeacherDraftItems.Remove(scopeById[payload.Before!.Id]);
                         break;
@@ -461,19 +461,19 @@ public sealed class TeacherDraftsAutogenPlanService
                         _db.TeacherDraftItems.Remove(scopeById[payload.Entity.AppliedDraftId!.Value]);
                         break;
                     case AutoGenPlanOperation.Update:
-                    {
-                        var entity = scopeById[payload.Entity.AppliedDraftId!.Value];
-                        ApplySnapshot(entity, payload.Before!, payload.Before!.GenerationJobId, isNew: false);
-                        break;
-                    }
+                        {
+                            var entity = scopeById[payload.Entity.AppliedDraftId!.Value];
+                            ApplySnapshot(entity, payload.Before!, payload.Before!.GenerationJobId, isNew: false);
+                            break;
+                        }
                     case AutoGenPlanOperation.Delete:
-                    {
-                        var entity = new TeacherDraftItem { Id = payload.Before!.Id };
-                        ApplySnapshot(entity, payload.Before, payload.Before.GenerationJobId, isNew: true);
-                        entity.CreatedAt = payload.Before.CreatedAt;
-                        _db.TeacherDraftItems.Add(entity);
-                        break;
-                    }
+                        {
+                            var entity = new TeacherDraftItem { Id = payload.Before!.Id };
+                            ApplySnapshot(entity, payload.Before, payload.Before.GenerationJobId, isNew: true);
+                            entity.CreatedAt = payload.Before.CreatedAt;
+                            _db.TeacherDraftItems.Add(entity);
+                            break;
+                        }
                     default:
                         throw CorruptPlan("План містить невідому операцію відкоту.");
                 }
