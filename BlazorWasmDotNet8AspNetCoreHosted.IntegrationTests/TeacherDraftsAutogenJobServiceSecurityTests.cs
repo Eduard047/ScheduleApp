@@ -173,6 +173,143 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
     }
 
     [Fact]
+    public void Integrated_fill_merge_replaces_provisional_gaps_but_preserves_durable_warnings()
+    {
+        const string preflightDeficit =
+            "Попередня перевірка ресурсів: доступні викладачі — 1. Додайте викладача.";
+        const string gap =
+            "Автогенерація не заповнила слот 08:30-09:50 для групи 9301 на 2026-09-01.";
+        const string searchLimit =
+            "[2026-09-01] Група 9301: [search-limit] фінальний repair-pass досягнув межі вузлів.";
+        const string topicExhausted =
+            "Для модуля <Фізика> у групи 9301 вичерпано теми. Пропустили розкладення.";
+        const string resourceUnavailable =
+            "Фінальний matching не знайшов повного набору обов'язкових ресурсів.";
+        const string recommendation =
+            "Рекомендація автогенерації: додайте або звільніть викладачів.";
+        const string diagnosticSummary =
+            "Зведення причин незаповнених слотів: викладач — 1.";
+        const string incomplete =
+            "Створено 1 неповних чернеток: без викладача — 1, без аудиторії — 0.";
+        const string topicReused =
+            "Для модуля <Фізика> у групі 9301 повторно використано тему Т1, щоб заповнити слот без порушення жорстких правил.";
+        const string departmentFallback =
+            "Для групи 9301 використано явний зв'язок викладача з модулем поза кафедрою теми.";
+        const string inputAdjusted = "Ігноровано модулі, що не належать курсу #2: 17.";
+        const string fillOptimization =
+            "Фінальна синхронізація застосувала 1 однозначне переміщення чернетки із repair-проходу.";
+        var finalDeficit = new AutoGenPreflightItem(
+            "teacher",
+            "Викладачі",
+            1,
+            "Додайте викладача.",
+            ["9301"]);
+        var generationResult = new AutoGenResult(
+            5,
+            4,
+            [
+                preflightDeficit,
+                gap,
+                searchLimit,
+                topicExhausted,
+                resourceUnavailable,
+                recommendation,
+                diagnosticSummary,
+                incomplete,
+                topicReused,
+                departmentFallback,
+                inputAdjusted
+            ]);
+        var fillResult = new AutoGenResult(
+            2,
+            0,
+            [inputAdjusted, fillOptimization],
+            [],
+            [],
+            [finalDeficit]);
+        var mergeMethod = typeof(TeacherDraftsAutogenJobService).GetMethod(
+            "MergeIntegratedGenerationResult",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        Assert.NotNull(mergeMethod);
+
+        var merged = Assert.IsType<AutoGenResult>(
+            mergeMethod.Invoke(null, new object[] { generationResult, fillResult }));
+
+        Assert.Equal(7, merged.Created);
+        Assert.Equal(0, merged.Skipped);
+        Assert.Equal(
+            [incomplete, topicReused, departmentFallback, inputAdjusted, fillOptimization],
+            merged.Warnings);
+        Assert.Empty(merged.GapDetails ?? []);
+        Assert.Empty(merged.GapSummary ?? []);
+        Assert.Equal([finalDeficit], merged.Preflight);
+        Assert.Equal(
+            merged.Warnings,
+            (merged.WarningDetails ?? []).Select(item => item.Message));
+    }
+
+    [Fact]
+    public void Integrated_fill_merge_clears_stale_diagnostics_after_all_gaps_are_closed()
+    {
+        const string stableWarning = "Ігноровано модулі, що не належать курсу #2: 17.";
+        const string preflightDeficit =
+            "Попередня перевірка ресурсів: доступні викладачі — 1. Додайте викладача.";
+        const string recommendation =
+            "Рекомендація автогенерації: додайте або звільніть викладачів.";
+        const string diagnosticSummary =
+            "Зведення причин незаповнених слотів: викладач — 1.";
+        var generationResult = new AutoGenResult(1, 1, [preflightDeficit, recommendation]);
+        var fillResult = new AutoGenResult(
+            1,
+            0,
+            [stableWarning, preflightDeficit, recommendation, diagnosticSummary],
+            [],
+            [],
+            [new AutoGenPreflightItem("teacher", "Викладачі", 1, "Додайте викладача.", ["9301"])]);
+        var mergeMethod = typeof(TeacherDraftsAutogenJobService).GetMethod(
+            "MergeIntegratedGenerationResult",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        Assert.NotNull(mergeMethod);
+
+        var merged = Assert.IsType<AutoGenResult>(
+            mergeMethod.Invoke(null, new object[] { generationResult, fillResult }));
+
+        Assert.Equal(2, merged.Created);
+        Assert.Equal(0, merged.Skipped);
+        Assert.Equal([stableWarning], merged.Warnings);
+        Assert.Empty(merged.GapDetails ?? []);
+        Assert.Empty(merged.Preflight ?? []);
+    }
+
+    [Fact]
+    public void Integrated_generation_runtime_exposes_phase_progress_without_completing_the_range()
+    {
+        var runtime = CreateRuntime(CreateValidRequest() with
+        {
+            Kind = AutoGenJobKind.Generate,
+            PreviewOnly = true
+        });
+        var date = new DateOnly(2026, 9, 1);
+        runtime.GetType().GetMethod("MarkRunning")!.Invoke(runtime, new object[] { 1 });
+        runtime.GetType().GetMethod("StartWeek")!.Invoke(
+            runtime,
+            new object[] { 0, new DateOnly(2026, 8, 31), date, date });
+        Assert.Equal(1, GetStatus(runtime).Percent);
+
+        runtime.GetType().GetMethod("StartIntegratedFill")!.Invoke(runtime, new object[] { date, date });
+        var fillStatus = GetStatus(runtime);
+        Assert.Equal(50, fillStatus.Percent);
+        Assert.Contains("Дозаповнюємо", fillStatus.CurrentStage, StringComparison.Ordinal);
+
+        runtime.GetType().GetMethod("StartIntegratedRelaxedRepair")!
+            .Invoke(runtime, new object[] { date, date });
+        var repairStatus = GetStatus(runtime);
+        Assert.Equal(75, repairStatus.Percent);
+        Assert.Contains("резервне дозаповнення", repairStatus.CurrentStage, StringComparison.Ordinal);
+        Assert.Equal(0, repairStatus.CompletedWeeks);
+    }
+
+    [Fact]
     public async Task Persisted_plan_applies_once_and_rolls_back_only_untouched_result()
     {
         await using var fixture = await AutoGenPlanFixture.CreateAsync();

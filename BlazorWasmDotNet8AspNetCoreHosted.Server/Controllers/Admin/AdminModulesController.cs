@@ -25,7 +25,9 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
     // Повертає список модулів із дозволеними аудиторіями та корпусами.
     public async Task<object> List()
     {
-        var modules = await db.Modules.AsNoTracking()
+        var modules = await db.Modules
+            .AsNoTracking()
+            .AsSplitQuery()
             .Select(m => new
             {
                 m.Id,
@@ -85,6 +87,7 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
             if (dto.Id is int id && id > 0)
             {
                 var existingModule = await db.Modules
+                    .AsSplitQuery()
                     .Include(x => x.AllowedRooms)
                     .Include(x => x.AllowedBuildings)
                     .Include(x => x.ModuleCourses)
@@ -95,6 +98,7 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
                 {
                     var moduleIdForCourse = await EnsureCourseScopeCore(m.Id, dto.CourseId, requireCourseLink: false);
                     var courseScopedModule = await db.Modules
+                        .AsSplitQuery()
                         .Include(x => x.AllowedRooms)
                         .Include(x => x.AllowedBuildings)
                         .Include(x => x.ModuleCourses)
@@ -246,21 +250,21 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
         await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         try
         {
-        var module = await db.Modules.AsNoTracking().FirstOrDefaultAsync(m => m.Id == id);
-        if (module is null) return NotFound();
-        var hasDrafts = await db.TeacherDraftItems
-            .AsNoTracking()
-            .AnyAsync(x => x.ModuleId == id);
-        if (hasDrafts)
-        {
-            return Conflict(new
+            var module = await db.Modules.AsNoTracking().FirstOrDefaultAsync(m => m.Id == id);
+            if (module is null) return NotFound();
+            var hasDrafts = await db.TeacherDraftItems
+                .AsNoTracking()
+                .AnyAsync(x => x.ModuleId == id);
+            if (hasDrafts)
             {
-                message = "Модуль використовується у чернетках. Спочатку перенесіть або видаліть пов'язані чернетки."
-            });
-        }
-        var used = await db.ScheduleItems.AnyAsync(x => x.ModuleId == id);
-        if (used && !force)
-            return Conflict(new { message = "Модуль використовується у розкладі" });
+                return Conflict(new
+                {
+                    message = "Модуль використовується у чернетках. Спочатку перенесіть або видаліть пов'язані чернетки."
+                });
+            }
+            var used = await db.ScheduleItems.AnyAsync(x => x.ModuleId == id);
+            if (used && !force)
+                return Conflict(new { message = "Модуль використовується у розкладі" });
 
             if (force)
             {
@@ -330,7 +334,16 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
                 .Select(di => new
                 {
                     di.Id,
+                    CourseId = di.Group.CourseId,
+                    di.Date,
+                    di.StartTime,
+                    di.EndTime,
+                    di.GroupId,
+                    di.ModuleId,
+                    di.LessonTypeId,
                     di.ModuleTopicId,
+                    di.TeacherId,
+                    di.RoomId,
                     di.BatchKey,
                     di.IsSelfStudy,
                     LessonTypeCode = di.LessonType != null ? (di.LessonType.Code ?? "") : "",
@@ -349,6 +362,8 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
                     .Where(si => reschedSourceIds.Contains(si.Id))
                     .Select(si => new { si.Id, si.ModuleTopicId })
                     .ToDictionaryAsync(x => x.Id, x => x.ModuleTopicId);
+            var plannedTopicRows = new List<CurriculumScheduleRow>();
+            var groupNamesById = new Dictionary<int, string>();
             foreach (var row in draftRows)
             {
                 if (string.IsNullOrWhiteSpace(row.GroupName)) continue;
@@ -365,27 +380,50 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
                 }
                 if (resolvedTopicId is null) continue;
                 if (!topicIds.Contains(resolvedTopicId.Value)) continue;
-                if (!plannedDict.TryGetValue(resolvedTopicId.Value, out var groups))
+                plannedTopicRows.Add(new CurriculumScheduleRow(
+                    row.Id,
+                    row.CourseId,
+                    row.BatchKey,
+                    row.Date,
+                    row.StartTime,
+                    row.EndTime,
+                    row.GroupId,
+                    row.ModuleId,
+                    row.LessonTypeId,
+                    resolvedTopicId,
+                    row.TeacherId,
+                    row.RoomId,
+                    row.IsSelfStudy));
+                groupNamesById[row.GroupId] = row.GroupName;
+            }
+            foreach (var row in CurriculumScheduleAggregation.CollapseForTopics(plannedTopicRows))
+            {
+                if (row.ModuleTopicId is not int resolvedTopicId
+                    || !groupNamesById.TryGetValue(row.GroupId, out var groupName))
+                {
+                    continue;
+                }
+                if (!plannedDict.TryGetValue(resolvedTopicId, out var groups))
                 {
                     groups = new List<string>();
-                    plannedDict[resolvedTopicId.Value] = groups;
+                    plannedDict[resolvedTopicId] = groups;
                 }
-                if (!groups.Contains(row.GroupName))
+                if (!groups.Contains(groupName))
                 {
-                    groups.Add(row.GroupName);
+                    groups.Add(groupName);
                 }
-                if (!plannedHoursDict.TryGetValue(resolvedTopicId.Value, out var hoursByGroup))
+                if (!plannedHoursDict.TryGetValue(resolvedTopicId, out var hoursByGroup))
                 {
                     hoursByGroup = new Dictionary<string, TopicGroupHoursDto>(StringComparer.CurrentCultureIgnoreCase);
-                    plannedHoursDict[resolvedTopicId.Value] = hoursByGroup;
+                    plannedHoursDict[resolvedTopicId] = hoursByGroup;
                 }
-                if (!hoursByGroup.TryGetValue(row.GroupName, out var stat))
+                if (!hoursByGroup.TryGetValue(groupName, out var stat))
                 {
-                    stat = new TopicGroupHoursDto(row.GroupName, 0, 0);
+                    stat = new TopicGroupHoursDto(groupName, 0, 0);
                 }
                 var aud = stat.AuditoriumHours + (row.IsSelfStudy ? 0 : 1);
                 var self = stat.SelfStudyHours + (row.IsSelfStudy ? 1 : 0);
-                hoursByGroup[row.GroupName] = new TopicGroupHoursDto(row.GroupName, aud, self);
+                hoursByGroup[groupName] = new TopicGroupHoursDto(groupName, aud, self);
             }
             foreach (var kvp in plannedDict.ToList())
             {
@@ -397,27 +435,54 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
                 .Where(si =>
                     si.LessonType != null
                     && !excludeCompletedCodes.Contains((si.LessonType.Code ?? "").ToUpper()))
-                .Select(si => new { TopicId = si.ModuleTopicId!.Value, GroupName = si.Group.Name, si.IsSelfStudy })
+                .Select(si => new CurriculumScheduleRow(
+                    si.Id,
+                    si.Group.CourseId,
+                    si.BatchKey,
+                    si.Date,
+                    si.StartTime,
+                    si.EndTime,
+                    si.GroupId,
+                    si.ModuleId,
+                    si.LessonTypeId,
+                    si.ModuleTopicId,
+                    si.TeacherId,
+                    si.RoomId,
+                    si.IsSelfStudy))
                 .ToListAsync();
+            completedRows = CurriculumScheduleAggregation.CollapseForTopics(completedRows).ToList();
+            var completedGroupNames = await db.Groups
+                .Where(group => completedRows.Select(row => row.GroupId).Contains(group.Id))
+                .ToDictionaryAsync(group => group.Id, group => group.Name);
             completedDict = completedRows
-                .DistinctBy(x => new { x.TopicId, x.GroupName })
-                .GroupBy(x => x.TopicId)
-                .ToDictionary(g => g.Key, g => g.Select(x => x.GroupName).OrderBy(x => x).ToList());
+                .Where(row => row.ModuleTopicId is not null && completedGroupNames.ContainsKey(row.GroupId))
+                .DistinctBy(row => new { TopicId = row.ModuleTopicId!.Value, row.GroupId })
+                .GroupBy(row => row.ModuleTopicId!.Value)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group
+                        .Select(row => completedGroupNames[row.GroupId])
+                        .OrderBy(name => name)
+                        .ToList());
             foreach (var row in completedRows)
             {
-                if (string.IsNullOrWhiteSpace(row.GroupName)) continue;
-                if (!completedHoursDict.TryGetValue(row.TopicId, out var hoursByGroup))
+                if (row.ModuleTopicId is not int topicId
+                    || !completedGroupNames.TryGetValue(row.GroupId, out var groupName))
+                {
+                    continue;
+                }
+                if (!completedHoursDict.TryGetValue(topicId, out var hoursByGroup))
                 {
                     hoursByGroup = new Dictionary<string, TopicGroupHoursDto>(StringComparer.CurrentCultureIgnoreCase);
-                    completedHoursDict[row.TopicId] = hoursByGroup;
+                    completedHoursDict[topicId] = hoursByGroup;
                 }
-                if (!hoursByGroup.TryGetValue(row.GroupName, out var stat))
+                if (!hoursByGroup.TryGetValue(groupName, out var stat))
                 {
-                    stat = new TopicGroupHoursDto(row.GroupName, 0, 0);
+                    stat = new TopicGroupHoursDto(groupName, 0, 0);
                 }
                 var aud = stat.AuditoriumHours + (row.IsSelfStudy ? 0 : 1);
                 var self = stat.SelfStudyHours + (row.IsSelfStudy ? 1 : 0);
-                hoursByGroup[row.GroupName] = new TopicGroupHoursDto(row.GroupName, aud, self);
+                hoursByGroup[groupName] = new TopicGroupHoursDto(groupName, aud, self);
             }
         }
         var result = topics.Select(t =>
@@ -476,6 +541,8 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
         var trimmedTopicCode = dto.TopicCode?.Trim() ?? string.Empty;
         if (string.IsNullOrWhiteSpace(trimmedTopicCode))
             return BadRequest(new { message = "Код теми є обов'язковим." });
+        if (trimmedTopicCode.Length > 64)
+            return BadRequest(new { message = "Код теми не може перевищувати 64 символи." });
         var normalizedTopicCode = trimmedTopicCode;
         if (dto.AuditoriumHours < 0 || dto.SelfStudyHours < 0)
         {
@@ -582,20 +649,20 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
         await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         try
         {
-        if (await db.TeacherDraftItems.AsNoTracking().AnyAsync())
-        {
-            return Conflict(new
+            if (await db.TeacherDraftItems.AsNoTracking().AnyAsync())
             {
-                message = "Неможливо очистити модулі, доки існують пов'язані чернетки."
-            });
-        }
-        if (await db.ScheduleItems.AsNoTracking().AnyAsync())
-        {
-            return Conflict(new
+                return Conflict(new
+                {
+                    message = "Неможливо очистити модулі, доки існують пов'язані чернетки."
+                });
+            }
+            if (await db.ScheduleItems.AsNoTracking().AnyAsync())
             {
-                message = "Неможливо очистити модулі, доки вони використовуються в опублікованому розкладі."
-            });
-        }
+                return Conflict(new
+                {
+                    message = "Неможливо очистити модулі, доки вони використовуються в опублікованому розкладі."
+                });
+            }
 
             await db.ModuleTopics.ExecuteDeleteAsync();
             await db.ModulePlans.ExecuteDeleteAsync();
@@ -667,6 +734,7 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
     private async Task<int> EnsureCourseScopeCore(int moduleId, int courseId, bool requireCourseLink)
     {
         var source = await db.Modules
+            .AsSplitQuery()
             .Include(m => m.ModuleCourses)
             .Include(m => m.AllowedRooms)
             .Include(m => m.AllowedBuildings)
@@ -695,93 +763,100 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
             : null;
         try
         {
-        var normalizedSourceCode = source.Code.Trim().ToUpperInvariant();
-        var targetCandidates = await db.Modules
-            .Include(m => m.ModuleCourses)
-            .Where(m => m.CourseId == courseId)
-            .OrderBy(m => m.Id)
-            .ToListAsync();
-        targetCandidates = targetCandidates
-            .Where(module => string.Equals(
-                module.Code.Trim(),
-                normalizedSourceCode,
-                StringComparison.OrdinalIgnoreCase))
-            .ToList();
-        if (targetCandidates.Count > 1)
-        {
-            throw new ArgumentException(
-                $"Для курсу знайдено кілька модулів із кодом '{normalizedSourceCode}'. Усуньте дублікати перед перенесенням даних.");
-        }
-        var target = targetCandidates.FirstOrDefault();
-        if (target is null)
-        {
-            target = new Module
-            {
-                Code = source.Code,
-                Title = source.Title,
-                Credits = source.Credits,
-                CourseId = courseId
-            };
-            db.Modules.Add(target);
-            await db.SaveChangesAsync();
-            db.ModuleCourses.Add(new ModuleCourse { ModuleId = target.Id, CourseId = courseId });
-            var roomIds = source.AllowedRooms
-                .Select(x => x.RoomId)
-                .Distinct()
-                .ToList();
-            foreach (var roomId in roomIds)
-            {
-                db.ModuleRooms.Add(new ModuleRoom { ModuleId = target.Id, RoomId = roomId });
-            }
-            var buildingIds = source.AllowedBuildings
-                .Select(x => x.BuildingId)
-                .Distinct()
-                .ToList();
-            foreach (var buildingId in buildingIds)
-            {
-                db.ModuleBuildings.Add(new ModuleBuilding { ModuleId = target.Id, BuildingId = buildingId });
-            }
-            var sourceTopics = await db.ModuleTopics
-                .Where(t => t.ModuleId == source.Id)
-                .OrderBy(t => t.Order)
-                .ThenBy(t => t.Id)
+            var normalizedSourceCode = source.Code.Trim().ToUpperInvariant();
+            var targetCandidates = await db.Modules
+                .Include(m => m.ModuleCourses)
+                .Where(m => m.CourseId == courseId)
+                .OrderBy(m => m.Id)
                 .ToListAsync();
-            foreach (var topic in sourceTopics)
+            targetCandidates = targetCandidates
+                .Where(module => string.Equals(
+                    module.Code.Trim(),
+                    normalizedSourceCode,
+                    StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (targetCandidates.Count > 1)
             {
-                db.ModuleTopics.Add(new ModuleTopic
+                throw new ArgumentException(
+                    $"Для курсу знайдено кілька модулів із кодом '{normalizedSourceCode}'. Усуньте дублікати перед перенесенням даних.");
+            }
+            var target = targetCandidates.FirstOrDefault();
+            if (target is null)
+            {
+                target = new Module
                 {
-                    ModuleId = target.Id,
-                    Order = topic.Order,
-                    TopicCode = topic.TopicCode,
-                    LessonTypeId = topic.LessonTypeId,
-                    DepartmentId = topic.DepartmentId,
-                    TotalHours = topic.TotalHours,
-                    AuditoriumHours = topic.AuditoriumHours,
-                    SelfStudyHours = topic.SelfStudyHours,
-                    IsInterAssembly = topic.IsInterAssembly,
-                    SelfStudyBySupervisor = topic.SelfStudyBySupervisor
-                });
+                    Code = source.Code,
+                    Title = source.Title,
+                    Credits = source.Credits,
+                    CourseId = courseId
+                };
+                db.Modules.Add(target);
+                await db.SaveChangesAsync();
+                db.ModuleCourses.Add(new ModuleCourse { ModuleId = target.Id, CourseId = courseId });
+                var roomIds = source.AllowedRooms
+                    .Select(x => x.RoomId)
+                    .Distinct()
+                    .ToList();
+                foreach (var roomId in roomIds)
+                {
+                    db.ModuleRooms.Add(new ModuleRoom { ModuleId = target.Id, RoomId = roomId });
+                }
+                var buildingIds = source.AllowedBuildings
+                    .Select(x => x.BuildingId)
+                    .Distinct()
+                    .ToList();
+                foreach (var buildingId in buildingIds)
+                {
+                    db.ModuleBuildings.Add(new ModuleBuilding { ModuleId = target.Id, BuildingId = buildingId });
+                }
+                var sourceTopics = await db.ModuleTopics
+                    .Where(t => t.ModuleId == source.Id)
+                    .OrderBy(t => t.Order)
+                    .ThenBy(t => t.Id)
+                    .ToListAsync();
+                foreach (var topic in sourceTopics)
+                {
+                    db.ModuleTopics.Add(new ModuleTopic
+                    {
+                        ModuleId = target.Id,
+                        Order = topic.Order,
+                        TopicCode = topic.TopicCode,
+                        LessonTypeId = topic.LessonTypeId,
+                        DepartmentId = topic.DepartmentId,
+                        TotalHours = topic.TotalHours,
+                        AuditoriumHours = topic.AuditoriumHours,
+                        SelfStudyHours = topic.SelfStudyHours,
+                        IsInterAssembly = topic.IsInterAssembly,
+                        SelfStudyBySupervisor = topic.SelfStudyBySupervisor
+                    });
+                }
+                await db.SaveChangesAsync();
+            }
+            else if (!target.ModuleCourses.Any(mc => mc.CourseId == courseId))
+            {
+                db.ModuleCourses.Add(new ModuleCourse { ModuleId = target.Id, CourseId = courseId });
+                await db.SaveChangesAsync();
+            }
+            await MoveCourseScopedData(source.Id, target.Id, courseId);
+            await CopyModuleStaffLinksAsync(source, target.Id);
+            var detachedLink = source.ModuleCourses.FirstOrDefault(mc => mc.CourseId == courseId);
+            if (detachedLink is not null)
+            {
+                db.ModuleCourses.Remove(detachedLink);
             }
             await db.SaveChangesAsync();
-        }
-        else if (!target.ModuleCourses.Any(mc => mc.CourseId == courseId))
-        {
-            db.ModuleCourses.Add(new ModuleCourse { ModuleId = target.Id, CourseId = courseId });
-            await db.SaveChangesAsync();
-        }
-        await MoveCourseScopedData(source.Id, target.Id, courseId);
-        await CopyModuleStaffLinksAsync(source, target.Id);
-        var detachedLink = source.ModuleCourses.FirstOrDefault(mc => mc.CourseId == courseId);
-        if (detachedLink is not null)
-        {
-            db.ModuleCourses.Remove(detachedLink);
-        }
-        await db.SaveChangesAsync();
-        if (tx is not null)
-        {
-            await tx.CommitAsync();
-        }
-        return target.Id;
+            await new AggregatesService(db).RecalcAsync(
+                new[]
+                {
+                    (CourseId: courseId, ModuleId: source.Id),
+                    (CourseId: courseId, ModuleId: target.Id)
+                },
+                Array.Empty<(int TeacherId, int CourseId)>());
+            if (tx is not null)
+            {
+                await tx.CommitAsync();
+            }
+            return target.Id;
         }
         catch
         {
@@ -952,7 +1027,6 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
             else
             {
                 targetPlan.TargetHours = sourcePlan.TargetHours;
-                targetPlan.ScheduledHours = sourcePlan.ScheduledHours;
                 targetPlan.IsActive = sourcePlan.IsActive;
                 db.ModulePlans.Remove(sourcePlan);
             }

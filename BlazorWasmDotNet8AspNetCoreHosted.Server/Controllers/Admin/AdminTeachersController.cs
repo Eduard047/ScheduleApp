@@ -195,96 +195,96 @@ public class AdminTeachersController(AppDbContext db) : ControllerBase
         await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         try
         {
-        Teacher entity;
-        if (dto.Id is int id && id > 0)
-        {
-            var existing = await db.Teachers
-                .Include(t => t.TeacherModules)
-                .Include(t => t.ModuleSupervisions)
-                .FirstOrDefaultAsync(t => t.Id == id);
-            if (existing is null)
-                return NotFound(new { message = $"Викладача {id} не знайдено" });
-            var workingHoursViolation = await FindWorkingHoursViolationAsync(id, parsedWorkingHours);
-            if (workingHoursViolation is not null)
-                return Conflict(new { message = workingHoursViolation });
-            entity = existing;
-            entity.FullName = fullName;
-            entity.ScientificDegree = dto.ScientificDegree;
-            entity.AcademicTitle = dto.AcademicTitle;
-            entity.DepartmentId = normalizedDepartmentId;
-            db.TeacherModules.RemoveRange(entity.TeacherModules);
-            db.ModuleSupervisors.RemoveRange(entity.ModuleSupervisions);
-            await db.SaveChangesAsync();
-            var newLinks = moduleIds
-                .Select(mid => new TeacherModule { TeacherId = entity.Id, ModuleId = mid });
-            await db.TeacherModules.AddRangeAsync(newLinks);
-            var newSupLinks = supervisorModuleIds
-                .Select(mid => new ModuleSupervisor { TeacherId = entity.Id, ModuleId = mid });
-            await db.ModuleSupervisors.AddRangeAsync(newSupLinks);
-        }
-        else
-        {
-            entity = new Teacher
+            Teacher entity;
+            if (dto.Id is int id && id > 0)
             {
-                FullName = fullName,
-                ScientificDegree = dto.ScientificDegree,
-                AcademicTitle = dto.AcademicTitle,
-                DepartmentId = normalizedDepartmentId
-            };
-            db.Teachers.Add(entity);
-            await db.SaveChangesAsync(); 
-            if (moduleIds.Count > 0)
-            {
-                var links = moduleIds
+                var existing = await db.Teachers
+                    .Include(t => t.TeacherModules)
+                    .Include(t => t.ModuleSupervisions)
+                    .FirstOrDefaultAsync(t => t.Id == id);
+                if (existing is null)
+                    return NotFound(new { message = $"Викладача {id} не знайдено" });
+                var workingHoursViolation = await FindWorkingHoursViolationAsync(id, parsedWorkingHours);
+                if (workingHoursViolation is not null)
+                    return Conflict(new { message = workingHoursViolation });
+                entity = existing;
+                entity.FullName = fullName;
+                entity.ScientificDegree = dto.ScientificDegree;
+                entity.AcademicTitle = dto.AcademicTitle;
+                entity.DepartmentId = normalizedDepartmentId;
+                db.TeacherModules.RemoveRange(entity.TeacherModules);
+                db.ModuleSupervisors.RemoveRange(entity.ModuleSupervisions);
+                await db.SaveChangesAsync();
+                var newLinks = moduleIds
                     .Select(mid => new TeacherModule { TeacherId = entity.Id, ModuleId = mid });
-                await db.TeacherModules.AddRangeAsync(links);
-            }
-            if (supervisorModuleIds.Count > 0)
-            {
-                var supLinks = supervisorModuleIds
+                await db.TeacherModules.AddRangeAsync(newLinks);
+                var newSupLinks = supervisorModuleIds
                     .Select(mid => new ModuleSupervisor { TeacherId = entity.Id, ModuleId = mid });
-                await db.ModuleSupervisors.AddRangeAsync(supLinks);
+                await db.ModuleSupervisors.AddRangeAsync(newSupLinks);
             }
-        }
-        var oldLoads = await db.TeacherCourseLoads
-            .Where(l => l.TeacherId == entity.Id)
-            .ToListAsync();
-        db.TeacherCourseLoads.RemoveRange(oldLoads);
-        await db.SaveChangesAsync();
-        if (loads.Count > 0)
-        {
-            var toInsert = loads.Select(l =>
+            else
             {
-                var prev = oldLoads.FirstOrDefault(p => p.CourseId == l.CourseId);
-                return new TeacherCourseLoad
+                entity = new Teacher
+                {
+                    FullName = fullName,
+                    ScientificDegree = dto.ScientificDegree,
+                    AcademicTitle = dto.AcademicTitle,
+                    DepartmentId = normalizedDepartmentId
+                };
+                db.Teachers.Add(entity);
+                await db.SaveChangesAsync();
+                if (moduleIds.Count > 0)
+                {
+                    var links = moduleIds
+                        .Select(mid => new TeacherModule { TeacherId = entity.Id, ModuleId = mid });
+                    await db.TeacherModules.AddRangeAsync(links);
+                }
+                if (supervisorModuleIds.Count > 0)
+                {
+                    var supLinks = supervisorModuleIds
+                        .Select(mid => new ModuleSupervisor { TeacherId = entity.Id, ModuleId = mid });
+                    await db.ModuleSupervisors.AddRangeAsync(supLinks);
+                }
+            }
+            var oldLoads = await db.TeacherCourseLoads
+                .Where(l => l.TeacherId == entity.Id)
+                .ToListAsync();
+            db.TeacherCourseLoads.RemoveRange(oldLoads);
+            await db.SaveChangesAsync();
+            if (loads.Count > 0)
+            {
+                var toInsert = loads.Select(l =>
+                {
+                    var prev = oldLoads.FirstOrDefault(p => p.CourseId == l.CourseId);
+                    return new TeacherCourseLoad
+                    {
+                        TeacherId = entity.Id,
+                        CourseId = l.CourseId,
+                        ScheduledHours = prev?.ScheduledHours ?? l.ScheduledHours,
+                        IsActive = l.IsActive
+                    };
+                });
+                await db.TeacherCourseLoads.AddRangeAsync(toInsert);
+            }
+            var oldWh = await db.TeacherWorkingHours
+                .Where(w => w.TeacherId == entity.Id)
+                .ToListAsync();
+            db.TeacherWorkingHours.RemoveRange(oldWh);
+            await db.SaveChangesAsync();
+            if (parsedWorkingHours.Count > 0)
+            {
+                var toInsertWh = parsedWorkingHours.Select(w => new TeacherWorkingHour
                 {
                     TeacherId = entity.Id,
-                    CourseId = l.CourseId,
-                    ScheduledHours = prev?.ScheduledHours ?? l.ScheduledHours,
-                    IsActive = l.IsActive
-                };
-            });
-            await db.TeacherCourseLoads.AddRangeAsync(toInsert);
-        }
-        var oldWh = await db.TeacherWorkingHours
-            .Where(w => w.TeacherId == entity.Id)
-            .ToListAsync();
-        db.TeacherWorkingHours.RemoveRange(oldWh);
-        await db.SaveChangesAsync();
-        if (parsedWorkingHours.Count > 0)
-        {
-            var toInsertWh = parsedWorkingHours.Select(w => new TeacherWorkingHour
-            {
-                TeacherId = entity.Id,
-                DayOfWeek = w.Day,
-                Start = w.Start,
-                End = w.End
-            });
-            await db.TeacherWorkingHours.AddRangeAsync(toInsertWh);
-        }
-        await db.SaveChangesAsync();
-        await tx.CommitAsync();
-        return Ok(entity.Id);
+                    DayOfWeek = w.Day,
+                    Start = w.Start,
+                    End = w.End
+                });
+                await db.TeacherWorkingHours.AddRangeAsync(toInsertWh);
+            }
+            await db.SaveChangesAsync();
+            await tx.CommitAsync();
+            return Ok(entity.Id);
         }
         catch
         {

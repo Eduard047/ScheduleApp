@@ -372,6 +372,162 @@ public sealed class ProductionGuardrailTests
     }
 
     [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public async Task Rules_official_validation_requires_ten_minutes_only_when_room_changes_inside_building(
+        bool keepSameRoom,
+        bool expectTransitionError)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var seed = await SeedSameBuildingManualRulesModelAsync(fixture);
+        fixture.Db.ScheduleItems.Add(new ScheduleItem
+        {
+            Date = seed.Monday,
+            DayOfWeek = seed.Monday.DayOfWeek,
+            StartTime = new TimeOnly(8, 0),
+            EndTime = new TimeOnly(9, 0),
+            GroupId = seed.Ids.GroupId,
+            ModuleId = seed.Ids.ModuleId,
+            LessonTypeId = seed.LessonTypeId,
+            RoomId = seed.FirstRoomId
+        });
+        await fixture.Db.SaveChangesAsync();
+
+        var (errors, _) = await new RulesService(fixture.Db).ValidateUpsertAsync(
+            new UpsertScheduleItemRequest(
+                Id: null,
+                Date: seed.Monday,
+                TimeStart: "09:05",
+                TimeEnd: "10:05",
+                GroupId: seed.Ids.GroupId,
+                ModuleId: seed.Ids.ModuleId,
+                TeacherId: null,
+                RoomId: keepSameRoom ? seed.FirstRoomId : seed.SecondRoomId,
+                LessonTypeId: seed.LessonTypeId,
+                IsLocked: false));
+
+        if (expectTransitionError)
+        {
+            Assert.Contains(errors, error =>
+                error.Contains("Замало часу на перехід", StringComparison.OrdinalIgnoreCase));
+        }
+        else
+        {
+            Assert.Empty(errors);
+        }
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public async Task Rules_draft_validation_requires_ten_minutes_only_when_room_changes_inside_building(
+        bool keepSameRoom,
+        bool expectTransitionError)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var seed = await SeedSameBuildingManualRulesModelAsync(fixture);
+        fixture.Db.TeacherDraftItems.Add(new TeacherDraftItem
+        {
+            Date = seed.Monday,
+            DayOfWeek = seed.Monday.DayOfWeek,
+            StartTime = new TimeOnly(8, 0),
+            EndTime = new TimeOnly(9, 0),
+            GroupId = seed.Ids.GroupId,
+            ModuleId = seed.Ids.ModuleId,
+            LessonTypeId = seed.LessonTypeId,
+            RoomId = seed.FirstRoomId
+        });
+        await fixture.Db.SaveChangesAsync();
+
+        var result = await new RulesService(fixture.Db).ValidateDraftAsync(
+            new DraftUpsertRequest(
+                Id: null,
+                Date: seed.Monday,
+                TimeStart: "09:05",
+                TimeEnd: "10:05",
+                GroupId: seed.Ids.GroupId,
+                ModuleId: seed.Ids.ModuleId,
+                ModuleTopicId: null,
+                TeacherId: null,
+                RoomId: keepSameRoom ? seed.FirstRoomId : seed.SecondRoomId,
+                RequiresRoom: true,
+                LessonTypeId: seed.LessonTypeId));
+
+        if (expectTransitionError)
+        {
+            Assert.Contains(result.Report.Issues, issue => issue.Code == "travel-draft-before");
+        }
+        else
+        {
+            Assert.Empty(result.Errors);
+        }
+    }
+
+    [Fact]
+    public async Task Rules_official_validation_rejects_blocking_teacher_on_day_without_working_window()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var seed = await SeedSameBuildingManualRulesModelAsync(fixture);
+        fixture.Db.TeacherWorkingHours.Add(new TeacherWorkingHour
+        {
+            TeacherId = seed.TeacherId,
+            DayOfWeek = DayOfWeek.Monday,
+            Start = new TimeOnly(8, 0),
+            End = new TimeOnly(18, 0)
+        });
+        await fixture.Db.SaveChangesAsync();
+
+        var (errors, _) = await new RulesService(fixture.Db).ValidateUpsertAsync(
+            new UpsertScheduleItemRequest(
+                Id: null,
+                Date: seed.Tuesday,
+                TimeStart: "08:00",
+                TimeEnd: "09:00",
+                GroupId: seed.Ids.GroupId,
+                ModuleId: seed.Ids.ModuleId,
+                TeacherId: seed.TeacherId,
+                RoomId: seed.FirstRoomId,
+                LessonTypeId: seed.LessonTypeId,
+                IsLocked: false));
+
+        Assert.Contains(errors, error =>
+            error.Contains("робочих годин", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Rules_draft_validation_warns_for_blocking_teacher_on_day_without_working_window()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var seed = await SeedSameBuildingManualRulesModelAsync(fixture);
+        fixture.Db.TeacherWorkingHours.Add(new TeacherWorkingHour
+        {
+            TeacherId = seed.TeacherId,
+            DayOfWeek = DayOfWeek.Monday,
+            Start = new TimeOnly(8, 0),
+            End = new TimeOnly(18, 0)
+        });
+        await fixture.Db.SaveChangesAsync();
+
+        var result = await new RulesService(fixture.Db).ValidateDraftAsync(
+            new DraftUpsertRequest(
+                Id: null,
+                Date: seed.Tuesday,
+                TimeStart: "08:00",
+                TimeEnd: "09:00",
+                GroupId: seed.Ids.GroupId,
+                ModuleId: seed.Ids.ModuleId,
+                ModuleTopicId: null,
+                TeacherId: seed.TeacherId,
+                RoomId: seed.FirstRoomId,
+                RequiresRoom: true,
+                LessonTypeId: seed.LessonTypeId));
+
+        Assert.Contains(result.Report.Issues, issue =>
+            issue.Code == "teacher-working-hours"
+            && string.Equals(issue.Severity, "warning", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Theory]
     [InlineData("CANCELED")]
     [InlineData("RESCHEDULED")]
     public async Task Service_markers_do_not_occupy_autogen_slot_or_create_phantom_travel(string markerCode)
@@ -1755,12 +1911,22 @@ public sealed class ProductionGuardrailTests
             SoftFill = false,
             PreflightOnly = true
         });
+        var generate = InvokeNormalizeAutoGenJobRequest(valid with
+        {
+            Kind = AutoGenJobKind.Generate,
+            SoftFill = true,
+            PreflightOnly = true,
+            PreviewOnly = true
+        });
 
         Assert.True(preflight.PreflightOnly);
         Assert.False(preflight.ClearExisting);
         Assert.True(fill.SoftFill);
         Assert.False(fill.ClearExisting);
         Assert.False(fill.PreflightOnly);
+        Assert.False(generate.SoftFill);
+        Assert.False(generate.PreflightOnly);
+        Assert.True(generate.PreviewOnly);
     }
 
     [Fact]
@@ -1948,7 +2114,7 @@ public sealed class ProductionGuardrailTests
 
         var started = jobService.Start(request);
         AutoGenJobStatus? status = started.Status;
-        for (var attempt = 0; attempt < 200 && status?.State is AutoGenJobState.Queued or AutoGenJobState.Running; attempt++)
+        for (var attempt = 0; attempt < 1200 && status?.State is AutoGenJobState.Queued or AutoGenJobState.Running; attempt++)
         {
             await Task.Delay(25);
             status = jobService.Get(started.JobId);
@@ -1970,6 +2136,148 @@ public sealed class ProductionGuardrailTests
         Assert.Equal(1, plan.AddCount);
         Assert.Single(plan.Mutations);
         Assert.Equal((int)AutoGenPlanOperation.Add, plan.Mutations.Single().Operation);
+    }
+
+    [Fact]
+    public async Task Autogen_preview_relaxed_repair_rolls_back_when_required_resources_are_missing()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var scenario = await SeedAtomicAutogenScenarioAsync(fixture.Db);
+        var course = await fixture.Db.Courses.SingleAsync(item => item.Id == scenario.Ids.CourseId);
+        course.AcademicPeriodStartDate = scenario.Date;
+        var requiredModule = new Module
+        {
+            Code = "ATM-MISSING",
+            Title = "Модуль без доступних ресурсів",
+            Credits = 1,
+            Course = course
+        };
+        var requiredLessonType = new LessonTypeRef
+        {
+            Code = "ATOMIC_REQUIRED",
+            Name = "Аудиторне заняття з обов'язковими ресурсами",
+            IsActive = true,
+            RequiresTeacher = true,
+            RequiresRoom = true,
+            BlocksTeacher = true,
+            BlocksRoom = true,
+            CountInPlan = true,
+            CountInLoad = true
+        };
+        fixture.Db.AddRange(requiredModule, requiredLessonType);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ModuleTopics.AddRange(
+            new ModuleTopic
+            {
+                ModuleId = scenario.Ids.ModuleId,
+                LessonTypeId = scenario.Ids.LessonTypeId,
+                TopicCode = "ATM.1",
+                Order = 1,
+                TotalHours = 1,
+                AuditoriumHours = 0,
+                SelfStudyHours = 1
+            },
+            new ModuleTopic
+            {
+                ModuleId = requiredModule.Id,
+                LessonTypeId = requiredLessonType.Id,
+                TopicCode = "ATM-MISSING.1",
+                Order = 1,
+                TotalHours = 1,
+                AuditoriumHours = 1,
+                SelfStudyHours = 0
+            });
+        fixture.Db.TimeSlots.Add(new TimeSlot
+        {
+            CourseId = scenario.Ids.CourseId,
+            DayOfWeek = scenario.Date.DayOfWeek,
+            Start = new TimeOnly(9, 10),
+            End = new TimeOnly(10, 10),
+            SortOrder = 2,
+            IsActive = true
+        });
+        fixture.Db.TeacherModules.RemoveRange(await fixture.Db.TeacherModules.ToListAsync());
+        fixture.Db.Rooms.RemoveRange(await fixture.Db.Rooms.ToListAsync());
+        await fixture.Db.SaveChangesAsync();
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(fixture.Options));
+        services.AddScoped<TeacherDraftsAutogenService>();
+        services.AddScoped<TeacherDraftsAutogenPlanService>();
+        await using var provider = services.BuildServiceProvider();
+        var jobService = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
+        var request = new AutoGenJobRequest(
+            AutoGenJobKind.Generate,
+            scenario.Date,
+            scenario.Date,
+            scenario.Ids.CourseId,
+            new List<int> { scenario.Ids.GroupId },
+            new Dictionary<int, int>
+            {
+                [scenario.Ids.ModuleId] = 1,
+                [requiredModule.Id] = 1
+            },
+            WeekPreset.MonFri,
+            true,
+            false,
+            false,
+            AllowIncompleteDrafts: false,
+            ClientJobId: Guid.NewGuid().ToString("N"),
+            PreviewOnly: true);
+
+        var started = jobService.Start(request);
+        AutoGenJobStatus? status = started.Status;
+        for (var attempt = 0;
+             attempt < 1200 && status?.State is AutoGenJobState.Queued or AutoGenJobState.Running;
+             attempt++)
+        {
+            await Task.Delay(25);
+            status = jobService.Get(started.JobId);
+        }
+
+        Assert.NotNull(status);
+        Assert.Equal(AutoGenJobState.Succeeded, status.State);
+        Assert.NotNull(status.Result);
+        Assert.Equal(1, status.Result.Created);
+        Assert.Single(status.Result.GapDetails ?? []);
+        Assert.DoesNotContain(
+            status.Result.Warnings,
+            warning => AutoGenWarningClassifier.Classify(warning).Code
+                       == AutoGenWarningCodes.IncompleteDrafts);
+        Assert.NotNull(status.Plan);
+        Assert.Equal(AutoGenPlanState.Ready, status.Plan.State);
+        Assert.Equal(1, status.Plan.AddCount);
+        Assert.Equal(0, status.Plan.UpdateCount);
+        Assert.Equal(0, status.Plan.DeleteCount);
+        await jobService.StopAsync(CancellationToken.None);
+        await using (var previewVerification = new AppDbContext(fixture.Options))
+        {
+            Assert.Empty(await previewVerification.TeacherDraftItems.AsNoTracking().ToListAsync());
+        }
+        var readyPlan = await jobService.GetPlanAsync(started.JobId);
+        Assert.Single(readyPlan.Changes);
+        var appliedPlan = await jobService.ApplyPlanAsync(
+            started.JobId,
+            new AutoGenPlanActionRequest(readyPlan.Summary.Version));
+        Assert.Equal(AutoGenPlanState.Applied, appliedPlan.Summary.State);
+        Assert.Single(appliedPlan.Changes);
+
+        await using var verification = new AppDbContext(fixture.Options);
+        var appliedDraft = Assert.Single(await verification.TeacherDraftItems
+            .AsNoTracking()
+            .ToListAsync());
+        Assert.Equal(scenario.Ids.ModuleId, appliedDraft.ModuleId);
+        Assert.Null(appliedDraft.TeacherId);
+        Assert.Null(appliedDraft.RoomId);
+        var hardRuleValidation = await new TeacherDraftsAutogenHardRuleValidator(verification)
+            .ValidateAsync(
+                new TeacherDraftsAutogenHardRuleValidationRequest(
+                    scenario.Ids.CourseId,
+                    new[] { scenario.Ids.GroupId },
+                    scenario.Date,
+                    scenario.Date,
+                    WeekPreset.MonFri,
+                    AllowIncompleteDrafts: false));
+        Assert.Empty(hardRuleValidation.Violations);
     }
 
     [Theory]
@@ -2188,16 +2496,25 @@ public sealed class ProductionGuardrailTests
         try
         {
             var started = service.Start(request);
-            course.AcademicPeriodStartDate = null;
-            await fixture.Db.SaveChangesAsync();
+            var persistenceGate = await HoldAutogenJobServiceGateAsync(service, "_persistenceGate");
+            try
+            {
+                // Оновлення lease працює ще до проходження бар'єра виконання, тому ізолюємо спільне SQLite-з'єднання тесту.
+                course.AcademicPeriodStartDate = null;
+                await fixture.Db.SaveChangesAsync();
 
-            await using var observerProvider = services.BuildServiceProvider();
-            var observer = CreateAutogenJobService(observerProvider.GetRequiredService<IServiceScopeFactory>());
-            var repeated = observer.Start(request with { Title = "Повторне читання" });
+                await using var observerProvider = services.BuildServiceProvider();
+                var observer = CreateAutogenJobService(observerProvider.GetRequiredService<IServiceScopeFactory>());
+                var repeated = observer.Start(request with { Title = "Повторне читання" });
 
-            Assert.Equal(started.JobId, repeated.JobId);
-            Assert.Equal(started.Status.State, repeated.Status.State);
-            Assert.Equal(1, await fixture.Db.AutoGenJobRuns.CountAsync());
+                Assert.Equal(started.JobId, repeated.JobId);
+                Assert.Equal(started.Status.State, repeated.Status.State);
+                Assert.Equal(1, await fixture.Db.AutoGenJobRuns.CountAsync());
+            }
+            finally
+            {
+                persistenceGate.Release();
+            }
         }
         finally
         {
@@ -4139,6 +4456,75 @@ public sealed class ProductionGuardrailTests
         return new NonBlockingTravelSeed(ids, lessonType.Id, firstRoom.Id, secondRoom.Id, teacher.Id, date);
     }
 
+    private static async Task<SameBuildingManualRulesSeed> SeedSameBuildingManualRulesModelAsync(
+        TestDatabase fixture)
+    {
+        var ids = await fixture.SeedMinimalScheduleModelAsync();
+        var monday = new DateOnly(2026, 5, 4);
+        var tuesday = monday.AddDays(1);
+        var lessonType = new LessonTypeRef
+        {
+            Code = "MANUAL_ROOM",
+            Name = "Аудиторне заняття ручної перевірки",
+            IsActive = true,
+            RequiresRoom = true,
+            RequiresTeacher = false,
+            BlocksRoom = true,
+            BlocksTeacher = true,
+            CountInPlan = true,
+            CountInLoad = true
+        };
+        var building = new Building { Name = "Спільний корпус ручної перевірки" };
+        var firstRoom = new Room { Name = "РП-101", Capacity = 30, Building = building };
+        var secondRoom = new Room { Name = "РП-102", Capacity = 30, Building = building };
+        var teacher = new Teacher { FullName = "Викладач ручної перевірки" };
+        fixture.Db.AddRange(lessonType, firstRoom, secondRoom, teacher);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.TeacherModules.Add(new TeacherModule
+        {
+            TeacherId = teacher.Id,
+            ModuleId = ids.ModuleId
+        });
+        fixture.Db.TimeSlots.AddRange(
+            new TimeSlot
+            {
+                CourseId = ids.CourseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0),
+                SortOrder = 1,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                CourseId = ids.CourseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(9, 5),
+                End = new TimeOnly(10, 5),
+                SortOrder = 2,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                CourseId = ids.CourseId,
+                DayOfWeek = DayOfWeek.Tuesday,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0),
+                SortOrder = 1,
+                IsActive = true
+            });
+        await fixture.Db.SaveChangesAsync();
+
+        return new SameBuildingManualRulesSeed(
+            ids,
+            lessonType.Id,
+            firstRoom.Id,
+            secondRoom.Id,
+            teacher.Id,
+            monday,
+            tuesday);
+    }
+
     private sealed record SeedIds(int CourseId, int GroupId, int ModuleId, int LessonTypeId);
 
     private sealed record NonBlockingTravelSeed(
@@ -4148,6 +4534,15 @@ public sealed class ProductionGuardrailTests
         int SecondRoomId,
         int TeacherId,
         DateOnly Date);
+
+    private sealed record SameBuildingManualRulesSeed(
+        SeedIds Ids,
+        int LessonTypeId,
+        int FirstRoomId,
+        int SecondRoomId,
+        int TeacherId,
+        DateOnly Monday,
+        DateOnly Tuesday);
 
     private sealed record AtomicAutogenScenario(
         SeedIds Ids,

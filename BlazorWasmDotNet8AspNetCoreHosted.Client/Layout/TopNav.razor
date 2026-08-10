@@ -1,123 +1,335 @@
 @* Верхня панель навігації застосунку *@
 @using Microsoft.AspNetCore.Components.Routing
-@implements IDisposable
+@using Microsoft.JSInterop
+@implements IAsyncDisposable
 @inject NavigationManager NavigationManager
+@inject IJSRuntime JS
 
-<nav class="app-navbar" aria-label="Головна навігація">
+<nav class="app-navbar @(IsScheduleActive ? "app-navbar--workflow" : null)"
+     aria-label="Головна навігація">
     <div class="app-navbar__inner">
-        <div class="app-navbar__nav" role="menubar">
-            @foreach (var item in PrimaryNavItems)
-            {
-                <NavLink class="app-navbar__item"
-                         ActiveClass="app-navbar__item--active"
-                         href="@item.Href"
-                         Match="NavLinkMatch.All"
-                         role="menuitem">
-                    @item.Label
-                </NavLink>
-            }
-        </div>
+        <div class="app-navbar__menus">
+            <div class="app-navbar__menu">
+                <button type="button"
+                        @ref="_scheduleMenuTrigger"
+                        class="@ScheduleButtonClass"
+                        @onclick="() => ToggleMenu(NavigationMenu.Schedule)"
+                        aria-haspopup="true"
+                        aria-expanded="@ScheduleMenuExpanded"
+                        aria-controls="schedule-navigation-menu">
+                    Розклад
+                    <span class="app-navbar__caret" aria-hidden="true"></span>
+                </button>
 
-        <div class="app-navbar__admin">
-            <button type="button"
-                    class="@AdminItemClass"
-                    @onclick="ToggleAdminMenu"
-                    aria-expanded="@AdminMenuExpanded"
-                    aria-haspopup="menu">
-                Адмін
-                <span class="app-navbar__caret" aria-hidden="true"></span>
-            </button>
+                <div id="schedule-navigation-menu"
+                     class="@ScheduleMenuClass"
+                     aria-label="Етапи роботи з розкладом"
+                     aria-hidden="@ScheduleMenuHidden">
+                    @foreach (var item in ScheduleNavItems)
+                    {
+                        <NavLink class="app-navbar__dropdown-item"
+                                 ActiveClass="app-navbar__dropdown-item--active"
+                                 href="@GetWorkflowHref(item.Href)"
+                                 Match="NavLinkMatch.All"
+                                 @onclick="CloseMenusWithoutFocus">
+                            @item.Label
+                        </NavLink>
+                    }
+                </div>
+            </div>
 
-            <div class="@AdminMenuClass" role="menu" aria-hidden="@AdminMenuHidden">
-                @foreach (var item in AdminNavItems)
-                {
-                    <NavLink class="app-navbar__dropdown-item"
-                             href="@item.Href"
-                             Match="NavLinkMatch.All"
-                             @onclick="CloseAdminMenu"
-                             role="menuitem">
-                        @item.Label
-                    </NavLink>
-                }
+            <div class="app-navbar__menu app-navbar__menu--settings">
+                <button type="button"
+                        @ref="_settingsMenuTrigger"
+                        class="@SettingsButtonClass"
+                        @onclick="() => ToggleMenu(NavigationMenu.Settings)"
+                        aria-haspopup="true"
+                        aria-expanded="@SettingsMenuExpanded"
+                        aria-controls="settings-navigation-menu">
+                    Налаштування
+                    <span class="app-navbar__caret" aria-hidden="true"></span>
+                </button>
+
+                <div id="settings-navigation-menu"
+                     class="@SettingsMenuClass"
+                     aria-label="Розділи налаштувань"
+                     aria-hidden="@SettingsMenuHidden">
+                    @for (var groupIndex = 0; groupIndex < SettingsNavGroups.Length; groupIndex++)
+                    {
+                        var group = SettingsNavGroups[groupIndex];
+                        var groupTitleId = $"settings-navigation-group-{groupIndex}";
+                        <div class="app-navbar__dropdown-group"
+                             role="group"
+                             aria-labelledby="@groupTitleId">
+                            <div id="@groupTitleId" class="app-navbar__group-title">@group.Label</div>
+                            @foreach (var item in group.Items)
+                            {
+                                <NavLink class="app-navbar__dropdown-item"
+                                         ActiveClass="app-navbar__dropdown-item--active"
+                                         href="@item.Href"
+                                         Match="NavLinkMatch.All"
+                                         @onclick="CloseMenusWithoutFocus">
+                                    @item.Label
+                                </NavLink>
+                            }
+                        </div>
+                    }
+                </div>
             </div>
         </div>
+
+        @if (IsScheduleActive)
+        {
+            <ol class="app-navbar__workflow" aria-label="Етапи роботи з розкладом">
+                @for (var stepIndex = 0; stepIndex < ScheduleFlowItems.Length; stepIndex++)
+                {
+                    var step = ScheduleFlowItems[stepIndex];
+                    var stepNumber = stepIndex + 1;
+                    <li class="app-navbar__workflow-step">
+                        <NavLink class="@GetWorkflowLinkClass(stepIndex)"
+                                 href="@GetWorkflowHref(step.Href)"
+                                 Match="NavLinkMatch.All"
+                                 aria-current="@(IsCurrentRoute(step.Route) ? "step" : null)">
+                            <span class="app-navbar__workflow-number" aria-hidden="true">@stepNumber</span>
+                            <span>@step.Label</span>
+                        </NavLink>
+                    </li>
+                }
+            </ol>
+        }
     </div>
 </nav>
 
-@if (_isAdminMenuOpen)
+@if (_openMenu is not null)
 {
     <button type="button"
-            class="app-navbar__backdrop"
-            aria-label="Закрити меню Адмін"
-            @onclick="CloseAdminMenu"></button>
+            class="app-navbar__backdrop @(IsScheduleActive ? "app-navbar__backdrop--workflow" : null)"
+            aria-label="Закрити меню навігації"
+            tabindex="-1"
+            @onclick="CloseMenusAndRestoreFocusAsync"></button>
 }
 
 @code {
-    private static readonly NavItem[] PrimaryNavItems =
+    private static readonly NavItem[] ScheduleNavItems =
     [
-        new("/schedule", "Розклад"),
-        new("/teacher-drafts", "Графік викладачів"),
-        new("/admin/schedule", "Редактор")
+        new("/admin/schedule", "Сформувати план"),
+        new("/teacher-drafts", "Перевірити чернетку"),
+        new("/schedule", "Переглянути розклад")
     ];
 
-    private static readonly NavItem[] AdminNavItems =
+    private static readonly WorkflowItem[] ScheduleFlowItems =
     [
-        new("/admin/schedule-logs", "Журнал розкладу"),
-        new("/admin/time-slots", "Слоти часу"),
-        new("/admin/courses", "Курси"),
-        new("/admin/buildings", "Корпуси"),
-        new("/admin/rooms", "Аудиторії"),
-        new("/admin/groups", "Групи"),
-        new("/admin/lesson-types", "Типи занять"),
-        new("/admin/modules", "Модулі"),
-        new("/admin/module-sequence", "Послідовності"),
-        new("/admin/departments", "Кафедри"),
-        new("/admin/teachers", "Викладачі"),
-        new("/admin/calendar", "Календар")
+        new("/admin/schedule", "План"),
+        new("/teacher-drafts", "Перевірка"),
+        new("/schedule", "Розклад")
     ];
 
-    private bool _isAdminMenuOpen;
+    private static readonly NavGroup[] SettingsNavGroups =
+    [
+        new("Навчальний план",
+        [
+            new("/admin/courses", "Курси"),
+            new("/admin/groups", "Групи"),
+            new("/admin/modules", "Модулі"),
+            new("/admin/module-sequence", "Послідовності модулів")
+        ]),
+        new("Викладачі",
+        [
+            new("/admin/departments", "Кафедри"),
+            new("/admin/teachers", "Викладачі")
+        ]),
+        new("Локації",
+        [
+            new("/admin/buildings", "Корпуси"),
+            new("/admin/rooms", "Аудиторії")
+        ]),
+        new("Час і правила",
+        [
+            new("/admin/time-slots", "Слоти часу"),
+            new("/admin/lesson-types", "Типи занять"),
+            new("/admin/calendar", "Календарні винятки")
+        ]),
+        new("Історія",
+        [
+            new("/admin/schedule-logs", "Журнал розкладу")
+        ])
+    ];
 
-    private string AdminItemClass =>
-        IsAdminActive || _isAdminMenuOpen
-            ? "app-navbar__item app-navbar__item--dropdown app-navbar__item--active"
-            : "app-navbar__item app-navbar__item--dropdown";
+    private NavigationMenu? _openMenu;
+    private ElementReference _scheduleMenuTrigger;
+    private ElementReference _settingsMenuTrigger;
+    private DotNetObjectReference<TopNav>? _dotNetReference;
+    private int? _escapeListenerId;
 
-    private string AdminMenuClass =>
-        _isAdminMenuOpen
-            ? "app-navbar__dropdown-menu app-navbar__dropdown-menu--open"
-            : "app-navbar__dropdown-menu";
+    private string ScheduleButtonClass => GetMenuButtonClass(NavigationMenu.Schedule, IsScheduleActive);
 
-    private string AdminMenuExpanded => _isAdminMenuOpen ? "true" : "false";
+    private string SettingsButtonClass => GetMenuButtonClass(NavigationMenu.Settings, IsSettingsActive);
 
-    private string AdminMenuHidden => _isAdminMenuOpen ? "false" : "true";
+    private string ScheduleMenuClass => GetMenuClass(NavigationMenu.Schedule, "app-navbar__dropdown-menu--schedule");
 
-    private bool IsAdminActive => AdminNavItems.Any(item => IsCurrentRoute(item.Route));
+    private string SettingsMenuClass => GetMenuClass(NavigationMenu.Settings, "app-navbar__dropdown-menu--settings");
+
+    private string ScheduleMenuExpanded => GetExpandedValue(NavigationMenu.Schedule);
+
+    private string SettingsMenuExpanded => GetExpandedValue(NavigationMenu.Settings);
+
+    private string ScheduleMenuHidden => GetHiddenValue(NavigationMenu.Schedule);
+
+    private string SettingsMenuHidden => GetHiddenValue(NavigationMenu.Settings);
+
+    private bool IsScheduleActive => ScheduleNavItems.Any(item => IsCurrentRoute(item.Route));
+
+    private bool IsSettingsActive => SettingsNavGroups
+        .SelectMany(group => group.Items)
+        .Any(item => IsCurrentRoute(item.Route));
+
+    private int CurrentScheduleStepIndex
+        => Array.FindIndex(ScheduleFlowItems, item => IsCurrentRoute(item.Route));
 
     protected override void OnInitialized()
     {
         NavigationManager.LocationChanged += HandleLocationChanged;
     }
 
-    public void Dispose()
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender)
+        {
+            return;
+        }
+
+        _dotNetReference = DotNetObjectReference.Create(this);
+        try
+        {
+            _escapeListenerId = await JS.InvokeAsync<int>(
+                "scheduleApp.registerNavigationEscape",
+                _dotNetReference);
+        }
+        catch (JSException)
+        {
+            _dotNetReference.Dispose();
+            _dotNetReference = null;
+        }
+    }
+
+    public async ValueTask DisposeAsync()
     {
         NavigationManager.LocationChanged -= HandleLocationChanged;
+        if (_escapeListenerId is int listenerId)
+        {
+            try
+            {
+                await JS.InvokeVoidAsync("scheduleApp.unregisterNavigationEscape", listenerId);
+            }
+            catch (JSDisconnectedException)
+            {
+            }
+            catch (JSException)
+            {
+            }
+        }
+        _dotNetReference?.Dispose();
     }
 
     private void HandleLocationChanged(object? sender, LocationChangedEventArgs args)
     {
-        _isAdminMenuOpen = false;
+        _openMenu = null;
         _ = InvokeAsync(StateHasChanged);
     }
 
-    private void ToggleAdminMenu()
+    private void ToggleMenu(NavigationMenu menu)
     {
-        _isAdminMenuOpen = !_isAdminMenuOpen;
+        _openMenu = _openMenu == menu ? null : menu;
     }
 
-    private void CloseAdminMenu()
+    private void CloseMenusWithoutFocus()
     {
-        _isAdminMenuOpen = false;
+        _openMenu = null;
+    }
+
+    [JSInvokable]
+    public Task HandleDocumentEscapeAsync()
+        => CloseMenusAndRestoreFocusAsync();
+
+    private async Task CloseMenusAndRestoreFocusAsync()
+    {
+        var menuToRestore = _openMenu;
+        if (menuToRestore is null)
+        {
+            return;
+        }
+
+        _openMenu = null;
+        await InvokeAsync(StateHasChanged);
+        await Task.Yield();
+
+        if (menuToRestore == NavigationMenu.Schedule)
+        {
+            await _scheduleMenuTrigger.FocusAsync();
+        }
+        else
+        {
+            await _settingsMenuTrigger.FocusAsync();
+        }
+    }
+
+    private string GetMenuButtonClass(NavigationMenu menu, bool isRouteActive)
+    {
+        var isActive = isRouteActive || _openMenu == menu;
+        return isActive
+            ? "app-navbar__item app-navbar__item--dropdown app-navbar__item--active"
+            : "app-navbar__item app-navbar__item--dropdown";
+    }
+
+    private string GetMenuClass(NavigationMenu menu, string menuSpecificClass)
+    {
+        var openClass = _openMenu == menu ? " app-navbar__dropdown-menu--open" : string.Empty;
+        return $"app-navbar__dropdown-menu {menuSpecificClass}{openClass}";
+    }
+
+    private string GetExpandedValue(NavigationMenu menu) => _openMenu == menu ? "true" : "false";
+
+    private string GetHiddenValue(NavigationMenu menu) => _openMenu == menu ? "false" : "true";
+
+    private string GetWorkflowLinkClass(int stepIndex)
+    {
+        if (stepIndex == CurrentScheduleStepIndex)
+        {
+            return "app-navbar__workflow-link app-navbar__workflow-link--active";
+        }
+
+        return stepIndex < CurrentScheduleStepIndex
+            ? "app-navbar__workflow-link app-navbar__workflow-link--complete"
+            : "app-navbar__workflow-link";
+    }
+
+    private string GetWorkflowHref(string href)
+    {
+        var currentUri = new Uri(NavigationManager.Uri);
+        var contextQuery = new List<string>();
+        AddCurrentQueryValue(contextQuery, currentUri.Query, "weekStart");
+        AddCurrentQueryValue(contextQuery, currentUri.Query, "courseId");
+        return contextQuery.Count == 0 ? href : $"{href}?{string.Join("&", contextQuery)}";
+    }
+
+    private static void AddCurrentQueryValue(List<string> target, string query, string name)
+    {
+        foreach (var segment in query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var separatorIndex = segment.IndexOf('=');
+            var rawName = separatorIndex >= 0 ? segment[..separatorIndex] : segment;
+            if (!string.Equals(Uri.UnescapeDataString(rawName), name, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var rawValue = separatorIndex >= 0 ? segment[(separatorIndex + 1)..] : string.Empty;
+            if (!string.IsNullOrWhiteSpace(rawValue))
+            {
+                target.Add($"{Uri.EscapeDataString(name)}={rawValue}");
+            }
+            return;
+        }
     }
 
     private bool IsCurrentRoute(string route)
@@ -145,7 +357,20 @@
         return currentPath.Trim('/');
     }
 
+    private enum NavigationMenu
+    {
+        Schedule,
+        Settings
+    }
+
     private sealed record NavItem(string Href, string Label)
+    {
+        public string Route => Href.Trim('/');
+    }
+
+    private sealed record NavGroup(string Label, NavItem[] Items);
+
+    private sealed record WorkflowItem(string Href, string Label)
     {
         public string Route => Href.Trim('/');
     }

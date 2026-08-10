@@ -421,8 +421,7 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
             .OrderByDescending(item => item.GroupId != null)
             .ThenByDescending(item => item.CourseId != null)
             .FirstOrDefault();
-        return match?.IsWorkingDay
-               ?? date.DayOfWeek is not (DayOfWeek.Saturday or DayOfWeek.Sunday);
+        return match?.IsWorkingDay ?? true;
     }
 
     public sealed record BulkTimeSlotsSaveDto(int? CourseId, int? DayOfWeek, List<TimeSlotDto> Slots);

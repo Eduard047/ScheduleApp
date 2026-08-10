@@ -2,8 +2,10 @@
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <NoWarn>$(NoWarn);xUnit1051</NoWarn>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <EnableLocalAutogenHarness Condition="'$(EnableLocalAutogenHarness)' == ''">false</EnableLocalAutogenHarness>
 
@@ -16,12 +18,13 @@
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
-    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.13" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.29" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.1" />
     <PackageReference Include="Microsoft.Extensions.Configuration.UserSecrets" Version="8.0.1" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.12" />
-    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="System.Security.AccessControl" Version="6.0.1" PrivateAssets="all" />
+    <PackageReference Include="xunit.v3.mtp-off" Version="3.2.2" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
@@ -39,6 +42,7 @@
 
   <ItemGroup>
     <Compile Include="AdminControllerGuardrailTests.cs" />
+    <Compile Include="AggregateLogicalEventTests.cs" />
     <Compile Include="AutoGenGapReasonClassifierTests.cs" />
     <Compile Include="AutoGenWarningClassifierTests.cs" />
     <Compile Include="AutogenLecturePackingTests.cs" />
@@ -55,6 +59,7 @@
     <Compile Include="TeacherDraftEditMutationPlannerTests.cs" />
     <Compile Include="TeacherDraftsAutogenJobServiceSecurityTests.cs" />
     <Compile Include="TeacherDraftsAutogenServiceRegressionTests.cs" />
+    <Compile Include="TeacherDraftsWeekValidationTests.cs" />
     <Compile Include="Infrastructure\TravelInvariantVerifier.cs" />
   </ItemGroup>
 

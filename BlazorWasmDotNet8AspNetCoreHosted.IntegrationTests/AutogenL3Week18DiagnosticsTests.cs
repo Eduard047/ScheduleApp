@@ -108,10 +108,19 @@ public sealed class AutogenL3Week18DiagnosticsTests
                 item.StartTime,
                 item.EndTime,
                 item.ModuleId,
-                item.GroupId
+                item.GroupId,
+                item.IsSelfStudy,
+                item.LessonType.PreferredFirstInWeek,
+                LessonTypeCode = item.LessonType.Code,
+                LessonTypeName = item.LessonType.Name
             })
             .ToListAsync();
         var parallelModuleViolations = generatedRows
+            .Where(item => !IsShareable(
+                item.IsSelfStudy,
+                item.PreferredFirstInWeek,
+                item.LessonTypeCode,
+                item.LessonTypeName))
             .GroupBy(item => new { item.Date, item.StartTime, item.EndTime, item.ModuleId })
             .Where(group => group.Select(item => item.GroupId).Distinct().Count() > 4)
             .Select(group =>
@@ -512,10 +521,26 @@ public sealed class AutogenL3Week18DiagnosticsTests
     }
 
     private static bool IsShareable(TeacherDraftItem item)
+        => IsShareable(
+            item.IsSelfStudy,
+            item.LessonType.PreferredFirstInWeek,
+            item.LessonType.Code,
+            item.LessonType.Name);
+
+    private static bool IsShareable(
+        bool isSelfStudy,
+        bool preferredFirstInWeek,
+        string? lessonTypeCode,
+        string? lessonTypeName)
     {
-        var code = item.LessonType.Code?.Trim().ToUpperInvariant() ?? string.Empty;
-        var name = item.LessonType.Name?.Trim().ToUpperInvariant() ?? string.Empty;
-        return item.LessonType.PreferredFirstInWeek
+        if (isSelfStudy)
+        {
+            return false;
+        }
+
+        var code = lessonTypeCode?.Trim().ToUpperInvariant() ?? string.Empty;
+        var name = lessonTypeName?.Trim().ToUpperInvariant() ?? string.Empty;
+        return preferredFirstInWeek
                || code is "LECTURE" or "LECT" or "LEC"
                || name.Contains("LECTURE", StringComparison.Ordinal)
                || name.Contains("ЛЕКЦ", StringComparison.Ordinal);

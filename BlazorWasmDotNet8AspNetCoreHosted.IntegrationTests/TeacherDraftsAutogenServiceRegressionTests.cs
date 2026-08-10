@@ -25,11 +25,22 @@ public sealed class TeacherDraftsAutogenServiceRegressionTests
         fixture.Db.Courses.Add(course);
         await fixture.Db.SaveChangesAsync();
 
-        var meta = await new MetaController(fixture.Db).Get(weekStart: null);
+        var action = await new MetaController(fixture.Db).Get(weekStart: null);
+        var meta = Assert.IsType<MetaResponseDto>(action.Value);
 
         var courseLookup = Assert.Single(meta.Courses);
         Assert.Equal(course.Id, courseLookup.Id);
         Assert.Equal(academicPeriodStartDate, courseLookup.AcademicPeriodStartDate);
+    }
+
+    [Fact]
+    public async Task Meta_rejects_unsupported_week_start_before_range_calculation()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+
+        var result = await new MetaController(fixture.Db).Get(DateOnly.MaxValue);
+
+        Assert.IsType<BadRequestObjectResult>(result.Result);
     }
 
     [Fact]
@@ -389,6 +400,136 @@ public sealed class TeacherDraftsAutogenServiceRegressionTests
             .AsNoTracking()
             .SingleAsync(item => item.Date == generationDate);
         Assert.Equal(data.TopicId, generated.ModuleTopicId);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Explicit_range_before_academic_period_counts_existing_rows_during_fill(bool useDraft)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var generationDate = new DateOnly(2026, 5, 11);
+        var data = await fixture.SeedCurriculumProgressScenarioAsync(
+            generationDate,
+            academicPeriodStartDate: new DateOnly(2026, 9, 1),
+            targetHours: 1,
+            topicHours: 1);
+        var secondStart = new TimeOnly(9, 0);
+        var secondEnd = new TimeOnly(10, 0);
+        var roomId = await fixture.Db.Rooms.Select(item => item.Id).SingleAsync();
+        var workingHours = await fixture.Db.TeacherWorkingHours.SingleAsync();
+        workingHours.End = secondEnd;
+        var unrelatedCourse = new Course
+        {
+            Name = "Сторонній курс",
+            DurationWeeks = 52
+        };
+        var unrelatedGroup = new Group
+        {
+            Name = "СТР-1",
+            StudentsCount = 10,
+            Course = unrelatedCourse
+        };
+        var unrelatedModule = new Module
+        {
+            Code = "СТР",
+            Title = "Сторонній модуль",
+            Credits = 1,
+            Course = unrelatedCourse
+        };
+        var unrelatedTeacher = new Teacher { FullName = "Сторонній викладач" };
+        fixture.Db.TimeSlots.Add(new TimeSlot
+        {
+            CourseId = data.CourseId,
+            DayOfWeek = generationDate.DayOfWeek,
+            Start = secondStart,
+            End = secondEnd,
+            SortOrder = 2,
+            IsActive = true
+        });
+        fixture.Db.TeacherDraftItems.Add(new TeacherDraftItem
+        {
+            Date = generationDate,
+            DayOfWeek = generationDate.DayOfWeek,
+            StartTime = secondStart,
+            EndTime = secondEnd,
+            Group = unrelatedGroup,
+            Module = unrelatedModule,
+            LessonTypeId = data.LessonTypeId,
+            Teacher = unrelatedTeacher,
+            Status = DraftStatus.Draft
+        });
+        if (useDraft)
+        {
+            fixture.Db.TeacherDraftItems.Add(new TeacherDraftItem
+            {
+                Date = generationDate,
+                DayOfWeek = generationDate.DayOfWeek,
+                StartTime = data.Start,
+                EndTime = data.End,
+                GroupId = data.GroupId,
+                ModuleId = data.ModuleId,
+                ModuleTopicId = data.TopicId,
+                LessonTypeId = data.LessonTypeId,
+                TeacherId = data.TeacherId,
+                RoomId = roomId,
+                Status = DraftStatus.Draft
+            });
+        }
+        else
+        {
+            fixture.Db.ScheduleItems.Add(new ScheduleItem
+            {
+                Date = generationDate,
+                DayOfWeek = generationDate.DayOfWeek,
+                StartTime = data.Start,
+                EndTime = data.End,
+                GroupId = data.GroupId,
+                ModuleId = data.ModuleId,
+                ModuleTopicId = data.TopicId,
+                LessonTypeId = data.LessonTypeId,
+                TeacherId = data.TeacherId,
+                RoomId = roomId
+            });
+        }
+        await fixture.Db.SaveChangesAsync();
+
+        async Task<List<string>> LoadFingerprintAsync()
+        {
+            var drafts = await fixture.Db.TeacherDraftItems
+                .AsNoTracking()
+                .Where(item => item.GroupId == data.GroupId && item.Date == generationDate)
+                .Select(item => $"draft|{item.Date}|{item.StartTime}|{item.EndTime}|{item.ModuleId}|{item.ModuleTopicId}|{item.TeacherId}|{item.RoomId}")
+                .ToListAsync();
+            var schedule = await fixture.Db.ScheduleItems
+                .AsNoTracking()
+                .Where(item => item.GroupId == data.GroupId && item.Date == generationDate)
+                .Select(item => $"schedule|{item.Date}|{item.StartTime}|{item.EndTime}|{item.ModuleId}|{item.ModuleTopicId}|{item.TeacherId}|{item.RoomId}")
+                .ToListAsync();
+            return drafts.Concat(schedule).OrderBy(item => item, StringComparer.Ordinal).ToList();
+        }
+
+        var before = await LoadFingerprintAsync();
+        var action = await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(
+            new DraftAutoGenRequest(
+                WeekStart: data.GenerationDate,
+                ClearExisting: false,
+                CourseId: data.CourseId,
+                GroupIds: new List<int> { data.GroupId },
+                Days: WeekPreset.MonFri,
+                SoftFill: true,
+                AllowIncompleteDrafts: true,
+                RangeStartDate: data.GenerationDate,
+                RangeEndDate: data.GenerationDate,
+                SoftOptions: new DraftAutoGenSoftOptions(RecentRepeatWindowDays: 0)));
+
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+        fixture.Db.ChangeTracker.Clear();
+        var after = await LoadFingerprintAsync();
+        Assert.Single(before);
+        Assert.Equal(0, result.Created);
+        Assert.Equal(before, after);
     }
 
     [Fact]

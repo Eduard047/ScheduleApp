@@ -51,6 +51,22 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
     private static readonly TimeSpan DefaultCancellationLeaseGrace = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan DefaultTerminalPersistenceHorizon = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan SqliteExclusiveExecutionLeaseDuration = TimeSpan.FromHours(6);
+    private static readonly HashSet<string> ProvisionalIntegratedWarningCodes = new(StringComparer.Ordinal)
+    {
+        AutoGenWarningCodes.PreflightDeficit,
+        AutoGenWarningCodes.GapUnfilled,
+        AutoGenWarningCodes.SearchLimit,
+        AutoGenWarningCodes.TopicExhausted,
+        AutoGenWarningCodes.ResourceUnavailable,
+        AutoGenWarningCodes.Recommendation,
+        AutoGenWarningCodes.DiagnosticSummary
+    };
+    private static readonly HashSet<string> BlockingIntegratedWarningCodes = new(StringComparer.Ordinal)
+    {
+        AutoGenWarningCodes.IncompleteDrafts,
+        AutoGenWarningCodes.FinalValidationFailed,
+        AutoGenWarningCodes.ConfigurationMissing
+    };
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<TeacherDraftsAutogenJobService> _logger;
     private readonly IHostApplicationLifetime? _applicationLifetime;
@@ -1476,6 +1492,11 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             softFill = true;
             preflightOnly = false;
         }
+        else
+        {
+            softFill = false;
+            preflightOnly = false;
+        }
         var title = string.IsNullOrWhiteSpace(request.Title)
             ? BuildDefaultTitle(request.Kind)
             : request.Title.Trim();
@@ -1574,6 +1595,9 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                         var beforePreviewScope = job.Request.PreviewOnly
                             ? await plans.CaptureScopeAsync(job.Request, job.Token)
                             : null;
+                        var integratedSoftFill = job.Request.Kind == AutoGenJobKind.Generate
+                                                 && job.Request.PreviewOnly
+                                                 && !job.Request.PreflightOnly;
                         foreach (var runRange in runRanges)
                         {
                             job.Token.ThrowIfCancellationRequested();
@@ -1583,9 +1607,127 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                             {
                                 await PersistProgressOrCancelAsync(job, "початок діапазону");
                             }
-                            var request = BuildDraftRequest(job.Request, runRange.WeekStart, runRange.RangeStartDate, runRange.RangeEndDate);
+                            var request = BuildDraftRequest(
+                                job.Request,
+                                runRange.WeekStart,
+                                runRange.RangeStartDate,
+                                runRange.RangeEndDate);
+                            if (integratedSoftFill)
+                            {
+                                request = request with { SoftFill = false };
+                            }
                             var action = await autogen.DraftAutoGenInAmbientTransaction(request, job.Token);
                             var (rangeSucceeded, rangeResult, fallbackWarning) = ExtractAutoGenResult(action);
+                            if (rangeSucceeded && integratedSoftFill)
+                            {
+                                job.StartIntegratedFill(
+                                    runRange.RangeStartDate,
+                                    runRange.RangeEndDate);
+                                job.Token.ThrowIfCancellationRequested();
+                                if (persistIntermediateProgress)
+                                {
+                                    await PersistProgressOrCancelAsync(job, "початок дозаповнення");
+                                }
+                                var fillAction = await autogen.DraftAutoGenInAmbientTransaction(
+                                    request with
+                                    {
+                                        ClearExisting = false,
+                                        SoftFill = true,
+                                        PreflightOnly = false
+                                    },
+                                    job.Token);
+                                var (fillSucceeded, fillResult, fillFallbackWarning) =
+                                    ExtractAutoGenResult(fillAction);
+                                var effectiveFillResult = fillResult;
+                                if (fillSucceeded
+                                    && !job.Request.AllowIncompleteDrafts
+                                    && (fillResult.GapDetails?.Count ?? 0) > 0
+                                    && executionTransaction.SupportsSavepoints)
+                                {
+                                    var savepointName = $"integrated_relaxed_fill_{runRange.WeekIndex}";
+                                    await executionTransaction.CreateSavepointAsync(savepointName, job.Token);
+                                    var relaxedFillAccepted = false;
+                                    try
+                                    {
+                                        job.StartIntegratedRelaxedRepair(
+                                            runRange.RangeStartDate,
+                                            runRange.RangeEndDate);
+                                        job.Token.ThrowIfCancellationRequested();
+                                        if (persistIntermediateProgress)
+                                        {
+                                            await PersistProgressOrCancelAsync(job, "початок резервного дозаповнення");
+                                        }
+                                        var relaxedFillAction = await autogen.DraftAutoGenInAmbientTransaction(
+                                            request with
+                                            {
+                                                ClearExisting = false,
+                                                SoftFill = true,
+                                                PreflightOnly = false,
+                                                AllowIncompleteDrafts = true
+                                            },
+                                            job.Token);
+                                        var (relaxedFillSucceeded, relaxedFillResult, _) =
+                                            ExtractAutoGenResult(relaxedFillAction);
+                                        if (relaxedFillSucceeded)
+                                        {
+                                            var strictGapCount = fillResult.GapDetails?.Count ?? 0;
+                                            var relaxedGapCount = relaxedFillResult.GapDetails?.Count ?? 0;
+                                            var hardRuleValidation =
+                                                await new TeacherDraftsAutogenHardRuleValidator(executionDb)
+                                                    .ValidateAsync(
+                                                        new TeacherDraftsAutogenHardRuleValidationRequest(
+                                                            job.Request.CourseId,
+                                                            job.Request.GroupIds,
+                                                            runRange.RangeStartDate,
+                                                            runRange.RangeEndDate,
+                                                            job.Request.Days,
+                                                            AllowIncompleteDrafts: false,
+                                                            MaxParallelGroupsPerModuleInSlot:
+                                                                job.Request.SoftOptions?.MaxParallelGroupsPerModuleInSlot),
+                                                        job.Token);
+                                            if (!hardRuleValidation.HasViolations
+                                                && relaxedFillResult.Created > 0
+                                                && relaxedGapCount < strictGapCount)
+                                            {
+                                                effectiveFillResult = MergeIntegratedGenerationResult(
+                                                    fillResult,
+                                                    relaxedFillResult);
+                                                await executionTransaction.ReleaseSavepointAsync(
+                                                    savepointName,
+                                                    job.Token);
+                                                relaxedFillAccepted = true;
+                                            }
+                                        }
+
+                                        if (!relaxedFillAccepted)
+                                        {
+                                            await executionTransaction.RollbackToSavepointAsync(
+                                                savepointName,
+                                                CancellationToken.None);
+                                            executionDb.ChangeTracker.Clear();
+                                            await executionTransaction.ReleaseSavepointAsync(
+                                                savepointName,
+                                                CancellationToken.None);
+                                        }
+                                    }
+                                    catch
+                                    {
+                                        await executionTransaction.RollbackToSavepointAsync(
+                                            savepointName,
+                                            CancellationToken.None);
+                                        executionDb.ChangeTracker.Clear();
+                                        throw;
+                                    }
+                                }
+                                rangeSucceeded = fillSucceeded;
+                                fallbackWarning = string.Join(
+                                    " ",
+                                    new[] { fallbackWarning, fillFallbackWarning }
+                                        .Where(item => !string.IsNullOrWhiteSpace(item)));
+                                rangeResult = MergeIntegratedGenerationResult(
+                                    rangeResult,
+                                    effectiveFillResult);
+                            }
                             if (!rangeSucceeded)
                             {
                                 failed = true;
@@ -1621,6 +1763,33 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                         }
 
                         job.Token.ThrowIfCancellationRequested();
+                        if (!failed && integratedSoftFill && !job.Request.AllowIncompleteDrafts)
+                        {
+                            var hardRuleValidation = await new TeacherDraftsAutogenHardRuleValidator(executionDb)
+                                .ValidateAsync(
+                                    new TeacherDraftsAutogenHardRuleValidationRequest(
+                                        job.Request.CourseId,
+                                        job.Request.GroupIds,
+                                        job.Request.FromDate,
+                                        job.Request.ToDate,
+                                        job.Request.Days,
+                                        AllowIncompleteDrafts: false,
+                                        MaxParallelGroupsPerModuleInSlot:
+                                            job.Request.SoftOptions?.MaxParallelGroupsPerModuleInSlot),
+                                    job.Token);
+                            if (hardRuleValidation.HasViolations)
+                            {
+                                failed = true;
+                                warnings.AddRange(hardRuleValidation.Violations
+                                    .Take(50)
+                                    .Select(item => $"Фінальна перевірка: {item}"));
+                                if (hardRuleValidation.Violations.Count > 50)
+                                {
+                                    warnings.Add(
+                                        $"Фінальна перевірка знайшла ще {hardRuleValidation.Violations.Count - 50} проблем.");
+                                }
+                            }
+                        }
                         if (!failed && job.Request.PreviewOnly)
                         {
                             var afterPreviewScope = await plans.CaptureScopeAsync(job.Request, job.Token);
@@ -1987,6 +2156,45 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             SoftOptions: MapSoftOptions(request.SoftOptions),
             PreflightOnly: request.PreflightOnly);
 
+    private static AutoGenResult MergeIntegratedGenerationResult(
+        AutoGenResult generationResult,
+        AutoGenResult fillResult)
+    {
+        var warnings = generationResult.Warnings
+            .Where(item => !string.IsNullOrWhiteSpace(item))
+            .Where(item => !ProvisionalIntegratedWarningCodes.Contains(
+                AutoGenWarningClassifier.Classify(item).Code))
+            .Concat(fillResult.Warnings)
+            .Where(item => !string.IsNullOrWhiteSpace(item))
+            .Select(item => item.Trim())
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        var finalHasNoGaps = fillResult.Skipped == 0
+                             && (fillResult.GapDetails?.Count ?? 0) == 0;
+        var hasBlockingWarning = warnings.Any(item => BlockingIntegratedWarningCodes.Contains(
+            AutoGenWarningClassifier.Classify(item).Code));
+        var canClearProvisionalDiagnostics = finalHasNoGaps && !hasBlockingWarning;
+        if (canClearProvisionalDiagnostics)
+        {
+            warnings = warnings
+                .Where(item => !ProvisionalIntegratedWarningCodes.Contains(
+                    AutoGenWarningClassifier.Classify(item).Code))
+                .ToList();
+        }
+        var preflight = canClearProvisionalDiagnostics
+            ? new List<AutoGenPreflightItem>()
+            : fillResult.Preflight;
+
+        return new AutoGenResult(
+            generationResult.Created + fillResult.Created,
+            fillResult.Skipped,
+            warnings,
+            fillResult.GapDetails,
+            fillResult.GapSummary,
+            preflight,
+            AutoGenWarningClassifier.ClassifyMany(warnings));
+    }
+
     private static DraftAutoGenSoftOptions? MapSoftOptions(AutoGenSoftOptionsDto? dto)
         => dto is null
             ? null
@@ -2124,6 +2332,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         private int _warningCount;
         private int _gapCount;
         private int _deficitCount;
+        private int _phasePercentFloor;
         private string? _lastCompletedMessage;
         private AutoGenResult? _result;
         private AutoGenRunReport? _report;
@@ -2234,6 +2443,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                 _state = AutoGenJobState.Running;
                 _startedAt = DateTimeOffset.UtcNow;
                 _totalWeeks = Math.Max(1, totalWeeks);
+                _phasePercentFloor = 0;
                 _currentStage = "Підготовка автогенерації...";
             }
         }
@@ -2246,7 +2456,28 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                 _currentWeekStartDate = weekStart;
                 _currentRangeStartDate = rangeStartDate;
                 _currentRangeEndDate = rangeEndDate;
+                _phasePercentFloor = Math.Max(_phasePercentFloor, 1);
                 _currentStage = $"{BuildStageVerb(Request.Kind)} {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}";
+            }
+        }
+
+        public void StartIntegratedFill(DateOnly rangeStartDate, DateOnly rangeEndDate)
+        {
+            lock (_sync)
+            {
+                _phasePercentFloor = Math.Max(_phasePercentFloor, 50);
+                _currentStage =
+                    $"Дозаповнюємо порожні слоти {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}…";
+            }
+        }
+
+        public void StartIntegratedRelaxedRepair(DateOnly rangeStartDate, DateOnly rangeEndDate)
+        {
+            lock (_sync)
+            {
+                _phasePercentFloor = Math.Max(_phasePercentFloor, 75);
+                _currentStage =
+                    $"Перевіряємо резервне дозаповнення {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}…";
             }
         }
 
@@ -2373,6 +2604,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             var total = Math.Max(1, _totalWeeks);
             var completed = Math.Clamp(_completedWeeks, 0, total);
             var minimum = _currentWeekNumber > 0 ? 1 : 0;
+            minimum = Math.Max(minimum, _phasePercentFloor);
             return Math.Clamp((int)Math.Floor((double)completed / total * 100), minimum, 99);
         }
 

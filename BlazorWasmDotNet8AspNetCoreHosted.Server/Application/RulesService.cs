@@ -227,8 +227,13 @@ public sealed class RulesService(AppDbContext db)
         {
             var travel = await db.BuildingTravels.AsNoTracking()
                 .ToDictionaryAsync(k => (k.FromBuildingId, k.ToBuildingId), v => v.Minutes);
-            int TravelMinutes(int fromId, int toId)
-                => TravelTimePolicy.Resolve(travel, fromId, toId);
+            int TransitionMinutes(Room from, Room to)
+                => RoomTransitionPolicy.Resolve(
+                    travel,
+                    from.Id,
+                    from.BuildingId,
+                    to.Id,
+                    to.BuildingId);
             var adj = dayScheduleCandidates!
                 .Where(x => x.LessonType.RequiresRoom
                             && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(x.LessonType.Code)
@@ -238,7 +243,7 @@ public sealed class RulesService(AppDbContext db)
             foreach (var a in adj)
             {
                 if (a.Room is null) continue;
-                var need = TravelMinutes(a.Room.BuildingId, room!.BuildingId);
+                var need = TransitionMinutes(a.Room, room!);
                 var gapBefore = (start.ToTimeSpan() - a.EndTime.ToTimeSpan()).TotalMinutes;
                 var gapAfter = (a.StartTime.ToTimeSpan() - end.ToTimeSpan()).TotalMinutes;
                 if (a.EndTime <= start && gapBefore < need)
@@ -247,16 +252,17 @@ public sealed class RulesService(AppDbContext db)
                     errors.Add("Замало часу на перехід (наступне заняття).");
             }
         }
-        if (requiresTeacher && r.TeacherId is int tWin)
+        if ((requiresTeacher || blocksTeacher) && r.TeacherId is int tWin)
         {
-            var dayEnum = r.Date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
             var windows = await db.TeacherWorkingHours
-                .Where(w => w.TeacherId == tWin && w.DayOfWeek == dayEnum)
-                .Select(w => new { w.Start, w.End })
+                .AsNoTracking()
+                .Where(w => w.TeacherId == tWin)
+                .Select(w => new { w.DayOfWeek, w.Start, w.End })
                 .ToListAsync();
             if (windows.Count > 0)
             {
-                bool fits = windows.Any(w => w.Start <= start && end <= w.End);
+                var dayEnum = r.Date.ToDateTime(TimeOnly.MinValue).DayOfWeek;
+                bool fits = windows.Any(w => w.DayOfWeek == dayEnum && w.Start <= start && end <= w.End);
                 if (!fits) errors.Add("Заняття виходить за межі робочих годин викладача.");
             }
         }
@@ -527,12 +533,17 @@ public sealed class RulesService(AppDbContext db)
         {
             var travelMap = await db.BuildingTravels.AsNoTracking()
                 .ToDictionaryAsync(k => (k.FromBuildingId, k.ToBuildingId), v => v.Minutes);
-            int TravelMinutes(int fromId, int toId)
-                => TravelTimePolicy.Resolve(travelMap, fromId, toId);
+            int TransitionMinutes(Room from, Room to)
+                => RoomTransitionPolicy.Resolve(
+                    travelMap,
+                    from.Id,
+                    from.BuildingId,
+                    to.Id,
+                    to.BuildingId);
             void CheckTravel(TimeOnly otherStart, TimeOnly otherEnd, Room? otherRoom, string scope, string label)
             {
                 if (otherRoom is null) return;
-                var need = TravelMinutes(otherRoom.BuildingId, room.BuildingId);
+                var need = TransitionMinutes(otherRoom, room);
                 var gapBefore = (start.ToTimeSpan() - otherEnd.ToTimeSpan()).TotalMinutes;
                 var gapAfter = (otherStart.ToTimeSpan() - end.ToTimeSpan()).TotalMinutes;
                 if (otherEnd <= start && gapBefore < need)
@@ -554,15 +565,16 @@ public sealed class RulesService(AppDbContext db)
                          && (x.GroupId == r.GroupId || (r.TeacherId != null && x.TeacherId == r.TeacherId))))
                 CheckTravel(a.StartTime, a.EndTime, a.Room, "draft", "Чернетка");
         }
-        if (requiresTeacher && r.TeacherId is int tWin)
+        if ((requiresTeacher || blocksTeacher) && r.TeacherId is int tWin)
         {
             var windows = await db.TeacherWorkingHours
-                .Where(w => w.TeacherId == tWin && w.DayOfWeek == dayOfWeek)
-                .Select(w => new { w.Start, w.End })
+                .AsNoTracking()
+                .Where(w => w.TeacherId == tWin)
+                .Select(w => new { w.DayOfWeek, w.Start, w.End })
                 .ToListAsync();
             if (windows.Count > 0)
             {
-                bool fits = windows.Any(w => w.Start <= start && end <= w.End);
+                bool fits = windows.Any(w => w.DayOfWeek == dayOfWeek && w.Start <= start && end <= w.End);
                 if (!fits)
                     AddWarning("teacher-working-hours", "Поза робочими годинами", $"Інтервал {r.TimeStart}-{r.TimeEnd} виходить за межі робочих годин викладача для {dayOfWeek}.");
             }

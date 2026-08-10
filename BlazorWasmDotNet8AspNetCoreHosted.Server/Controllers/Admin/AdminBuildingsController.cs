@@ -34,26 +34,26 @@ public class AdminBuildingsController(AppDbContext db) : ControllerBase
         await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         try
         {
-        if (dto.Id is int id && id > 0)
-        {
-            var b = await db.Buildings.FindAsync(id);
-            if (b is null) return NotFound(new { message = "Корпус не знайдено" });
-            b.Name = name;
-            b.Address = dto.Address;
-            await db.SaveChangesAsync();
-            await EnsureDefaultTravelsForBuilding(b.Id);
-            await tx.CommitAsync();
-            return Ok(b.Id);
-        }
-        else
-        {
-            var b = new Building { Name = name, Address = dto.Address };
-            db.Buildings.Add(b);
-            await db.SaveChangesAsync();
-            await EnsureDefaultTravelsForBuilding(b.Id);
-            await tx.CommitAsync();
-            return Ok(b.Id);
-        }
+            if (dto.Id is int id && id > 0)
+            {
+                var b = await db.Buildings.FindAsync(id);
+                if (b is null) return NotFound(new { message = "Корпус не знайдено" });
+                b.Name = name;
+                b.Address = dto.Address;
+                await db.SaveChangesAsync();
+                await EnsureDefaultTravelsForBuilding(b.Id);
+                await tx.CommitAsync();
+                return Ok(b.Id);
+            }
+            else
+            {
+                var b = new Building { Name = name, Address = dto.Address };
+                db.Buildings.Add(b);
+                await db.SaveChangesAsync();
+                await EnsureDefaultTravelsForBuilding(b.Id);
+                await tx.CommitAsync();
+                return Ok(b.Id);
+            }
         }
         catch
         {

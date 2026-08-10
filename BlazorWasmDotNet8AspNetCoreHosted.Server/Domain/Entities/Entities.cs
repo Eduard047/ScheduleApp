@@ -5,9 +5,9 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 // Доменно-дані сутності для розкладу
 public class LessonTypeRef
 {
-    public int Id { get; set; } 
-    public string Code { get; set; } = default!; 
-    public string Name { get; set; } = default!; 
+    public int Id { get; set; }
+    public string Code { get; set; } = default!;
+    public string Name { get; set; } = default!;
     public bool IsActive { get; set; } = true;
     public bool RequiresRoom { get; set; } = true;
     public bool RequiresTeacher { get; set; } = true;
@@ -52,8 +52,8 @@ public class Teacher
 {
     public int Id { get; set; }
     public string FullName { get; set; } = default!;
-    public string? ScientificDegree { get; set; } 
-    public string? AcademicTitle { get; set; } 
+    public string? ScientificDegree { get; set; }
+    public string? AcademicTitle { get; set; }
     public int? DepartmentId { get; set; }
     public Department? Department { get; set; }
     public ICollection<TeacherModule> TeacherModules { get; set; } = new List<TeacherModule>();
@@ -131,7 +131,7 @@ public class Building
 public class BuildingTravel
 {
     public int Id { get; set; }
-    public int FromBuildingId { get; set; } 
+    public int FromBuildingId { get; set; }
     public Building From { get; set; } = default!;
     public int ToBuildingId { get; set; }
     public Building To { get; set; } = default!;
@@ -254,7 +254,7 @@ public class CalendarException
 {
     public int Id { get; set; }
     public DateOnly Date { get; set; }
-    public bool IsWorkingDay { get; set; } 
+    public bool IsWorkingDay { get; set; }
     public string Name { get; set; } = default!;
     public int? CourseId { get; set; }
     public Course? Course { get; set; }
@@ -305,12 +305,12 @@ public class TeacherDraftItem
     public int? RoomId { get; set; }
     public Room? Room { get; set; }
     public DraftStatus Status { get; set; } = DraftStatus.Draft;
-    public int? PublishedItemId { get; set; } 
-    public string? BatchKey { get; set; }     
-    public string? ValidationWarnings { get; set; } 
+    public int? PublishedItemId { get; set; }
+    public string? BatchKey { get; set; }
+    public string? ValidationWarnings { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
-    public bool IsLocked { get; set; }   
+    public bool IsLocked { get; set; }
     public bool IsSelfStudy { get; set; } = false;
     public string? GenerationJobId { get; set; }
 }

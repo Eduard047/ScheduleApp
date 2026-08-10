@@ -22,6 +22,87 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 public sealed class AutogenLecturePackingTests
 {
     [Fact]
+    public void Global_catch_up_atomic_repair_waits_for_last_group_in_rotated_round()
+    {
+        var rotatedRoundGroupIds = new[] { 11, 12, 31, 13, 8, 9, 10 };
+
+        Assert.False(GlobalCatchUpRepairPlanner.ShouldRunAtomicRepairAfterGroup(
+            currentGroupId: 13,
+            groupIdsInCurrentRound: rotatedRoundGroupIds,
+            repairRequested: true));
+        Assert.True(GlobalCatchUpRepairPlanner.ShouldRunAtomicRepairAfterGroup(
+            currentGroupId: 10,
+            groupIdsInCurrentRound: rotatedRoundGroupIds,
+            repairRequested: true));
+        Assert.False(GlobalCatchUpRepairPlanner.ShouldRunAtomicRepairAfterGroup(
+            currentGroupId: 10,
+            groupIdsInCurrentRound: rotatedRoundGroupIds,
+            repairRequested: false));
+    }
+
+    [Theory]
+    [InlineData(false, 5, false)]
+    [InlineData(true, 0, false)]
+    [InlineData(true, 5, true)]
+    public void Global_catch_up_rearms_atomic_repair_only_after_effective_reservation_release(
+        bool reservationsReleased,
+        int remainingPlacements,
+        bool retryExpected)
+    {
+        var plan = GlobalCatchUpRepairPlanner.PlanAfterReservationRelease(
+            reservationsReleased,
+            remainingPlacements);
+
+        Assert.Equal(retryExpected, plan.ContinueCatchUp);
+        Assert.Equal(retryExpected, plan.RequestAtomicRepair);
+        Assert.Equal(retryExpected, plan.AllowAtomicRepairRetry);
+        Assert.Equal(retryExpected, plan.ResetExhaustedSearchBudgets);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Global_catch_up_marks_atomic_attempt_even_when_trial_may_be_rolled_back(bool repairRan)
+    {
+        var plan = GlobalCatchUpRepairPlanner.PlanAfterAtomicRepair(repairRan);
+
+        Assert.Equal(repairRan, plan.ClearRepairRequest);
+        Assert.Equal(repairRan, plan.MarkRepairAttempted);
+        Assert.Equal(repairRan, plan.ContinueCatchUp);
+    }
+
+    [Theory]
+    [InlineData(0, 1, false)]
+    [InlineData(1, 0, false)]
+    [InlineData(8, 1, true)]
+    [InlineData(9, 1, false)]
+    [InlineData(21, 7, true)]
+    [InlineData(22, 7, false)]
+    public void Global_catch_up_atomic_repair_runs_only_for_bounded_tail(
+        int remainingPlacements,
+        int selectedGroupCount,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            GlobalCatchUpRepairPlanner.CanRunAtomicSharedTailRepair(
+                remainingPlacements,
+                selectedGroupCount));
+    }
+
+    [Theory]
+    [InlineData(2, 5)]
+    [InlineData(3, 6)]
+    public void Global_catch_up_round_limit_reserves_atomic_transition_retries(
+        int remainingPlacements,
+        int expectedRoundLimit)
+    {
+        Assert.Equal(
+            expectedRoundLimit,
+            GlobalCatchUpRepairPlanner.CalculateMaxCatchUpRounds(remainingPlacements));
+    }
+
+    [Fact]
     public async Task Hard_rule_validator_compares_pending_topic_order_with_published_previous_week()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
@@ -920,6 +1001,152 @@ public sealed class AutogenLecturePackingTests
         Assert.False(
             hardRuleValidation.HasViolations,
             $"Після міжденного ущільнення не повинно бути порушень жорстких правил: {string.Join(" | ", hardRuleValidation.Violations)}");
+    }
+
+    [Fact]
+    public async Task Draft_autogen_cross_date_chain_prioritizes_donor_whose_source_accepts_residual_module()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+
+        await using var db = new AppDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var data = await SeedCrossDateDonorRankingScenarioAsync(db);
+        var moduleHours = data.DonorModuleIds
+            .ToDictionary(moduleId => moduleId, _ => 1);
+        moduleHours[data.TargetModuleId] = 1;
+        var request = new DraftAutoGenRequest(
+            WeekStart: data.StartDate,
+            ClearExisting: false,
+            CourseId: data.CourseId,
+            GroupIds: new List<int> { data.TargetGroupId },
+            Days: WeekPreset.MonFri,
+            ModuleHours: moduleHours,
+            SoftFill: true,
+            RangeStartDate: data.StartDate,
+            RangeEndDate: data.FinalGapDate,
+            SoftOptions: new DraftAutoGenSoftOptions(
+                RecentRepeatWindowDays: 0,
+                MaxParallelGroupsPerModuleInSlot: 4));
+
+        var action = await new TeacherDraftsAutogenService(db).DraftAutoGen(request);
+        var failedResult = (action.Result as ObjectResult)?.Value as AutoGenResult;
+        Assert.True(
+            action.Result is OkObjectResult,
+            $"Міжденний repair має завершитися безпечно. Попередження: {string.Join(" | ", failedResult?.Warnings ?? new List<string>())}");
+        var result = Assert.IsType<AutoGenResult>(((OkObjectResult)action.Result!).Value);
+
+        var generatedTarget = await db.TeacherDraftItems
+            .AsNoTracking()
+            .SingleAsync(item => item.GroupId == data.TargetGroupId
+                                 && item.ModuleId == data.TargetModuleId);
+        var movedDonor = await db.TeacherDraftItems
+            .AsNoTracking()
+            .SingleAsync(item => item.Id == data.ViableDonorDraftId);
+        var parallelTargetCounts = await db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => item.ModuleId == data.TargetModuleId
+                           && item.Date >= data.StartDate
+                           && item.Date <= data.FinalGapDate)
+            .GroupBy(item => new { item.Date, item.StartTime, item.EndTime })
+            .Select(group => group.Select(item => item.GroupId).Distinct().Count())
+            .ToListAsync();
+
+        Assert.Equal(1, result.Created);
+        Assert.Empty(result.GapDetails ?? new List<AutoGenGapDetail>());
+        Assert.Equal(data.ViableDonorDate, generatedTarget.Date);
+        Assert.Equal(data.FinalGapDate, movedDonor.Date);
+        Assert.All(parallelTargetCounts, count => Assert.True(count <= 4));
+
+        var hardRuleValidation = await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(
+            new TeacherDraftsAutogenHardRuleValidationRequest(
+                data.CourseId,
+                new[] { data.TargetGroupId },
+                data.StartDate,
+                data.FinalGapDate,
+                WeekPreset.MonFri,
+                MaxParallelGroupsPerModuleInSlot: 4));
+        Assert.False(
+            hardRuleValidation.HasViolations,
+            $"Після пріоритетного вибору донора не повинно бути порушень жорстких правил: {string.Join(" | ", hardRuleValidation.Violations)}");
+    }
+
+    [Fact]
+    public async Task Draft_autogen_cross_date_chain_reserves_generic_budget_after_constrained_search()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+
+        await using var db = new AppDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var data = await SeedCrossDateBranchBudgetScenarioAsync(db);
+        var moduleHours = data.DonorModuleIds
+            .ToDictionary(moduleId => moduleId, _ => 1);
+        moduleHours[data.TargetModuleId] = data.TargetModuleHours;
+        var request = new DraftAutoGenRequest(
+            WeekStart: data.StartDate,
+            ClearExisting: false,
+            CourseId: data.CourseId,
+            GroupIds: new List<int> { data.TargetGroupId },
+            Days: WeekPreset.MonFri,
+            ModuleHours: moduleHours,
+            SoftFill: true,
+            RangeStartDate: data.StartDate,
+            RangeEndDate: data.EndDate,
+            SoftOptions: new DraftAutoGenSoftOptions(
+                RecentRepeatWindowDays: 0,
+                MaxParallelGroupsPerModuleInSlot: 4));
+
+        var action = await new TeacherDraftsAutogenService(db).DraftAutoGen(request);
+        var failedResult = (action.Result as ObjectResult)?.Value as AutoGenResult;
+        Assert.True(
+            action.Result is OkObjectResult,
+            $"Універсальна гілка repair має отримати власний бюджет. Попередження: {string.Join(" | ", failedResult?.Warnings ?? new List<string>())}");
+        var result = Assert.IsType<AutoGenResult>(((OkObjectResult)action.Result!).Value);
+
+        var generatedTarget = await db.TeacherDraftItems
+            .AsNoTracking()
+            .SingleAsync(item => item.GroupId == data.TargetGroupId
+                                 && item.ModuleTopicId == data.PendingTargetTopicId);
+        var movedDonor = await db.TeacherDraftItems
+            .AsNoTracking()
+            .SingleAsync(item => item.Id == data.ViableDonorDraftId);
+        var parallelTargetCounts = await db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => item.ModuleId == data.TargetModuleId
+                           && item.Date >= data.StartDate
+                           && item.Date <= data.EndDate)
+            .GroupBy(item => new { item.Date, item.StartTime, item.EndTime })
+            .Select(group => group.Select(item => item.GroupId).Distinct().Count())
+            .ToListAsync();
+
+        Assert.Equal(1, result.Created);
+        Assert.Empty(result.GapDetails ?? new List<AutoGenGapDetail>());
+        Assert.Equal(data.ViableDonorDate, generatedTarget.Date);
+        Assert.Equal(data.ViableDonorStart, generatedTarget.StartTime);
+        Assert.Equal(data.StartDate, movedDonor.Date);
+        Assert.Equal(data.RootGapStart, movedDonor.StartTime);
+        Assert.All(parallelTargetCounts, count => Assert.True(count <= 4));
+
+        var hardRuleValidation = await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(
+            new TeacherDraftsAutogenHardRuleValidationRequest(
+                data.CourseId,
+                new[] { data.TargetGroupId },
+                data.StartDate,
+                data.EndDate,
+                WeekPreset.MonFri,
+                MaxParallelGroupsPerModuleInSlot: 4));
+        Assert.False(
+            hardRuleValidation.HasViolations,
+            $"Розділений бюджет repair не повинен послаблювати жорсткі правила: {string.Join(" | ", hardRuleValidation.Violations)}");
     }
 
     [Fact]
@@ -3415,6 +3642,510 @@ public sealed class AutogenLecturePackingTests
             earlyGapStart);
     }
 
+    private static async Task<CrossDateDonorRankingSeed> SeedCrossDateDonorRankingScenarioAsync(AppDbContext db)
+    {
+        const int courseId = 760;
+        const int targetGroupId = 760;
+        const int targetModuleId = 760;
+        const int targetTopicId = 760;
+        const int lessonTypeId = 760;
+        const int buildingId = 760;
+        const int donorTeacherId = 7605;
+        const int donorRoomId = 7605;
+        const int viableDonorDraftId = 760100;
+        var startDate = new DateOnly(2026, 6, 1);
+        var workingDates = Enumerable.Range(0, 21)
+            .Select(offset => startDate.AddDays(offset))
+            .Where(date => date.DayOfWeek is not DayOfWeek.Saturday and not DayOfWeek.Sunday)
+            .Take(15)
+            .ToList();
+        var donorModuleIds = Enumerable.Range(761, 14).ToList();
+        var peerGroupIds = Enumerable.Range(761, 4).ToList();
+        var targetTeacherIds = Enumerable.Range(7601, 4).ToList();
+        var targetRoomIds = Enumerable.Range(7601, 4).ToList();
+
+        db.Courses.Add(new Course
+        {
+            Id = courseId,
+            Name = "Рейтинг міжденних донорів",
+            DurationWeeks = 3,
+            AcademicPeriodStartDate = startDate
+        });
+        db.Groups.Add(new Group
+        {
+            Id = targetGroupId,
+            Name = "9301",
+            StudentsCount = 20,
+            CourseId = courseId
+        });
+        db.Groups.AddRange(peerGroupIds.Select((groupId, index) => new Group
+        {
+            Id = groupId,
+            Name = $"93{index + 2:D2}",
+            StudentsCount = 20,
+            CourseId = courseId
+        }));
+        db.LessonTypes.Add(new LessonTypeRef
+        {
+            Id = lessonTypeId,
+            Code = "WORK",
+            Name = "Практичне заняття",
+            IsActive = true,
+            RequiresRoom = true,
+            RequiresTeacher = true,
+            BlocksRoom = true,
+            BlocksTeacher = true,
+            CountInPlan = true,
+            CountInLoad = true
+        });
+        db.Modules.Add(new Module
+        {
+            Id = targetModuleId,
+            Code = "TARGET",
+            Title = "Залишковий модуль",
+            Credits = 1,
+            CourseId = courseId
+        });
+        db.ModuleTopics.Add(new ModuleTopic
+        {
+            Id = targetTopicId,
+            ModuleId = targetModuleId,
+            Order = 1,
+            TopicCode = "TARGET.1",
+            LessonTypeId = lessonTypeId,
+            TotalHours = 20,
+            AuditoriumHours = 20
+        });
+        foreach (var (moduleId, index) in donorModuleIds.Select((moduleId, index) => (moduleId, index)))
+        {
+            db.Modules.Add(new Module
+            {
+                Id = moduleId,
+                Code = $"DONOR-{index + 1:D2}",
+                Title = $"Донор {index + 1:D2}",
+                Credits = 1,
+                CourseId = courseId
+            });
+            db.ModuleTopics.Add(new ModuleTopic
+            {
+                Id = moduleId,
+                ModuleId = moduleId,
+                Order = 1,
+                TopicCode = $"DONOR.{index + 1:D2}",
+                LessonTypeId = lessonTypeId,
+                TotalHours = 1,
+                AuditoriumHours = 1
+            });
+        }
+
+        db.Buildings.Add(new Building
+        {
+            Id = buildingId,
+            Name = "Головний корпус"
+        });
+        db.Rooms.AddRange(targetRoomIds
+            .Append(donorRoomId)
+            .Select(roomId => new Room
+            {
+                Id = roomId,
+                Name = $"Аудиторія {roomId}",
+                Capacity = 30,
+                BuildingId = buildingId
+            }));
+        db.Teachers.AddRange(targetTeacherIds
+            .Append(donorTeacherId)
+            .Select(teacherId => new Teacher
+            {
+                Id = teacherId,
+                FullName = $"Викладач {teacherId}"
+            }));
+        db.TeacherModules.AddRange(targetTeacherIds.Select(teacherId => new TeacherModule
+        {
+            TeacherId = teacherId,
+            ModuleId = targetModuleId
+        }));
+        db.TeacherModules.AddRange(donorModuleIds.Select(moduleId => new TeacherModule
+        {
+            TeacherId = donorTeacherId,
+            ModuleId = moduleId
+        }));
+        db.TimeSlots.AddRange(Enum.GetValues<DayOfWeek>()
+            .Where(day => day is not DayOfWeek.Saturday and not DayOfWeek.Sunday)
+            .Select((day, index) => new TimeSlot
+            {
+                Id = 7600 + index,
+                CourseId = courseId,
+                DayOfWeek = day,
+                Start = new TimeOnly(9, 0),
+                End = new TimeOnly(10, 0),
+                SortOrder = 1,
+                IsActive = true
+            }));
+        await db.SaveChangesAsync();
+
+        for (var index = 0; index < donorModuleIds.Count; index++)
+        {
+            var date = workingDates[index];
+            db.TeacherDraftItems.Add(new TeacherDraftItem
+            {
+                Id = viableDonorDraftId + index,
+                Date = date,
+                DayOfWeek = date.DayOfWeek,
+                StartTime = new TimeOnly(9, 0),
+                EndTime = new TimeOnly(10, 0),
+                GroupId = targetGroupId,
+                ModuleId = donorModuleIds[index],
+                ModuleTopicId = donorModuleIds[index],
+                LessonTypeId = lessonTypeId,
+                TeacherId = donorTeacherId,
+                RoomId = donorRoomId,
+                Status = DraftStatus.Draft,
+                IsLocked = false
+            });
+        }
+
+        foreach (var (date, dateIndex) in workingDates.Select((date, index) => (date, index)))
+        {
+            var peerCount = dateIndex == 0 ? 3 : 4;
+            for (var peerIndex = 0; peerIndex < peerCount; peerIndex++)
+            {
+                db.TeacherDraftItems.Add(new TeacherDraftItem
+                {
+                    Date = date,
+                    DayOfWeek = date.DayOfWeek,
+                    StartTime = new TimeOnly(9, 0),
+                    EndTime = new TimeOnly(10, 0),
+                    GroupId = peerGroupIds[peerIndex],
+                    ModuleId = targetModuleId,
+                    ModuleTopicId = targetTopicId,
+                    LessonTypeId = lessonTypeId,
+                    TeacherId = targetTeacherIds[peerIndex],
+                    RoomId = targetRoomIds[peerIndex],
+                    Status = DraftStatus.Draft,
+                    IsLocked = true
+                });
+            }
+        }
+
+        await db.SaveChangesAsync();
+        return new CrossDateDonorRankingSeed(
+            courseId,
+            targetGroupId,
+            targetModuleId,
+            donorModuleIds,
+            viableDonorDraftId,
+            startDate,
+            workingDates[0],
+            workingDates[^1]);
+    }
+
+    private static async Task<CrossDateBranchBudgetSeed> SeedCrossDateBranchBudgetScenarioAsync(AppDbContext db)
+    {
+        const int courseId = 780;
+        const int targetGroupId = 780;
+        const int targetModuleId = 780;
+        const int firstTargetTopicId = 780;
+        const int pendingTargetTopicId = 781;
+        const int firstLessonTypeId = 780;
+        const int pendingLessonTypeId = 781;
+        const int firstDepartmentId = 780;
+        const int pendingDepartmentId = 781;
+        const int buildingId = 780;
+        const int donorTeacherId = 7808;
+        const int donorRoomId = 7808;
+        const int viableDonorDraftId = 780105;
+        var startDate = new DateOnly(2026, 6, 1);
+        var workingDates = Enumerable.Range(0, 10)
+            .Select(offset => startDate.AddDays(offset))
+            .Where(date => date.DayOfWeek is not DayOfWeek.Saturday and not DayOfWeek.Sunday)
+            .Take(6)
+            .ToList();
+        var endDate = workingDates[^1];
+        var rootGapStart = new TimeOnly(9, 0);
+        var donorStart = new TimeOnly(10, 10);
+        var donorModuleIds = Enumerable.Range(782, 6).ToList();
+        var peerGroupIds = Enumerable.Range(781, 3).ToList();
+        var firstTeacherIds = Enumerable.Range(7801, 4).ToList();
+        var pendingTeacherIds = Enumerable.Range(7805, 3).ToList();
+        var targetRoomIds = Enumerable.Range(7801, 4).ToList();
+
+        db.Courses.Add(new Course
+        {
+            Id = courseId,
+            Name = "Розділений бюджет міжденного repair",
+            DurationWeeks = 2,
+            AcademicPeriodStartDate = startDate
+        });
+        db.Groups.Add(new Group
+        {
+            Id = targetGroupId,
+            Name = "9301",
+            StudentsCount = 20,
+            CourseId = courseId
+        });
+        db.Groups.AddRange(peerGroupIds.Select((groupId, index) => new Group
+        {
+            Id = groupId,
+            Name = $"93{index + 2:D2}",
+            StudentsCount = 20,
+            CourseId = courseId
+        }));
+        db.LessonTypes.AddRange(
+            new LessonTypeRef
+            {
+                Id = firstLessonTypeId,
+                Code = "WORK-A",
+                Name = "Практичне заняття А",
+                IsActive = true,
+                RequiresRoom = true,
+                RequiresTeacher = true,
+                BlocksRoom = true,
+                BlocksTeacher = true,
+                CountInPlan = true,
+                CountInLoad = true
+            },
+            new LessonTypeRef
+            {
+                Id = pendingLessonTypeId,
+                Code = "WORK-B",
+                Name = "Практичне заняття Б",
+                IsActive = true,
+                RequiresRoom = true,
+                RequiresTeacher = true,
+                BlocksRoom = true,
+                BlocksTeacher = true,
+                CountInPlan = true,
+                CountInLoad = true
+            });
+        db.Departments.AddRange(
+            new Department
+            {
+                Id = firstDepartmentId,
+                Name = "Кафедра А"
+            },
+            new Department
+            {
+                Id = pendingDepartmentId,
+                Name = "Кафедра Б"
+            });
+        db.Modules.Add(new Module
+        {
+            Id = targetModuleId,
+            Code = "TARGET",
+            Title = "Модуль із двома гілками repair",
+            Credits = 1,
+            CourseId = courseId
+        });
+        db.ModuleTopics.AddRange(
+            new ModuleTopic
+            {
+                Id = firstTargetTopicId,
+                ModuleId = targetModuleId,
+                Order = 1,
+                TopicCode = "TARGET.A",
+                LessonTypeId = firstLessonTypeId,
+                DepartmentId = firstDepartmentId,
+                TotalHours = 5,
+                AuditoriumHours = 5
+            },
+            new ModuleTopic
+            {
+                Id = pendingTargetTopicId,
+                ModuleId = targetModuleId,
+                Order = 2,
+                TopicCode = "TARGET.B",
+                LessonTypeId = pendingLessonTypeId,
+                DepartmentId = pendingDepartmentId,
+                TotalHours = 1,
+                AuditoriumHours = 1
+            });
+        foreach (var (moduleId, index) in donorModuleIds.Select((moduleId, index) => (moduleId, index)))
+        {
+            db.Modules.Add(new Module
+            {
+                Id = moduleId,
+                Code = $"DONOR-{index + 1:D2}",
+                Title = $"Донор бюджету {index + 1:D2}",
+                Credits = 1,
+                CourseId = courseId
+            });
+            db.ModuleTopics.Add(new ModuleTopic
+            {
+                Id = moduleId,
+                ModuleId = moduleId,
+                Order = 1,
+                TopicCode = $"DONOR.{index + 1:D2}",
+                LessonTypeId = firstLessonTypeId,
+                TotalHours = 1,
+                AuditoriumHours = 1
+            });
+        }
+
+        db.Buildings.Add(new Building
+        {
+            Id = buildingId,
+            Name = "Єдиний корпус"
+        });
+        db.Rooms.AddRange(targetRoomIds
+            .Append(donorRoomId)
+            .Select(roomId => new Room
+            {
+                Id = roomId,
+                Name = $"Аудиторія {roomId}",
+                Capacity = 30,
+                BuildingId = buildingId
+            }));
+        db.Teachers.AddRange(firstTeacherIds.Select(teacherId => new Teacher
+        {
+            Id = teacherId,
+            FullName = $"Викладач кафедри А {teacherId}",
+            DepartmentId = firstDepartmentId
+        }));
+        db.Teachers.AddRange(pendingTeacherIds.Select(teacherId => new Teacher
+        {
+            Id = teacherId,
+            FullName = $"Викладач кафедри Б {teacherId}",
+            DepartmentId = pendingDepartmentId
+        }));
+        db.Teachers.Add(new Teacher
+        {
+            Id = donorTeacherId,
+            FullName = "Викладач донорських модулів"
+        });
+        db.TeacherModules.AddRange(firstTeacherIds
+            .Concat(pendingTeacherIds)
+            .Select(teacherId => new TeacherModule
+            {
+                TeacherId = teacherId,
+                ModuleId = targetModuleId
+            }));
+        db.TeacherModules.AddRange(donorModuleIds.Select(moduleId => new TeacherModule
+        {
+            TeacherId = donorTeacherId,
+            ModuleId = moduleId
+        }));
+        db.TimeSlots.AddRange(Enum.GetValues<DayOfWeek>()
+            .Where(day => day is not DayOfWeek.Saturday and not DayOfWeek.Sunday)
+            .SelectMany((day, dayIndex) => new[]
+            {
+                new TimeSlot
+                {
+                    Id = 7800 + dayIndex * 2,
+                    CourseId = courseId,
+                    DayOfWeek = day,
+                    Start = rootGapStart,
+                    End = new TimeOnly(10, 0),
+                    SortOrder = 1,
+                    IsActive = true
+                },
+                new TimeSlot
+                {
+                    Id = 7801 + dayIndex * 2,
+                    CourseId = courseId,
+                    DayOfWeek = day,
+                    Start = donorStart,
+                    End = new TimeOnly(11, 10),
+                    SortOrder = 2,
+                    IsActive = true
+                }
+            }));
+        await db.SaveChangesAsync();
+
+        for (var dateIndex = 0; dateIndex < workingDates.Count; dateIndex++)
+        {
+            var date = workingDates[dateIndex];
+            db.TeacherDraftItems.Add(new TeacherDraftItem
+            {
+                Id = viableDonorDraftId - (workingDates.Count - 1) + dateIndex,
+                Date = date,
+                DayOfWeek = date.DayOfWeek,
+                StartTime = donorStart,
+                EndTime = new TimeOnly(11, 10),
+                GroupId = targetGroupId,
+                ModuleId = donorModuleIds[dateIndex],
+                ModuleTopicId = donorModuleIds[dateIndex],
+                LessonTypeId = firstLessonTypeId,
+                TeacherId = donorTeacherId,
+                RoomId = donorRoomId,
+                Status = DraftStatus.Draft,
+                IsLocked = false
+            });
+
+            if (dateIndex > 0)
+            {
+                db.TeacherDraftItems.Add(new TeacherDraftItem
+                {
+                    Date = date,
+                    DayOfWeek = date.DayOfWeek,
+                    StartTime = rootGapStart,
+                    EndTime = new TimeOnly(10, 0),
+                    GroupId = targetGroupId,
+                    ModuleId = targetModuleId,
+                    ModuleTopicId = firstTargetTopicId,
+                    LessonTypeId = firstLessonTypeId,
+                    TeacherId = firstTeacherIds[^1],
+                    RoomId = targetRoomIds[^1],
+                    Status = DraftStatus.Draft,
+                    IsLocked = false
+                });
+            }
+
+            var secondSlotPeerCount = dateIndex == workingDates.Count - 1 ? 2 : 3;
+            for (var peerIndex = 0; peerIndex < peerGroupIds.Count; peerIndex++)
+            {
+                db.TeacherDraftItems.Add(new TeacherDraftItem
+                {
+                    Date = date,
+                    DayOfWeek = date.DayOfWeek,
+                    StartTime = rootGapStart,
+                    EndTime = new TimeOnly(10, 0),
+                    GroupId = peerGroupIds[peerIndex],
+                    ModuleId = targetModuleId,
+                    ModuleTopicId = null,
+                    LessonTypeId = firstLessonTypeId,
+                    TeacherId = firstTeacherIds[peerIndex],
+                    RoomId = targetRoomIds[peerIndex],
+                    Status = DraftStatus.Draft,
+                    IsLocked = true
+                });
+
+                if (peerIndex < secondSlotPeerCount)
+                {
+                    db.TeacherDraftItems.Add(new TeacherDraftItem
+                    {
+                        Date = date,
+                        DayOfWeek = date.DayOfWeek,
+                        StartTime = donorStart,
+                        EndTime = new TimeOnly(11, 10),
+                        GroupId = peerGroupIds[peerIndex],
+                        ModuleId = targetModuleId,
+                        ModuleTopicId = null,
+                        LessonTypeId = firstLessonTypeId,
+                        TeacherId = firstTeacherIds[peerIndex],
+                        RoomId = targetRoomIds[peerIndex],
+                        Status = DraftStatus.Draft,
+                        IsLocked = true
+                    });
+                }
+            }
+        }
+
+        await db.SaveChangesAsync();
+        return new CrossDateBranchBudgetSeed(
+            courseId,
+            targetGroupId,
+            targetModuleId,
+            donorModuleIds,
+            TargetModuleHours: 6,
+            pendingTargetTopicId,
+            viableDonorDraftId,
+            startDate,
+            endDate,
+            workingDates[^1],
+            rootGapStart,
+            donorStart);
+    }
+
     private static async Task<SharedTopicSubflowSeed> SeedSharedTopicSubflowScenarioAsync(AppDbContext db)
     {
         const int courseId = 710;
@@ -3914,7 +4645,7 @@ public sealed class AutogenLecturePackingTests
             {
                 CourseId = courseId,
                 ModuleId = lectureModuleId,
-                GroupOrder = 2,
+                GroupOrder = 1,
                 Order = 2
             });
         db.Buildings.Add(new Building
@@ -4804,6 +5535,30 @@ public sealed class AutogenLecturePackingTests
         int SecondTargetTopicId,
         DateOnly StartDate,
         TimeOnly EarlyGapStart);
+
+    private sealed record CrossDateDonorRankingSeed(
+        int CourseId,
+        int TargetGroupId,
+        int TargetModuleId,
+        List<int> DonorModuleIds,
+        int ViableDonorDraftId,
+        DateOnly StartDate,
+        DateOnly ViableDonorDate,
+        DateOnly FinalGapDate);
+
+    private sealed record CrossDateBranchBudgetSeed(
+        int CourseId,
+        int TargetGroupId,
+        int TargetModuleId,
+        List<int> DonorModuleIds,
+        int TargetModuleHours,
+        int PendingTargetTopicId,
+        int ViableDonorDraftId,
+        DateOnly StartDate,
+        DateOnly EndDate,
+        DateOnly ViableDonorDate,
+        TimeOnly RootGapStart,
+        TimeOnly ViableDonorStart);
 
     private sealed record PreferredFirstLimitSeed(
         int CourseId,

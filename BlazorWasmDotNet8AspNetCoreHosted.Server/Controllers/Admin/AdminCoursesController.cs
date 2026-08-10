@@ -83,28 +83,28 @@ public class AdminCoursesController(AppDbContext db) : ControllerBase
         await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         try
         {
-        if (!await db.Courses.AsNoTracking().AnyAsync(c => c.Id == id))
-        {
-            return NotFound();
-        }
-        var hasDrafts = await db.TeacherDraftItems
-            .AsNoTracking()
-            .AnyAsync(d => d.Group.CourseId == id || d.Module.CourseId == id);
-        if (hasDrafts)
-        {
-            return Conflict(new
+            if (!await db.Courses.AsNoTracking().AnyAsync(c => c.Id == id))
             {
-                message = "Курс або його модулі використовуються у чернетках. Спочатку перенесіть або видаліть пов'язані чернетки."
-            });
-        }
-        var used = await db.Groups.AnyAsync(g => g.CourseId == id)
-                   || await db.Modules.AnyAsync(m => m.CourseId == id)
-                   || await db.ModuleCourses.AnyAsync(mc => mc.CourseId == id)
-                   || await db.ModulePlans.AnyAsync(p => p.CourseId == id)
-                   || await db.TeacherCourseLoads.AnyAsync(l => l.CourseId == id)
-                   || await db.ScheduleItems.AnyAsync(s => s.Group.CourseId == id);
-        if (used && !force)
-            return Conflict(new { message = "Курс використовується групами/модулями/розкладом" });
+                return NotFound();
+            }
+            var hasDrafts = await db.TeacherDraftItems
+                .AsNoTracking()
+                .AnyAsync(d => d.Group.CourseId == id || d.Module.CourseId == id);
+            if (hasDrafts)
+            {
+                return Conflict(new
+                {
+                    message = "Курс або його модулі використовуються у чернетках. Спочатку перенесіть або видаліть пов'язані чернетки."
+                });
+            }
+            var used = await db.Groups.AnyAsync(g => g.CourseId == id)
+                       || await db.Modules.AnyAsync(m => m.CourseId == id)
+                       || await db.ModuleCourses.AnyAsync(mc => mc.CourseId == id)
+                       || await db.ModulePlans.AnyAsync(p => p.CourseId == id)
+                       || await db.TeacherCourseLoads.AnyAsync(l => l.CourseId == id)
+                       || await db.ScheduleItems.AnyAsync(s => s.Group.CourseId == id);
+            if (used && !force)
+                return Conflict(new { message = "Курс використовується групами/модулями/розкладом" });
 
             if (used && force)
             {

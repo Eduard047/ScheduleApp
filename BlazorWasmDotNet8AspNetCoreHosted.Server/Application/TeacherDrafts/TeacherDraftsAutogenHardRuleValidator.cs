@@ -37,10 +37,25 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
         var currentDraftRows = activeDraftRows
             .Where(row => row.IsDraft)
             .ToList();
+        var coursePeriod = await _db.Courses
+            .AsNoTracking()
+            .Where(course => course.Id == request.CourseId)
+            .Select(course => new
+            {
+                course.AcademicPeriodStartDate,
+                course.DurationWeeks
+            })
+            .SingleOrDefaultAsync(cancellationToken);
+        var academicPeriodStartDate = coursePeriod?.AcademicPeriodStartDate;
+        var academicPeriodEndDateExclusive = ResolveAcademicPeriodEndDateExclusive(
+            academicPeriodStartDate,
+            coursePeriod?.DurationWeeks);
         var scheduleRows = await LoadScheduleRowsAsync(request, groupIds, currentDraftRows, cancellationToken);
-        var topicOrderHistoryRows = await LoadTopicOrderHistoryRowsAsync(
+        var topicOrderContextRows = await LoadTopicOrderContextRowsAsync(
             request,
             currentDraftRows,
+            academicPeriodStartDate,
+            academicPeriodEndDateExclusive,
             cancellationToken);
         var modulesWithAuditoriumTopics = await LoadModulesWithAuditoriumTopicsAsync(currentDraftRows, cancellationToken);
         var placements = scheduleRows.Concat(draftRows).ToList();
@@ -75,7 +90,12 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
         }
 
         var resourceEligibilityRows = request.PendingDrafts is not null
-            ? await LoadPendingDraftRowsAsync(request.PendingDrafts, cancellationToken)
+            ? (await LoadPendingDraftRowsAsync(
+                    request.PendingDrafts,
+                    request.ScopePendingDraftsToCourse ? request.CourseId : null,
+                    cancellationToken))
+                .Where(row => row.IsDraft)
+                .ToList()
             : currentDraftRows;
         violations.AddRange(await FindResourceEligibilityViolationsAsync(
             resourceEligibilityRows,
@@ -97,9 +117,22 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             "аудиторії",
             CollapseSharedFlowPlacements(placements.Where(row => row.RoomId is not null && row.BlocksRoom))
                 .GroupBy(row => (Id: row.RoomId!.Value, Name: row.RoomName ?? $"#{row.RoomId.Value}"))));
-        violations.AddRange(FindTopicOrderViolations(
+        violations.AddRange(await FindModuleSequenceViolationsAsync(
+            request,
             placements,
-            topicOrderHistoryRows,
+            currentDraftRows,
+            academicPeriodStartDate,
+            academicPeriodEndDateExclusive,
+            cancellationToken));
+        violations.AddRange(FindTopicOrderViolations(
+            placements
+                .Where(row => row.CourseId == request.CourseId
+                              && (academicPeriodStartDate is not DateOnly periodStart
+                                  || row.Date >= periodStart)
+                              && (academicPeriodEndDateExclusive is not DateOnly periodEnd
+                                  || row.Date < periodEnd))
+                .ToList(),
+            topicOrderContextRows,
             cancellationToken));
         violations.AddRange(FindModuleTopicPlanViolations(currentDraftRows, modulesWithAuditoriumTopics));
         violations.AddRange(FindLectureBlockOrderViolations(placements));
@@ -114,6 +147,23 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             violations,
             roomCapacityStats.MaxSharedGroupCount,
             roomCapacityStats.MaxSharedGroupLabel);
+    }
+
+    private static DateOnly? ResolveAcademicPeriodEndDateExclusive(
+        DateOnly? academicPeriodStartDate,
+        int? durationWeeks)
+    {
+        if (academicPeriodStartDate is not DateOnly periodStart
+            || durationWeeks is not > 0)
+        {
+            return null;
+        }
+
+        var durationDays = (long)durationWeeks.Value * 7L;
+        var availableDays = (long)DateOnly.MaxValue.DayNumber - periodStart.DayNumber;
+        return durationDays <= availableDays
+            ? periodStart.AddDays((int)durationDays)
+            : null;
     }
 
     private async Task<IReadOnlyList<string>> FindResourceEligibilityViolationsAsync(
@@ -217,7 +267,10 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
         {
             if (request.PendingDrafts is { Count: > 0 })
             {
-                rows.AddRange(await LoadPendingDraftRowsAsync(request.PendingDrafts, cancellationToken));
+                rows.AddRange(await LoadPendingDraftRowsAsync(
+                    request.PendingDrafts,
+                    request.ScopePendingDraftsToCourse ? request.CourseId : null,
+                    cancellationToken));
             }
 
             return rows;
@@ -308,7 +361,10 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
 
         if (request.PendingDrafts is { Count: > 0 })
         {
-            rows.AddRange(await LoadPendingDraftRowsAsync(request.PendingDrafts, cancellationToken));
+            rows.AddRange(await LoadPendingDraftRowsAsync(
+                request.PendingDrafts,
+                request.ScopePendingDraftsToCourse ? request.CourseId : null,
+                cancellationToken));
         }
 
         return rows;
@@ -316,6 +372,7 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
 
     private async Task<IReadOnlyList<PlacementRow>> LoadPendingDraftRowsAsync(
         IReadOnlyCollection<TeacherDraftsAutogenPendingDraft> pendingDrafts,
+        int? draftCourseId,
         CancellationToken cancellationToken)
     {
         var groupIds = pendingDrafts.Select(item => item.GroupId).Distinct().ToList();
@@ -381,7 +438,7 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             }
 
             rows.Add(new PlacementRow(
-                true,
+                draftCourseId is null || group.CourseId == draftCourseId,
                 item.Date,
                 item.Start,
                 item.End,
@@ -473,9 +530,11 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             .ToListAsync(cancellationToken);
     }
 
-    private async Task<IReadOnlyList<PlacementRow>> LoadTopicOrderHistoryRowsAsync(
+    private async Task<IReadOnlyList<PlacementRow>> LoadTopicOrderContextRowsAsync(
         TeacherDraftsAutogenHardRuleValidationRequest request,
         IReadOnlyList<PlacementRow> currentDraftRows,
+        DateOnly? academicPeriodStartDate,
+        DateOnly? academicPeriodEndDateExclusive,
         CancellationToken cancellationToken)
     {
         var affectedKeys = currentDraftRows
@@ -487,29 +546,21 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             return Array.Empty<PlacementRow>();
         }
 
-        cancellationToken.ThrowIfCancellationRequested();
-        var academicPeriodStartDate = await _db.Courses
-            .AsNoTracking()
-            .Where(course => course.Id == request.CourseId)
-            .Select(course => course.AcademicPeriodStartDate)
-            .SingleOrDefaultAsync(cancellationToken);
-        if (academicPeriodStartDate is DateOnly periodStart && periodStart >= request.From)
-        {
-            return Array.Empty<PlacementRow>();
-        }
-
         var affectedGroupIds = affectedKeys.Select(key => key.GroupId).Distinct().ToList();
         var affectedModuleIds = affectedKeys.Select(key => key.ModuleId).Distinct().ToList();
         var draftQuery = _db.TeacherDraftItems
             .AsNoTracking()
-            .Where(item => item.Date < request.From
-                           && item.Date <= request.To
+            .Where(item => (item.Date < request.From || item.Date > request.To)
                            && item.ModuleTopicId != null
                            && affectedGroupIds.Contains(item.GroupId)
                            && affectedModuleIds.Contains(item.ModuleId));
         if (academicPeriodStartDate is DateOnly draftPeriodStart)
         {
             draftQuery = draftQuery.Where(item => item.Date >= draftPeriodStart);
+        }
+        if (academicPeriodEndDateExclusive is DateOnly draftPeriodEnd)
+        {
+            draftQuery = draftQuery.Where(item => item.Date < draftPeriodEnd);
         }
         if (request.ExcludedDraftIds is { Count: > 0 })
         {
@@ -552,14 +603,17 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
         cancellationToken.ThrowIfCancellationRequested();
         var scheduleQuery = _db.ScheduleItems
             .AsNoTracking()
-            .Where(item => item.Date < request.From
-                           && item.Date <= request.To
+            .Where(item => (item.Date < request.From || item.Date > request.To)
                            && item.ModuleTopicId != null
                            && affectedGroupIds.Contains(item.GroupId)
                            && affectedModuleIds.Contains(item.ModuleId));
         if (academicPeriodStartDate is DateOnly schedulePeriodStart)
         {
             scheduleQuery = scheduleQuery.Where(item => item.Date >= schedulePeriodStart);
+        }
+        if (academicPeriodEndDateExclusive is DateOnly schedulePeriodEnd)
+        {
+            scheduleQuery = scheduleQuery.Where(item => item.Date < schedulePeriodEnd);
         }
 
         var scheduleHistoryRows = await scheduleQuery
@@ -834,11 +888,11 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
     {
         var violations = new List<string>();
         foreach (var group in placements.GroupBy(row => new
-                 {
-                     row.GroupId,
-                     row.GroupName,
-                     row.Date
-                 }))
+        {
+            row.GroupId,
+            row.GroupName,
+            row.Date
+        }))
         {
             var ordered = CollapseLogicalDraftEventPlacements(group)
                 .Where(row => !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(row.LessonTypeCode))
@@ -901,12 +955,12 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
         var violations = new List<string>();
 
         foreach (var group in activePlacements.GroupBy(row => new
-                 {
-                     row.GroupId,
-                     row.GroupName,
-                     row.CourseId,
-                     row.Date
-                 }))
+        {
+            row.GroupId,
+            row.GroupName,
+            row.CourseId,
+            row.Date
+        }))
         {
             var ordered = CollapseLogicalDraftEventPlacements(group)
                 .OrderBy(row => row.Start)
@@ -1022,7 +1076,7 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
                                      .Any();
             if (isLogicalEvent)
             {
-                yield return legacyRows[0];
+                yield return legacyRows[0] with { IsDraft = legacyRows.Any(row => row.IsDraft) };
                 continue;
             }
 
@@ -1045,7 +1099,7 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
                          row.LessonTypeId
                      }))
         {
-            yield return group.First();
+            yield return group.First() with { IsDraft = group.Any(row => row.IsDraft) };
         }
     }
 
@@ -1140,6 +1194,171 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
                 }
             }
         }
+    }
+
+    private async Task<IReadOnlyList<string>> FindModuleSequenceViolationsAsync(
+        TeacherDraftsAutogenHardRuleValidationRequest request,
+        IReadOnlyList<PlacementRow> currentPlacements,
+        IReadOnlyList<PlacementRow> currentDraftRows,
+        DateOnly? academicPeriodStartDate,
+        DateOnly? academicPeriodEndDateExclusive,
+        CancellationToken cancellationToken)
+    {
+        var sequenceRows = await _db.ModuleSequenceItems
+            .AsNoTracking()
+            .Where(item => item.CourseId == request.CourseId)
+            .Select(item => new { item.ModuleId, item.GroupOrder })
+            .ToListAsync(cancellationToken);
+        if (sequenceRows.Count == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        var groupOrderByModule = sequenceRows
+            .GroupBy(item => item.ModuleId)
+            .ToDictionary(group => group.Key, group => group.Min(item => item.GroupOrder));
+        var configuredModuleIds = groupOrderByModule.Keys.ToList();
+        var fillerModuleIds = (await _db.ModuleFillers
+                .AsNoTracking()
+                .Where(item => item.CourseId == request.CourseId)
+                .Select(item => item.ModuleId)
+                .ToListAsync(cancellationToken))
+            .ToHashSet();
+        var affectedGroupIds = currentDraftRows
+            .Where(row => row.CourseId == request.CourseId
+                          && groupOrderByModule.ContainsKey(row.ModuleId)
+                          && !fillerModuleIds.Contains(row.ModuleId))
+            .Select(row => row.GroupId)
+            .Distinct()
+            .ToList();
+        if (affectedGroupIds.Count == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        var currentRows = CollapseLogicalDraftEventPlacements(currentPlacements)
+            .Where(row => row.CourseId == request.CourseId
+                          && affectedGroupIds.Contains(row.GroupId)
+                          && groupOrderByModule.ContainsKey(row.ModuleId)
+                          && !fillerModuleIds.Contains(row.ModuleId)
+                          && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(row.LessonTypeCode))
+            .Select(row => new ModuleSequencePlacement(
+                row.Date,
+                row.Start,
+                row.End,
+                row.GroupId,
+                row.GroupName,
+                row.ModuleId,
+                row.IsDraft))
+            .ToList();
+
+        if (academicPeriodStartDate is DateOnly currentPeriodStart)
+        {
+            currentRows = currentRows
+                .Where(row => row.Date >= currentPeriodStart)
+                .ToList();
+        }
+        if (academicPeriodEndDateExclusive is DateOnly currentPeriodEnd)
+        {
+            currentRows = currentRows
+                .Where(row => row.Date < currentPeriodEnd)
+                .ToList();
+        }
+        var draftContextQuery = _db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => (item.Date < request.From || item.Date > request.To)
+                           && affectedGroupIds.Contains(item.GroupId)
+                           && configuredModuleIds.Contains(item.ModuleId));
+        var scheduleContextQuery = _db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => (item.Date < request.From || item.Date > request.To)
+                           && affectedGroupIds.Contains(item.GroupId)
+                           && configuredModuleIds.Contains(item.ModuleId));
+        if (academicPeriodStartDate is DateOnly periodStart)
+        {
+            draftContextQuery = draftContextQuery.Where(item => item.Date >= periodStart);
+            scheduleContextQuery = scheduleContextQuery.Where(item => item.Date >= periodStart);
+        }
+        if (academicPeriodEndDateExclusive is DateOnly periodEnd)
+        {
+            draftContextQuery = draftContextQuery.Where(item => item.Date < periodEnd);
+            scheduleContextQuery = scheduleContextQuery.Where(item => item.Date < periodEnd);
+        }
+        if (request.ExcludedDraftIds is { Count: > 0 })
+        {
+            draftContextQuery = draftContextQuery.Where(item => !request.ExcludedDraftIds.Contains(item.Id));
+        }
+
+        var draftContextRows = await draftContextQuery
+            .Select(item => new ModuleSequenceHistoryRow(
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                item.GroupId,
+                item.Group.Name,
+                item.ModuleId,
+                item.LessonType.Code))
+            .ToListAsync(cancellationToken);
+        var scheduleContextRows = await scheduleContextQuery
+            .Select(item => new ModuleSequenceHistoryRow(
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                item.GroupId,
+                item.Group.Name,
+                item.ModuleId,
+                item.LessonType.Code))
+            .ToListAsync(cancellationToken);
+        var contextRows = draftContextRows
+            .Concat(scheduleContextRows)
+            .Where(row => !fillerModuleIds.Contains(row.ModuleId)
+                          && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(row.LessonTypeCode))
+            .Select(row => new ModuleSequencePlacement(
+                row.Date,
+                row.Start,
+                row.End,
+                row.GroupId,
+                row.GroupName,
+                row.ModuleId,
+                false));
+
+        var violations = new List<string>();
+        foreach (var group in currentRows.Concat(contextRows).GroupBy(row => row.GroupId))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            ModuleSequencePlacement? highest = null;
+            var highestGroupOrder = int.MinValue;
+            foreach (var current in group
+                         .OrderBy(row => row.Date)
+                         .ThenBy(row => row.Start)
+                         .ThenBy(row => row.End)
+                         .ThenBy(row => groupOrderByModule[row.ModuleId])
+                         .ThenBy(row => row.ModuleId))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var currentGroupOrder = groupOrderByModule[current.ModuleId];
+                if (highest is not null
+                    && currentGroupOrder < highestGroupOrder
+                    && (current.IsCurrentValidationDraft || highest.IsCurrentValidationDraft))
+                {
+                    violations.Add(
+                        $"{current.Date:yyyy-MM-dd} {current.GroupName} {current.Start:HH\\:mm}: модуль #{current.ModuleId} "
+                        + $"із блоком послідовності {currentGroupOrder} розміщено після модуля #{highest.ModuleId} "
+                        + $"із блоком {highestGroupOrder}.");
+                }
+
+                if (currentGroupOrder > highestGroupOrder
+                    || (currentGroupOrder == highestGroupOrder
+                        && current.IsCurrentValidationDraft
+                        && highest?.IsCurrentValidationDraft == false))
+                {
+                    highest = current;
+                    highestGroupOrder = currentGroupOrder;
+                }
+            }
+        }
+
+        return violations;
     }
 
     private static IEnumerable<string> FindTopicOrderViolations(
@@ -1350,6 +1569,24 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
         PlacementRow Row,
         bool IsCurrentValidationDraft);
 
+    private sealed record ModuleSequenceHistoryRow(
+        DateOnly Date,
+        TimeOnly Start,
+        TimeOnly End,
+        int GroupId,
+        string GroupName,
+        int ModuleId,
+        string LessonTypeCode);
+
+    private sealed record ModuleSequencePlacement(
+        DateOnly Date,
+        TimeOnly Start,
+        TimeOnly End,
+        int GroupId,
+        string GroupName,
+        int ModuleId,
+        bool IsCurrentValidationDraft);
+
     private sealed record PlacementRow(
         bool IsDraft,
         DateOnly Date,
@@ -1393,7 +1630,8 @@ public sealed record TeacherDraftsAutogenHardRuleValidationRequest(
     IReadOnlyCollection<TeacherDraftsAutogenPendingDraft>? PendingDrafts = null,
     IReadOnlyCollection<int>? ExcludedDraftIds = null,
     bool IncludeStoredDrafts = true,
-    int? MaxParallelGroupsPerModuleInSlot = null);
+    int? MaxParallelGroupsPerModuleInSlot = null,
+    bool ScopePendingDraftsToCourse = false);
 
 public sealed record TeacherDraftsAutogenPendingDraft(
     DateOnly Date,

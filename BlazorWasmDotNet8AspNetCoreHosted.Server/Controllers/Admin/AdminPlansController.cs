@@ -3,6 +3,7 @@ using Microsoft.EntityFrameworkCore;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Admin;
 
@@ -50,11 +51,28 @@ public sealed class AdminPlansController : ControllerBase
                 || string.Equals(t.Code, "RESCHEDULED", System.StringComparison.OrdinalIgnoreCase))
             .Select(t => t.Id)
             .ToHashSet();
-        var scheduled = await _db.ScheduleItems
+        var scheduledRows = await _db.ScheduleItems
             .Where(si => si.ModuleId == moduleId
                          && si.Group.CourseId == resolvedCourseId
                          && !excludePlanIds.Contains(si.LessonTypeId))
-            .CountAsync();
+            .Select(si => new CurriculumScheduleRow(
+                si.Id,
+                si.Group.CourseId,
+                si.BatchKey,
+                si.Date,
+                si.StartTime,
+                si.EndTime,
+                si.GroupId,
+                si.ModuleId,
+                si.LessonTypeId,
+                si.ModuleTopicId,
+                si.TeacherId,
+                si.RoomId,
+                si.IsSelfStudy))
+            .ToListAsync();
+        var scheduled = CurriculumScheduleAggregation
+            .CollapseForPlan(scheduledRows)
+            .Sum(row => CurriculumScheduleAggregation.ScheduledHours(row.StartTime, row.EndTime));
         var plan = await _db.ModulePlans.AsNoTracking()
             .FirstOrDefaultAsync(p => p.CourseId == resolvedCourseId && p.ModuleId == moduleId);
         var row = new CourseModulePlanDto(
@@ -95,6 +113,8 @@ public sealed class AdminPlansController : ControllerBase
         var dto = items?.FirstOrDefault();
         if (dto is null)
             return BadRequest(new { message = "Некоректні дані" });
+        if (dto.TargetHours is < 0 or > 299999)
+            return BadRequest(new { message = "Планові години мають бути в діапазоні від 0 до 299999." });
         var plan = await _db.ModulePlans
             .FirstOrDefaultAsync(p => p.CourseId == resolvedCourseId && p.ModuleId == moduleId);
         if (plan is null)

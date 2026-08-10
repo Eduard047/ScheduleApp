@@ -112,14 +112,19 @@ public record DraftValidationIssueDto(
 // DTO звіту про валідацію чернетки.
 public record DraftValidationReportDto(
     DateTimeOffset GeneratedAt,
-    IReadOnlyList<DraftValidationIssueDto> Issues
+    IReadOnlyList<DraftValidationIssueDto> Issues,
+    Guid ScopeRevision = default
 );
 
 // DTO для запиту чернеток за тиждень.
 public record DraftWeekQuery(DateOnly WeekStart, int? TeacherId);
 
 // DTO для публікації тижня.
-public record PublishWeekRequest(DateOnly WeekStart, int? TeacherId);
+public record PublishWeekRequest(
+    DateOnly WeekStart,
+    int? TeacherId,
+    Guid? ExpectedScopeRevision = null
+);
 
 // DTO для автогенерації чернеток по місяцю.
 public record AutogenMonthRequest(
