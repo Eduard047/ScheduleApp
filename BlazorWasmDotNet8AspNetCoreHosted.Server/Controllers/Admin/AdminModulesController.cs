@@ -334,7 +334,16 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
                 .Select(di => new
                 {
                     di.Id,
+                    CourseId = di.Group.CourseId,
+                    di.Date,
+                    di.StartTime,
+                    di.EndTime,
+                    di.GroupId,
+                    di.ModuleId,
+                    di.LessonTypeId,
                     di.ModuleTopicId,
+                    di.TeacherId,
+                    di.RoomId,
                     di.BatchKey,
                     di.IsSelfStudy,
                     LessonTypeCode = di.LessonType != null ? (di.LessonType.Code ?? "") : "",
@@ -353,6 +362,8 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
                     .Where(si => reschedSourceIds.Contains(si.Id))
                     .Select(si => new { si.Id, si.ModuleTopicId })
                     .ToDictionaryAsync(x => x.Id, x => x.ModuleTopicId);
+            var plannedTopicRows = new List<CurriculumScheduleRow>();
+            var groupNamesById = new Dictionary<int, string>();
             foreach (var row in draftRows)
             {
                 if (string.IsNullOrWhiteSpace(row.GroupName)) continue;
@@ -369,27 +380,50 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
                 }
                 if (resolvedTopicId is null) continue;
                 if (!topicIds.Contains(resolvedTopicId.Value)) continue;
-                if (!plannedDict.TryGetValue(resolvedTopicId.Value, out var groups))
+                plannedTopicRows.Add(new CurriculumScheduleRow(
+                    row.Id,
+                    row.CourseId,
+                    row.BatchKey,
+                    row.Date,
+                    row.StartTime,
+                    row.EndTime,
+                    row.GroupId,
+                    row.ModuleId,
+                    row.LessonTypeId,
+                    resolvedTopicId,
+                    row.TeacherId,
+                    row.RoomId,
+                    row.IsSelfStudy));
+                groupNamesById[row.GroupId] = row.GroupName;
+            }
+            foreach (var row in CurriculumScheduleAggregation.CollapseForTopics(plannedTopicRows))
+            {
+                if (row.ModuleTopicId is not int resolvedTopicId
+                    || !groupNamesById.TryGetValue(row.GroupId, out var groupName))
+                {
+                    continue;
+                }
+                if (!plannedDict.TryGetValue(resolvedTopicId, out var groups))
                 {
                     groups = new List<string>();
-                    plannedDict[resolvedTopicId.Value] = groups;
+                    plannedDict[resolvedTopicId] = groups;
                 }
-                if (!groups.Contains(row.GroupName))
+                if (!groups.Contains(groupName))
                 {
-                    groups.Add(row.GroupName);
+                    groups.Add(groupName);
                 }
-                if (!plannedHoursDict.TryGetValue(resolvedTopicId.Value, out var hoursByGroup))
+                if (!plannedHoursDict.TryGetValue(resolvedTopicId, out var hoursByGroup))
                 {
                     hoursByGroup = new Dictionary<string, TopicGroupHoursDto>(StringComparer.CurrentCultureIgnoreCase);
-                    plannedHoursDict[resolvedTopicId.Value] = hoursByGroup;
+                    plannedHoursDict[resolvedTopicId] = hoursByGroup;
                 }
-                if (!hoursByGroup.TryGetValue(row.GroupName, out var stat))
+                if (!hoursByGroup.TryGetValue(groupName, out var stat))
                 {
-                    stat = new TopicGroupHoursDto(row.GroupName, 0, 0);
+                    stat = new TopicGroupHoursDto(groupName, 0, 0);
                 }
                 var aud = stat.AuditoriumHours + (row.IsSelfStudy ? 0 : 1);
                 var self = stat.SelfStudyHours + (row.IsSelfStudy ? 1 : 0);
-                hoursByGroup[row.GroupName] = new TopicGroupHoursDto(row.GroupName, aud, self);
+                hoursByGroup[groupName] = new TopicGroupHoursDto(groupName, aud, self);
             }
             foreach (var kvp in plannedDict.ToList())
             {
@@ -401,27 +435,54 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
                 .Where(si =>
                     si.LessonType != null
                     && !excludeCompletedCodes.Contains((si.LessonType.Code ?? "").ToUpper()))
-                .Select(si => new { TopicId = si.ModuleTopicId!.Value, GroupName = si.Group.Name, si.IsSelfStudy })
+                .Select(si => new CurriculumScheduleRow(
+                    si.Id,
+                    si.Group.CourseId,
+                    si.BatchKey,
+                    si.Date,
+                    si.StartTime,
+                    si.EndTime,
+                    si.GroupId,
+                    si.ModuleId,
+                    si.LessonTypeId,
+                    si.ModuleTopicId,
+                    si.TeacherId,
+                    si.RoomId,
+                    si.IsSelfStudy))
                 .ToListAsync();
+            completedRows = CurriculumScheduleAggregation.CollapseForTopics(completedRows).ToList();
+            var completedGroupNames = await db.Groups
+                .Where(group => completedRows.Select(row => row.GroupId).Contains(group.Id))
+                .ToDictionaryAsync(group => group.Id, group => group.Name);
             completedDict = completedRows
-                .DistinctBy(x => new { x.TopicId, x.GroupName })
-                .GroupBy(x => x.TopicId)
-                .ToDictionary(g => g.Key, g => g.Select(x => x.GroupName).OrderBy(x => x).ToList());
+                .Where(row => row.ModuleTopicId is not null && completedGroupNames.ContainsKey(row.GroupId))
+                .DistinctBy(row => new { TopicId = row.ModuleTopicId!.Value, row.GroupId })
+                .GroupBy(row => row.ModuleTopicId!.Value)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group
+                        .Select(row => completedGroupNames[row.GroupId])
+                        .OrderBy(name => name)
+                        .ToList());
             foreach (var row in completedRows)
             {
-                if (string.IsNullOrWhiteSpace(row.GroupName)) continue;
-                if (!completedHoursDict.TryGetValue(row.TopicId, out var hoursByGroup))
+                if (row.ModuleTopicId is not int topicId
+                    || !completedGroupNames.TryGetValue(row.GroupId, out var groupName))
+                {
+                    continue;
+                }
+                if (!completedHoursDict.TryGetValue(topicId, out var hoursByGroup))
                 {
                     hoursByGroup = new Dictionary<string, TopicGroupHoursDto>(StringComparer.CurrentCultureIgnoreCase);
-                    completedHoursDict[row.TopicId] = hoursByGroup;
+                    completedHoursDict[topicId] = hoursByGroup;
                 }
-                if (!hoursByGroup.TryGetValue(row.GroupName, out var stat))
+                if (!hoursByGroup.TryGetValue(groupName, out var stat))
                 {
-                    stat = new TopicGroupHoursDto(row.GroupName, 0, 0);
+                    stat = new TopicGroupHoursDto(groupName, 0, 0);
                 }
                 var aud = stat.AuditoriumHours + (row.IsSelfStudy ? 0 : 1);
                 var self = stat.SelfStudyHours + (row.IsSelfStudy ? 1 : 0);
-                hoursByGroup[row.GroupName] = new TopicGroupHoursDto(row.GroupName, aud, self);
+                hoursByGroup[groupName] = new TopicGroupHoursDto(groupName, aud, self);
             }
         }
         var result = topics.Select(t =>
@@ -480,6 +541,8 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
         var trimmedTopicCode = dto.TopicCode?.Trim() ?? string.Empty;
         if (string.IsNullOrWhiteSpace(trimmedTopicCode))
             return BadRequest(new { message = "Код теми є обов'язковим." });
+        if (trimmedTopicCode.Length > 64)
+            return BadRequest(new { message = "Код теми не може перевищувати 64 символи." });
         var normalizedTopicCode = trimmedTopicCode;
         if (dto.AuditoriumHours < 0 || dto.SelfStudyHours < 0)
         {
@@ -782,6 +845,13 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
                 db.ModuleCourses.Remove(detachedLink);
             }
             await db.SaveChangesAsync();
+            await new AggregatesService(db).RecalcAsync(
+                new[]
+                {
+                    (CourseId: courseId, ModuleId: source.Id),
+                    (CourseId: courseId, ModuleId: target.Id)
+                },
+                Array.Empty<(int TeacherId, int CourseId)>());
             if (tx is not null)
             {
                 await tx.CommitAsync();
@@ -957,7 +1027,6 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
             else
             {
                 targetPlan.TargetHours = sourcePlan.TargetHours;
-                targetPlan.ScheduledHours = sourcePlan.ScheduledHours;
                 targetPlan.IsActive = sourcePlan.IsActive;
                 db.ModulePlans.Remove(sourcePlan);
             }

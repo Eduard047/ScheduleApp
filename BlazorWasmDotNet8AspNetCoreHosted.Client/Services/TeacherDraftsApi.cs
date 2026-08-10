@@ -17,6 +17,17 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
         await res.EnsureSuccessWithDetailsAsync();
         return await res.Content.ReadFromJsonAsync<List<TeacherDraftItemDto>>() ?? new();
     }
+    // Повторно перевіряє всі чернетки тижня незалежно від активних фільтрів.
+    public async Task<DraftValidationReportDto> ValidateWeek(DateOnly weekStart)
+    {
+        var url = ApiClientHelpers.WithQuery(
+            "api/teacher-drafts/validate-week",
+            ("weekStart", weekStart.ToString("yyyy-MM-dd")));
+        var res = await http.GetAsync(url);
+        await res.EnsureSuccessWithDetailsAsync();
+        return await res.Content.ReadFromJsonAsync<DraftValidationReportDto>()
+               ?? throw new InvalidOperationException("Сервер не повернув результат перевірки тижня.");
+    }
     // Експортує чернетки тижня у файл.
     public async Task<byte[]> ExportWeek(DateOnly weekStart, int? teacherId, int? groupId, int? roomId)
     {

@@ -13,6 +13,66 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 public sealed class AdminControllerGuardrailTests
 {
     [Fact]
+    public async Task Department_upsert_rejects_name_longer_than_database_limit()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+
+        var result = await new AdminDepartmentsController(fixture.Db).Upsert(
+            new DepartmentEditDto(null, new string('К', 257), true));
+
+        Assert.IsType<BadRequestObjectResult>(result.Result);
+        Assert.Empty(await fixture.Db.Departments.AsNoTracking().ToListAsync());
+    }
+
+    [Fact]
+    public async Task Topic_upsert_rejects_code_longer_than_database_limit()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedRoomModelAsync(20, 20, 40);
+
+        var result = await new AdminModulesController(fixture.Db).UpsertTopic(
+            model.Module.Id,
+            new ModuleTopicDto(
+                null,
+                model.Module.Id,
+                1,
+                new string('Т', 65),
+                model.LessonType.Id,
+                null,
+                1,
+                1,
+                0,
+                false,
+                false));
+
+        Assert.IsType<BadRequestObjectResult>(result.Result);
+        Assert.Empty(await fixture.Db.ModuleTopics.AsNoTracking().ToListAsync());
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(300000)]
+    public async Task Module_plan_upsert_rejects_hours_outside_supported_range(int targetHours)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedRoomModelAsync(20, 20, 40);
+        var originalCredits = model.Module.Credits;
+
+        var result = await new AdminPlansController(fixture.Db).Upsert(
+            model.Module.Id,
+            new List<SaveCourseModulePlanDto> { new(targetHours, true) },
+            model.Course.Id);
+
+        Assert.IsType<BadRequestObjectResult>(result);
+        fixture.Db.ChangeTracker.Clear();
+        Assert.Empty(await fixture.Db.ModulePlans.AsNoTracking().ToListAsync());
+        Assert.Equal(originalCredits, await fixture.Db.Modules
+            .Where(module => module.Id == model.Module.Id)
+            .Select(module => module.Credits)
+            .SingleAsync());
+    }
+
+    [Fact]
     public async Task Group_course_move_preserves_group_calendar_exception_scope()
     {
         await using var fixture = await TestDatabase.CreateAsync();
@@ -1309,11 +1369,11 @@ public sealed class AdminControllerGuardrailTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task Calendar_upsert_rejects_new_nonworking_scope_with_existing_placement(bool useDraft)
+    public async Task Calendar_upsert_rejects_new_nonworking_weekend_scope_with_existing_placement(bool useDraft)
     {
         await using var fixture = await TestDatabase.CreateAsync();
         var model = await fixture.SeedRoomModelAsync(20, 20, 40);
-        var date = new DateOnly(2026, 9, 7);
+        var date = new DateOnly(2026, 9, 5);
         if (useDraft)
         {
             fixture.Db.TeacherDraftItems.Add(CreateDraftItem(model, model.FirstGroup.Id, date));
@@ -1392,7 +1452,7 @@ public sealed class AdminControllerGuardrailTests
     }
 
     [Fact]
-    public async Task Calendar_delete_rejects_removing_working_override_when_weekend_fallback_is_nonworking()
+    public async Task Calendar_delete_allows_removing_redundant_working_weekend_override()
     {
         await using var fixture = await TestDatabase.CreateAsync();
         var model = await fixture.SeedRoomModelAsync(20, 20, 40);
@@ -1412,9 +1472,10 @@ public sealed class AdminControllerGuardrailTests
 
         var result = await new AdminConfigController(fixture.Db).CalendarDelete(exception.Id);
 
-        Assert.IsType<ConflictObjectResult>(result);
+        Assert.IsType<NoContentResult>(result);
         fixture.Db.ChangeTracker.Clear();
-        Assert.True(await fixture.Db.CalendarExceptions.AnyAsync(item => item.Id == exception.Id));
+        Assert.False(await fixture.Db.CalendarExceptions.AnyAsync(item => item.Id == exception.Id));
+        Assert.True(await fixture.Db.TeacherDraftItems.AnyAsync(item => item.GroupId == model.FirstGroup.Id && item.Date == date));
     }
 
     [Fact]

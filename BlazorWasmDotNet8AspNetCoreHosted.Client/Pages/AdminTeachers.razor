@@ -7,6 +7,11 @@
 
 <h3>Викладачі</h3>
 
+@if (edit is null && !string.IsNullOrWhiteSpace(error))
+{
+    <div class="alert alert-danger" role="alert">@error</div>
+}
+
 @if (loading)
 {
     <p>Завантаження…</p>
@@ -59,6 +64,10 @@ else
                       CssClass="teacher-editor"
                       OnClose="@Cancel">
             <div class="teacher-editor-body">
+                @if (!string.IsNullOrWhiteSpace(error))
+                {
+                    <div class="alert alert-danger" role="alert">@error</div>
+                }
                 <div class="row g-3">
                     <div class="col-md-5">
                         <label class="form-label">ПІБ</label>
@@ -227,6 +236,7 @@ else
     private List<TeacherViewDto> list = new();
     private TeacherEditDto? edit;
     private bool loading = true;
+    private string? error;
     private const string DepartmentField = "Department";
     private const string ModulesField = "ModulesCount";
     private const string ActiveCoursesField = "ActiveCourses";
@@ -256,6 +266,7 @@ else
     // Відкриває форму редагування викладача.
     private async Task Edit(int id)
     {
+        error = null;
         edit = await Http.GetFromJsonAsync<TeacherEditDto>($"api/admin/teachers/{id}");
     }
     private const string DefaultWhStart = "08:30";
@@ -263,6 +274,7 @@ else
     // Ініціалізує форму створення викладача.
     private void CreateNew()
     {
+        error = null;
         var defaultWorkingHours = Enumerable.Range(0, 7)
             .Select(ui => new TeacherWorkingHourDto((ui + 1) % 7, DefaultWhStart, DefaultWhEnd))
             .ToList();
@@ -282,17 +294,22 @@ else
     private async Task Save()
     {
         if (edit is null) return;
-        var resp = await Http.PostAsJsonAsync("api/admin/teachers/upsert", edit);
-        if (resp.IsSuccessStatusCode)
+        error = null;
+        try
         {
-            edit = null;
-            await LoadList();
-            StateHasChanged();
+            var resp = await Http.PostAsJsonAsync("api/admin/teachers/upsert", edit);
+            if (resp.IsSuccessStatusCode)
+            {
+                edit = null;
+                await LoadList();
+                StateHasChanged();
+                return;
+            }
+            error = await ReadErrorAsync(resp, "Не вдалося зберегти викладача.");
         }
-        else
+        catch (Exception ex)
         {
-            var msg = await resp.Content.ReadAsStringAsync();
-            Console.Error.WriteLine(msg);
+            error = $"Не вдалося зберегти викладача: {ex.Message}";
         }
     }
     // Видаляє викладача після підтвердження.
@@ -302,12 +319,48 @@ else
         var caption = teacher?.FullName ?? $"#{id}";
         var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити викладача {caption}? Дію не можна скасувати.");
         if (!confirmed) return;
-        var resp = await Http.DeleteAsync($"api/admin/teachers/{id}?confirm=true");
-        if (resp.IsSuccessStatusCode)
-            await LoadList();
+        error = null;
+        try
+        {
+            var resp = await Http.DeleteAsync($"api/admin/teachers/{id}?confirm=true");
+            if (resp.IsSuccessStatusCode)
+            {
+                await LoadList();
+                return;
+            }
+            error = await ReadErrorAsync(resp, "Не вдалося видалити викладача.");
+        }
+        catch (Exception ex)
+        {
+            error = $"Не вдалося видалити викладача: {ex.Message}";
+        }
+    }
+    // Витягує зрозуміле повідомлення з типової відповіді API.
+    private static async Task<string> ReadErrorAsync(HttpResponseMessage response, string fallback)
+    {
+        var body = await response.Content.ReadAsStringAsync();
+        if (string.IsNullOrWhiteSpace(body)) return fallback;
+        try
+        {
+            using var document = System.Text.Json.JsonDocument.Parse(body);
+            if (document.RootElement.TryGetProperty("message", out var message)
+                && message.ValueKind == System.Text.Json.JsonValueKind.String
+                && !string.IsNullOrWhiteSpace(message.GetString()))
+            {
+                return message.GetString()!;
+            }
+        }
+        catch (System.Text.Json.JsonException)
+        {
+        }
+        return body;
     }
     // Закриває форму редагування.
-    private void Cancel() => edit = null;
+    private void Cancel()
+    {
+        edit = null;
+        error = null;
+    }
     // Нормалізує значення прапорця.
     private static bool AsBool(object? v) => v is bool b ? b : bool.TryParse(v?.ToString(), out var bb) && bb;
     // Формує підпис модуля для відображення.

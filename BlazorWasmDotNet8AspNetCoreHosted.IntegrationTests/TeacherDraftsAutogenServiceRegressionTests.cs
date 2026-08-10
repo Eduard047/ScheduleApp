@@ -25,11 +25,22 @@ public sealed class TeacherDraftsAutogenServiceRegressionTests
         fixture.Db.Courses.Add(course);
         await fixture.Db.SaveChangesAsync();
 
-        var meta = await new MetaController(fixture.Db).Get(weekStart: null);
+        var action = await new MetaController(fixture.Db).Get(weekStart: null);
+        var meta = Assert.IsType<MetaResponseDto>(action.Value);
 
         var courseLookup = Assert.Single(meta.Courses);
         Assert.Equal(course.Id, courseLookup.Id);
         Assert.Equal(academicPeriodStartDate, courseLookup.AcademicPeriodStartDate);
+    }
+
+    [Fact]
+    public async Task Meta_rejects_unsupported_week_start_before_range_calculation()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+
+        var result = await new MetaController(fixture.Db).Get(DateOnly.MaxValue);
+
+        Assert.IsType<BadRequestObjectResult>(result.Result);
     }
 
     [Fact]

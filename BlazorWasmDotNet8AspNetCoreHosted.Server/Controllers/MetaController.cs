@@ -11,8 +11,14 @@ public class MetaController(AppDbContext db) : ControllerBase
 {
     [HttpGet]
     // Повертає довідкові дані для клієнта, зокрема календар на тиждень.
-    public async Task<MetaResponseDto> Get([FromQuery] DateOnly? weekStart)
+    public async Task<ActionResult<MetaResponseDto>> Get([FromQuery] DateOnly? weekStart)
     {
+        if (weekStart is DateOnly requestedWeekStart
+            && !DateHelpers.IsSupportedScheduleDate(requestedWeekStart))
+        {
+            return BadRequest(new { message = DateHelpers.SupportedScheduleDateMessage });
+        }
+
         var courses = await db.Courses.AsNoTracking()
             .Select(x => new LookupDto(x.Id, x.Name)
             {

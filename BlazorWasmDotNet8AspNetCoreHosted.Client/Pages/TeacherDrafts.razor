@@ -75,9 +75,14 @@
     private bool _isPublishing;
     private bool _draftMutationInProgress;
     private int _reloadVersion;
+    private int _draftItemsReloadVersion;
+    private int _editorLoadVersion;
     private bool _reloadInProgress;
     private bool _hasFreshSuccessfulLoad;
     private List<string> _publishWarnings = new();
+    private DraftValidationReportDto? _weekValidationReport;
+    private string? _weekValidationError;
+    private readonly HashSet<DateOnly> _manuallyChangedWeeks = new();
     private readonly HashSet<int> _expandedWarningSlots = new();
     private readonly Dictionary<int, DraftValidationReportDto> _warningReports = new();
     private static readonly JsonSerializerOptions WarningJsonOptions = new()
@@ -102,6 +107,7 @@
         PropertyNameCaseInsensitive = true
     };
     private const string ConflictStorageKey = "teacherDrafts.conflicts.v1";
+    private const string ManualReviewStorageKey = "teacherDrafts.manualReviewWeeks.v1";
     private const string MixedTopicLessonTypeError = "Можна обрати кілька тем лише з однаковим типом заняття.";
     private record SlotRow(string Start, string End) { public string Label => $"{Start}-{End}"; }
     private List<SlotRow> _rows = new();
@@ -114,14 +120,12 @@
     private bool _showProblemsOnly;
     private bool _manualEditingEnabled;
     private bool _showPublishedScheduleLink;
-    private int _groupPageIndex;
     private DateOnly? _loadedWeekStart;
     private int? _loadedCourseId;
     private ElementReference _bulkDialogElement;
     private ElementReference _editDialogElement;
     private bool _bulkDialogWasOpen;
     private bool _editDialogWasOpen;
-    private const int GroupsPerPage = 4;
     private static readonly string[] UkrainianDayNames = { "Неділя", "Понеділок", "Вівторок", "Середа", "Четвер", "П'ятниця", "Субота" };
     private DragPayload? _dragPayload;
     private SlotKey? _dragHover;
@@ -130,24 +134,48 @@
         => _isPublishing || _bulkApplying || _isProcessingDrop || _draftMutationInProgress || _reloadInProgress;
     private bool HasWeekItems
         => _items.Count > 0;
+    private IReadOnlyList<DraftValidationIssueDto> VisibleWeekValidationIssues
+    {
+        get
+        {
+            var issues = _weekValidationReport?.Issues.ToList() ?? new List<DraftValidationIssueDto>();
+            if (_manuallyChangedWeeks.Contains(_weekStart)
+                && string.IsNullOrWhiteSpace(_weekValidationError)
+                && HasValidatedLoadedWeekScope
+                && !issues.Any(issue => string.Equals(
+                    issue.Code,
+                    "autogen-applied-scope-changed",
+                    StringComparison.OrdinalIgnoreCase)))
+            {
+                issues.Add(new DraftValidationIssueDto(
+                    "warning",
+                    "manual-week-change",
+                    "Ручні зміни потребують перегляду",
+                    "Заняття було додано, переміщено, змінено або видалено вручну. Автоматична перевірка завершена; перегляньте порядок і повноту тижня перед публікацією."));
+            }
+            return issues;
+        }
+    }
+    private bool HasCriticalWeekIssues
+        => VisibleWeekValidationIssues.Any(issue =>
+            string.Equals(issue.Severity, "error", StringComparison.OrdinalIgnoreCase)) == true;
+    private Guid LoadedWeekScopeRevision
+        => LogicalRevisionToken.Combine(_items.Select(item =>
+            new KeyValuePair<int, Guid>(item.Id, item.Revision)));
+    private bool HasValidatedLoadedWeekScope
+        => _weekValidationReport is not null
+           && _weekValidationReport.ScopeRevision == LoadedWeekScopeRevision;
     private bool CanPublishDrafts
         => _hasFreshSuccessfulLoad
+           && HasValidatedLoadedWeekScope
            && string.IsNullOrWhiteSpace(_err)
+           && string.IsNullOrWhiteSpace(_weekValidationError)
+           && _publishWarnings.Count == 0
+           && !HasCriticalWeekIssues
            && HasWeekItems
            && !IsDraftMutationBusy
            && _edit is null
            && !_bulkEditOpen;
-    private int GroupPageCount
-        => _displayGroups.Count == 0 ? 0 : (int)Math.Ceiling(_displayGroups.Count / (double)GroupsPerPage);
-    private int GroupPageFirstNumber
-        => _displayGroups.Count == 0 ? 0 : (_groupPageIndex * GroupsPerPage) + 1;
-    private int GroupPageLastNumber
-        => Math.Min((_groupPageIndex + 1) * GroupsPerPage, _displayGroups.Count);
-    private List<LookupDto> PagedDisplayGroups
-        => _displayGroups
-            .Skip(_groupPageIndex * GroupsPerPage)
-            .Take(GroupsPerPage)
-            .ToList();
     private int ProblemRecordCount
         => _matchingItems.Count(HasReportedIssues);
     private string PublishedScheduleUrl
@@ -162,6 +190,16 @@
             return $"/schedule?{string.Join("&", query)}";
         }
     }
+    private string PublishButtonTitle
+        => !HasWeekItems
+            ? "Немає записів для публікації"
+            : !_hasFreshSuccessfulLoad
+                ? "Спочатку оновіть дані та повторно перевірте весь тиждень"
+            : !string.IsNullOrWhiteSpace(_weekValidationError) || !HasValidatedLoadedWeekScope
+                ? "Спочатку повторіть перевірку всього тижня"
+                : HasCriticalWeekIssues
+                    ? "Спочатку виправте критичні проблеми тижня"
+                    : $"Опублікувати весь тиждень: {FormatRecordCount(_items.Count)} у всіх статусах";
     // Блокує паралельну зміну чернеток під час публікації або іншої серверної операції.
     private bool TryBeginDraftMutation()
     {
@@ -171,6 +209,32 @@
         }
         _draftMutationInProgress = true;
         return true;
+    }
+    // Позначає тиждень після фактично успішної ручної зміни, навіть якщо обов'язкові правила не порушено.
+    private async Task MarkManualWeekChangeAsync(DateOnly changedWeekStart)
+    {
+        var normalizedWeekStart = FirstMonday(changedWeekStart);
+        _manuallyChangedWeeks.Add(normalizedWeekStart);
+        if (_weekStart == normalizedWeekStart)
+        {
+            _publishWarnings.Clear();
+        }
+        await SaveManualReviewWeeksAsync();
+    }
+    // Оновлює таблицю після зміни лише тоді, коли користувач досі переглядає той самий тиждень.
+    private async Task ReloadChangedWeekIfCurrentAsync(DateOnly changedWeekStart)
+    {
+        if (_weekStart == FirstMonday(changedWeekStart))
+        {
+            if (_reloadInProgress)
+            {
+                await Reload();
+            }
+            else
+            {
+                await ReloadDraftItemsOnlyAsync();
+            }
+        }
     }
     // Переносить фокус у щойно відкритий редактор, щоб клавіатура не залишалася на тлі.
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -216,6 +280,8 @@
     private const string LogActionCreate = "create-item";
     private const string LogActionDelete = "delete-item";
     private string CurrentConflictKey => $"{_weekStart:yyyy-MM-dd}|t:{_teacherId?.ToString() ?? "all"}|g:{_groupId?.ToString() ?? "all"}|r:{_roomId?.ToString() ?? "all"}|c:{_courseId?.ToString() ?? "all"}";
+    private bool IsOperationContextCurrent(string contextKey)
+        => string.Equals(CurrentConflictKey, contextKey, StringComparison.Ordinal);
     // Початкове завантаження метаданих, конфліктів та чернеток.
     protected override async Task OnInitializedAsync()
     {
@@ -231,6 +297,7 @@
                 ?? throw new InvalidOperationException("Сервер повернув порожні довідники.");
             RebuildMetaLookups();
             await LoadConflictsAsync();
+            await LoadManualReviewWeeksAsync();
         }
         catch (Exception ex)
         {
@@ -358,7 +425,6 @@
             ? MergeSlotRows(_rows, _matchingItems)
             : MergeSlotRows(Array.Empty<SlotRow>(), _filteredItems);
         _displayLookup = BuildLookup(_filteredItems);
-        NormalizeGroupPage();
     }
     // Прибирає попередній тиждень до завершення завантаження нового контексту.
     private void ClearLoadedDraftView()
@@ -374,6 +440,8 @@
         _displayLookup = new Dictionary<(int DayNumber, string Start, string End, int GroupId), TeacherDraftItemDto>();
         _loadedWeekStart = null;
         _loadedCourseId = null;
+        _weekValidationReport = null;
+        _weekValidationError = null;
         _warningReports.Clear();
         _expandedWarningSlots.Clear();
         ClearBulkSelection();
@@ -427,16 +495,6 @@
             .OrderBy(group => group.Name, StringComparer.CurrentCultureIgnoreCase)
             .ToList();
     }
-    // Утримує номер сторінки груп у межах доступного діапазону.
-    private void NormalizeGroupPage()
-    {
-        if (GroupPageCount == 0)
-        {
-            _groupPageIndex = 0;
-            return;
-        }
-        _groupPageIndex = Math.Clamp(_groupPageIndex, 0, GroupPageCount - 1);
-    }
     // Нормалізує query-параметр і перетворює 0/від'ємні значення на відсутність фільтра.
     private static int? NormalizeQueryId(int? value)
         => value is > 0 ? value : null;
@@ -444,6 +502,8 @@
     private async Task Reload()
     {
         var reloadVersion = ++_reloadVersion;
+        var draftItemsReloadVersion = ++_draftItemsReloadVersion;
+        _editorLoadVersion++;
         var requestedWeekStart = _weekStart;
         var requestedCourseId = _courseId;
         _hasFreshSuccessfulLoad = false;
@@ -473,12 +533,20 @@
         {
             await Task.WhenAll(draftsTask, slotsTask);
             if (reloadVersion != _reloadVersion
+                || draftItemsReloadVersion != _draftItemsReloadVersion
                 || requestedWeekStart != _weekStart
                 || requestedCourseId != _courseId)
             {
                 return;
             }
             await LoadConflictsAsync();
+            if (reloadVersion != _reloadVersion
+                || draftItemsReloadVersion != _draftItemsReloadVersion
+                || requestedWeekStart != _weekStart
+                || requestedCourseId != _courseId)
+            {
+                return;
+            }
             ApplyLoadedDraftItems(await draftsTask);
             var eff = await slotsTask;
             _slots = eff?.slots ?? new();
@@ -491,11 +559,23 @@
             RebuildDraftDisplayCache();
             _loadedWeekStart = requestedWeekStart;
             _loadedCourseId = requestedCourseId;
+            await RefreshWeekValidationAsync(
+                requestedWeekStart,
+                reloadVersion,
+                draftItemsReloadVersion);
+            if (reloadVersion != _reloadVersion
+                || draftItemsReloadVersion != _draftItemsReloadVersion
+                || requestedWeekStart != _weekStart
+                || requestedCourseId != _courseId)
+            {
+                return;
+            }
             _hasFreshSuccessfulLoad = true;
         }
         catch (ApiErrorException ex)
         {
-            if (reloadVersion == _reloadVersion)
+            if (reloadVersion == _reloadVersion
+                && draftItemsReloadVersion == _draftItemsReloadVersion)
             {
                 ClearLoadedDraftView();
                 await HandleApiError(ex);
@@ -503,7 +583,8 @@
         }
         catch (Exception ex)
         {
-            if (reloadVersion == _reloadVersion)
+            if (reloadVersion == _reloadVersion
+                && draftItemsReloadVersion == _draftItemsReloadVersion)
             {
                 ClearLoadedDraftView();
                 _err = ex.Message;
@@ -519,21 +600,89 @@
     }
     private async Task ReloadDraftItemsOnlyAsync()
     {
+        var reloadVersion = ++_draftItemsReloadVersion;
+        var requestedWeekStart = _weekStart;
+        var requestedCourseId = _courseId;
         _hasFreshSuccessfulLoad = false;
         try
         {
             await LoadConflictsAsync();
             // Локальні фільтри не повинні звужувати серверний пакет логічного заняття.
-            var items = await DraftsApi.GetWeek(_weekStart, null);
+            var items = await DraftsApi.GetWeek(requestedWeekStart, null);
+            if (reloadVersion != _draftItemsReloadVersion
+                || requestedWeekStart != _weekStart
+                || requestedCourseId != _courseId)
+            {
+                return;
+            }
             ApplyLoadedDraftItems(items);
-            _loadedWeekStart = _weekStart;
-            _loadedCourseId = _courseId;
+            _loadedWeekStart = requestedWeekStart;
+            _loadedCourseId = requestedCourseId;
+            await RefreshWeekValidationAsync(
+                requestedWeekStart,
+                expectedDraftItemsReloadVersion: reloadVersion);
+            if (reloadVersion != _draftItemsReloadVersion
+                || requestedWeekStart != _weekStart
+                || requestedCourseId != _courseId)
+            {
+                return;
+            }
             _hasFreshSuccessfulLoad = true;
         }
         catch
         {
+            if (reloadVersion != _draftItemsReloadVersion
+                || requestedWeekStart != _weekStart
+                || requestedCourseId != _courseId)
+            {
+                return;
+            }
             ClearLoadedDraftView();
             throw;
+        }
+    }
+    // Повторно перевіряє весь тиждень після кожної ручної зміни, а не лише змінений запис.
+    private async Task RefreshWeekValidationAsync(
+        DateOnly requestedWeekStart,
+        int? expectedReloadVersion = null,
+        int? expectedDraftItemsReloadVersion = null)
+    {
+        if (requestedWeekStart != _weekStart
+            || expectedReloadVersion is int initialVersion && initialVersion != _reloadVersion
+            || expectedDraftItemsReloadVersion is int initialItemsVersion
+            && initialItemsVersion != _draftItemsReloadVersion)
+        {
+            return;
+        }
+        _weekValidationReport = null;
+        _weekValidationError = null;
+        try
+        {
+            var report = await DraftsApi.ValidateWeek(requestedWeekStart);
+            if (requestedWeekStart != _weekStart
+                || expectedReloadVersion is int version && version != _reloadVersion
+                || expectedDraftItemsReloadVersion is int itemsVersion
+                && itemsVersion != _draftItemsReloadVersion)
+            {
+                return;
+            }
+            if (report.ScopeRevision != LoadedWeekScopeRevision)
+            {
+                _weekValidationError = "Чернетки змінилися під час перевірки. Оновіть дані, щоб побачити актуальний склад тижня.";
+                return;
+            }
+            _weekValidationReport = report;
+        }
+        catch (Exception ex)
+        {
+            if (requestedWeekStart != _weekStart
+                || expectedReloadVersion is int version && version != _reloadVersion
+                || expectedDraftItemsReloadVersion is int itemsVersion
+                && itemsVersion != _draftItemsReloadVersion)
+            {
+                return;
+            }
+            _weekValidationError = $"Не вдалося повторно перевірити весь тиждень: {ex.Message}";
         }
     }
     private void ApplyLoadedDraftItems(IReadOnlyList<TeacherDraftItemDto> items)
@@ -610,21 +759,36 @@
         if (_isExporting) return;
         _isExporting = true;
         _exportError = null;
+        var exportWeek = _weekStart;
+        var exportTeacherId = _teacherId;
+        var exportGroupId = _groupId;
+        var exportRoomId = _roomId;
+        var operationContextKey = CurrentConflictKey;
         try
         {
-            var bytes = await DraftsApi.ExportWeek(_weekStart, _teacherId, _groupId, _roomId);
+            var bytes = await DraftsApi.ExportWeek(
+                exportWeek,
+                exportTeacherId,
+                exportGroupId,
+                exportRoomId);
             if (bytes is null || bytes.Length == 0)
             {
-                _exportError = "Не вдалося сформувати файл Excel.";
+                if (IsOperationContextCurrent(operationContextKey))
+                {
+                    _exportError = "Не вдалося сформувати файл Excel.";
+                }
                 return;
             }
-            var fileName = $"Rozklad-{_weekStart:yyyyMMdd}.xlsx";
+            var fileName = $"Rozklad-{exportWeek:yyyyMMdd}.xlsx";
             await using var module = await JS.InvokeAsync<IJSObjectReference>("import", "./js/download.js");
             await module.InvokeVoidAsync("downloadFromBytes", fileName, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", bytes);
         }
         catch (Exception ex)
         {
-            _exportError = ex.Message;
+            if (IsOperationContextCurrent(operationContextKey))
+            {
+                _exportError = ex.Message;
+            }
         }
         finally
         {
@@ -643,6 +807,8 @@
         _showPublishedScheduleLink = false;
         _publishWarnings.Clear();
         var publishWeek = _weekStart;
+        var publishScopeRevision = _weekValidationReport!.ScopeRevision;
+        var operationContextKey = CurrentConflictKey;
         try
         {
             var confirmed = await JS.InvokeAsync<bool>(
@@ -652,10 +818,24 @@
             {
                 return;
             }
+            _hasFreshSuccessfulLoad = false;
             var result = await DraftsApi.PublishWeek(new PublishWeekRequest(
                 WeekStart: publishWeek,
-                TeacherId: null
+                TeacherId: null,
+                ExpectedScopeRevision: publishScopeRevision
             ));
+            if (result.Created > 0
+                && result.Skipped == 0
+                && !result.Warnings.Any(warning => !string.IsNullOrWhiteSpace(warning)))
+            {
+                _manuallyChangedWeeks.Remove(publishWeek);
+                await SaveManualReviewWeeksAsync();
+            }
+            await ReloadChangedWeekIfCurrentAsync(publishWeek);
+            if (!IsOperationContextCurrent(operationContextKey))
+            {
+                return;
+            }
             _publishWarnings = result.Warnings
                 .Where(warning => !string.IsNullOrWhiteSpace(warning))
                 .Select(warning => warning.Trim())
@@ -677,15 +857,17 @@
                 _ok = $"Для тижня {publishWeek:dd.MM.yyyy} – {publishWeek.AddDays(6):dd.MM.yyyy} немає чернеток для публікації.";
             }
             _showPublishedScheduleLink = result.Skipped == 0 && _publishWarnings.Count == 0;
-            await ReloadDraftItemsOnlyAsync();
         }
         catch (ApiErrorException ex)
         {
-            await HandleApiError(ex);
+            await HandleApiError(ex, operationContextKey);
         }
         catch (Exception ex)
         {
-            _err = ex.Message;
+            if (IsOperationContextCurrent(operationContextKey))
+            {
+                _err = ex.Message;
+            }
         }
         finally
         {
@@ -693,19 +875,34 @@
         }
     }
     // Ліниво завантажує та кешує теми модуля.
-    private async Task EnsureTopicsLoaded(int moduleId)
+    private async Task<bool> EnsureTopicsLoaded(int moduleId, int editorLoadVersion)
     {
-        if (moduleId <= 0) return;
-        if (_topicsCache.ContainsKey(moduleId)) return;
+        if (moduleId <= 0)
+        {
+            return editorLoadVersion == _editorLoadVersion;
+        }
+        if (_topicsCache.ContainsKey(moduleId))
+        {
+            return editorLoadVersion == _editorLoadVersion;
+        }
         try
         {
             var topics = await Http.GetFromJsonAsync<List<ModuleTopicViewDto>>($"api/admin/modules/{moduleId}/topics");
+            if (editorLoadVersion != _editorLoadVersion)
+            {
+                return false;
+            }
             _topicsCache[moduleId] = topics ?? new();
+            return true;
         }
         catch (Exception ex)
         {
+            if (editorLoadVersion != _editorLoadVersion)
+            {
+                return false;
+            }
             _err = ex.Message;
-            _topicsCache[moduleId] = new List<ModuleTopicViewDto>();
+            return false;
         }
     }
     private ModuleTopicViewDto? FindTopic(int moduleId, int? topicId)
@@ -888,12 +1085,24 @@
     }
     private async Task OnBulkModuleChanged(ChangeEventArgs e)
     {
+        _err = null;
+        var previousModuleId = _bulkModuleId;
+        var previousTopicIds = _bulkTopicIds.ToList();
+        var editorLoadVersion = ++_editorLoadVersion;
         _bulkModuleId = int.TryParse(e.Value?.ToString(), out var parsed) ? parsed : (int?)null;
         _bulkTopicIds.Clear();
         var effectiveModuleId = ResolveEffectiveBulkModuleId();
         if (effectiveModuleId is int moduleId)
         {
-            await EnsureTopicsLoaded(moduleId);
+            var loaded = await EnsureTopicsLoaded(moduleId, editorLoadVersion);
+            if (!loaded && editorLoadVersion == _editorLoadVersion)
+            {
+                _bulkModuleId = previousModuleId;
+                foreach (var topicId in previousTopicIds)
+                {
+                    _bulkTopicIds.Add(topicId);
+                }
+            }
         }
     }
     // Застосовує вибір теми й синхронізує залежні поля (тип заняття, викладач).
@@ -1057,14 +1266,47 @@
     private async Task OnModuleChanged(ChangeEventArgs e)
     {
         if (_edit is null) return;
+        _err = null;
+        var previousEdit = _edit;
+        var previousTopicIds = _editTopicIds.ToList();
+        var editorLoadVersion = ++_editorLoadVersion;
         var moduleId = int.TryParse(e.Value?.ToString(), out var parsed) ? parsed : 0;
-        await EnsureTopicsLoaded(moduleId);
-        var topics = OrderedTopicsForModule(moduleId);
         _editTopicIds.Clear();
-        _edit = _edit with { ModuleId = moduleId, ModuleTopicId = null };
+        _edit = previousEdit with
+        {
+            ModuleId = moduleId,
+            ModuleTopicId = null,
+            LessonTypeId = previousEdit.Id is null ? 0 : previousEdit.LessonTypeId
+        };
+        var loaded = await EnsureTopicsLoaded(moduleId, editorLoadVersion);
+        if (!loaded)
+        {
+            if (editorLoadVersion == _editorLoadVersion
+                && _edit is not null
+                && _edit.Id == previousEdit.Id
+                && _edit.ExpectedRevision == previousEdit.ExpectedRevision
+                && _edit.ModuleId == moduleId)
+            {
+                _edit = previousEdit;
+                _editTopicIds.Clear();
+                foreach (var topicId in previousTopicIds)
+                {
+                    _editTopicIds.Add(topicId);
+                }
+            }
+            return;
+        }
+        if (editorLoadVersion != _editorLoadVersion
+            || _edit is null
+            || _edit.Id != previousEdit.Id
+            || _edit.ExpectedRevision != previousEdit.ExpectedRevision
+            || _edit.ModuleId != moduleId)
+        {
+            return;
+        }
+        var topics = OrderedTopicsForModule(moduleId);
         if (_edit.Id is null)
         {
-            _edit = _edit with { LessonTypeId = 0 };
             return;
         }
         var shouldAttachTopic = !IsFinalAssessment(_edit.LessonTypeId);
@@ -1099,6 +1341,11 @@
         if (!DateOnly.TryParseExact(raw, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var newDate)
             && !DateOnly.TryParse(raw, out newDate))
         {
+            return;
+        }
+        if (newDate < _weekStart || newDate > _weekStart.AddDays(6))
+        {
+            _err = "У цьому редакторі заняття можна переносити лише в межах поточного тижня.";
             return;
         }
         var previousSlots = DaySlotsFor(_edit.Date);
@@ -1265,6 +1512,19 @@
     }
     private string GetSlotNumberLabel(SlotRow slot, int slotIndex)
     {
+        var configuredOrders = _slots
+            .Where(configured => configured.IsActive
+                                 && configured.Start == slot.Start
+                                 && configured.End == slot.End
+                                 && configured.SortOrder > 0)
+            .Select(configured => configured.SortOrder)
+            .Distinct()
+            .Take(2)
+            .ToList();
+        if (configuredOrders.Count == 1)
+        {
+            return configuredOrders[0].ToString("00");
+        }
         if (_rows.Count == 0) return (slotIndex + 1).ToString("00");
         var exactIndex = _rows.FindIndex(r => r.Start == slot.Start && r.End == slot.End);
         if (exactIndex >= 0) return (exactIndex + 1).ToString("00");
@@ -1287,6 +1547,21 @@
             .ToList();
         return OrderedTopicIdsForModule(moduleId, topicIds);
     }
+    // Не відкриває редактор для контексту, який користувач уже змінив під час очікування мережі.
+    private bool IsEditorLoadCurrent(
+        int version,
+        DateOnly weekStart,
+        int? courseId,
+        int? groupId,
+        int? teacherId,
+        int? roomId)
+        => version == _editorLoadVersion
+           && weekStart == _weekStart
+           && courseId == _courseId
+           && groupId == _groupId
+           && teacherId == _teacherId
+           && roomId == _roomId
+           && !IsDraftMutationBusy;
     // Готує форму редагування для існуючої чернетки.
     private async Task StartEdit(TeacherDraftItemDto item)
     {
@@ -1304,8 +1579,21 @@
             _err = "Зафіксоване заняття не можна редагувати. За потреби видаліть його в режимі без обмежень і створіть заново.";
             return;
         }
-        await EnsureTopicsLoaded(item.ModuleId);
-        if (IsDraftMutationBusy)
+        _err = null;
+        var editorLoadVersion = ++_editorLoadVersion;
+        var requestedWeekStart = _weekStart;
+        var requestedCourseId = _courseId;
+        var requestedGroupId = _groupId;
+        var requestedTeacherId = _teacherId;
+        var requestedRoomId = _roomId;
+        if (!await EnsureTopicsLoaded(item.ModuleId, editorLoadVersion)
+            || !IsEditorLoadCurrent(
+                editorLoadVersion,
+                requestedWeekStart,
+                requestedCourseId,
+                requestedGroupId,
+                requestedTeacherId,
+                requestedRoomId))
         {
             return;
         }
@@ -1316,15 +1604,41 @@
         }
         catch (ApiErrorException ex)
         {
+            if (!IsEditorLoadCurrent(
+                    editorLoadVersion,
+                    requestedWeekStart,
+                    requestedCourseId,
+                    requestedGroupId,
+                    requestedTeacherId,
+                    requestedRoomId))
+            {
+                return;
+            }
             await HandleApiError(ex);
             return;
         }
         catch (Exception ex)
         {
+            if (!IsEditorLoadCurrent(
+                    editorLoadVersion,
+                    requestedWeekStart,
+                    requestedCourseId,
+                    requestedGroupId,
+                    requestedTeacherId,
+                    requestedRoomId))
+            {
+                return;
+            }
             _err = ex.Message;
             return;
         }
-        if (IsDraftMutationBusy)
+        if (!IsEditorLoadCurrent(
+                editorLoadVersion,
+                requestedWeekStart,
+                requestedCourseId,
+                requestedGroupId,
+                requestedTeacherId,
+                requestedRoomId))
         {
             return;
         }
@@ -1400,6 +1714,13 @@
         {
             return;
         }
+        _err = null;
+        var editorLoadVersion = ++_editorLoadVersion;
+        var requestedWeekStart = _weekStart;
+        var requestedCourseId = _courseId;
+        var requestedGroupId = _groupId;
+        var requestedTeacherId = _teacherId;
+        var requestedRoomId = _roomId;
         _extraGroups.Clear();
         _extraTeachers.Clear();
         _editSourceItem = null;
@@ -1416,8 +1737,14 @@
             _err = "Немає доступних модулів для створення чернетки.";
             return;
         }
-        await EnsureTopicsLoaded(module.Id);
-        if (IsDraftMutationBusy)
+        if (!await EnsureTopicsLoaded(module.Id, editorLoadVersion)
+            || !IsEditorLoadCurrent(
+                editorLoadVersion,
+                requestedWeekStart,
+                requestedCourseId,
+                requestedGroupId,
+                requestedTeacherId,
+                requestedRoomId))
         {
             return;
         }
@@ -1444,7 +1771,7 @@
             GroupId: resolvedGroupId.Value,
             ModuleId: module.Id,
             ModuleTopicId: null,
-            TeacherId: _teacherId,
+            TeacherId: requestedTeacherId,
             RoomId: resolvedRoomId,
             RequiresRoom: requiresRoom,
             LessonTypeId: lessonTypeId,
@@ -1574,10 +1901,20 @@
         {
             return false;
         }
+        var hasExplicitBatch = !string.IsNullOrWhiteSpace(left.BatchKey)
+                               || !string.IsNullOrWhiteSpace(right.BatchKey);
+        if (hasExplicitBatch
+            && !string.Equals(left.BatchKey?.Trim(), right.BatchKey?.Trim(), StringComparison.Ordinal))
+        {
+            return false;
+        }
         return left.ModuleId == right.ModuleId
                && left.LessonTypeId == right.LessonTypeId
                && left.RoomId == right.RoomId
                && left.ModuleTopicId == right.ModuleTopicId
+               && left.Status == right.Status
+               && left.IsLocked == right.IsLocked
+               && left.IsRescheduled == right.IsRescheduled
                && HasSameTeacherForGroupMerge(left, right);
     }
     // Обчислює ширину об'єднаного блоку лекції (в кількості групових колонок).
@@ -1825,16 +2162,31 @@
                 return;
             }
             _err = null;
+            var editorLoadVersion = ++_editorLoadVersion;
+            var requestedWeekStart = _weekStart;
+            var requestedCourseId = _courseId;
+            var requestedGroupId = _groupId;
+            var requestedTeacherId = _teacherId;
+            var requestedRoomId = _roomId;
             _bulkTopicIds.Clear();
             _bulkModuleId = null;
             var moduleId = ResolveEffectiveBulkModuleId();
             if (moduleId is int mid)
             {
-                await EnsureTopicsLoaded(mid);
-                if (IsDraftMutationBusy)
+                if (!await EnsureTopicsLoaded(mid, editorLoadVersion))
                 {
                     return;
                 }
+            }
+            if (!IsEditorLoadCurrent(
+                    editorLoadVersion,
+                    requestedWeekStart,
+                    requestedCourseId,
+                    requestedGroupId,
+                    requestedTeacherId,
+                    requestedRoomId))
+            {
+                return;
             }
             _bulkEditOpen = true;
             return;
@@ -1844,6 +2196,7 @@
     // Закриває масове редагування.
     private void CloseBulkEdit()
     {
+        _editorLoadVersion++;
         _bulkEditOpen = false;
         _bulkTeacherIds.Clear();
         _bulkRoomId = null;
@@ -1933,6 +2286,8 @@
             _err = "Обрані пари не знайдені у поточному тижні.";
             return;
         }
+        var changedWeekStart = FirstMonday(selectedItems[0].Date);
+        var operationContextKey = CurrentConflictKey;
         if (selectedItems.Any(item => item.Status != DraftStatusDto.Draft))
         {
             _err = "Схвалені заняття не можна масово редагувати. Видаліть їх у режимі без обмежень або опублікуйте без змін.";
@@ -2069,6 +2424,7 @@
             updated = 0;
             if (upsertRequests.Count > 0 || deleteIds.Count > 0)
             {
+                _hasFreshSuccessfulLoad = false;
                 var mutationResult = await DraftsApi.MutateBatch(new TeacherDraftBatchMutationRequest(
                     upsertRequests,
                     deleteIds.OrderBy(id => id).ToList(),
@@ -2076,23 +2432,31 @@
                     Unrestricted: _unrestrictedMode,
                     DeleteExpectedRevisions: BuildExpectedRevisionMap(deleteIds, _items)));
                 updated = mutationResult.Upserted + mutationResult.Deleted;
+                await MarkManualWeekChangeAsync(changedWeekStart);
+                await ReloadChangedWeekIfCurrentAsync(changedWeekStart);
+                if (!IsOperationContextCurrent(operationContextKey))
+                {
+                    return;
+                }
             }
             _ok = $"Оновлено пар: {updated}. Пропущено: {skipped}.";
             if (skippedLocked > 0)
             {
                 _ok += $" Заблокованих: {skippedLocked}.";
             }
-            await ReloadDraftItemsOnlyAsync();
             ClearBulkSelection();
             CloseBulkEdit();
         }
         catch (ApiErrorException ex)
         {
-            await HandleApiError(ex);
+            await HandleApiError(ex, operationContextKey);
         }
         catch (Exception ex)
         {
-            _err = ex.Message;
+            if (IsOperationContextCurrent(operationContextKey))
+            {
+                _err = ex.Message;
+            }
         }
         finally
         {
@@ -2191,7 +2555,6 @@
     {
         _dragPayload = null;
         _dragHover = null;
-        _isProcessingDrop = false;
         StateHasChanged();
     }
     private void OnSlotDragEnter(SlotKey key, TeacherDraftItemDto? target)
@@ -2251,6 +2614,8 @@
         }
         var sourceItem = _dragPayload.Snapshot;
         var sourceEventSnapshot = _dragPayload.EventSnapshot;
+        var changedWeekStart = FirstMonday(sourceItem.Date);
+        var operationContextKey = CurrentConflictKey;
         if (targetItem?.IsLocked == true && targetItem.Id != sourceItem.Id)
         {
             _err = "Неможливо перенести пару у заблокований слот.";
@@ -2265,11 +2630,13 @@
         _ok = null;
         _err = null;
         _isProcessingDrop = true;
+        _hasFreshSuccessfulLoad = false;
         try
         {
             if (targetItem is null)
             {
-                await MoveItemAsync(sourceItem, sourceEventSnapshot, targetKey);
+                var targetDate = DayToDate(targetKey.DayNumber);
+                await MoveItemAsync(sourceItem, sourceEventSnapshot, targetKey, targetDate);
             }
             else
             {
@@ -2284,15 +2651,23 @@
                     targetEventSnapshot,
                     targetKey);
             }
-            await ReloadDraftItemsOnlyAsync();
+            await MarkManualWeekChangeAsync(changedWeekStart);
+            await ReloadChangedWeekIfCurrentAsync(changedWeekStart);
+            if (!IsOperationContextCurrent(operationContextKey))
+            {
+                return;
+            }
         }
         catch (ApiErrorException ex)
         {
-            await HandleApiError(ex);
+            await HandleApiError(ex, operationContextKey);
         }
         catch (Exception ex)
         {
-            _err = ex.Message;
+            if (IsOperationContextCurrent(operationContextKey))
+            {
+                _err = ex.Message;
+            }
         }
         finally
         {
@@ -2305,14 +2680,15 @@
     private async Task MoveItemAsync(
         TeacherDraftItemDto sourceItem,
         IReadOnlyList<TeacherDraftItemDto> sourceEventSnapshot,
-        SlotKey targetKey)
+        SlotKey targetKey,
+        DateOnly targetDate)
     {
         var weekItems = await DraftsApi.GetWeek(FirstMonday(sourceItem.Date), null);
         var currentSource = ResolveCurrentLogicalEventSource(weekItems, sourceItem);
         var sourceRows = ResolveMovableLogicalEventRows(weekItems, currentSource);
         EnsureLogicalEventSnapshotCurrent(sourceEventSnapshot, sourceRows);
         var target = new TeacherDraftRelocationTarget(
-            DayToDate(targetKey.DayNumber),
+            targetDate,
             targetKey.Start,
             targetKey.End,
             targetKey.GroupId);
@@ -2445,8 +2821,32 @@
     private async Task SaveEdit()
     {
         if (_edit is null || IsDraftMutationBusy) return;
+        var editRequest = _edit;
+        var sourceItem = _editSourceItem;
+        var sourceRevisions = new Dictionary<int, Guid>(_editSourceRevisions);
+        var selectedTopicIds = _editTopicIds.ToList();
+        var selectedExtraGroupIds = _extraGroups
+            .Select(item => item.GroupId)
+            .Where(id => id is > 0)
+            .Select(id => id!.Value)
+            .Distinct()
+            .ToList();
+        var selectedExtraTeacherIds = _extraTeachers
+            .Select(item => item.TeacherId)
+            .Where(id => id is > 0)
+            .Select(id => id!.Value)
+            .Distinct()
+            .ToList();
+        var unrestrictedMode = _unrestrictedMode;
         _ok = _err = null;
-        var lessonTypeId = _edit.LessonTypeId;
+        if (editRequest.Date < _weekStart || editRequest.Date > _weekStart.AddDays(6))
+        {
+            _err = "Збереження за межами поточного тижня заборонено. Відкрийте потрібний тиждень і додайте заняття там.";
+            return;
+        }
+        var changedWeekStart = FirstMonday(editRequest.Date);
+        var operationContextKey = CurrentConflictKey;
+        var lessonTypeId = editRequest.LessonTypeId;
         if (lessonTypeId <= 0)
         {
             var fallbackLessonTypeId = NoneLessonTypeId;
@@ -2466,47 +2866,51 @@
             var requestsToUpsert = new List<DraftUpsertRequest>();
             var deleteIds = new HashSet<int>();
             var primaryCount = 0;
-            var isNewDraft = _edit.Id is null;
-            var orderedTopicIds = ResolveOrderedEditTopicIds();
+            var isNewDraft = editRequest.Id is null;
+            var orderedTopicIds = OrderedTopicIdsForModule(editRequest.ModuleId, selectedTopicIds);
             if (IsFinalAssessment(lessonTypeId))
             {
                 orderedTopicIds.Clear();
             }
             if (orderedTopicIds.Count > 1
-                && !TopicsShareSingleLessonType(_edit.ModuleId, orderedTopicIds, out _))
+                && !TopicsShareSingleLessonType(editRequest.ModuleId, orderedTopicIds, out _))
             {
                 _err = MixedTopicLessonTypeError;
                 return;
             }
             var primaryTopicId = orderedTopicIds.Count == 0 ? (int?)null : orderedTopicIds[0];
-            var payload = ApplyTopicToRequest(_edit with
+            var payload = ApplyTopicToRequest(editRequest with
             {
                 LessonTypeId = lessonTypeId,
                 ModuleTopicId = primaryTopicId,
-                IgnoreValidationErrors = _unrestrictedMode
+                IgnoreValidationErrors = unrestrictedMode
             }, primaryTopicId);
             var existingLogicalEventRows = new List<TeacherDraftItemDto>();
             if (!isNewDraft)
             {
-                if (_editSourceItem is null || _editSourceItem.Id != _edit.Id)
+                if (sourceItem is null || sourceItem.Id != editRequest.Id)
                 {
                     _err = "Не вдалося визначити вихідне логічне заняття. Закрийте редактор, оновіть таблицю та повторіть спробу.";
                     return;
                 }
-                var currentWeekItems = await DraftsApi.GetWeek(FirstMonday(_editSourceItem.Date), null);
-                var currentSourceItem = currentWeekItems.FirstOrDefault(item => item.Id == _editSourceItem.Id);
-                if (currentSourceItem is null)
+                var currentWeekItems = await DraftsApi.GetWeek(FirstMonday(sourceItem.Date), null);
+                if (!IsOperationContextCurrent(operationContextKey))
                 {
-                    _err = $"Пара #{_editSourceItem.Id} вже не існує. Оновіть таблицю.";
                     return;
                 }
-                if (!TeacherDraftEditMutationPlanner.HasSameOriginalIdentity(_editSourceItem, currentSourceItem))
+                var currentSourceItem = currentWeekItems.FirstOrDefault(item => item.Id == sourceItem.Id);
+                if (currentSourceItem is null)
                 {
-                    _err = $"Пара #{_editSourceItem.Id} була змінена в іншому вікні. Закрийте редактор та оновіть таблицю.";
+                    _err = $"Пара #{sourceItem.Id} вже не існує. Оновіть таблицю.";
+                    return;
+                }
+                if (!TeacherDraftEditMutationPlanner.HasSameOriginalIdentity(sourceItem, currentSourceItem))
+                {
+                    _err = $"Пара #{sourceItem.Id} була змінена в іншому вікні. Закрийте редактор та оновіть таблицю.";
                     return;
                 }
                 existingLogicalEventRows = TeacherDraftEditMutationPlanner
-                    .SelectLogicalEventRows(currentWeekItems, _editSourceItem)
+                    .SelectLogicalEventRows(currentWeekItems, sourceItem)
                     .ToList();
                 if (existingLogicalEventRows.Count == 0)
                 {
@@ -2524,10 +2928,10 @@
                 : new List<SlotRow>();
             var hasRange = isNewDraft && slotRange.Count > 1;
             var extraGroupIds = isNewDraft
-                ? _extraGroups.Select(x => x.GroupId).Where(id => id is > 0).Select(id => id!.Value).Distinct().ToList()
+                ? selectedExtraGroupIds
                 : new List<int>();
             var extraTeacherIds = isNewDraft
-                ? _extraTeachers.Select(x => x.TeacherId).Where(id => id is > 0).Select(id => id!.Value).Distinct().ToList()
+                ? selectedExtraTeacherIds
                 : new List<int>();
             var hasExtras = isNewDraft && (extraGroupIds.Count > 0 || extraTeacherIds.Count > 0);
             var existingBatchKey = string.IsNullOrWhiteSpace(payload.BatchKey) ? null : payload.BatchKey;
@@ -2548,7 +2952,7 @@
                             .Select(item => new TeacherDraftEditExistingRow(item.Id, item.ModuleTopicId, item.TeacherId))
                             .ToList(),
                         singleSlotTopicIds,
-                        _editSourceItem!.TeacherId,
+                        sourceItem!.TeacherId,
                         payload.TeacherId);
                     foreach (var targetRow in editPlan.TargetRows)
                     {
@@ -2560,7 +2964,7 @@
                             BatchKey = resolvedBatchKey,
                             IgnoreValidationErrors = true,
                             ExpectedRevision = targetRow.ExistingId is int existingId
-                                ? RequireExpectedRevision(existingId, _editSourceRevisions)
+                                ? RequireExpectedRevision(existingId, sourceRevisions)
                                 : null
                         }, targetRow.ModuleTopicId);
                         requestsToUpsert.Add(request);
@@ -2576,7 +2980,7 @@
                         {
                             Id = null,
                             BatchKey = resolvedBatchKey ?? primaryRequest.BatchKey ?? $"clone-{Guid.NewGuid():N}",
-                            IgnoreValidationErrors = topicIndex > 0 || _unrestrictedMode
+                            IgnoreValidationErrors = topicIndex > 0 || unrestrictedMode
                         }, topicIdForRequest);
                         requestsToUpsert.Add(request);
                     }
@@ -2633,11 +3037,12 @@
             List<int> upsertedIds;
             int processed;
             var deleted = 0;
+            _hasFreshSuccessfulLoad = false;
             if (isNewDraft)
             {
                 var batchResult = await DraftsApi.UpsertBatch(new TeacherDraftBatchUpsertRequest(
                     requestsToUpsert,
-                    Unrestricted: _unrestrictedMode));
+                    Unrestricted: unrestrictedMode));
                 upsertedIds = batchResult.Ids;
                 processed = batchResult.Processed;
             }
@@ -2647,8 +3052,8 @@
                     requestsToUpsert,
                     deleteIds.OrderBy(id => id).ToList(),
                     Confirm: true,
-                    Unrestricted: _unrestrictedMode,
-                    DeleteExpectedRevisions: BuildExpectedRevisionMap(deleteIds, _editSourceRevisions)));
+                    Unrestricted: unrestrictedMode,
+                    DeleteExpectedRevisions: BuildExpectedRevisionMap(deleteIds, sourceRevisions)));
                 upsertedIds = mutationResult.UpsertedIds;
                 processed = mutationResult.Upserted;
                 deleted = mutationResult.Deleted;
@@ -2659,6 +3064,7 @@
             {
                 throw new InvalidOperationException("Сервер повернув неповний результат атомарного збереження.");
             }
+            await MarkManualWeekChangeAsync(changedWeekStart);
             var createdItemsForLog = new List<CreatedDraftLogItem>();
             if (isNewDraft)
             {
@@ -2670,6 +3076,12 @@
                         createdItemsForLog.Add(new CreatedDraftLogItem(upsertedIds[requestIndex], request));
                     }
                 }
+            }
+            await LogManualCreateAsync(createdItemsForLog);
+            await ReloadChangedWeekIfCurrentAsync(changedWeekStart);
+            if (!IsOperationContextCurrent(operationContextKey))
+            {
+                return;
             }
             if (!isNewDraft)
             {
@@ -2691,17 +3103,18 @@
             }
             _extraGroups.Clear();
             _extraTeachers.Clear();
-            await ReloadDraftItemsOnlyAsync();
             CancelEdit();
-            await LogManualCreateAsync(createdItemsForLog);
         }
         catch (ApiErrorException ex)
         {
-            await HandleApiError(ex);
+            await HandleApiError(ex, operationContextKey);
         }
         catch (Exception ex)
         {
-            _err = ex.Message;
+            if (IsOperationContextCurrent(operationContextKey))
+            {
+                _err = ex.Message;
+            }
         }
         finally
         {
@@ -2740,6 +3153,7 @@
         {
             return;
         }
+        _ok = _err = null;
         var selectedItems = _items
             .Where(x => _bulkSelectedIds.Contains(x.Id))
             .OrderBy(x => x.Date)
@@ -2750,6 +3164,8 @@
             _err = "Не знайдено виділених пар для видалення.";
             return;
         }
+        var changedWeekStart = FirstMonday(selectedItems[0].Date);
+        var operationContextKey = CurrentConflictKey;
         var lockedCount = selectedItems.Count(x => x.IsLocked);
         if (lockedCount > 0 && !_unrestrictedMode)
         {
@@ -2781,28 +3197,36 @@
         }
         try
         {
+            _hasFreshSuccessfulLoad = false;
             var deleteResult = await DraftsApi.DeleteBatch(new TeacherDraftBatchDeleteRequest(
                 idsToDelete.OrderBy(id => id).ToList(),
                 Unrestricted: _unrestrictedMode,
                 ExpectedRevisions: BuildExpectedRevisionMap(idsToDelete, deletedItemsMap.Values)));
-            _ok = $"Видалено {selectedItems.Count} виділених пар ({deleteResult.Deleted} записів).";
+            await MarkManualWeekChangeAsync(changedWeekStart);
+            var deleteSummary = $"Видалено {selectedItems.Count} виділених пар ({deleteResult.Deleted} записів).";
+            await LogManualDeleteAsync(deletedItemsMap.Values.ToList(), deleteSummary);
+            await ReloadChangedWeekIfCurrentAsync(changedWeekStart);
+            if (!IsOperationContextCurrent(operationContextKey))
+            {
+                return;
+            }
+            _ok = deleteSummary;
             _edit = null;
             _editSourceItem = null;
             _editSourceRevisions.Clear();
             _extraGroups.Clear();
             _extraTeachers.Clear();
-            await LogManualDeleteAsync(
-                deletedItemsMap.Values.ToList(),
-                _ok ?? $"Видалено {selectedItems.Count} виділених пар ({idsToDelete.Count} записів).");
-            await ReloadDraftItemsOnlyAsync();
         }
         catch (ApiErrorException ex)
         {
-            await HandleApiError(ex);
+            await HandleApiError(ex, operationContextKey);
         }
         catch (Exception ex)
         {
-            _err = ex.Message;
+            if (IsOperationContextCurrent(operationContextKey))
+            {
+                _err = ex.Message;
+            }
         }
         finally
         {
@@ -2816,12 +3240,15 @@
         {
             return;
         }
+        _ok = _err = null;
         var batch = CollectSlotItemsForDelete(item);
         if (batch.Count == 0)
         {
             _err = "Не знайдено записів для видалення.";
             return;
         }
+        var changedWeekStart = FirstMonday(item.Date);
+        var operationContextKey = CurrentConflictKey;
         var confirmText = batch.Count == 1
             ? $"Видалити пару #{item.Id}? Цю дію неможливо скасувати."
             : $"Видалити пару та всіх викладачів у цьому слоті? Буде видалено {batch.Count} записів. Цю дію неможливо скасувати.";
@@ -2833,30 +3260,38 @@
         }
         try
         {
+            _hasFreshSuccessfulLoad = false;
             var deleteResult = await DraftsApi.DeleteBatch(new TeacherDraftBatchDeleteRequest(
                 batch.Select(entry => entry.Id).Distinct().OrderBy(id => id).ToList(),
                 Unrestricted: _unrestrictedMode,
                 ExpectedRevisions: BuildExpectedRevisionMap(batch.Select(entry => entry.Id), batch)));
-            _ok = deleteResult.Deleted == 1
+            await MarkManualWeekChangeAsync(changedWeekStart);
+            var deleteSummary = deleteResult.Deleted == 1
                 ? $"Видалено (Id = {item.Id})."
                 : $"Видалено {deleteResult.Deleted} записів цієї пари.";
+            await LogManualDeleteAsync(batch, deleteSummary);
+            await ReloadChangedWeekIfCurrentAsync(changedWeekStart);
+            if (!IsOperationContextCurrent(operationContextKey))
+            {
+                return;
+            }
+            _ok = deleteSummary;
             _edit = null;
             _editSourceItem = null;
             _editSourceRevisions.Clear();
             _extraGroups.Clear();
             _extraTeachers.Clear();
-            await LogManualDeleteAsync(
-                batch,
-                _ok ?? (batch.Count == 1 ? $"Видалено (Id = {item.Id})." : $"Видалено {batch.Count} записів цієї пари."));
-            RemoveDraftItemsFromState(batch.Select(x => x.Id));
         }
         catch (ApiErrorException ex)
         {
-            await HandleApiError(ex);
+            await HandleApiError(ex, operationContextKey);
         }
         catch (Exception ex)
         {
-            _err = ex.Message;
+            if (IsOperationContextCurrent(operationContextKey))
+            {
+                _err = ex.Message;
+            }
         }
         finally
         {
@@ -2897,8 +3332,12 @@
            && left.RoomId == right.RoomId
            && left.IsSelfStudy == right.IsSelfStudy;
     // Узгоджене відображення помилок API та конфліктів.
-    private async Task HandleApiError(ApiErrorException ex)
+    private async Task HandleApiError(ApiErrorException ex, string? expectedContextKey = null)
     {
+        if (expectedContextKey is not null && !IsOperationContextCurrent(expectedContextKey))
+        {
+            return;
+        }
         var headline = ComposeErrorHeadline(ex);
         _err = headline;
         if (ex.StatusCode == HttpStatusCode.Conflict && (ex.Errors.Count > 0 || ex.Warnings.Count > 0))
@@ -2991,6 +3430,63 @@
         {
         }
     }
+    // Відновлює тижні з ручними змінами, які ще не були успішно опубліковані.
+    private async Task LoadManualReviewWeeksAsync()
+    {
+        try
+        {
+            var json = await JS.InvokeAsync<string?>("localStorage.getItem", ManualReviewStorageKey);
+            var values = string.IsNullOrWhiteSpace(json)
+                ? null
+                : JsonSerializer.Deserialize<List<string>>(json);
+            _manuallyChangedWeeks.Clear();
+            foreach (var value in values ?? new List<string>())
+            {
+                if (DateOnly.TryParseExact(
+                        value,
+                        "yyyy-MM-dd",
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.None,
+                        out var weekStart))
+                {
+                    _manuallyChangedWeeks.Add(FirstMonday(weekStart));
+                }
+            }
+        }
+        catch
+        {
+            _manuallyChangedWeeks.Clear();
+        }
+    }
+    // Зберігає локальний маркер, щоб застереження не зникало після оновлення сторінки.
+    private async Task SaveManualReviewWeeksAsync()
+    {
+        try
+        {
+            if (_manuallyChangedWeeks.Count == 0)
+            {
+                await JS.InvokeVoidAsync("localStorage.removeItem", ManualReviewStorageKey);
+                return;
+            }
+            var values = _manuallyChangedWeeks
+                .OrderByDescending(value => value)
+                .Take(32)
+                .Select(value => value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture))
+                .ToList();
+            _manuallyChangedWeeks.Clear();
+            _manuallyChangedWeeks.UnionWith(values.Select(value => DateOnly.ParseExact(
+                value,
+                "yyyy-MM-dd",
+                CultureInfo.InvariantCulture)));
+            await JS.InvokeVoidAsync(
+                "localStorage.setItem",
+                ManualReviewStorageKey,
+                JsonSerializer.Serialize(values));
+        }
+        catch
+        {
+        }
+    }
     private void SyncCurrentConflict()
     {
         _conflictStorage.TryGetValue(CurrentConflictKey, out _currentConflict);
@@ -3015,6 +3511,7 @@
     // Скидає стан редактора.
     private void CancelEdit()
     {
+        _editorLoadVersion++;
         _edit = null;
         _editSourceItem = null;
         _editSourceRevisions.Clear();
@@ -3106,6 +3603,7 @@
             .Take(LogLessonLimit)
             .Select(BuildCreatedLesson)
             .ToList();
+        var changedWeekStart = FirstMonday(ordered[0].Request.Date);
         var courseId = ResolveSingleCourseId(ordered);
         var summary = ordered.Count == 1
             ? "Створено 1 заняття вручну."
@@ -3118,8 +3616,8 @@
             Summary: summary,
             Success: true,
             Error: null,
-            WeekStart: _weekStart.ToString("yyyy-MM-dd"),
-            WeekEnd: _weekStart.AddDays(6).ToString("yyyy-MM-dd"),
+            WeekStart: changedWeekStart.ToString("yyyy-MM-dd"),
+            WeekEnd: changedWeekStart.AddDays(6).ToString("yyyy-MM-dd"),
             DaysPreset: null,
             AllowDaysOff: null,
             CourseId: courseId,
@@ -3180,6 +3678,7 @@
                 Source: "Чернетка"
             ))
             .ToList();
+        var changedWeekStart = FirstMonday(ordered[0].Date);
         var courseId = ResolveSingleCourseIdByGroups(ordered.Select(item => item.GroupId));
         var entry = new AdminScheduleLogEntry(
             Id: Guid.NewGuid().ToString("N"),
@@ -3189,8 +3688,8 @@
             Summary: summary,
             Success: true,
             Error: null,
-            WeekStart: _weekStart.ToString("yyyy-MM-dd"),
-            WeekEnd: _weekStart.AddDays(6).ToString("yyyy-MM-dd"),
+            WeekStart: changedWeekStart.ToString("yyyy-MM-dd"),
+            WeekEnd: changedWeekStart.AddDays(6).ToString("yyyy-MM-dd"),
             DaysPreset: null,
             AllowDaysOff: null,
             CourseId: courseId,
@@ -3379,10 +3878,9 @@ static string CssByCode(string code) => code switch
         Nav.NavigateTo(uri, replace: true);
         return true;
     }
-    // Повертає таблицю до компактного режиму перевірки на першій сторінці груп.
+    // Повертає таблицю до компактного режиму перевірки.
     private void ResetGridView()
     {
-        _groupPageIndex = 0;
         _manualEditingEnabled = false;
         ClearBulkSelection();
     }
@@ -3404,33 +3902,13 @@ static string CssByCode(string code) => code switch
     {
         _showProblemsOnly = false;
         _manualEditingEnabled = true;
-        _groupPageIndex = 0;
         RebuildDraftDisplayCache();
     }
     // Повертає компактний режим після ручного редагування порожніх слотів.
     private void DisableManualEditing()
     {
         _manualEditingEnabled = false;
-        _groupPageIndex = 0;
         RebuildDraftDisplayCache();
-    }
-    private void PreviousGroupPage()
-    {
-        if (_groupPageIndex <= 0)
-        {
-            return;
-        }
-        ClearBulkSelection();
-        _groupPageIndex--;
-    }
-    private void NextGroupPage()
-    {
-        if (_groupPageIndex >= GroupPageCount - 1)
-        {
-            return;
-        }
-        ClearBulkSelection();
-        _groupPageIndex++;
     }
     private DraftValidationReportDto? ParseWarningReport(string? raw)
     {
@@ -3456,6 +3934,15 @@ static string CssByCode(string code) => code switch
     {
         var critical = _publishWarnings.Count;
         var warnings = 0;
+        var visibleWeekIssues = VisibleWeekValidationIssues;
+        if (visibleWeekIssues.Count > 0)
+        {
+            var weekCounts = CountIssues(new DraftValidationReportDto(
+                _weekValidationReport?.GeneratedAt ?? DateTimeOffset.UtcNow,
+                visibleWeekIssues));
+            critical += weekCounts.errors;
+            warnings += weekCounts.warnings;
+        }
         foreach (var report in _warningReports.Values)
         {
             var counts = CountIssues(report);
@@ -3545,7 +4032,10 @@ else if (_meta is null)
 }
 else
 {
-@if (_hasFreshSuccessfulLoad && string.IsNullOrWhiteSpace(_err))
+@if (_hasFreshSuccessfulLoad
+     && string.IsNullOrWhiteSpace(_err)
+     && string.IsNullOrWhiteSpace(_weekValidationError)
+     && HasValidatedLoadedWeekScope)
 {
     var knownIssues = CountAllKnownIssues();
     var readinessClass = !HasWeekItems
@@ -3606,7 +4096,7 @@ else
             <button class="btn btn-primary btn-publish"
                     @onclick="PublishWeek"
                     disabled="@(!CanPublishDrafts)"
-                    title="@(HasWeekItems ? $"Опублікувати весь тиждень: {FormatRecordCount(_items.Count)} у всіх статусах" : "Немає записів для публікації")">
+                    title="@PublishButtonTitle">
                 <span class="btn-icon" aria-hidden="true">➤</span>
                 @(_isPublishing ? "Публікуємо..." : $"Опублікувати весь тиждень · {_items.Count}")
             </button>
@@ -3615,6 +4105,57 @@ else
             </span>
         </div>
     </section>
+}
+
+@if (_hasFreshSuccessfulLoad && VisibleWeekValidationIssues.Count > 0)
+{
+    var weekIssues = VisibleWeekValidationIssues;
+    var weekIssueCounts = CountIssues(new DraftValidationReportDto(
+        _weekValidationReport?.GeneratedAt ?? DateTimeOffset.UtcNow,
+        weekIssues));
+    <section class="week-validation-panel" aria-labelledby="week-validation-title">
+        <div class="week-validation-head">
+            <div>
+                <div class="week-validation-eyebrow">Автоматична перевірка після ручних змін</div>
+                <h2 id="week-validation-title">@(weekIssueCounts.errors > 0 ? "Знайдено проблеми у всьому тижні" : "Перевірте ручні зміни тижня")</h2>
+                <p>Перевірка оновлюється після додавання, перенесення, обміну, редагування та видалення занять.</p>
+            </div>
+            <div class="week-validation-counters" aria-label="Підсумок перевірки тижня">
+                @if (weekIssueCounts.errors > 0)
+                {
+                    <span class="week-validation-counter week-validation-counter--error">Критичних: @weekIssueCounts.errors</span>
+                }
+                @if (weekIssueCounts.warnings > 0)
+                {
+                    <span class="week-validation-counter week-validation-counter--warning">Застережень: @weekIssueCounts.warnings</span>
+                }
+            </div>
+        </div>
+        <div class="week-validation-list">
+            @foreach (var issue in weekIssues.Take(12))
+            {
+                var issueCss = string.Equals(issue.Severity, "error", StringComparison.OrdinalIgnoreCase)
+                    ? "week-validation-item week-validation-item--error"
+                    : "week-validation-item week-validation-item--warning";
+                <article class="@issueCss">
+                    <strong>@issue.Title</strong>
+                    <span>@issue.Description</span>
+                </article>
+            }
+        </div>
+        @if (weekIssues.Count > 12)
+        {
+            <div class="week-validation-more">Показано 12 із @weekIssues.Count проблем. Виправте їх і оновіть перевірку.</div>
+        }
+    </section>
+}
+
+@if (!_reloadInProgress && !string.IsNullOrWhiteSpace(_weekValidationError))
+{
+    <div class="alert alert-err week-validation-error" role="alert">
+        <span>@_weekValidationError</span>
+        <button class="btn btn-ghost btn-sm" type="button" @onclick="Reload" disabled="@IsDraftMutationBusy">Перевірити ще раз</button>
+    </div>
 }
 
 <div class="week-nav">
@@ -3649,7 +4190,10 @@ else
     <div class="toolbar-filters">
         <label class="filter-field">
             <span class="filter-label">Курс</span>
-            <select class="select" @bind="_courseId" @bind:after="OnCourseFilterChangedAsync">
+            <select class="select"
+                    @bind="_courseId"
+                    @bind:after="OnCourseFilterChangedAsync"
+                    disabled="@IsDraftMutationBusy">
                 <option value="">Всі курси</option>
                 @if (_meta is not null)
                 {
@@ -3662,7 +4206,10 @@ else
         </label>
         <label class="filter-field">
             <span class="filter-label">Група</span>
-            <select class="select" @bind="_groupId" @bind:after="OnGroupFilterChangedAsync">
+            <select class="select"
+                    @bind="_groupId"
+                    @bind:after="OnGroupFilterChangedAsync"
+                    disabled="@IsDraftMutationBusy">
                 <option value="">Всі групи</option>
                 @foreach (var g in CourseScopedGroups())
                 {
@@ -3699,7 +4246,10 @@ else
     <div class="additional-filters-body">
         <label class="filter-field">
             <span class="filter-label">Викладач</span>
-            <select class="select" @bind="_teacherId" @bind:after="OnFilterChangedAsync">
+            <select class="select"
+                    @bind="_teacherId"
+                    @bind:after="OnFilterChangedAsync"
+                    disabled="@IsDraftMutationBusy">
                 <option value="">Всі викладачі</option>
                 @if (_meta is not null)
                 {
@@ -3712,7 +4262,10 @@ else
         </label>
         <label class="filter-field">
             <span class="filter-label">Аудиторія</span>
-            <select class="select" @bind="_roomId" @bind:after="OnFilterChangedAsync">
+            <select class="select"
+                    @bind="_roomId"
+                    @bind:after="OnFilterChangedAsync"
+                    disabled="@IsDraftMutationBusy">
                 <option value="">Всі аудиторії</option>
                 @if (_meta is not null)
                 {
@@ -3891,7 +4444,7 @@ else if (!_manualEditingEnabled && _filteredItems.Count == 0)
 }
 else
 {
-    var groups = PagedDisplayGroups;
+    var groups = _displayGroups;
     var weekDays = _displayWeekDays;
     var slots = _displaySlots;
     var lookup = _displayLookup;
@@ -3911,24 +4464,7 @@ else
             <div class="grid-controls">
                 <div class="grid-mode">
                     <strong>@(_manualEditingEnabled ? "Ручне редагування" : _showProblemsOnly ? "Лише проблемні записи" : "Зайняті слоти")</strong>
-                    <span>Групи @GroupPageFirstNumber–@GroupPageLastNumber із @_displayGroups.Count</span>
-                </div>
-                <div class="group-pagination" aria-label="Сторінки груп">
-                    <button class="btn btn-ghost btn-sm"
-                            type="button"
-                            @onclick="PreviousGroupPage"
-                            disabled="@(_groupPageIndex == 0 || IsDraftMutationBusy)"
-                            aria-label="Попередні групи">
-                        ← Назад
-                    </button>
-                    <span>Сторінка @(_groupPageIndex + 1) із @GroupPageCount</span>
-                    <button class="btn btn-ghost btn-sm"
-                            type="button"
-                            @onclick="NextGroupPage"
-                            disabled="@(_groupPageIndex >= GroupPageCount - 1 || IsDraftMutationBusy)"
-                            aria-label="Наступні групи">
-                        Далі →
-                    </button>
+                    <span>Усі групи: @_displayGroups.Count · використовуйте нижню горизонтальну прокрутку</span>
                 </div>
                 @if (_manualEditingEnabled)
                 {
@@ -4033,7 +4569,7 @@ else
                                             {
                                                 <div class="td-empty-box">
                                                     <span class="td-empty">@(_showProblemsOnly ? "Без проблем" : "Вільно")</span>
-                                                    @if (_manualEditingEnabled)
+                                                    @if (!_showProblemsOnly)
                                                     {
                                                         <button type="button"
                                                                 class="btn btn-ghost btn-sm td-empty-add"
@@ -4325,6 +4861,8 @@ else
             <div class="editor-field">
                 <label for="teacher-draft-edit-date">Дата</label>
                 <input id="teacher-draft-edit-date" type="date" class="select"
+                       min="@_weekStart.ToString("yyyy-MM-dd")"
+                       max="@_weekStart.AddDays(6).ToString("yyyy-MM-dd")"
                        value="@_edit!.Date.ToString("yyyy-MM-dd")"
                        @onchange="OnEditDateChanged" />
             </div>

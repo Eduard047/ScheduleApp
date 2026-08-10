@@ -18,7 +18,9 @@ public sealed class DocxImportService
     private const int MaxTableCount = 500;
     private const int MaxRowCount = 20_000;
     private const int MaxCellCount = 100_000;
-    private static readonly Regex CourseCodeRegex = new(@"[A-Za-zА-Яа-яІіЇїЄєҐґ]{1,6}-\d+", RegexOptions.Compiled);
+    private static readonly Regex CourseCodeRegex = new(
+        @"(?<![A-Za-zА-Яа-яІіЇїЄєҐґ0-9])[A-Za-zА-Яа-яІіЇїЄєҐґ]{1,6}-\d+(?![A-Za-zА-Яа-яІіЇїЄєҐґ0-9])",
+        RegexOptions.Compiled);
     private static readonly Regex ModulePrefixRegex = new(@"\b\d+\.\d+\.\d+\b", RegexOptions.Compiled);
     private static readonly Regex TopicCodeRegex = new(@"\d+(?:\.\d+){2,}", RegexOptions.Compiled);
     private static readonly Regex LetterTopicCodeRegex = new(@"[A-Za-zА-Яа-яІіЇїЄєҐґ]+\.?((\d+\.?)+)", RegexOptions.Compiled);
@@ -114,24 +116,54 @@ public sealed class DocxImportService
         {
             return new DocxImportResultDto(string.Empty, null, false, parsedModules, warnings, "Не вдалося визначити назву курсу");
         }
-        var upperCourse = NormalizeCourseName(courseName);
+        var normalizedCourseName = NormalizeCourseName(courseName);
         var allCourses = await db.Courses.AsNoTracking().ToListAsync(ct);
-        var course = allCourses.FirstOrDefault(c => NormalizeCourseName(c.Name) == upperCourse)
-                     ?? allCourses.FirstOrDefault(c => NormalizeCourseName(c.Name).Contains(upperCourse));
+        var exactNameMatches = allCourses
+            .Where(course => NormalizeCourseName(course.Name) == normalizedCourseName)
+            .ToList();
+        if (exactNameMatches.Count > 1)
+        {
+            return new DocxImportResultDto(
+                courseName,
+                null,
+                false,
+                parsedModules,
+                warnings,
+                $"Знайдено кілька курсів із назвою \"{courseName}\". Уточніть назву курсу в документі або файлі");
+        }
+
+        Course? course = exactNameMatches.SingleOrDefault();
         if (course is null)
         {
-            var codeMatch = CourseCodeRegex.Match(courseName);
-            if (codeMatch.Success)
+            var requestedCodeMatch = CourseCodeRegex.Match(courseName);
+            var normalizedRequestedCode = requestedCodeMatch.Success
+                ? NormalizeCourseName(requestedCodeMatch.Value)
+                : string.Empty;
+            var codeMatches = string.IsNullOrWhiteSpace(normalizedRequestedCode)
+                ? new List<Course>()
+                : allCourses
+                    .Where(candidate => CourseCodeRegex
+                        .Matches(candidate.Name)
+                        .Cast<Match>()
+                        .Any(match => NormalizeCourseName(match.Value) == normalizedRequestedCode))
+                    .ToList();
+            if (codeMatches.Count == 0)
             {
-                var codeUpper = NormalizeCourseName(codeMatch.Value);
-                course = allCourses.FirstOrDefault(c => NormalizeCourseName(c.Name).Contains(codeUpper));
+                return new DocxImportResultDto(courseName, null, false, parsedModules, warnings, $"Не знайдено курс \"{courseName}\"");
             }
+            if (codeMatches.Count > 1)
+            {
+                return new DocxImportResultDto(
+                    courseName,
+                    null,
+                    false,
+                    parsedModules,
+                    warnings,
+                    $"Знайдено кілька курсів із кодом \"{courseName}\". Уточніть назву курсу в документі або файлі");
+            }
+            course = codeMatches[0];
         }
-        if (course is null)
-        {
-            return new DocxImportResultDto(courseName, null, false, parsedModules, warnings, $"Не знайдено курс \"{courseName}\"");
-        }
-        var result = new DocxImportResultDto(courseName, course.Id, true, parsedModules, warnings, null);
+        var result = new DocxImportResultDto(course.Name, course.Id, true, parsedModules, warnings, null);
         if (!apply)
         {
             return result;

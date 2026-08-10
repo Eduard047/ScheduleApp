@@ -782,6 +782,68 @@ public sealed class TeacherDraftsAutogenPlanService
             .ExecuteDeleteAsync(cancellationToken);
     }
 
+    // Завершує застосований план після публікації першої чернетки, яку створив цей план.
+    internal static async Task<int> ExpireAppliedPlansConsumedByPublicationAsync(
+        AppDbContext db,
+        IReadOnlyCollection<TeacherDraftItem> publishedDrafts,
+        CancellationToken cancellationToken = default)
+    {
+        if (publishedDrafts.Count == 0)
+        {
+            return 0;
+        }
+
+        var publishedPlanIds = publishedDrafts
+            .Select(item => item.GenerationJobId)
+            .Where(planId => !string.IsNullOrWhiteSpace(planId))
+            .Select(planId => planId!)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (publishedPlanIds.Count == 0)
+        {
+            return 0;
+        }
+
+        var candidates = await db.AutoGenDraftPlans
+            .Include(plan => plan.AutoGenJobRun)
+            .Where(plan => plan.State == (int)AutoGenPlanState.Applied
+                           && plan.AppliedScopeRevision != null
+                           && (plan.AddCount > 0 || plan.UpdateCount > 0)
+                           && publishedPlanIds.Contains(plan.PlanId))
+            .ToListAsync(cancellationToken);
+        var publishedPlanIdSet = publishedPlanIds.ToHashSet(StringComparer.Ordinal);
+        var nowUtc = DateTime.UtcNow;
+        var expiredCount = 0;
+        foreach (var plan in candidates)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!publishedPlanIdSet.Contains(plan.PlanId))
+            {
+                continue;
+            }
+
+            var previousVersion = plan.Version;
+            plan.State = (int)AutoGenPlanState.Expired;
+            plan.Version = previousVersion + 1;
+            plan.ExpiresAtUtc = nowUtc;
+            try
+            {
+                UpdatePersistedJobPlanStatus(plan);
+            }
+            catch (AutoGenPlanPersistenceException)
+            {
+                // Пошкоджений старий JSON не повинен скасовувати завершення спожитого плану або блокувати публікацію.
+            }
+            expiredCount++;
+        }
+
+        if (expiredCount > 0)
+        {
+            await db.SaveChangesAsync(cancellationToken);
+        }
+        return expiredCount;
+    }
+
     private static void EnsureScopeRevision(
         Guid expected,
         IEnumerable<TeacherDraftItem> rows,

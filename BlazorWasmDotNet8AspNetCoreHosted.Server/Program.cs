@@ -51,6 +51,7 @@ builder.Services.AddDbContextPool<AppDbContext>(opt => opt.UseMySql(cs, serverVe
 builder.Services.AddScoped<RulesService>();
 builder.Services.AddScoped<AggregatesService>();
 builder.Services.AddScoped<TeacherDraftsQueryService>();
+builder.Services.AddScoped<TeacherDraftsWeekValidationService>();
 builder.Services.AddScoped<TeacherDraftsExportService>();
 builder.Services.AddScoped<TeacherDraftsAutogenService>();
 builder.Services.AddScoped<TeacherDraftsAutogenPlanService>();

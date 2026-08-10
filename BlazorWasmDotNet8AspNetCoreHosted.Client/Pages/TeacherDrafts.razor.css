@@ -41,6 +41,101 @@
     .readiness-panel--warning { border-left-color: #f59e0b; }
     .readiness-panel--critical { border-left-color: #ef4444; }
     .readiness-panel--empty { border-left-color: #94a3b8; }
+    .week-validation-panel {
+        display: flex;
+        flex-direction: column;
+        gap: .85rem;
+        padding: 1rem 1.1rem;
+        border: 1px solid #f5c2c7;
+        border-radius: 16px;
+        background: #fffafb;
+        box-shadow: 0 1px 2px rgba(127, 29, 29, .05);
+    }
+    .week-validation-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 1rem;
+    }
+    .week-validation-eyebrow {
+        color: #9f1239;
+        font-size: .75rem;
+        font-weight: 750;
+        letter-spacing: .055em;
+        text-transform: uppercase;
+    }
+    .week-validation-head h2 {
+        margin: .2rem 0 .25rem;
+        color: #7f1d1d;
+        font-size: 1.08rem;
+    }
+    .week-validation-head p {
+        margin: 0;
+        color: #475569;
+        font-size: .86rem;
+        line-height: 1.45;
+    }
+    .week-validation-counters {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: .45rem;
+    }
+    .week-validation-counter {
+        display: inline-flex;
+        padding: .38rem .62rem;
+        border: 1px solid;
+        border-radius: 999px;
+        font-size: .78rem;
+        font-weight: 700;
+        white-space: nowrap;
+    }
+    .week-validation-counter--error {
+        border-color: #fecaca;
+        background: #fef2f2;
+        color: #b91c1c;
+    }
+    .week-validation-counter--warning {
+        border-color: #fde68a;
+        background: #fffbeb;
+        color: #92400e;
+    }
+    .week-validation-list {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        gap: .55rem;
+    }
+    .week-validation-item {
+        display: flex;
+        flex-direction: column;
+        gap: .2rem;
+        padding: .68rem .75rem;
+        border: 1px solid;
+        border-radius: 11px;
+        background: #fff;
+    }
+    .week-validation-item strong {
+        font-size: .86rem;
+    }
+    .week-validation-item span {
+        color: #475569;
+        font-size: .8rem;
+        line-height: 1.4;
+    }
+    .week-validation-item--error { border-color: #fecaca; }
+    .week-validation-item--error strong { color: #b91c1c; }
+    .week-validation-item--warning { border-color: #fde68a; }
+    .week-validation-item--warning strong { color: #92400e; }
+    .week-validation-more {
+        color: #64748b;
+        font-size: .8rem;
+    }
+    .week-validation-error {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: .75rem;
+    }
     .readiness-main {
         min-width: 0;
     }
@@ -483,10 +578,6 @@
         .grid-controls {
             grid-template-columns: 1fr auto;
         }
-        .group-pagination {
-            grid-column: 1 / -1;
-            grid-row: 2;
-        }
     }
     @media (max-width: 900px) {
         .teacher-drafts-headline-actions {
@@ -535,8 +626,7 @@
         .grid-controls {
             grid-template-columns: 1fr;
         }
-        .grid-controls > .btn,
-        .group-pagination {
+        .grid-controls > .btn {
             grid-column: auto;
             grid-row: auto;
             width: 100%;
@@ -690,7 +780,7 @@
     }
     .grid-controls {
         display: grid;
-        grid-template-columns: minmax(150px, 1fr) auto minmax(150px, 1fr);
+        grid-template-columns: minmax(150px, 1fr) auto;
         align-items: center;
         gap: .75rem;
         margin-bottom: .5rem;
@@ -711,19 +801,6 @@
     .grid-mode span {
         color: #64748b;
         font-size: .78rem;
-    }
-    .group-pagination {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        gap: .55rem;
-    }
-    .group-pagination > span {
-        min-width: 112px;
-        color: #475569;
-        font-size: .82rem;
-        font-weight: 650;
-        text-align: center;
     }
     .teacher-drafts-print-header {
         text-align: center;
@@ -756,6 +833,25 @@
         isolation: isolate;
         box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
         margin-bottom: 0;
+        scrollbar-color: #64748b #e2e8f0;
+        scrollbar-width: auto;
+    }
+    .teacher-drafts-table-wrapper::-webkit-scrollbar {
+        width: 14px;
+        height: 14px;
+    }
+    .teacher-drafts-table-wrapper::-webkit-scrollbar-track {
+        background: #e2e8f0;
+        border-radius: 999px;
+    }
+    .teacher-drafts-table-wrapper::-webkit-scrollbar-thumb {
+        min-width: 64px;
+        border: 3px solid #e2e8f0;
+        border-radius: 999px;
+        background: #64748b;
+    }
+    .teacher-drafts-table-wrapper::-webkit-scrollbar-thumb:hover {
+        background: #475569;
     }
     .teacher-drafts-table {
         width: max-content;
@@ -843,7 +939,7 @@
         overflow-x: hidden;
         overflow-y: visible;
     }
-    .td-cell--merged {
+    .teacher-drafts-table td.td-cell--merged {
         box-shadow: inset 0 0 0 2px #3b82f6;
         background: linear-gradient(180deg, #f8fbff 0%, #eef6ff 100%);
     }
@@ -1189,8 +1285,7 @@
         .grid-controls {
             grid-template-columns: minmax(0, 1fr);
         }
-        .grid-controls > .btn,
-        .group-pagination {
+        .grid-controls > .btn {
             grid-column: auto;
             grid-row: auto;
             width: 100%;
@@ -1198,14 +1293,6 @@
         }
         .grid-controls > .btn {
             justify-self: stretch;
-        }
-        .group-pagination {
-            justify-content: space-between;
-            flex-wrap: wrap;
-            gap: .35rem;
-        }
-        .group-pagination > span {
-            min-width: 0;
         }
         .teacher-drafts-table-wrapper {
             --td-day-col-width: 90px;

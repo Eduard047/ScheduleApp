@@ -4645,7 +4645,7 @@ public sealed class AutogenLecturePackingTests
             {
                 CourseId = courseId,
                 ModuleId = lectureModuleId,
-                GroupOrder = 2,
+                GroupOrder = 1,
                 Order = 2
             });
         db.Buildings.Add(new Building

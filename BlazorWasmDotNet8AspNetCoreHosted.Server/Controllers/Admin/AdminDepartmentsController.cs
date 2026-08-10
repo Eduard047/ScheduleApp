@@ -33,6 +33,10 @@ public sealed class AdminDepartmentsController(AppDbContext db) : ControllerBase
         {
             return BadRequest(new { message = "Назва кафедри є обов'язковою." });
         }
+        if (name.Length > 256)
+        {
+            return BadRequest(new { message = "Назва кафедри не може перевищувати 256 символів." });
+        }
         var id = dto.Id ?? 0;
         var duplicate = await db.Departments.AnyAsync(x => x.Id != id && x.Name == name);
         if (duplicate)

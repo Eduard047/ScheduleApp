@@ -5,6 +5,8 @@ public interface ITeacherDraftsApi
 {
     // Завантажує чернетки тижня.
     Task<List<TeacherDraftItemDto>> GetWeek(DateOnly weekStart, int? teacherId);
+    // Повторно перевіряє весь тиждень після ручних змін.
+    Task<DraftValidationReportDto> ValidateWeek(DateOnly weekStart);
     // Експортує чернетки у файл.
     Task<byte[]> ExportWeek(DateOnly weekStart, int? teacherId, int? groupId, int? roomId);
     // Створює або оновлює чернетку.

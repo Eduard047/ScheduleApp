@@ -65,6 +65,19 @@ public sealed class TeacherDraftsController : ControllerBase
         }
         return Ok(await _queryService.GetAsync(weekStart, teacherId, groupId, roomId));
     }
+    [HttpGet("validate-week")]
+    // Повторно перевіряє всі чернетки тижня незалежно від активних фільтрів клієнта.
+    public async Task<ActionResult<DraftValidationReportDto>> ValidateWeek(
+        [FromQuery] DateOnly weekStart,
+        [FromServices] TeacherDraftsWeekValidationService validationService,
+        CancellationToken cancellationToken)
+    {
+        if (!DateHelpers.IsSupportedScheduleDate(weekStart))
+        {
+            return BadRequest(new { message = DateHelpers.SupportedScheduleDateMessage });
+        }
+        return Ok(await validationService.ValidateAsync(weekStart, cancellationToken));
+    }
     [HttpGet("export")]
     // Експортує чернетки в Excel за фільтрами.
     public async Task<IActionResult> Export(

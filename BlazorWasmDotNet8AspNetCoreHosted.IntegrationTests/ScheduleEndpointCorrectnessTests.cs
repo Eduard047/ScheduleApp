@@ -899,6 +899,101 @@ public sealed class ScheduleEndpointCorrectnessTests
         Assert.Contains("надто великий", result.Error, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public async Task Docx_import_matches_exact_course_code_without_numeric_prefix_collision()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var longerCodeCourse = new Course { Name = "КН-10 — Старший курс", DurationWeeks = 52 };
+        var requestedCourse = new Course { Name = "КН-1 — Основний курс", DurationWeeks = 52 };
+        fixture.Db.Courses.AddRange(longerCodeCourse, requestedCourse);
+        await fixture.Db.SaveChangesAsync();
+        var bytes = CreateMinimalImportDocx();
+        await using var stream = new MemoryStream(bytes);
+        var file = new FormFile(stream, 0, bytes.Length, "file", "КН-1.docx");
+
+        var result = await new DocxImportService().ImportAsync(
+            file,
+            fixture.Db,
+            apply: false,
+            CancellationToken.None);
+
+        Assert.Null(result.Error);
+        Assert.True(result.CourseFound);
+        Assert.Equal(requestedCourse.Id, result.CourseId);
+        Assert.Equal(requestedCourse.Name, result.CourseName);
+    }
+
+    [Fact]
+    public async Task Docx_import_prefers_exact_normalized_name_over_ambiguous_code_matches()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var exactNameCourse = new Course { Name = "КН - 1", DurationWeeks = 52 };
+        fixture.Db.Courses.AddRange(
+            exactNameCourse,
+            new Course { Name = "КН-1 — Розширений курс", DurationWeeks = 52 });
+        await fixture.Db.SaveChangesAsync();
+        var bytes = CreateMinimalImportDocx();
+        await using var stream = new MemoryStream(bytes);
+        var file = new FormFile(stream, 0, bytes.Length, "file", "КН-1.docx");
+
+        var result = await new DocxImportService().ImportAsync(
+            file,
+            fixture.Db,
+            apply: false,
+            CancellationToken.None);
+
+        Assert.Null(result.Error);
+        Assert.True(result.CourseFound);
+        Assert.Equal(exactNameCourse.Id, result.CourseId);
+        Assert.Equal(exactNameCourse.Name, result.CourseName);
+    }
+
+    [Fact]
+    public async Task Docx_import_does_not_treat_longer_numeric_course_code_as_match()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        fixture.Db.Courses.Add(new Course { Name = "КН-10 — Інший курс", DurationWeeks = 52 });
+        await fixture.Db.SaveChangesAsync();
+        var bytes = CreateMinimalImportDocx();
+        await using var stream = new MemoryStream(bytes);
+        var file = new FormFile(stream, 0, bytes.Length, "file", "КН-1.docx");
+
+        var result = await new DocxImportService().ImportAsync(
+            file,
+            fixture.Db,
+            apply: false,
+            CancellationToken.None);
+
+        Assert.NotNull(result.Error);
+        Assert.False(result.CourseFound);
+        Assert.Null(result.CourseId);
+        Assert.Contains("Не знайдено", result.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Docx_import_rejects_ambiguous_exact_course_code_matches()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        fixture.Db.Courses.AddRange(
+            new Course { Name = "КН-1 — Перший курс", DurationWeeks = 52 },
+            new Course { Name = "Навчальний курс КН-1", DurationWeeks = 52 });
+        await fixture.Db.SaveChangesAsync();
+        var bytes = CreateMinimalImportDocx();
+        await using var stream = new MemoryStream(bytes);
+        var file = new FormFile(stream, 0, bytes.Length, "file", "КН-1.docx");
+
+        var result = await new DocxImportService().ImportAsync(
+            file,
+            fixture.Db,
+            apply: false,
+            CancellationToken.None);
+
+        Assert.NotNull(result.Error);
+        Assert.False(result.CourseFound);
+        Assert.Null(result.CourseId);
+        Assert.Contains("кілька курсів", result.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

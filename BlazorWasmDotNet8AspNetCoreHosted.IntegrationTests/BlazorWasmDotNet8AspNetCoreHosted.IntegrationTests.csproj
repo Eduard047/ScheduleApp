@@ -42,6 +42,7 @@
 
   <ItemGroup>
     <Compile Include="AdminControllerGuardrailTests.cs" />
+    <Compile Include="AggregateLogicalEventTests.cs" />
     <Compile Include="AutoGenGapReasonClassifierTests.cs" />
     <Compile Include="AutoGenWarningClassifierTests.cs" />
     <Compile Include="AutogenLecturePackingTests.cs" />
@@ -58,6 +59,7 @@
     <Compile Include="TeacherDraftEditMutationPlannerTests.cs" />
     <Compile Include="TeacherDraftsAutogenJobServiceSecurityTests.cs" />
     <Compile Include="TeacherDraftsAutogenServiceRegressionTests.cs" />
+    <Compile Include="TeacherDraftsWeekValidationTests.cs" />
     <Compile Include="Infrastructure\TravelInvariantVerifier.cs" />
   </ItemGroup>
 
