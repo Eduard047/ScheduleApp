@@ -2,6 +2,7 @@
 @page "/admin/departments"
 @using System.Net
 @using System.Net.Http.Json
+@using BlazorWasmDotNet8AspNetCoreHosted.Client.Services
 @using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
 @inject HttpClient Http
 @inject IJSRuntime JS
@@ -124,7 +125,7 @@
         try
         {
             error = ok = null;
-            items = await Http.GetFromJsonAsync<List<DepartmentEditDto>>("api/admin/departments") ?? new();
+            items = await Http.GetFromJsonWithDetailsAsync<List<DepartmentEditDto>>("api/admin/departments") ?? new();
         }
         catch (Exception ex)
         {
@@ -139,7 +140,7 @@
             error = null;
             ok = null;
             var resp = await Http.PostAsJsonAsync("api/admin/departments/upsert", form);
-            await Ensure(resp);
+            await resp.EnsureSuccessWithDetailsAsync();
             await Load();
             ok = "Збережено.";
             CloseEditor();
@@ -169,7 +170,7 @@
                 if (!forceConfirmed) return;
                 resp = await Http.DeleteAsync($"api/admin/departments/{id}?confirm=true&force=true");
             }
-            await Ensure(resp);
+            await resp.EnsureSuccessWithDetailsAsync();
             await Load();
             ok = "Видалено.";
         }
@@ -177,14 +178,6 @@
         {
             error = ex.Message;
         }
-    }
-    // Перевіряє успішність відповіді API.
-    private static async Task Ensure(HttpResponseMessage resp)
-    {
-        if (resp.IsSuccessStatusCode) return;
-        var body = await resp.Content.ReadAsStringAsync();
-        var msg = string.IsNullOrWhiteSpace(body) ? resp.ReasonPhrase : body;
-        throw new HttpRequestException(msg ?? "Request failed", null, resp.StatusCode);
     }
     // Перемикає напрямок сортування.
     private void ToggleSort(string field)

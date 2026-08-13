@@ -1,0 +1,17 @@
+<section class="not-found-state" role="alert">
+    <h1 @ref="_heading" tabindex="-1">Сторінку не знайдено</h1>
+    <p>Перевірте адресу або поверніться до опублікованого розкладу.</p>
+    <a class="btn btn-primary" href="/schedule">Перейти до розкладу</a>
+</section>
+
+@code {
+    private ElementReference _heading;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            await _heading.FocusAsync(preventScroll: true);
+        }
+    }
+}

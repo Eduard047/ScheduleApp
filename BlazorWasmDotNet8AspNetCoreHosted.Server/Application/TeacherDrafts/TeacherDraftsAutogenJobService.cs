@@ -31,8 +31,12 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
 {
     private const int MaxRangeDays = 370;
     private const int MaxGroupCount = 200;
+    private const int MaxFullRangeGroupCount = 32;
     private const int MaxModuleHourEntryCount = 200;
     private const int MaxHoursPerModulePerRange = 500;
+    private const long MaxGroupDayBudget = (long)MaxRangeDays * MaxFullRangeGroupCount;
+    private const long MaxGroupRequestedModuleHours =
+        (long)MaxModuleHourEntryCount * MaxHoursPerModulePerRange;
     private const int MaxPreferredRoomCountPerGroup = 500;
     private const int MaxPreferredFirstSlotOrderOverride = 64;
     private const int MaxRecentRepeatWindowDays = 31;
@@ -41,6 +45,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
     private const int MaxTitleLength = 256;
     private const int MaxOutstandingJobCount = 8;
     private const int MaxRetainedTerminalJobCount = 200;
+    private const int DurableCleanupBatchSize = 200;
     private const string GlobalExecutionLockBaseName = "scheduleapp:teacher-drafts-autogen";
     private const string FullJobRollbackWarning =
         "Усі зміни автогенерації за вибраний період повністю відкочено; жодної нової чернетки не збережено.";
@@ -50,6 +55,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
     private static readonly TimeSpan DefaultJobHeartbeatInterval = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan DefaultCancellationLeaseGrace = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan DefaultTerminalPersistenceHorizon = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan DurableTerminalJobRetention = TimeSpan.FromDays(45);
     private static readonly TimeSpan SqliteExclusiveExecutionLeaseDuration = TimeSpan.FromHours(6);
     private static readonly HashSet<string> ProvisionalIntegratedWarningCodes = new(StringComparer.Ordinal)
     {
@@ -638,9 +644,10 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                             "Виявлено незавершене завдання автогенерації попередньої версії без lease-власника. Нові запуски заблоковано до безпечного завершення оновлення.");
                     }
 
+                    var now = _databaseUtcNow(db);
+                    CleanupPersistedTerminalJobs(db, now);
                     ValidateAcademicPeriod(db, job.Request);
 
-                    var now = _databaseUtcNow(db);
                     var outstandingCount = db.AutoGenJobRuns.Count(item =>
                         (item.State == (int)AutoGenJobState.Queued || item.State == (int)AutoGenJobState.Running)
                         && item.OwnerInstanceId != null
@@ -712,6 +719,43 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             .Select(item => new CourseAcademicPeriod(item.Name, item.AcademicPeriodStartDate))
             .SingleOrDefault();
         EnsureAcademicPeriodAllowsRequest(course, request);
+    }
+
+    internal static int CleanupPersistedTerminalJobs(AppDbContext db, DateTime nowUtc)
+    {
+        var cutoffUtc = nowUtc.Subtract(DurableTerminalJobRetention);
+        var removable = db.AutoGenJobRuns
+            .Where(run => (run.State == (int)AutoGenJobState.Succeeded
+                           || run.State == (int)AutoGenJobState.Failed
+                           || run.State == (int)AutoGenJobState.Canceled)
+                          && !db.AutoGenDraftPlans.Any(plan => plan.AutoGenJobRunId == run.Id));
+        // Очищаємо обмежений пакет за один запуск, щоб велика legacy-історія
+        // не створювала необмежений список параметрів усередині глобальної транзакції.
+        var idsToDelete = removable
+            .Where(run => (run.CompletedAtUtc ?? run.UpdatedAtUtc) < cutoffUtc)
+            .OrderBy(run => run.CompletedAtUtc ?? run.UpdatedAtUtc)
+            .ThenBy(run => run.Id)
+            .Select(run => run.Id)
+            .Take(DurableCleanupBatchSize)
+            .ToList();
+        if (idsToDelete.Count < DurableCleanupBatchSize)
+        {
+            var selectedIds = idsToDelete.ToHashSet();
+            var excessIds = removable
+                .Where(run => !selectedIds.Contains(run.Id))
+                .OrderByDescending(run => run.CompletedAtUtc ?? run.UpdatedAtUtc)
+                .ThenByDescending(run => run.Id)
+                .Skip(MaxRetainedTerminalJobCount)
+                .Select(run => run.Id)
+                .Take(DurableCleanupBatchSize - idsToDelete.Count)
+                .ToList();
+            idsToDelete.AddRange(excessIds);
+        }
+        return idsToDelete.Count == 0
+            ? 0
+            : db.AutoGenJobRuns
+                .Where(run => idsToDelete.Contains(run.Id))
+                .ExecuteDelete();
     }
 
     private static async Task ValidateAcademicPeriodAsync(
@@ -1385,6 +1429,12 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         {
             throw new AutoGenJobValidationException("Потрібно вибрати щонайменше одну коректну групу.");
         }
+        var groupDayBudget = checked((long)rangeDays * groupIds.Count);
+        if (groupDayBudget > MaxGroupDayBudget)
+        {
+            throw new AutoGenJobValidationException(
+                $"Добуток кількості днів і груп не може перевищувати {MaxGroupDayBudget}. Зменште діапазон або кількість груп.");
+        }
         if (request.ModuleHours is null)
         {
             throw new AutoGenJobValidationException("Перелік годин модулів для автогенерації відсутній.");
@@ -1409,10 +1459,22 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         {
             throw new AutoGenJobValidationException("Потрібно вибрати щонайменше один модуль із годинами.");
         }
+        var requestedHoursPerGroup = moduleHours.Values.Aggregate(0L, (total, hours) => total + hours);
+        var groupRequestedModuleHours = checked(requestedHoursPerGroup * groupIds.Count);
+        if (groupRequestedModuleHours > MaxGroupRequestedModuleHours)
+        {
+            throw new AutoGenJobValidationException(
+                $"Добуток кількості груп і сумарних годин модулів не може перевищувати {MaxGroupRequestedModuleHours}. Зменште кількість груп або годин.");
+        }
         if (request.GroupRoomPreferences is { Count: > MaxGroupCount })
         {
             throw new AutoGenJobValidationException(
                 $"За один запуск можна передати не більше {MaxGroupCount} налаштувань аудиторій груп.");
+        }
+        if (request.GroupRoomPreferences?.Any(preference => preference is null) == true)
+        {
+            throw new AutoGenJobValidationException(
+                "Налаштування аудиторій груп не можуть містити порожні елементи.");
         }
         if (request.GroupRoomPreferences is { } roomPreferences
             && roomPreferences.Any(preference => preference.RoomIds is { Count: > MaxPreferredRoomCountPerGroup }))

@@ -19,6 +19,7 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.29" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="8.0.29" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.1" />
     <PackageReference Include="Microsoft.Extensions.Configuration.UserSecrets" Version="8.0.1" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
@@ -47,17 +48,23 @@
     <Compile Include="AutoGenWarningClassifierTests.cs" />
     <Compile Include="AutogenLecturePackingTests.cs" />
     <Compile Include="AutogenQualityMatrixTests.cs" />
+    <Compile Include="ClientHttpContractTests.cs" />
     <Compile Include="DeterministicResidualOptimizerOracleTests.cs" />
     <Compile Include="DeterministicResourceMatcherTests.cs" />
+    <Compile Include="DocxImportSecurityTests.cs" />
+    <Compile Include="HttpBoundarySecurityTests.cs" />
     <Compile Include="LogicalEventRotationPlannerTests.cs" />
     <Compile Include="ProductionGuardrailTests.cs" />
+    <Compile Include="ProductionPipelineSecurityTests.cs" />
     <Compile Include="PublishGuardrailTests.cs" />
     <Compile Include="ScheduleEndpointCorrectnessTests.cs" />
     <Compile Include="ScheduleOverviewLayoutPlannerTests.cs" />
     <Compile Include="SpaFallbackRoutingTests.cs" />
+    <Compile Include="SwaggerEndpointTests.cs" />
     <Compile Include="TeacherDraftBatchAtomicityTests.cs" />
     <Compile Include="TeacherDraftEditMutationPlannerTests.cs" />
     <Compile Include="TeacherDraftsAutogenJobServiceSecurityTests.cs" />
+    <Compile Include="TeacherDraftsSecurityRemediationTests.cs" />
     <Compile Include="TeacherDraftsAutogenServiceRegressionTests.cs" />
     <Compile Include="TeacherDraftsWeekValidationTests.cs" />
     <Compile Include="Infrastructure\TravelInvariantVerifier.cs" />

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
@@ -22,7 +23,9 @@ public sealed class TeacherDraftsQueryService
         DateOnly weekStart,
         int? teacherId,
         int? groupId,
-        int? roomId)
+        int? roomId,
+        CancellationToken cancellationToken = default,
+        int? maxItemCount = null)
     {
         var weekEnd = weekStart.AddDays(7);
         var q = _db.TeacherDraftItems
@@ -38,7 +41,13 @@ public sealed class TeacherDraftsQueryService
         if (teacherId is int tid) q = q.Where(x => x.TeacherId == tid);
         if (groupId is int gid) q = q.Where(x => x.GroupId == gid);
         if (roomId is int rid) q = q.Where(x => x.RoomId == rid);
-        var items = await q.OrderBy(x => x.Date).ThenBy(x => x.StartTime).ToListAsync();
+        var orderedQuery = q.OrderBy(x => x.Date)
+            .ThenBy(x => x.StartTime)
+            .ThenBy(x => x.Id);
+        var items = await (maxItemCount is > 0
+                ? orderedQuery.Take(maxItemCount.Value)
+                : orderedQuery)
+            .ToListAsync(cancellationToken);
         var topicIds = items
             .Where(i => i.ModuleTopicId is int)
             .Select(i => i.ModuleTopicId!.Value)
@@ -49,7 +58,10 @@ public sealed class TeacherDraftsQueryService
             : await _db.ModuleTopics
                 .Where(mt => topicIds.Contains(mt.Id))
                 .Select(mt => new { mt.Id, mt.TopicCode })
-                .ToDictionaryAsync(mt => mt.Id, mt => (mt.TopicCode ?? string.Empty).Trim());
+                .ToDictionaryAsync(
+                    mt => mt.Id,
+                    mt => (mt.TopicCode ?? string.Empty).Trim(),
+                    cancellationToken);
         var rescheduleSourceIds = items
             .Select(i => TeacherDraftsHelpers.ParseRescheduleBatchKey(i.BatchKey))
             .Where(info => info.isRescheduled && info.sourceItemId is int)
@@ -69,7 +81,8 @@ public sealed class TeacherDraftsQueryService
                 })
                 .ToDictionaryAsync(
                     x => x.Id,
-                    x => (topicId: x.ModuleTopicId, topicCode: string.IsNullOrWhiteSpace(x.TopicCode) ? null : x.TopicCode!.Trim()));
+                    x => (topicId: x.ModuleTopicId, topicCode: string.IsNullOrWhiteSpace(x.TopicCode) ? null : x.TopicCode!.Trim()),
+                    cancellationToken);
         // Формує ключ для групування викладачів у межах одного слоту та групи.
         static string ResolveTeacherGroupKey(TeacherDraftItem item)
         {

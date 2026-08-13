@@ -84,13 +84,29 @@ public sealed class TeacherDraftsController : ControllerBase
         [FromQuery] DateOnly weekStart,
         [FromQuery] int? teacherId,
         [FromQuery] int? groupId,
-        [FromQuery] int? roomId)
+        [FromQuery] int? roomId,
+        CancellationToken cancellationToken = default)
     {
         if (!DateHelpers.IsSupportedScheduleDate(weekStart))
         {
             return BadRequest(new { message = DateHelpers.SupportedScheduleDateMessage });
         }
-        return await _exportService.ExportAsync(weekStart, teacherId, groupId, roomId);
+        try
+        {
+            return await _exportService.ExportAsync(
+                weekStart,
+                teacherId,
+                groupId,
+                roomId,
+                cancellationToken);
+        }
+        catch (TeacherDraftsExportLimitException ex)
+        {
+            return Problem(
+                statusCode: ex.StatusCode,
+                title: "Експорт перевищує безпечний ліміт",
+                detail: ex.Message);
+        }
     }
     [HttpGet("week")]
     // Додає коротку кінцеву точку, що делегує основному методу отримання даних.
@@ -718,15 +734,12 @@ public sealed class TeacherDraftsController : ControllerBase
             .Select(item => item.BatchKey!)
             .Distinct(StringComparer.Ordinal)
             .ToList();
-        if (batchKeys.Count == 0)
-        {
-            return null;
-        }
-
-        var candidates = await _db.TeacherDraftItems
-            .AsNoTracking()
-            .Where(item => item.BatchKey != null && batchKeys.Contains(item.BatchKey))
-            .ToListAsync();
+        var candidates = batchKeys.Count == 0
+            ? new List<TeacherDraftItem>()
+            : await _db.TeacherDraftItems
+                .AsNoTracking()
+                .Where(item => item.BatchKey != null && batchKeys.Contains(item.BatchKey))
+                .ToListAsync();
         foreach (var logicalEvent in selectedRows
                      .Where(item => !string.IsNullOrWhiteSpace(item.BatchKey))
                      .GroupBy(item => new
@@ -752,6 +765,64 @@ public sealed class TeacherDraftsController : ControllerBase
                                     && candidate.ModuleId == logicalEvent.Key.ModuleId
                                     && candidate.LessonTypeId == logicalEvent.Key.LessonTypeId
                                     && !mutationIdSet.Contains(candidate.Id))
+                .Select(candidate => candidate.Id)
+                .OrderBy(id => id)
+                .ToList();
+            if (missingIds.Count == 0)
+            {
+                continue;
+            }
+
+            return Conflict(new
+            {
+                message = "Багаторядкове логічне заняття не можна змінювати або видаляти частково. Передайте всі його рядки в одному атомарному пакетному запиті.",
+                missingIds
+            });
+        }
+
+        // Legacy-рядки без BatchKey теж утворюють одну подію, якщо однакова сигнатура
+        // розкладена за різними темами або співвикладачами.
+        foreach (var logicalEvent in selectedRows
+                     .Where(item => string.IsNullOrWhiteSpace(item.BatchKey))
+                     .GroupBy(item => new
+                     {
+                         item.Date,
+                         item.StartTime,
+                         item.EndTime,
+                         item.GroupId,
+                         item.ModuleId,
+                         item.LessonTypeId
+                     }))
+        {
+            var signatureRows = await _db.TeacherDraftItems
+                .AsNoTracking()
+                .Where(candidate => candidate.Date == logicalEvent.Key.Date
+                                    && candidate.StartTime == logicalEvent.Key.StartTime
+                                    && candidate.EndTime == logicalEvent.Key.EndTime
+                                    && candidate.GroupId == logicalEvent.Key.GroupId
+                                    && candidate.ModuleId == logicalEvent.Key.ModuleId
+                                    && candidate.LessonTypeId == logicalEvent.Key.LessonTypeId)
+                .ToListAsync();
+            var legacyRows = signatureRows
+                .Where(candidate => string.IsNullOrWhiteSpace(candidate.BatchKey))
+                .ToList();
+            var isLogicalEvent = legacyRows.Count > 1
+                                 && legacyRows
+                                     .Select(candidate => new
+                                     {
+                                         candidate.ModuleTopicId,
+                                         candidate.TeacherId
+                                     })
+                                     .Distinct()
+                                     .Skip(1)
+                                     .Any();
+            if (!isLogicalEvent)
+            {
+                continue;
+            }
+
+            var missingIds = legacyRows
+                .Where(candidate => !mutationIdSet.Contains(candidate.Id))
                 .Select(candidate => candidate.Id)
                 .OrderBy(id => id)
                 .ToList();
@@ -884,29 +955,48 @@ public sealed class TeacherDraftsController : ControllerBase
             .Select(x => x.Id)
             .ToHashSet();
 
-        // Не дозволяє масовому очищенню розірвати багаторядкове логічне заняття.
-        foreach (var logicalEvent in scopedRows
-                     .Where(x => !string.IsNullOrWhiteSpace(x.BatchKey))
-                     .GroupBy(x => new
-                     {
-                         BatchKey = x.BatchKey!,
-                         x.Date,
-                         x.StartTime,
-                         x.EndTime,
-                         x.GroupId,
-                         x.ModuleId,
-                         x.LessonTypeId
-                     })
-                     .Where(group => group.Skip(1).Any()))
+        // Не дозволяє масовому очищенню розірвати явну або консервативно розпізнану legacy-подію.
+        var logicalEvents = scopedRows
+            .Where(x => !string.IsNullOrWhiteSpace(x.BatchKey))
+            .GroupBy(x => new
+            {
+                BatchKey = x.BatchKey!,
+                x.Date,
+                x.StartTime,
+                x.EndTime,
+                x.GroupId,
+                x.ModuleId,
+                x.LessonTypeId
+            })
+            .Where(group => group.Skip(1).Any())
+            .Select(group => group.ToList())
+            .ToList();
+        logicalEvents.AddRange(scopedRows
+            .Where(x => string.IsNullOrWhiteSpace(x.BatchKey))
+            .GroupBy(x => new
+            {
+                x.Date,
+                x.StartTime,
+                x.EndTime,
+                x.GroupId,
+                x.ModuleId,
+                x.LessonTypeId
+            })
+            .Where(group => group
+                .Select(x => new { x.ModuleTopicId, x.TeacherId })
+                .Distinct()
+                .Skip(1)
+                .Any())
+            .Select(group => group.ToList()));
+        foreach (var rows in logicalEvents)
         {
-            var rows = logicalEvent.ToList();
             if (rows.Select(x => x.Status).Distinct().Skip(1).Any())
             {
                 await transaction.RollbackAsync();
                 return Conflict(new
                 {
                     message = "Логічне заняття має змішані статуси рядків. Повторно схваліть його цілісним пакетом перед очищенням тижня.",
-                    batchKey = logicalEvent.Key.BatchKey,
+                    batchKey = rows[0].BatchKey,
                     itemIds = rows.Select(x => x.Id).OrderBy(id => id).ToList()
                 });
             }
@@ -922,7 +1012,7 @@ public sealed class TeacherDraftsController : ControllerBase
                 return Conflict(new
                 {
                     message = "Логічне заняття містить заблоковані рядки й не може бути частково очищене.",
-                    batchKey = logicalEvent.Key.BatchKey,
+                    batchKey = rows[0].BatchKey,
                     itemIds = rows.Select(x => x.Id).OrderBy(id => id).ToList()
                 });
             }
@@ -1124,7 +1214,17 @@ public sealed class TeacherDraftsController : ControllerBase
     [HttpPost("publish-week")]
     // Публікує всі чернетки вибраного тижня у розклад після атомарної пакетної перевірки.
     public async Task<ActionResult<PublishWeekResults>> PublishWeek([FromBody] PublishWeekRequest r)
-        => await _publishService.PublishWeekAsync(r);
+    {
+        if (r.ExpectedScopeRevision is not Guid expectedScopeRevision
+            || expectedScopeRevision == Guid.Empty)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status428PreconditionRequired,
+                title: "Потрібна актуальна перевірка тижня",
+                detail: "Перед публікацією повторно перевірте тиждень і передайте його актуальну версію.");
+        }
+        return await _publishService.PublishWeekAsync(r);
+    }
 
     private ObjectResult LegacyAutogenEndpointDisabled()
         => Problem(

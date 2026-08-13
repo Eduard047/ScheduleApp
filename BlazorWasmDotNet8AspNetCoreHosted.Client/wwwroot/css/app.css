@@ -62,7 +62,7 @@ a, .btn-link {
 }
 
     .blazor-error-boundary::after {
-        content: "An error has occurred."
+        content: "Сталася неочікувана помилка."
     }
 
 .loading-progress {
@@ -95,7 +95,7 @@ a, .btn-link {
 }
 
     .loading-progress-text:after {
-        content: var(--blazor-load-percentage-text, "Loading");
+        content: var(--blazor-load-percentage-text, "Завантаження");
     }
 
 code {
@@ -103,9 +103,59 @@ code {
 }
 
 .sortable-th {
+    padding: 0 !important;
+    white-space: nowrap;
+}
+
+.sortable-th__button {
+    width: 100%;
+    min-height: 2.45rem;
+    display: inline-flex;
+    align-items: center;
+    gap: .1rem;
+    padding: .3rem;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: inherit;
+    text-transform: inherit;
     cursor: pointer;
     user-select: none;
-    white-space: nowrap;
+}
+
+.sortable-th.text-center .sortable-th__button {
+    justify-content: center;
+}
+
+.sortable-th.text-end .sortable-th__button {
+    justify-content: flex-end;
+}
+
+.sortable-th__button:focus-visible {
+    position: relative;
+    z-index: 1;
+    outline: 3px solid #1d4ed8;
+    outline-offset: -3px;
+}
+
+.not-found-state {
+    max-width: 44rem;
+    margin: clamp(1.5rem, 8vh, 5rem) auto;
+    padding: clamp(1.25rem, 4vw, 2.5rem);
+    border: 1px solid #e2e8f0;
+    border-radius: 16px;
+    background: #fff;
+    text-align: center;
+}
+
+.not-found-state h1 {
+    margin-bottom: .75rem;
+}
+
+.not-found-state p {
+    margin-bottom: 1.25rem;
+    color: #64748b;
 }
 
 .editor-overlay {

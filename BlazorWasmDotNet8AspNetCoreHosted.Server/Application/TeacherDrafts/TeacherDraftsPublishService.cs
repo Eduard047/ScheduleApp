@@ -57,6 +57,19 @@ public sealed class TeacherDraftsPublishService
         {
             return new BadRequestObjectResult(new { message = DateHelpers.SupportedScheduleDateMessage });
         }
+        if (r.ExpectedScopeRevision is not Guid expectedScopeRevision
+            || expectedScopeRevision == Guid.Empty)
+        {
+            return new ObjectResult(new ProblemDetails
+            {
+                Status = StatusCodes.Status428PreconditionRequired,
+                Title = "Потрібна актуальна перевірка тижня",
+                Detail = "Перед публікацією повторно перевірте тиждень і передайте його актуальну версію."
+            })
+            {
+                StatusCode = StatusCodes.Status428PreconditionRequired
+            };
+        }
         var start = r.WeekStart;
         var end = start.AddDays(7);
         await using var tx = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
@@ -69,21 +82,18 @@ public sealed class TeacherDraftsPublishService
             .ThenBy(x => x.GroupId)
             .ThenBy(x => x.Id)
             .ToListAsync();
-        if (r.ExpectedScopeRevision is Guid expectedScopeRevision)
+        var actualScopeRevision = LogicalRevisionToken.Combine(weekDrafts.Select(item =>
+            new KeyValuePair<int, Guid>(item.Id, item.Revision)));
+        if (actualScopeRevision != expectedScopeRevision)
         {
-            var actualScopeRevision = LogicalRevisionToken.Combine(weekDrafts.Select(item =>
-                new KeyValuePair<int, Guid>(item.Id, item.Revision)));
-            if (actualScopeRevision != expectedScopeRevision)
-            {
-                await tx.RollbackAsync();
-                return new OkObjectResult(new PublishWeekResults(
-                    0,
-                    weekDrafts.Count,
-                    new List<string>
-                    {
-                        "Публікацію скасовано: чернетки змінилися після останньої перевірки. Дані оновлено — перегляньте тиждень і повторіть публікацію."
-                    }));
-            }
+            await tx.RollbackAsync();
+            return new OkObjectResult(new PublishWeekResults(
+                0,
+                weekDrafts.Count,
+                new List<string>
+                {
+                    "Публікацію скасовано: чернетки змінилися після останньої перевірки. Дані оновлено — перегляньте тиждень і повторіть публікацію."
+                }));
         }
         var drafts = r.TeacherId is int teacherId
             ? ExpandTeacherPublishSelection(weekDrafts, teacherId)
@@ -652,29 +662,49 @@ public sealed class TeacherDraftsPublishService
         }
     }
 
-    // Вимагає повторного цілісного схвалення для legacy-пакетів зі змішаними статусами рядків.
+    // Вимагає повторного цілісного схвалення для явних і консервативно розпізнаних legacy-подій.
     private static IEnumerable<string> FindMixedStatusLogicalEventViolations(
         IReadOnlyList<TeacherDraftItem> drafts)
     {
-        foreach (var mixedEvent in drafts
-                     .Where(draft => !string.IsNullOrWhiteSpace(draft.BatchKey))
-                     .GroupBy(draft => new
-                     {
-                         draft.BatchKey,
-                         draft.Date,
-                         draft.StartTime,
-                         draft.EndTime,
-                         draft.GroupId,
-                         draft.ModuleId,
-                         draft.LessonTypeId
-                     })
-                     .Where(group => group
-                         .Select(draft => draft.Status)
-                         .Distinct()
-                         .Skip(1)
-                         .Any()))
+        var logicalEvents = drafts
+            .Where(draft => !string.IsNullOrWhiteSpace(draft.BatchKey))
+            .GroupBy(draft => new
+            {
+                draft.BatchKey,
+                draft.Date,
+                draft.StartTime,
+                draft.EndTime,
+                draft.GroupId,
+                draft.ModuleId,
+                draft.LessonTypeId
+            })
+            .Select(group => group.ToList())
+            .ToList();
+        logicalEvents.AddRange(drafts
+            .Where(draft => string.IsNullOrWhiteSpace(draft.BatchKey))
+            .GroupBy(draft => new
+            {
+                draft.Date,
+                draft.StartTime,
+                draft.EndTime,
+                draft.GroupId,
+                draft.ModuleId,
+                draft.LessonTypeId
+            })
+            .Where(group => group
+                .Select(draft => new { draft.ModuleTopicId, draft.TeacherId })
+                .Distinct()
+                .Skip(1)
+                .Any())
+            .Select(group => group.ToList()));
+        foreach (var mixedEvent in logicalEvents.Where(rows => rows
+                     .Select(draft => draft.Status)
+                     .Distinct()
+                     .Skip(1)
+                     .Any()))
         {
-            yield return $"{mixedEvent.Key.Date:yyyy-MM-dd} {mixedEvent.Key.StartTime:HH\\:mm}-{mixedEvent.Key.EndTime:HH\\:mm}: логічне заняття має змішані статуси рядків. Повторно схваліть заняття цілісним пакетом перед публікацією.";
+            var first = mixedEvent[0];
+            yield return $"{first.Date:yyyy-MM-dd} {first.StartTime:HH\\:mm}-{first.EndTime:HH\\:mm}: логічне заняття має змішані статуси рядків. Повторно схваліть заняття цілісним пакетом перед публікацією.";
         }
     }
 

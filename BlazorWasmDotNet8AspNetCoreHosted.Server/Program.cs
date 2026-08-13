@@ -23,6 +23,9 @@ builder.Services.AddHealthChecks();
 // Стискаємо JSON, WebAssembly та статичні ресурси під час передавання через HTTPS.
 builder.Services.AddResponseCompression(options => options.EnableForHttps = true);
 
+var allowedHosts = AllowedHostPolicy.Parse(builder.Configuration["AllowedHosts"]);
+builder.Services.AddHostFiltering(options => AllowedHostPolicy.Apply(options, allowedHosts));
+
 var trustedProxyAddresses = builder.Configuration
     .GetSection("ReverseProxy:KnownProxies")
     .Get<string[]>()
@@ -66,6 +69,9 @@ var app = builder.Build();
 
 // Приймаємо схему та адресу клієнта лише від явно довірених reverse proxy.
 app.UseForwardedHeaders();
+app.UseHostFiltering();
+// Перевіряємо браузерне походження всіх API-запитів, що можуть змінювати стан.
+app.UseMiddleware<ApiRequestOriginPolicyMiddleware>();
 
 if (app.Environment.IsDevelopment())
 {
@@ -81,9 +87,13 @@ else
     app.UseHsts();
 }
 
-app.UseWhen(
-    context => !context.Request.Path.StartsWithSegments("/health"),
-    branch => branch.UseHttpsRedirection());
+if (!app.Environment.IsDevelopment())
+{
+    // Локальний HTTP-профіль не має HTTPS-порту; у робочому середовищі перенаправлення залишається обов'язковим.
+    app.UseWhen(
+        context => !context.Request.Path.StartsWithSegments("/health"),
+        branch => branch.UseHttpsRedirection());
+}
 
 app.UseResponseCompression();
 app.UseBlazorFrameworkFiles();

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Json;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -33,6 +34,21 @@ public sealed class ApiErrorException : Exception
 
 public static class HttpResponseMessageExtensions
 {
+    // Отримує JSON лише після перевірки статусу, щоб клієнт не втрачав деталі помилки сервера.
+    public static async Task<T?> GetFromJsonWithDetailsAsync<T>(
+        this HttpClient client,
+        string requestUri,
+        CancellationToken cancellationToken = default)
+    {
+        using var response = await client.GetAsync(requestUri, cancellationToken);
+        await response.EnsureSuccessWithDetailsAsync(cancellationToken);
+        if (response.StatusCode == HttpStatusCode.NoContent)
+        {
+            return default;
+        }
+        return await response.Content.ReadFromJsonAsync<T>(cancellationToken: cancellationToken);
+    }
+
     // Перевіряє відповідь HTTP і кидає виняток з деталями помилки.
     public static async Task EnsureSuccessWithDetailsAsync(this HttpResponseMessage response, CancellationToken cancellationToken = default)
     {

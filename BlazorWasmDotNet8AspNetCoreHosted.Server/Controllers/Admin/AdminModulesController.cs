@@ -628,7 +628,7 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
     [RequestSizeLimit(11 * 1024 * 1024)]
     [RequestFormLimits(MultipartBodyLengthLimit = 11 * 1024 * 1024)]
     // Імпортує модулі та теми з DOCX.
-    public async Task<ActionResult<DocxImportResultDto>> ImportDocx([FromForm] IFormFile file, [FromQuery] bool apply = false, CancellationToken ct = default)
+    public async Task<ActionResult<DocxImportResultDto>> ImportDocx(IFormFile file, [FromQuery] bool apply = false, CancellationToken ct = default)
     {
         var service = new DocxImportService();
         var result = await service.ImportAsync(file, db, apply, ct);

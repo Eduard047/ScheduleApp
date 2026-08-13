@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
@@ -12,9 +13,18 @@ using Microsoft.EntityFrameworkCore;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 
+public sealed class TeacherDraftsExportLimitException(
+    int statusCode,
+    string message) : Exception(message)
+{
+    public int StatusCode { get; } = statusCode;
+}
+
 // Сервіс експорту чернеток у формат Excel.
 public sealed class TeacherDraftsExportService
 {
+    internal const int MaxDraftRowCount = 5_000;
+    internal const int MaxMatrixCellCount = 50_000;
     private readonly AppDbContext _db;
     private readonly TeacherDraftsQueryService _queryService;
     public TeacherDraftsExportService(AppDbContext db, TeacherDraftsQueryService queryService)
@@ -142,13 +152,26 @@ public sealed class TeacherDraftsExportService
         return span;
     }
     // Формує Excel-файл з розкладом чернеток.
-    public async Task<FileContentResult> ExportAsync(
+    public async Task<FileStreamResult> ExportAsync(
         DateOnly weekStart,
         int? teacherId,
         int? groupId,
-        int? roomId)
+        int? roomId,
+        CancellationToken cancellationToken = default)
     {
-        var drafts = await _queryService.GetAsync(weekStart, teacherId, groupId, roomId);
+        var drafts = await _queryService.GetAsync(
+            weekStart,
+            teacherId,
+            groupId,
+            roomId,
+            cancellationToken,
+            MaxDraftRowCount + 1);
+        if (drafts.Count > MaxDraftRowCount)
+        {
+            throw new TeacherDraftsExportLimitException(
+                StatusCodes.Status413PayloadTooLarge,
+                $"Експорт містить понад {MaxDraftRowCount} рядків чернеток. Звузьте фільтри й повторіть спробу.");
+        }
         var groups = drafts
             .GroupBy(d => (d.GroupId, d.Group))
             .Select(g => new GroupInfo(g.Key.GroupId, g.Key.Group))
@@ -160,7 +183,7 @@ public sealed class TeacherDraftsExportService
             teacherLabel = await _db.Teachers.AsNoTracking()
                 .Where(t => t.Id == tid)
                 .Select(t => t.FullName)
-                .FirstOrDefaultAsync();
+                .FirstOrDefaultAsync(cancellationToken);
         }
         string? roomLabel = null;
         if (roomId is int rid)
@@ -168,7 +191,7 @@ public sealed class TeacherDraftsExportService
             roomLabel = await _db.Rooms.AsNoTracking()
                 .Where(r => r.Id == rid)
                 .Select(r => r.Name)
-                .FirstOrDefaultAsync();
+                .FirstOrDefaultAsync(cancellationToken);
         }
         string? groupLabel = null;
         if (groupId is int gid)
@@ -176,7 +199,7 @@ public sealed class TeacherDraftsExportService
             groupLabel = await _db.Groups.AsNoTracking()
                 .Where(g => g.Id == gid)
                 .Select(g => g.Name)
-                .FirstOrDefaultAsync();
+                .FirstOrDefaultAsync(cancellationToken);
         }
         if (groupId is int sectionId && !groups.Any() && groupLabel is not null)
         {
@@ -193,7 +216,8 @@ public sealed class TeacherDraftsExportService
                 .Select(m => new { m.Id, m.Code })
                 .ToDictionaryAsync(
                     m => m.Id,
-                    m => string.IsNullOrWhiteSpace(m.Code) ? string.Empty : m.Code.Trim());
+                    m => string.IsNullOrWhiteSpace(m.Code) ? string.Empty : m.Code.Trim(),
+                    cancellationToken);
         var weekDays = Enumerable.Range(0, 7)
             .Select(offset => weekStart.AddDays(offset))
             .ToList();
@@ -202,7 +226,8 @@ public sealed class TeacherDraftsExportService
             .Where(s => s.CourseId == null)
             .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
             .Select(s => new { s.Start, s.End, s.SortOrder })
-            .ToListAsync();
+            .Take(MaxMatrixCellCount + 1)
+            .ToListAsync(cancellationToken);
         var globalSlots = rawSlots.Select(s => (s.Start, s.End)).ToList();
         var slotNumberLookup = rawSlots
             .GroupBy(s => (s.Start, s.End))
@@ -224,6 +249,15 @@ public sealed class TeacherDraftsExportService
             .OrderBy(x => x.Start)
             .ThenBy(x => x.End)
             .ToList();
+        var matrixCellCount = checked((long)weekDays.Count
+                                      * Math.Max(1, groups.Count)
+                                      * Math.Max(1, slotPeriods.Count));
+        if (matrixCellCount > MaxMatrixCellCount)
+        {
+            throw new TeacherDraftsExportLimitException(
+                StatusCodes.Status422UnprocessableEntity,
+                $"Таблиця експорту потребує {matrixCellCount} комірок, що перевищує безпечний ліміт {MaxMatrixCellCount}. Звузьте групи або часові слоти й повторіть спробу.");
+        }
         var lookup = enriched
             .GroupBy(x => (x.Item.Date, x.Start, x.End, x.Item.GroupId))
             .ToDictionary(
@@ -301,9 +335,11 @@ public sealed class TeacherDraftsExportService
             var row = tableStartRow;
             foreach (var day in weekDays)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var dayStartRow = row;
                 for (var slotIndex = 0; slotIndex < slotPeriods.Count; slotIndex++)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     var slot = slotPeriods[slotIndex];
                     var slotNumber = slotNumberLookup.TryGetValue((slot.Start, slot.End), out var mappedSlotNumber) && mappedSlotNumber > 0
                         ? mappedSlotNumber
@@ -353,11 +389,22 @@ public sealed class TeacherDraftsExportService
         tableRange.Style.Border.OutsideBorder = XLBorderStyleValues.Thin;
         worksheet.SheetView.FreezeRows(tableHeaderRow);
         worksheet.Columns(1, columnCount).AdjustToContents();
-        using var stream = new MemoryStream();
-        workbook.SaveAs(stream);
+        cancellationToken.ThrowIfCancellationRequested();
+        var stream = new MemoryStream();
+        try
+        {
+            workbook.SaveAs(stream);
+            cancellationToken.ThrowIfCancellationRequested();
+            stream.Position = 0;
+        }
+        catch
+        {
+            stream.Dispose();
+            throw;
+        }
         var fileName = $"Rozklad-{weekStart:yyyyMMdd}.xlsx";
         const string contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-        return new FileContentResult(stream.ToArray(), contentType)
+        return new FileStreamResult(stream, contentType)
         {
             FileDownloadName = fileName
         };

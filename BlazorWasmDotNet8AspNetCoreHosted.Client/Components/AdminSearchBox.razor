@@ -1,10 +1,14 @@
 @* Єдине поле пошуку для адмінських таблиць. *@
 <div class="@SearchClass" style="@Style">
-    <span class="input-group-text">@Label</span>
-    <input class="form-control"
+    <label class="input-group-text" for="@_inputId">@Label</label>
+    <input id="@_inputId"
+           type="search"
+           class="form-control"
            value="@Value"
            @oninput="OnInput"
-           placeholder="@Placeholder" />
+           placeholder="@Placeholder"
+           autocomplete="off"
+           spellcheck="false" />
 </div>
 
 @code {
@@ -25,6 +29,8 @@
 
     [Parameter]
     public string? Style { get; set; }
+
+    private readonly string _inputId = $"admin-search-{Guid.NewGuid():N}";
 
     private string SearchClass => string.IsNullOrWhiteSpace(Class)
         ? "input-group"

@@ -1,0 +1,28 @@
+<Project>
+  <!-- Видаляємо службові AppleDouble-файли з артефактів, щоб testhost і publish не сприймали їх як збірки або ресурси. -->
+  <Target Name="RemoveAppleDoubleArtifactsAfterBuild"
+          AfterTargets="Build">
+    <ItemGroup>
+      <_AppleDoubleBuildArtifacts Include="$(OutputPath)**/._*;$(IntermediateOutputPath)**/._*" />
+    </ItemGroup>
+    <Delete Files="@(_AppleDoubleBuildArtifacts)" />
+  </Target>
+
+  <!-- Окремий захист потрібен для тестових запусків без повторної збірки зі вже наявними артефактами. -->
+  <Target Name="RemoveAppleDoubleArtifactsBeforeVSTest"
+          BeforeTargets="VSTest">
+    <ItemGroup>
+      <_AppleDoubleTestArtifacts Include="$(OutputPath)**/._*;$(IntermediateOutputPath)**/._*" />
+    </ItemGroup>
+    <Delete Files="@(_AppleDoubleTestArtifacts)" />
+  </Target>
+
+  <!-- PublishDir може бути порожнім поза publish, тому шаблон додається лише для фактичної публікації. -->
+  <Target Name="RemoveAppleDoubleArtifactsAfterPublish"
+          AfterTargets="Publish">
+    <ItemGroup Condition="'$(PublishDir)' != ''">
+      <_AppleDoublePublishArtifacts Include="$(PublishDir)**/._*" />
+    </ItemGroup>
+    <Delete Files="@(_AppleDoublePublishArtifacts)" />
+  </Target>
+</Project>

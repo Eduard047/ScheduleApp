@@ -22,7 +22,7 @@ public class TimeSlotsApi
         if (dayOfWeek is not null) query.Add($"dayOfWeek={dayOfWeek}");
         if (includeDayOverrides) query.Add("includeDayOverrides=true");
         var url = "api/admin/config/slots" + (query.Count == 0 ? "" : $"?{string.Join("&", query)}");
-        var res = await _http.GetFromJsonAsync<EffectiveSlotsResponse>(url);
+        var res = await _http.GetFromJsonWithDetailsAsync<EffectiveSlotsResponse>(url);
         return res?.slots ?? new();
     }
     // Повертає сирі слоти для редагування.
@@ -32,7 +32,7 @@ public class TimeSlotsApi
         if (courseId is not null) query.Add($"courseId={courseId}");
         if (dayOfWeek is not null) query.Add($"dayOfWeek={dayOfWeek}");
         var url = "api/admin/config/slots/raw" + (query.Count == 0 ? "" : $"?{string.Join("&", query)}");
-        var res = await _http.GetFromJsonAsync<RawSlotsResponse>(url);
+        var res = await _http.GetFromJsonWithDetailsAsync<RawSlotsResponse>(url);
         return (courseId is null) ? (res?.global ?? new()) : (res?.course ?? new());
     }
     // Зберігає список слотів.
@@ -40,7 +40,7 @@ public class TimeSlotsApi
     public async Task<PreferredFirstSlotLimitConfigEditDto> GetPreferredFirstSlotLimitAsync(int? courseId)
     {
         var query = courseId is null ? "" : $"?courseId={courseId}";
-        var res = await _http.GetFromJsonAsync<PreferredFirstSlotLimitConfigEditDto>($"api/admin/config/preferred-first-slot-limit{query}");
+        var res = await _http.GetFromJsonWithDetailsAsync<PreferredFirstSlotLimitConfigEditDto>($"api/admin/config/preferred-first-slot-limit{query}");
         return res ?? new PreferredFirstSlotLimitConfigEditDto(null, courseId, 0);
     }
     // Зберігає ліміт слота для типу з прапорцем "Бажано першим у тижні".

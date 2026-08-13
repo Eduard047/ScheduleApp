@@ -1,5 +1,6 @@
 @* Сторінка адміністрування часових слотів *@
 @page "/admin/time-slots"
+@using BlazorWasmDotNet8AspNetCoreHosted.Client.Services
 @using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
 @inject HttpClient Http
 @inject BlazorWasmDotNet8AspNetCoreHosted.Client.Services.TimeSlotsApi Api
@@ -249,7 +250,7 @@
     // Завантажує метадані курсів при старті сторінки.
     protected override async Task OnInitializedAsync()
     {
-        var meta = await Http.GetFromJsonAsync<MetaResponseDto>("api/meta");
+        var meta = await Http.GetFromJsonWithDetailsAsync<MetaResponseDto>("api/meta");
         _courses = meta?.Courses ?? new();
         await LoadRaw();
     }

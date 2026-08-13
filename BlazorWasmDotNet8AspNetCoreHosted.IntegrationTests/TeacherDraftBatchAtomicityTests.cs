@@ -277,8 +277,11 @@ public sealed class TeacherDraftBatchAtomicityTests
         Assert.Equal(2, logicalRows.Select(item => item.TeacherId).Distinct().Count());
     }
 
-    [Fact]
-    public async Task Single_mutations_reject_partial_logical_event_but_complete_batch_delete_succeeds()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Single_mutations_reject_partial_explicit_and_legacy_logical_event_but_complete_batch_delete_succeeds(
+        bool withBatchKey)
     {
         await using var fixture = await TestDatabase.CreateAsync();
         var model = await fixture.SeedAsync(secondDraftLocked: false);
@@ -293,16 +296,31 @@ public sealed class TeacherDraftBatchAtomicityTests
         var createResponse = Assert.IsType<OkObjectResult>(createResult.Result);
         var created = Assert.IsType<TeacherDraftBatchUpsertResult>(createResponse.Value);
         Assert.Equal(2, created.Ids.Count);
+        if (!withBatchKey)
+        {
+            var legacyRows = await fixture.Db.TeacherDraftItems
+                .Where(item => created.Ids.Contains(item.Id))
+                .ToListAsync();
+            foreach (var row in legacyRows)
+            {
+                row.BatchKey = null;
+            }
+            await fixture.Db.SaveChangesAsync();
+        }
 
         var partialUpdate = await controller.Upsert(
             CreateLogicalEventRequest(model, model.FirstTopicId, model.FirstTeacherId, batchKey) with
             {
                 Id = created.Ids[0],
+                BatchKey = withBatchKey ? batchKey : null,
                 ExpectedRevision = await fixture.Db.TeacherDraftItems
                     .Where(item => item.Id == created.Ids[0])
                     .Select(item => item.Revision)
                     .SingleAsync()
             });
+        // Кожен HTTP-запит отримує окремий scoped DbContext, тому наступну мутацію
+        // перевіряємо без стану трекера, залишеного попередньою відкоченою транзакцією.
+        fixture.Db.ChangeTracker.Clear();
         var createdRevisions = await fixture.Db.TeacherDraftItems
             .AsNoTracking()
             .Where(item => created.Ids.Contains(item.Id))
@@ -317,7 +335,7 @@ public sealed class TeacherDraftBatchAtomicityTests
         Assert.IsType<ConflictObjectResult>(partialDelete);
         Assert.Equal(2, await fixture.Db.TeacherDraftItems
             .AsNoTracking()
-            .CountAsync(item => item.BatchKey == batchKey));
+            .CountAsync(item => created.Ids.Contains(item.Id)));
 
         var batchDelete = await controller.DeleteBatch(
             new TeacherDraftBatchDeleteRequest(created.Ids, ExpectedRevisions: createdRevisions),
@@ -325,7 +343,7 @@ public sealed class TeacherDraftBatchAtomicityTests
 
         var deleteResponse = Assert.IsType<OkObjectResult>(batchDelete.Result);
         Assert.Equal(2, Assert.IsType<TeacherDraftBatchDeleteResult>(deleteResponse.Value).Deleted);
-        Assert.Equal(0, await fixture.Db.TeacherDraftItems.CountAsync(item => item.BatchKey == batchKey));
+        Assert.Equal(0, await fixture.Db.TeacherDraftItems.CountAsync(item => created.Ids.Contains(item.Id)));
     }
 
     [Fact]
@@ -758,8 +776,11 @@ public sealed class TeacherDraftBatchAtomicityTests
         Assert.All(remaining, item => Assert.Equal(DraftStatus.Published, item.Status));
     }
 
-    [Fact]
-    public async Task ClearWeek_rejects_mixed_status_logical_event_without_deleting_other_drafts()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ClearWeek_rejects_mixed_status_explicit_and_legacy_logical_event_without_deleting_other_drafts(
+        bool withBatchKey)
     {
         await using var fixture = await TestDatabase.CreateAsync();
         var model = await fixture.SeedAsync(secondDraftLocked: false);
@@ -773,6 +794,17 @@ public sealed class TeacherDraftBatchAtomicityTests
             }));
         var createResponse = Assert.IsType<OkObjectResult>(createResult.Result);
         var created = Assert.IsType<TeacherDraftBatchUpsertResult>(createResponse.Value);
+        if (!withBatchKey)
+        {
+            var legacyRows = await fixture.Db.TeacherDraftItems
+                .Where(item => created.Ids.Contains(item.Id))
+                .ToListAsync();
+            foreach (var row in legacyRows)
+            {
+                row.BatchKey = null;
+            }
+            await fixture.Db.SaveChangesAsync();
+        }
         var publishedSibling = await fixture.Db.TeacherDraftItems
             .SingleAsync(item => item.Id == created.Ids[0]);
         publishedSibling.Status = DraftStatus.Published;
@@ -786,7 +818,7 @@ public sealed class TeacherDraftBatchAtomicityTests
         Assert.Equal(4, await fixture.Db.TeacherDraftItems.AsNoTracking().CountAsync());
         var packageStatuses = await fixture.Db.TeacherDraftItems
             .AsNoTracking()
-            .Where(item => item.BatchKey == batchKey)
+            .Where(item => created.Ids.Contains(item.Id))
             .OrderBy(item => item.Id)
             .Select(item => item.Status)
             .ToListAsync();
@@ -871,7 +903,7 @@ public sealed class TeacherDraftBatchAtomicityTests
         SeedModel model,
         int topicId,
         int teacherId,
-        string batchKey)
+        string? batchKey)
         => new(
             Id: null,
             Date: Monday,

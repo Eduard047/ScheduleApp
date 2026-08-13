@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using System.Text.RegularExpressions;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
@@ -18,16 +19,28 @@ public sealed class DocxImportService
     private const int MaxTableCount = 500;
     private const int MaxRowCount = 20_000;
     private const int MaxCellCount = 100_000;
+    private const int MaxHeaderOrCellTextLength = 16_384;
+    private const RegexOptions LinearRegexOptions = RegexOptions.Compiled
+                                                    | RegexOptions.CultureInvariant
+                                                    | RegexOptions.NonBacktracking;
     private static readonly Regex CourseCodeRegex = new(
         @"(?<![A-Za-zА-Яа-яІіЇїЄєҐґ0-9])[A-Za-zА-Яа-яІіЇїЄєҐґ]{1,6}-\d+(?![A-Za-zА-Яа-яІіЇїЄєҐґ0-9])",
-        RegexOptions.Compiled);
-    private static readonly Regex ModulePrefixRegex = new(@"\b\d+\.\d+\.\d+\b", RegexOptions.Compiled);
-    private static readonly Regex TopicCodeRegex = new(@"\d+(?:\.\d+){2,}", RegexOptions.Compiled);
-    private static readonly Regex LetterTopicCodeRegex = new(@"[A-Za-zА-Яа-яІіЇїЄєҐґ]+\.?((\d+\.?)+)", RegexOptions.Compiled);
-    private static readonly Regex LetteredModulePrefixRegex = new(@"[A-Za-zА-Яа-яІіЇїЄєҐґ]+\.?((\d+\.?)+)", RegexOptions.Compiled);
-    private static readonly Regex NumericDottedCodeRegex = new(@"^\d+(?:\.\d+)+$", RegexOptions.Compiled);
-    private static readonly Regex LetterPrefixedCodeRegex = new(@"^[A-Za-zА-Яа-яІіЇїЄєҐґ]+\.?(?<tail>\d+(?:\.\d+)*)$", RegexOptions.Compiled);
-    private static readonly Regex NumericModuleCodeRegex = new(@"^\d+(?:\.\d+)*$", RegexOptions.Compiled);
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex ModulePrefixRegex = new(@"\b\d+\.\d+\.\d+\b", LinearRegexOptions);
+    private static readonly Regex TopicCodeRegex = new(@"\d+(?:\.\d+){2,}", LinearRegexOptions);
+    private static readonly Regex LetterTopicCodeRegex = new(@"[A-Za-zА-Яа-яІіЇїЄєҐґ]+\.?\d+(?:\.\d+)*\.?", LinearRegexOptions);
+    private static readonly Regex LetteredModulePrefixRegex = new(@"[A-Za-zА-Яа-яІіЇїЄєҐґ]+\.?\d+(?:\.\d+)*\.?", LinearRegexOptions);
+    private static readonly Regex NumericDottedCodeRegex = new(@"^\d+(?:\.\d+)+$", LinearRegexOptions);
+    private static readonly Regex LetterPrefixedCodeRegex = new(@"^[A-Za-zА-Яа-яІіЇїЄєҐґ]+\.?(?<tail>\d+(?:\.\d+)*)$", LinearRegexOptions);
+    private static readonly Regex NumericModuleCodeRegex = new(@"^\d+(?:\.\d+)*$", LinearRegexOptions);
+    private static readonly Regex ModuleRowCodeRegex = new(@"^\d+(?:[.,]\d+)?$", LinearRegexOptions);
+    private static readonly Regex LetterHeadRegex = new(@"^[A-Za-zА-Яа-яІіЇїЄєҐґ]+", LinearRegexOptions);
+    private static readonly Regex HeaderPrefixRegex = new(@"(?:[A-Za-zА-Яа-яІіЇїЄєҐґ]+\.?)?\d+(?:\.\d+)+", LinearRegexOptions);
+    private static readonly Regex HeaderModuleCodeRegex = new(
+        @"(?:^|[^A-Za-zА-Яа-яІіЇїЄєҐґ0-9])(?<code>\d+(?:\.\d+)*)(?:$|[.\s])",
+        LinearRegexOptions);
+    private static readonly Regex NumericLessonTypeRegex = new(@"^\d+\.$", LinearRegexOptions);
+    private static readonly Regex NumericHeaderRegex = new(@"^\d+$", LinearRegexOptions);
     // Зчитує DOCX і формує результат імпорту з опційним застосуванням у БД.
     public async Task<DocxImportResultDto> ImportAsync(IFormFile file, AppDbContext db, bool apply, CancellationToken ct)
     {
@@ -35,6 +48,8 @@ public sealed class DocxImportService
             return new DocxImportResultDto(string.Empty, null, false, new(), new() { "Файл порожній або не надісланий" }, "Файл порожній або не надісланий");
         if (file.Length > MaxFileSizeBytes)
             return new DocxImportResultDto(string.Empty, null, false, new(), new() { "Розмір DOCX-файлу перевищує дозволені 10 МБ" }, "Розмір DOCX-файлу перевищує дозволені 10 МБ");
+        if (file.FileName.Length > MaxHeaderOrCellTextLength)
+            return CreateOversizedTextResult();
         using var buffer = new MemoryStream((int)Math.Min(file.Length, MaxFileSizeBytes));
         await using (var input = file.OpenReadStream())
         {
@@ -75,14 +90,25 @@ public sealed class DocxImportService
             var body = doc.MainDocumentPart?.Document?.Body;
             if (body is null)
                 return new DocxImportResultDto(string.Empty, null, false, new(), new() { "Не вдалося прочитати тіло документа" }, "Не вдалося прочитати тіло документа");
-            if (body.Descendants<Table>().Take(MaxTableCount + 1).Count() > MaxTableCount
-                || body.Descendants<TableRow>().Take(MaxRowCount + 1).Count() > MaxRowCount
-                || body.Descendants<TableCell>().Take(MaxCellCount + 1).Count() > MaxCellCount)
+            var documentTables = body.Descendants<Table>().Take(MaxTableCount + 1).ToList();
+            var documentRows = body.Descendants<TableRow>().Take(MaxRowCount + 1).ToList();
+            var documentCells = body.Descendants<TableCell>().Take(MaxCellCount + 1).ToList();
+            if (documentTables.Count > MaxTableCount
+                || documentRows.Count > MaxRowCount
+                || documentCells.Count > MaxCellCount)
             {
                 return new DocxImportResultDto(string.Empty, null, false, new(), new() { "DOCX-документ має надто складну структуру для безпечного імпорту" }, "DOCX-документ має надто складну структуру для безпечного імпорту");
             }
-            allTexts = body.Descendants<Text>().Select(t => t.Text ?? string.Empty).ToList();
-            tables = body.Descendants<Table>().ToList();
+            if (documentCells.Any(cell => cell.InnerText.Length > MaxHeaderOrCellTextLength))
+            {
+                return CreateOversizedTextResult();
+            }
+            allTexts = body.Descendants<Text>().Select(text => text.Text ?? string.Empty).ToList();
+            if (allTexts.Any(text => text.Length > MaxHeaderOrCellTextLength))
+            {
+                return CreateOversizedTextResult();
+            }
+            tables = documentTables;
         }
         catch (Exception exception) when (exception is OpenXmlPackageException
                                                    or FileFormatException
@@ -101,10 +127,10 @@ public sealed class DocxImportService
         var moduleOrder = parsedModules.Select(m => m.Code).ToList();
         var knownModuleCodes = new HashSet<string>(moduleOrder, StringComparer.OrdinalIgnoreCase);
         var topicsByModule = ParseTopics(topicTables, moduleOrder, knownModuleCodes, warnings);
+        var modulesByCode = parsedModules.ToDictionary(module => module.Code, StringComparer.OrdinalIgnoreCase);
         foreach (var (moduleCode, topics) in topicsByModule)
         {
-            var target = parsedModules.FirstOrDefault(m => string.Equals(m.Code, moduleCode, StringComparison.OrdinalIgnoreCase));
-            if (target is null)
+            if (!modulesByCode.TryGetValue(moduleCode, out var target))
             {
                 warnings.Add($"Для модуля з кодом \"{moduleCode}\" знайдено теми, але такого модуля немає у таблиці модулів");
                 continue;
@@ -205,17 +231,18 @@ public sealed class DocxImportService
     {
         var rows = table.Elements<TableRow>().Skip(1).ToList();
         var modules = new List<DocxImportModuleDto>();
+        var moduleCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var row in rows)
         {
             var cells = GetRowCells(row);
             if (cells.Count < 3) continue;
             var rawCode = cells[0];
             if (string.IsNullOrWhiteSpace(rawCode)) continue;
-            if (!Regex.IsMatch(rawCode, @"^\d+(?:[\\.,]\d+)?$")) continue; // пропускаємо службові рядки типу Усього
+            if (!ModuleRowCodeRegex.IsMatch(rawCode)) continue; // пропускаємо службові рядки типу Усього
             var code = NormalizeCode(rawCode.Replace(',', '.'));
             var title = NormalizeText(cells.ElementAtOrDefault(1) ?? string.Empty);
             var credits = ParseDecimal(cells.ElementAtOrDefault(2));
-            if (modules.Any(m => string.Equals(m.Code, code, StringComparison.OrdinalIgnoreCase)))
+            if (!moduleCodes.Add(code))
             {
                 warnings.Add($"Модуль з кодом \"{code}\" повторюється у таблиці");
                 continue;
@@ -266,7 +293,7 @@ public sealed class DocxImportService
             }
             if (moduleCode is null && modulePrefix is not null && hasLetterPrefix)
             {
-                var letterHead = Regex.Match(modulePrefix, @"^[A-Za-zА-Яа-яІіЇїЄєҐґ]+").Value.ToUpperInvariant();
+                var letterHead = LetterHeadRegex.Match(modulePrefix).Value.ToUpperInvariant();
                 if (letterHead.StartsWith("КП") && knownModuleCodes.Contains("13"))
                 {
                     moduleCode = "13";
@@ -280,15 +307,18 @@ public sealed class DocxImportService
             }
             if (moduleCode is null && !hasLetterPrefix)
             {
-                foreach (var code in knownModuleCodes.OrderByDescending(c => c.Length))
+                foreach (Match match in HeaderModuleCodeRegex.Matches(moduleHeader))
                 {
-                    var pattern = $@"(?<![A-Za-zА-Яа-яІіЇїЄєҐґ0-9]){Regex.Escape(code)}(?=[\.\s]|$)";
-                    if (Regex.IsMatch(moduleHeader, pattern, RegexOptions.IgnoreCase))
+                    var segments = match.Groups["code"].Value.Split('.');
+                    for (var take = segments.Length; take >= 1; take--)
                     {
-                        moduleCode = code;
-                        modulePrefix ??= code;
+                        var candidate = string.Join('.', segments.Take(take));
+                        if (!knownModuleCodes.Contains(candidate)) continue;
+                        moduleCode = candidate;
+                        modulePrefix ??= candidate;
                         break;
                     }
+                    if (moduleCode is not null) break;
                 }
             }
             if (moduleCode is null && tableIndex >= moduleOrder.Count && modulePrefix is not null && lastModuleCode is not null)
@@ -367,7 +397,7 @@ public sealed class DocxImportService
                 if (cells.All(string.IsNullOrWhiteSpace)) continue;
                 if (cells.Count == 1 && !string.IsNullOrWhiteSpace(cells[0]))
                 {
-                    var headerPrefix = Regex.Match(cells[0], @"(?:[A-Za-zА-Яа-яІіЇїЄєҐґ]+\.?)?\d+(?:\.\d+)+");
+                    var headerPrefix = HeaderPrefixRegex.Match(cells[0]);
                     if (headerPrefix.Success)
                     {
                         modulePrefix = NormalizeLetterPrefixedCode(headerPrefix.Value, moduleCodeValue);
@@ -398,7 +428,7 @@ public sealed class DocxImportService
                     string.Equals(lessonTypeName, "Екзамен", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(lessonTypeName, "Всього", StringComparison.OrdinalIgnoreCase) ||
                     lessonTypeName.StartsWith("Всього", StringComparison.OrdinalIgnoreCase) ||
-                    Regex.IsMatch(lessonTypeName, @"^\d+\.$"))
+                    NumericLessonTypeRegex.IsMatch(lessonTypeName))
                 {
                     // Пропускаємо заліки, екзамени, підсумкові рядки та службові номери-типи, користувач створюватиме їх вручну.
                     continue;
@@ -650,18 +680,16 @@ public sealed class DocxImportService
     {
         foreach (var module in modules)
         {
-            var duplicateCode = module.Topics
-                .GroupBy(topic => topic.TopicCode.Trim(), StringComparer.OrdinalIgnoreCase)
-                .FirstOrDefault(group => group.Count() > 1)
-                ?.Key;
-            if (!string.IsNullOrWhiteSpace(duplicateCode))
-            {
-                throw new DocxImportConflictException(
-                    $"Імпорт скасовано: код теми \"{duplicateCode}\" повторюється у модулі \"{module.Code}\".");
-            }
-
+            var topicCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var topic in module.Topics)
             {
+                var topicCode = topic.TopicCode.Trim();
+                if (!topicCodes.Add(topicCode))
+                {
+                    throw new DocxImportConflictException(
+                        $"Імпорт скасовано: код теми \"{topicCode}\" повторюється у модулі \"{module.Code}\".");
+                }
+
                 var hasNegativeHours = topic.TotalHours < 0
                                        || topic.AuditoriumHours < 0
                                        || topic.SelfStudyHours < 0;
@@ -697,7 +725,7 @@ public sealed class DocxImportService
             for (var i = 0; i < 6; i++)
             {
                 var value = cells[i].Trim().Trim('.');
-                if (!Regex.IsMatch(value, @"^\d+$")) return false;
+                if (!NumericHeaderRegex.IsMatch(value)) return false;
                 if (int.Parse(value) != i + 1) return false;
             }
             return true;
@@ -722,16 +750,31 @@ public sealed class DocxImportService
     private static string NormalizeText(string input)
     {
         if (string.IsNullOrWhiteSpace(input)) return string.Empty;
-        var normalized = input
-            .Replace("\r", " ")
-            .Replace("\n", " ")
-            .Replace("\t", " ")
-            .Replace('\u00A0', ' '); // прибираємо нерозривні пробіли
-        while (normalized.Contains("  "))
+        var normalized = new StringBuilder(input.Length);
+        var previousWasSpace = false;
+        foreach (var sourceCharacter in input)
         {
-            normalized = normalized.Replace("  ", " ");
+            var character = sourceCharacter is '\r' or '\n' or '\t' or '\u00A0'
+                ? ' '
+                : sourceCharacter;
+            if (character == ' ')
+            {
+                if (previousWasSpace) continue;
+                previousWasSpace = true;
+            }
+            else
+            {
+                previousWasSpace = false;
+            }
+            normalized.Append(character);
         }
-        return normalized.Trim();
+        return normalized.ToString().Trim();
+    }
+
+    private static DocxImportResultDto CreateOversizedTextResult()
+    {
+        const string message = "DOCX-документ містить клітинку або заголовок, довший за дозволені 16384 символи";
+        return new DocxImportResultDto(string.Empty, null, false, new(), new() { message }, message);
     }
     private static string NormalizeCode(string raw) => NormalizeText(raw.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault() ?? raw);
     // Перетворює рядок у число з плаваючою крапкою.

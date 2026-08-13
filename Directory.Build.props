@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <!-- Не дозволяємо службовим AppleDouble-файлам потрапляти до елементів збірки на зовнішніх дисках. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);**/._*</DefaultItemExcludes>
+  </PropertyGroup>
+</Project>

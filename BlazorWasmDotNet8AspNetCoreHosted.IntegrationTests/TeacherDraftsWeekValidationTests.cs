@@ -98,7 +98,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var ok = Assert.IsType<OkObjectResult>(action.Result);
         var payload = Assert.IsType<PublishWeekResults>(ok.Value);
@@ -166,7 +166,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var ok = Assert.IsType<OkObjectResult>(action.Result);
         var payload = Assert.IsType<PublishWeekResults>(ok.Value);
@@ -676,7 +676,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         Assert.Contains(report.Issues, issue =>
             issue.Code == "week-publish-package-violation"
@@ -729,7 +729,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         Assert.Contains(report.Issues, issue =>
             issue.Code == "week-publish-rule-violation"
@@ -780,7 +780,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         Assert.Contains(report.Issues, issue =>
             issue.Code == "week-publish-rule-violation"
@@ -984,7 +984,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var ok = Assert.IsType<OkObjectResult>(result.Result);
         var payload = Assert.IsType<PublishWeekResults>(ok.Value);
@@ -1010,7 +1010,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var ok = Assert.IsType<OkObjectResult>(result.Result);
         var payload = Assert.IsType<PublishWeekResults>(ok.Value);
@@ -1146,7 +1146,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var ok = Assert.IsType<OkObjectResult>(result.Result);
         var payload = Assert.IsType<PublishWeekResults>(ok.Value);
@@ -1246,7 +1246,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var ok = Assert.IsType<OkObjectResult>(result.Result);
         var payload = Assert.IsType<PublishWeekResults>(ok.Value);
@@ -1408,7 +1408,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var ok = Assert.IsType<OkObjectResult>(result.Result);
         var payload = Assert.IsType<PublishWeekResults>(ok.Value);

@@ -293,7 +293,7 @@
         _metaLoadError = null;
         try
         {
-            _meta = await Http.GetFromJsonAsync<MetaResponseDto>("api/meta")
+            _meta = await Http.GetFromJsonWithDetailsAsync<MetaResponseDto>("api/meta")
                 ?? throw new InvalidOperationException("Сервер повернув порожні довідники.");
             RebuildMetaLookups();
             await LoadConflictsAsync();
@@ -528,7 +528,7 @@
         }
         // Повний тиждень потрібен, щоб жодна відфільтрована тема або співвикладач не випала з атомарної операції.
         var draftsTask = DraftsApi.GetWeek(requestedWeekStart, null);
-        var slotsTask = Http.GetFromJsonAsync<EffectiveSlotsResponse>(slotsUrl);
+        var slotsTask = Http.GetFromJsonWithDetailsAsync<EffectiveSlotsResponse>(slotsUrl);
         try
         {
             await Task.WhenAll(draftsTask, slotsTask);
@@ -887,7 +887,7 @@
         }
         try
         {
-            var topics = await Http.GetFromJsonAsync<List<ModuleTopicViewDto>>($"api/admin/modules/{moduleId}/topics");
+            var topics = await Http.GetFromJsonWithDetailsAsync<List<ModuleTopicViewDto>>($"api/admin/modules/{moduleId}/topics");
             if (editorLoadVersion != _editorLoadVersion)
             {
                 return false;

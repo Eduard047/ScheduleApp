@@ -79,6 +79,24 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
     }
 
     [Fact]
+    public void Start_rejects_null_group_room_preference_before_persistence()
+    {
+        var service = new TeacherDraftsAutogenJobService(
+            new ThrowingScopeFactory(() => new InvalidOperationException("Сховище не повинно викликатися.")),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+        var request = CreateValidRequest() with
+        {
+            GroupRoomPreferences = new List<GroupRoomPreferenceDto> { null! }
+        };
+
+        var exception = Assert.Throws<AutoGenJobValidationException>(() => service.Start(request));
+
+        Assert.Contains("порожні елементи", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, GetPrivateCollectionCount(service, "_jobs"));
+        Assert.Equal(0, GetPrivateCollectionCount(service, "_runningTasks"));
+    }
+
+    [Fact]
     public async Task Start_rejects_new_job_after_service_stopping_begins()
     {
         var service = new TeacherDraftsAutogenJobService(

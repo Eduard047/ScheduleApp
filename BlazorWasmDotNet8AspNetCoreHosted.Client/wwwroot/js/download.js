@@ -4,11 +4,13 @@ export function downloadFromBytes(fileName, contentType, byteArray) {
         return;
     }
     const blob = new Blob([byteArray], { type: contentType });
+    const objectUrl = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    link.href = URL.createObjectURL(blob);
+    link.href = objectUrl;
     link.download = fileName ?? "file.xlsx";
     document.body.appendChild(link);
     link.click();
     link.remove();
-    URL.revokeObjectURL(link.href);
+    // Даємо браузеру завершити обробку кліку перед звільненням Blob URL.
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
 }
