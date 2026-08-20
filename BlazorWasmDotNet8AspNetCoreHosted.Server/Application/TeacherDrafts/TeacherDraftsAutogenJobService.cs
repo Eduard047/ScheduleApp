@@ -1676,7 +1676,14 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                                 runRange.RangeEndDate);
                             if (integratedSoftFill)
                             {
-                                request = request with { SoftFill = false };
+                                // У попередньому плані неповний кандидат може бути лише тимчасовою
+                                // точкою пошуку. Перед видачею плану все одно виконується сувора
+                                // перевірка, тому чернетки без обов'язкових ресурсів назовні не потраплять.
+                                request = request with
+                                {
+                                    SoftFill = false,
+                                    AllowIncompleteDrafts = true
+                                };
                             }
                             var action = await autogen.DraftAutoGenInAmbientTransaction(request, job.Token);
                             var (rangeSucceeded, rangeResult, fallbackWarning) = ExtractAutoGenResult(action);

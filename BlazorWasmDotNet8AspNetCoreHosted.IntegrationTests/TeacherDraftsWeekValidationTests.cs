@@ -112,7 +112,7 @@ public sealed class TeacherDraftsWeekValidationTests
     }
 
     [Fact]
-    public async Task Validate_week_reports_topic_order_regression_against_published_future_week()
+    public async Task Validate_week_allows_topic_reordering_against_published_future_week()
     {
         await using var fixture = await WeekValidationFixture.CreateAsync();
         var (firstTopic, secondTopic) = await AddOrderedTopicsAsync(fixture);
@@ -135,13 +135,13 @@ public sealed class TeacherDraftsWeekValidationTests
 
         var report = await new TeacherDraftsWeekValidationService(fixture.Db).ValidateAsync(Monday);
 
-        Assert.Contains(report.Issues, issue =>
+        Assert.DoesNotContain(report.Issues, issue =>
             issue.Code == "week-hard-rule-violation"
-            && issue.Description.Contains("має порядок", StringComparison.OrdinalIgnoreCase));
+            && issue.Description.Contains("поряд", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
-    public async Task Publish_week_rejects_topic_order_regression_against_published_future_week()
+    public async Task Publish_week_allows_topic_reordering_against_published_future_week()
     {
         await using var fixture = await WeekValidationFixture.CreateAsync();
         var (firstTopic, secondTopic) = await AddOrderedTopicsAsync(fixture);
@@ -170,13 +170,16 @@ public sealed class TeacherDraftsWeekValidationTests
 
         var ok = Assert.IsType<OkObjectResult>(action.Result);
         var payload = Assert.IsType<PublishWeekResults>(ok.Value);
-        Assert.Equal(0, payload.Created);
-        Assert.Contains(payload.Warnings, warning =>
-            warning.Contains("має порядок", StringComparison.OrdinalIgnoreCase));
-        Assert.True(await fixture.Db.TeacherDraftItems.AnyAsync(item => item.Id == draft.Id));
-        Assert.Equal(
-            new[] { future.Id },
-            await fixture.Db.ScheduleItems.Select(item => item.Id).ToArrayAsync());
+        Assert.Equal(1, payload.Created);
+        Assert.DoesNotContain(payload.Warnings, warning =>
+            warning.Contains("поряд", StringComparison.OrdinalIgnoreCase));
+        Assert.False(await fixture.Db.TeacherDraftItems.AnyAsync(item => item.Id == draft.Id));
+        Assert.Equal(2, await fixture.Db.ScheduleItems.CountAsync());
+        Assert.True(await fixture.Db.ScheduleItems.AnyAsync(item => item.Id == future.Id));
+        Assert.True(await fixture.Db.ScheduleItems.AnyAsync(item =>
+            item.Date == Monday
+            && item.GroupId == fixture.GroupId
+            && item.ModuleTopicId == secondTopic.Id));
     }
 
     [Fact]

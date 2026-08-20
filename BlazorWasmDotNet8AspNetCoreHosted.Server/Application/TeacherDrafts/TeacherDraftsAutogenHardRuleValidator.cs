@@ -51,12 +51,6 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             academicPeriodStartDate,
             coursePeriod?.DurationWeeks);
         var scheduleRows = await LoadScheduleRowsAsync(request, groupIds, currentDraftRows, cancellationToken);
-        var topicOrderContextRows = await LoadTopicOrderContextRowsAsync(
-            request,
-            currentDraftRows,
-            academicPeriodStartDate,
-            academicPeriodEndDateExclusive,
-            cancellationToken);
         var modulesWithAuditoriumTopics = await LoadModulesWithAuditoriumTopicsAsync(currentDraftRows, cancellationToken);
         var placements = scheduleRows.Concat(draftRows).ToList();
         var violations = new List<string>();
@@ -123,16 +117,6 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             currentDraftRows,
             academicPeriodStartDate,
             academicPeriodEndDateExclusive,
-            cancellationToken));
-        violations.AddRange(FindTopicOrderViolations(
-            placements
-                .Where(row => row.CourseId == request.CourseId
-                              && (academicPeriodStartDate is not DateOnly periodStart
-                                  || row.Date >= periodStart)
-                              && (academicPeriodEndDateExclusive is not DateOnly periodEnd
-                                  || row.Date < periodEnd))
-                .ToList(),
-            topicOrderContextRows,
             cancellationToken));
         violations.AddRange(FindModuleTopicPlanViolations(currentDraftRows, modulesWithAuditoriumTopics));
         violations.AddRange(FindLectureBlockOrderViolations(placements));

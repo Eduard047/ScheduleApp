@@ -2515,7 +2515,7 @@ else
                 AutoGenGapReasonCodes.Teacher => $"{item.Count} пар не вдалося поставити через викладачів. Перевірте, чи прив'язані викладачі до цих модулів і чи вільні вони в потрібний час.",
                 AutoGenGapReasonCodes.Room => $"{item.Count} пар не вдалося поставити через аудиторії. Перевірте вільні аудиторії потрібної місткості та дозволені корпуси.",
                 AutoGenGapReasonCodes.Travel => $"{item.Count} пар не вдалося поставити через зміну аудиторії або перехід між корпусами. Залиште сусідні пари в тій самій аудиторії або збільшіть перерву.",
-                AutoGenGapReasonCodes.TopicOrder => $"{item.Count} пар заблокував порядок тем. Перевірте, чи попередні теми вже поставлені і чи не завищено план модуля.",
+                AutoGenGapReasonCodes.TopicOrder => $"Для {item.Count} пар не вистачає доступних годин тем. Додайте години тем потрібного типу або зменште план модуля.",
                 AutoGenGapReasonCodes.ModuleBlock => $"{item.Count} пар не вдалося поставити через правило суцільного модуля. Тримайте пари одного модуля поруч або перенесіть зайву пару цього дня.",
                 AutoGenGapReasonCodes.Limit => $"{item.Count} пар зупинили денні обмеження. Додайте навчальний день або час чи зменште кількість пар у вибраному діапазоні.",
                 AutoGenGapReasonCodes.SearchLimit => $"{item.Count} пар лишилися після досягнення безпечної межі пошуку. Спочатку виправте найвужчі обмеження ресурсів, а потім повторіть генерацію.",
@@ -2550,7 +2550,7 @@ else
             "room" => $"{item.Count} пар не вдалося поставити через аудиторії. Додайте або звільніть аудиторії потрібної місткості.{exampleSuffix}",
             "building" => $"{item.Count} пар заблокували налаштування корпусів. Розширте дозволені корпуси або пріоритетні аудиторії групи.{exampleSuffix}",
             "travel" => $"{item.Count} пар не вдалося поставити через переходи. Підберіть аудиторії ближче до сусідніх занять або збільшіть перерву.{exampleSuffix}",
-            "topic-order" => $"{item.Count} пар не мають доступних тем. Додайте теми потрібного типу або зменште план модуля.{exampleSuffix}",
+            "topic-order" => $"Для {item.Count} пар не вистачає доступних годин тем. Додайте години тем потрібного типу або зменште план модуля.{exampleSuffix}",
             _ => $"{item.Title}: {item.Count}. {item.Recommendation}{exampleSuffix}"
         };
     }
@@ -2601,12 +2601,12 @@ else
         int warningsTotal,
         IReadOnlyList<AutoGenGapSummaryItem> gapSummary)
     {
-        var topicOrderCount = gapSummary
+        var topicHoursCount = gapSummary
             .Where(item => string.Equals(item.Code, AutoGenGapReasonCodes.TopicOrder, StringComparison.Ordinal))
             .Sum(item => item.Count);
-        if (report?.Created == 0 && gapCount > 0 && topicOrderCount > 0)
+        if (report?.Created == 0 && gapCount > 0 && topicHoursCount > 0)
         {
-            return $"{gapCount} пар не додано: {topicOrderCount} заблоковано доступними годинами та порядком тем";
+            return $"{gapCount} пар не додано: для {topicHoursCount} пар не вистачає доступних годин тем";
         }
         if (gapCount > 0 && deficitCount > 0)
         {
@@ -2815,7 +2815,7 @@ else
             AutoGenGapReasonCodes.Teacher => "Додайте викладача до цього модуля або відкрийте його робочий час у цей слот.",
             AutoGenGapReasonCodes.Room => "Звільніть аудиторію потрібної місткості або додайте її в дозволені для модуля/групи.",
             AutoGenGapReasonCodes.Travel => "Поставте сусіднє заняття в ту саму аудиторію або збільшіть перерву для зміни аудиторії.",
-            AutoGenGapReasonCodes.TopicOrder => "Додайте раніший слот для попередньої теми або зменште години модуля в цьому діапазоні.",
+            AutoGenGapReasonCodes.TopicOrder => "Додайте до модуля достатньо годин тем потрібного типу або зменште його квоту в цьому діапазоні.",
             AutoGenGapReasonCodes.ModuleBlock => "Залиште поруч кілька слотів під цей модуль або перенесіть зайву пару з дня.",
             AutoGenGapReasonCodes.Limit => "Додайте слоти/дні для групи або зменште кількість годин у цьому діапазоні.",
             AutoGenGapReasonCodes.SearchLimit => "Перевірте дефіцитні ресурси й повторіть генерацію після їх виправлення; межу пошуку не слід просто збільшувати без аналізу.",
@@ -2828,7 +2828,7 @@ else
             AutoGenGapReasonCodes.Teacher => $"Для {gap.GroupName} немає вільного викладача на {gap.SlotLabel}.",
             AutoGenGapReasonCodes.Room => $"Для {gap.GroupName} немає вільної аудиторії на {gap.SlotLabel}.",
             AutoGenGapReasonCodes.Travel => $"Для {gap.GroupName} не вистачає часу змінити аудиторію біля {gap.SlotLabel}.",
-            AutoGenGapReasonCodes.TopicOrder => $"Для {gap.GroupName} тема модуля має йти раніше або пізніше за поточний слот.",
+            AutoGenGapReasonCodes.TopicOrder => $"Для {gap.GroupName} не вистачає доступних годин тем модуля для цього слота.",
             AutoGenGapReasonCodes.ModuleBlock => $"Модуль {target} розривається в межах дня.",
             AutoGenGapReasonCodes.Limit => $"Для {gap.GroupName} спрацював ліміт дня або слоту.",
             AutoGenGapReasonCodes.SearchLimit => $"Для {gap.GroupName} пошук безпечного варіанта досяг установленої межі на {gap.SlotLabel}.",
