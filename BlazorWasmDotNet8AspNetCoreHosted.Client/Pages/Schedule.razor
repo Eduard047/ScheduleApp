@@ -16,7 +16,7 @@
     [Parameter, SupplyParameterFromQuery(Name = "courseId")]
     public int? QueryCourseId { get; set; }
 
-    private const string AppVersion = "1.4.20"; // Оновлюйте перед релізом
+    private const string AppVersion = "1.4.21"; // Оновлюйте перед релізом
     private MetaResponseDto? _meta;
     private int? _courseId;
     private int? _groupId;
@@ -1298,15 +1298,26 @@ else
     }
     .week-date-picker {
         display: grid;
-        gap: .2rem;
-        min-width: 150px;
+        gap: .3rem;
+        width: 220px;
+        min-width: 220px;
         color: #64748b;
-        font-size: .72rem;
-        font-weight: 600;
+        font-size: .78rem;
+        font-weight: 700;
+        line-height: 1.2;
     }
     .week-date-picker .select {
-        min-width: 0;
-        padding: .35rem .5rem;
+        min-width: 220px;
+        min-height: 46px;
+        padding: .62rem .75rem;
+        border-radius: 12px;
+        font-size: .95rem;
+        font-variant-numeric: tabular-nums;
+        line-height: 1.2;
+        color-scheme: light;
+    }
+    .week-date-picker input[type="date"]::-webkit-date-and-time-value {
+        text-align: left;
     }
     .card-edit-trigger {
         position: absolute;
@@ -1418,6 +1429,7 @@ else
             font-size: .78rem;
         }
         .week-date-picker {
+            min-width: 0;
             width: 100%;
         }
         .filters-panel {
