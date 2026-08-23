@@ -1,6 +1,8 @@
 using System.Net;
+using System.Threading.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.HttpOverrides;
+using Microsoft.AspNetCore.RateLimiting;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using Pomelo.EntityFrameworkCore.MySql.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
@@ -20,6 +22,53 @@ builder.Services.AddProblemDetails(options =>
         context.ProblemDetails.Extensions["traceId"] = context.HttpContext.TraceIdentifier;
 });
 builder.Services.AddHealthChecks();
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.OnRejected = async (context, cancellationToken) =>
+    {
+        if (context.HttpContext.Response.HasStarted)
+        {
+            return;
+        }
+
+        await Results.Problem(
+                statusCode: StatusCodes.Status429TooManyRequests,
+                title: "Забагато дорогих операцій",
+                detail: "Зачекайте перед повторним запуском цієї операції.")
+            .ExecuteAsync(context.HttpContext);
+    };
+    options.AddPolicy("autogen-start", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ClientPartitionKey.Resolve(context),
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 4,
+                Window = TimeSpan.FromMinutes(3),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+    options.AddPolicy("docx-import", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ClientPartitionKey.Resolve(context),
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 2,
+                Window = TimeSpan.FromMinutes(5),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+    options.AddPolicy("xlsx-export", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ClientPartitionKey.Resolve(context),
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 6,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+});
 // Стискаємо JSON, WebAssembly та статичні ресурси під час передавання через HTTPS.
 builder.Services.AddResponseCompression(options => options.EnableForHttps = true);
 
@@ -70,8 +119,11 @@ var app = builder.Build();
 // Приймаємо схему та адресу клієнта лише від явно довірених reverse proxy.
 app.UseForwardedHeaders();
 app.UseHostFiltering();
+app.UseMiddleware<SecurityResponseHeadersMiddleware>();
 // Перевіряємо браузерне походження всіх API-запитів, що можуть змінювати стан.
 app.UseMiddleware<ApiRequestOriginPolicyMiddleware>();
+app.UseRouting();
+app.UseRateLimiter();
 
 if (app.Environment.IsDevelopment())
 {

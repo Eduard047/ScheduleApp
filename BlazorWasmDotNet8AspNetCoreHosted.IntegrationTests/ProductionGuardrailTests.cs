@@ -1894,7 +1894,7 @@ public sealed class ProductionGuardrailTests
     }
 
     [Fact]
-    public void Autogen_job_normalization_enforces_kind_flags()
+    public void Autogen_job_normalization_enforces_kind_flags_and_preserves_generate_soft_fill()
     {
         var valid = CreateValidAutoGenJobRequest();
 
@@ -1924,7 +1924,7 @@ public sealed class ProductionGuardrailTests
         Assert.True(fill.SoftFill);
         Assert.False(fill.ClearExisting);
         Assert.False(fill.PreflightOnly);
-        Assert.False(generate.SoftFill);
+        Assert.True(generate.SoftFill);
         Assert.False(generate.PreflightOnly);
         Assert.True(generate.PreviewOnly);
     }

@@ -14,6 +14,8 @@ public sealed class AutoGenPlanConflictException(string message) : Exception(mes
 public sealed class AutoGenPlanPersistenceException(string message, Exception? innerException = null)
     : Exception(message, innerException);
 
+public sealed class AutoGenPlanCapacityException(string message) : Exception(message);
+
 internal sealed record AutoGenDraftSnapshot(
     int Id,
     Guid Revision,
@@ -85,9 +87,12 @@ internal sealed record AutoGenDraftPlanPayload(
 
 public sealed class TeacherDraftsAutogenPlanService
 {
+    private const int MaxRetainedPlanCount = 50;
+    private const int MaxRetainedMutationCount = 10_000;
+    private const int MaxMutationsPerPlan = 2_000;
+    private const int MaxSerializedSnapshotLength = 8_192;
     private static readonly TimeSpan PreviewLifetime = TimeSpan.FromHours(24);
     private static readonly TimeSpan RollbackLifetime = TimeSpan.FromDays(7);
-    private static readonly TimeSpan PlanRetention = TimeSpan.FromDays(30);
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         WriteIndented = false
@@ -220,6 +225,19 @@ public sealed class TeacherDraftsAutogenPlanService
         {
             return;
         }
+        if (payload.Mutations.Count > MaxMutationsPerPlan)
+        {
+            throw new AutoGenPlanCapacityException(
+                $"План містить {payload.Mutations.Count} змін, що перевищує безпечний ліміт {MaxMutationsPerPlan}.");
+        }
+        var retainedPlanCount = await db.AutoGenDraftPlans.CountAsync(cancellationToken);
+        var retainedMutationCount = await db.AutoGenDraftPlanMutations.CountAsync(cancellationToken);
+        if (retainedPlanCount >= MaxRetainedPlanCount
+            || retainedMutationCount + payload.Mutations.Count > MaxRetainedMutationCount)
+        {
+            throw new AutoGenPlanCapacityException(
+                "Сховище попередніх планів досягло безпечної квоти. Дочекайтеся штатного очищення старих планів.");
+        }
 
         var plan = new AutoGenDraftPlan
         {
@@ -243,14 +261,22 @@ public sealed class TeacherDraftsAutogenPlanService
         };
         foreach (var mutation in payload.Mutations)
         {
+            var beforeJson = SerializeSnapshot(mutation.Before);
+            var afterJson = SerializeSnapshot(mutation.After);
+            if ((beforeJson?.Length ?? 0) > MaxSerializedSnapshotLength
+                || (afterJson?.Length ?? 0) > MaxSerializedSnapshotLength)
+            {
+                throw new AutoGenPlanCapacityException(
+                    $"Знімок зміни плану перевищує безпечний ліміт {MaxSerializedSnapshotLength} символів.");
+            }
             plan.Mutations.Add(new AutoGenDraftPlanMutation
             {
                 Ordinal = mutation.Ordinal,
                 Operation = (int)mutation.Operation,
                 SourceDraftId = mutation.Before?.Id,
                 BeforeRevision = mutation.Before?.Revision,
-                BeforeJson = SerializeSnapshot(mutation.Before),
-                AfterJson = SerializeSnapshot(mutation.After)
+                BeforeJson = beforeJson,
+                AfterJson = afterJson
             });
         }
         db.AutoGenDraftPlans.Add(plan);
@@ -776,7 +802,7 @@ public sealed class TeacherDraftsAutogenPlanService
         AppDbContext db,
         CancellationToken cancellationToken = default)
     {
-        var cutoffUtc = DateTime.UtcNow.Subtract(PlanRetention);
+        var cutoffUtc = DateTime.UtcNow;
         return db.AutoGenDraftPlans
             .Where(item => item.ExpiresAtUtc < cutoffUtc)
             .ExecuteDeleteAsync(cancellationToken);

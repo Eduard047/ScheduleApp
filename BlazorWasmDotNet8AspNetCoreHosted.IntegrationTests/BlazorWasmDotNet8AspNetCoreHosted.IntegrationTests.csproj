@@ -48,6 +48,7 @@
     <Compile Include="AutoGenWarningClassifierTests.cs" />
     <Compile Include="AutogenLecturePackingTests.cs" />
     <Compile Include="AutogenQualityMatrixTests.cs" />
+    <Compile Include="AutogenSeededStressTests.cs" />
     <Compile Include="ClientHttpContractTests.cs" />
     <Compile Include="DeterministicResidualOptimizerOracleTests.cs" />
     <Compile Include="DeterministicResourceMatcherTests.cs" />

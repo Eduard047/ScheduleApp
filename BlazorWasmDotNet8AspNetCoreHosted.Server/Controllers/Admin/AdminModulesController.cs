@@ -12,6 +12,7 @@ using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.RateLimiting;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Admin;
 
@@ -625,6 +626,7 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
         return NoContent();
     }
     [HttpPost("import-docx")]
+    [EnableRateLimiting("docx-import")]
     [RequestSizeLimit(11 * 1024 * 1024)]
     [RequestFormLimits(MultipartBodyLengthLimit = 11 * 1024 * 1024)]
     // Імпортує модулі та теми з DOCX.

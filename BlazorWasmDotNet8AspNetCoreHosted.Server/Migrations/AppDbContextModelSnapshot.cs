@@ -17,7 +17,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
         {
 #pragma warning disable 612, 618
             modelBuilder
-                .HasAnnotation("ProductVersion", "8.0.13")
+                .HasAnnotation("ProductVersion", "8.0.29")
                 .HasAnnotation("Relational:MaxIdentifierLength", 64);
 
             MySqlModelBuilderExtensions.AutoIncrementColumns(modelBuilder);
@@ -170,6 +170,13 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                     b.Property<bool>("CancellationRequested")
                         .HasColumnType("tinyint(1)");
 
+                    b.Property<string>("ClientPartitionKey")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)")
+                        .HasDefaultValue("legacy");
+
                     b.Property<DateTime?>("CompletedAtUtc")
                         .HasColumnType("datetime(6)");
 
@@ -294,6 +301,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                     b.HasIndex("State");
 
                     b.HasIndex("UpdatedAtUtc");
+
+                    b.HasIndex("ClientPartitionKey", "State");
 
                     b.HasIndex("State", "LeaseExpiresAtUtc");
 

@@ -59,16 +59,40 @@ public sealed class DocxImportSecurityTests
         Assert.Equal("Тестовий модуль", module.Title);
     }
 
+    [Fact]
+    public async Task Import_rejects_excessive_semantic_module_count_before_database_mutation()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        fixture.Db.Courses.Add(new Course { Name = "КН-1", DurationWeeks = 52 });
+        await fixture.Db.SaveChangesAsync();
+        var bytes = CreateModuleDocx(Enumerable.Range(1, 501)
+            .Select(index => (index.ToString(), $"Модуль {index}")));
+        await using var stream = new MemoryStream(bytes);
+        var file = new FormFile(stream, 0, bytes.Length, "file", "КН-1.docx");
+
+        var result = await new DocxImportService().ImportAsync(
+            file,
+            fixture.Db,
+            apply: true,
+            CancellationToken.None);
+
+        Assert.NotNull(result.Error);
+        Assert.Contains("навчальних сутностей", result.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(await fixture.Db.Modules.ToListAsync());
+    }
+
     private static byte[] CreateModuleDocx(string moduleTitle)
+        => CreateModuleDocx(new[] { ("1", moduleTitle) });
+
+    private static byte[] CreateModuleDocx(IEnumerable<(string Code, string Title)> modules)
     {
         using var stream = new MemoryStream();
         using (var document = WordprocessingDocument.Create(stream, WordprocessingDocumentType.Document, true))
         {
             var mainPart = document.AddMainDocumentPart();
-            mainPart.Document = new Document(new Body(
-                new Table(
-                    CreateRow("Код", "Назва", "Кредити"),
-                    CreateRow("1", moduleTitle, "1"))));
+            var rows = new List<TableRow> { CreateRow("Код", "Назва", "Кредити") };
+            rows.AddRange(modules.Select(module => CreateRow(module.Code, module.Title, "1")));
+            mainPart.Document = new Document(new Body(new Table(rows)));
             mainPart.Document.Save();
         }
         return stream.ToArray();

@@ -20,6 +20,11 @@ public sealed class DocxImportService
     private const int MaxRowCount = 20_000;
     private const int MaxCellCount = 100_000;
     private const int MaxHeaderOrCellTextLength = 16_384;
+    private const int MaxParsedModuleCount = 500;
+    private const int MaxParsedTopicCount = 5_000;
+    private const long MaxEstimatedDatabaseOperationCount = 50_000;
+    private static readonly TimeSpan ImportDeadline = TimeSpan.FromSeconds(45);
+    private static readonly SemaphoreSlim ImportConcurrencyGate = new(1, 1);
     private const RegexOptions LinearRegexOptions = RegexOptions.Compiled
                                                     | RegexOptions.CultureInvariant
                                                     | RegexOptions.NonBacktracking;
@@ -43,6 +48,46 @@ public sealed class DocxImportService
     private static readonly Regex NumericHeaderRegex = new(@"^\d+$", LinearRegexOptions);
     // Зчитує DOCX і формує результат імпорту з опційним застосуванням у БД.
     public async Task<DocxImportResultDto> ImportAsync(IFormFile file, AppDbContext db, bool apply, CancellationToken ct)
+    {
+        if (!await ImportConcurrencyGate.WaitAsync(TimeSpan.Zero, ct))
+        {
+            return new DocxImportResultDto(
+                string.Empty,
+                null,
+                false,
+                new(),
+                new() { "Інший DOCX-імпорт уже виконується" },
+                "Одночасно дозволено лише один DOCX-імпорт. Повторіть спробу пізніше");
+        }
+
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(ImportDeadline);
+        try
+        {
+            return await ImportCoreAsync(file, db, apply, deadline.Token);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            db.ChangeTracker.Clear();
+            return new DocxImportResultDto(
+                string.Empty,
+                null,
+                false,
+                new(),
+                new() { "Імпорт перевищив безпечний час виконання" },
+                "DOCX-імпорт не завершився у безпечний час. Зменште документ і повторіть спробу");
+        }
+        finally
+        {
+            ImportConcurrencyGate.Release();
+        }
+    }
+
+    private static async Task<DocxImportResultDto> ImportCoreAsync(
+        IFormFile file,
+        AppDbContext db,
+        bool apply,
+        CancellationToken ct)
     {
         if (file == null || file.Length == 0)
             return new DocxImportResultDto(string.Empty, null, false, new(), new() { "Файл порожній або не надісланий" }, "Файл порожній або не надісланий");
@@ -138,6 +183,17 @@ public sealed class DocxImportService
             target.Topics.Clear();
             target.Topics.AddRange(topics);
         }
+        var parsedTopicCount = parsedModules.Sum(module => module.Topics.Count);
+        if (parsedModules.Count > MaxParsedModuleCount || parsedTopicCount > MaxParsedTopicCount)
+        {
+            return new DocxImportResultDto(
+                courseName ?? string.Empty,
+                null,
+                false,
+                parsedModules,
+                warnings,
+                $"DOCX містить надто багато навчальних сутностей: дозволено до {MaxParsedModuleCount} модулів і {MaxParsedTopicCount} тем");
+        }
         if (string.IsNullOrWhiteSpace(courseName))
         {
             return new DocxImportResultDto(string.Empty, null, false, parsedModules, warnings, "Не вдалося визначити назву курсу");
@@ -193,6 +249,18 @@ public sealed class DocxImportService
         if (!apply)
         {
             return result;
+        }
+        var roomCount = await db.Rooms.AsNoTracking().CountAsync(ct);
+        var buildingCount = await db.Buildings.AsNoTracking().CountAsync(ct);
+        var estimatedDatabaseOperations = checked(
+            (long)parsedModules.Count * (8L + roomCount + buildingCount)
+            + (long)parsedTopicCount * 3L);
+        if (estimatedDatabaseOperations > MaxEstimatedDatabaseOperationCount)
+        {
+            return result with
+            {
+                Error = $"Імпорт потребує орієнтовно {estimatedDatabaseOperations} операцій із базою даних, що перевищує безпечний ліміт {MaxEstimatedDatabaseOperationCount}"
+            };
         }
         await using var transaction = await db.Database.BeginTransactionAsync(ct);
         try

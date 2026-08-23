@@ -153,6 +153,62 @@ public sealed class TeacherDraftsSecurityRemediationTests
     }
 
     [Fact]
+    public async Task Autogen_plan_storage_rejects_new_plan_at_aggregate_count_quota()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedDraftModelAsync(groupCount: 1, draftCount: 0);
+        var now = DateTime.UtcNow;
+        var retainedRuns = Enumerable.Range(0, 50)
+            .Select(index => CreateRun($"retained-plan-{index:D2}", AutoGenJobState.Succeeded, now))
+            .ToList();
+        fixture.Db.AutoGenJobRuns.AddRange(retainedRuns);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.AutoGenDraftPlans.AddRange(retainedRuns.Select(run => new AutoGenDraftPlan
+        {
+            PlanId = run.JobId,
+            AutoGenJobRunId = run.Id,
+            State = (int)AutoGenPlanState.Ready,
+            Version = 1,
+            CourseId = model.CourseId,
+            RangeStartDate = Monday,
+            RangeEndDate = Monday,
+            Days = (int)WeekPreset.MonFri,
+            AllowIncompleteDrafts = false,
+            GroupIdsJson = $"[{model.GroupIds[0]}]",
+            BeforeScopeRevision = Guid.NewGuid(),
+            InputFingerprint = new string('a', 64),
+            CreatedAtUtc = now,
+            ExpiresAtUtc = now.AddHours(1)
+        }));
+        var candidateRun = CreateRun("candidate-plan", AutoGenJobState.Succeeded, now);
+        fixture.Db.AutoGenJobRuns.Add(candidateRun);
+        await fixture.Db.SaveChangesAsync();
+        var payload = new AutoGenDraftPlanPayload(
+            candidateRun.JobId,
+            model.CourseId,
+            Monday,
+            Monday,
+            WeekPreset.MonFri,
+            false,
+            model.GroupIds,
+            Guid.NewGuid(),
+            new string('b', 64),
+            now,
+            now.AddHours(1),
+            Array.Empty<AutoGenDraftPlanMutationPayload>());
+
+        var exception = await Assert.ThrowsAsync<AutoGenPlanCapacityException>(() =>
+            TeacherDraftsAutogenPlanService.AddReadyPlanAsync(
+                fixture.Db,
+                candidateRun,
+                payload,
+                CancellationToken.None));
+
+        Assert.Contains("квоти", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(50, await fixture.Db.AutoGenDraftPlans.CountAsync());
+    }
+
+    [Fact]
     public async Task Autogen_start_runs_durable_cleanup_before_persisting_new_job()
     {
         await using var fixture = await TestDatabase.CreateAsync();
@@ -188,13 +244,13 @@ public sealed class TeacherDraftsSecurityRemediationTests
     {
         var fullRangeBoundary = CreateValidJobRequest() with
         {
-            ToDate = new DateOnly(2026, 1, 1).AddDays(369),
-            GroupIds = Enumerable.Range(1, 32).ToList()
+            ToDate = new DateOnly(2026, 1, 1).AddDays(99),
+            GroupIds = Enumerable.Range(1, 40).ToList()
         };
         AssertReachesPersistence(fullRangeBoundary);
         var requestedHoursBoundary = CreateValidJobRequest() with
         {
-            GroupIds = Enumerable.Range(1, 200).ToList(),
+            GroupIds = Enumerable.Range(1, 50).ToList(),
             ModuleHours = new Dictionary<int, int> { [1] = 500 }
         };
         AssertReachesPersistence(requestedHoursBoundary);
@@ -219,6 +275,37 @@ public sealed class TeacherDraftsSecurityRemediationTests
         var hoursException = Assert.Throws<AutoGenJobValidationException>(() => service.Start(excessiveGroupHours));
         Assert.Contains("груп і сумарних годин", hoursException.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(0, scopeFactory.CreateScopeCalls);
+    }
+
+    [Fact]
+    public async Task Autogen_start_limits_each_network_client_without_consuming_global_capacity()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedDraftModelAsync(groupCount: 1, draftCount: 0);
+        var now = DateTime.UtcNow;
+        var first = CreateRun("client-a-1", AutoGenJobState.Running, now);
+        var second = CreateRun("client-a-2", AutoGenJobState.Queued, now);
+        first.ClientPartitionKey = "client-a";
+        second.ClientPartitionKey = "client-a";
+        fixture.Db.AutoGenJobRuns.AddRange(first, second);
+        await fixture.Db.SaveChangesAsync();
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(fixture.Options));
+        await using var provider = services.BuildServiceProvider();
+        var service = new TeacherDraftsAutogenJobService(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<TeacherDraftsAutogenJobService>.Instance);
+        var request = CreateValidJobRequest() with
+        {
+            CourseId = model.CourseId,
+            GroupIds = new List<int> { model.GroupIds[0] },
+            ClientJobId = Guid.NewGuid().ToString("N")
+        };
+
+        var rejected = Assert.Throws<AutoGenJobCapacityException>(() => service.Start(request, "client-a"));
+
+        Assert.Contains("мережевого клієнта", rejected.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(await fixture.Db.AutoGenJobRuns.AnyAsync(run => run.JobId == request.ClientJobId));
     }
 
     [Fact]

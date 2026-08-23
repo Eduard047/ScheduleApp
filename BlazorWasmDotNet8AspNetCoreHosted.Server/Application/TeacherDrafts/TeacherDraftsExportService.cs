@@ -25,6 +25,8 @@ public sealed class TeacherDraftsExportService
 {
     internal const int MaxDraftRowCount = 5_000;
     internal const int MaxMatrixCellCount = 50_000;
+    private static readonly TimeSpan ExportDeadline = TimeSpan.FromSeconds(45);
+    private static readonly SemaphoreSlim ExportConcurrencyGate = new(2, 2);
     private readonly AppDbContext _db;
     private readonly TeacherDraftsQueryService _queryService;
     public TeacherDraftsExportService(AppDbContext db, TeacherDraftsQueryService queryService)
@@ -158,6 +160,38 @@ public sealed class TeacherDraftsExportService
         int? groupId,
         int? roomId,
         CancellationToken cancellationToken = default)
+    {
+        if (!await ExportConcurrencyGate.WaitAsync(TimeSpan.Zero, cancellationToken))
+        {
+            throw new TeacherDraftsExportLimitException(
+                StatusCodes.Status429TooManyRequests,
+                "Одночасно вже виконується максимальна кількість експортів. Повторіть спробу пізніше.");
+        }
+
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(ExportDeadline);
+        try
+        {
+            return await ExportCoreAsync(weekStart, teacherId, groupId, roomId, deadline.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new TeacherDraftsExportLimitException(
+                StatusCodes.Status408RequestTimeout,
+                "Експорт не завершився у безпечний час. Звузьте фільтри й повторіть спробу.");
+        }
+        finally
+        {
+            ExportConcurrencyGate.Release();
+        }
+    }
+
+    private async Task<FileStreamResult> ExportCoreAsync(
+        DateOnly weekStart,
+        int? teacherId,
+        int? groupId,
+        int? roomId,
+        CancellationToken cancellationToken)
     {
         var drafts = await _queryService.GetAsync(
             weekStart,

@@ -11,6 +11,7 @@ using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers;
@@ -79,6 +80,7 @@ public sealed class TeacherDraftsController : ControllerBase
         return Ok(await validationService.ValidateAsync(weekStart, cancellationToken));
     }
     [HttpGet("export")]
+    [EnableRateLimiting("xlsx-export")]
     // Експортує чернетки в Excel за фільтрами.
     public async Task<IActionResult> Export(
         [FromQuery] DateOnly weekStart,
@@ -1045,6 +1047,7 @@ public sealed class TeacherDraftsController : ControllerBase
     public ActionResult<AutoGenResult> DraftAutoGen([FromBody] DraftAutoGenRequest r)
         => LegacyAutogenEndpointDisabled();
     [HttpPost("autogen/jobs")]
+    [EnableRateLimiting("autogen-start")]
     public ActionResult<AutoGenJobStartResult> StartAutoGenJob([FromBody] AutoGenJobRequest r)
     {
         if (r.Kind is AutoGenJobKind.Generate or AutoGenJobKind.Fill && !r.PreviewOnly)
@@ -1056,7 +1059,7 @@ public sealed class TeacherDraftsController : ControllerBase
         }
         try
         {
-            return Ok(_autogenJobService.Start(r));
+            return Ok(_autogenJobService.Start(r, ClientPartitionKey.Resolve(HttpContext)));
         }
         catch (AutoGenJobValidationException ex)
         {

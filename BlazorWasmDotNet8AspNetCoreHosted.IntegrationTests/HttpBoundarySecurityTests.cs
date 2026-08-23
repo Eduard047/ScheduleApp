@@ -114,6 +114,17 @@ public sealed class HttpBoundarySecurityTests
     }
 
     [Fact]
+    public async Task Application_responses_deny_cross_origin_framing()
+    {
+        await using var host = await SecurityTestHost.StartAsync("schedule.example.test");
+
+        using var response = await host.SendAsync(HttpMethod.Get, "schedule.example.test");
+
+        Assert.Equal("frame-ancestors 'none'", response.Headers.GetValues("Content-Security-Policy").Single());
+        Assert.Equal("DENY", response.Headers.GetValues("X-Frame-Options").Single());
+    }
+
+    [Fact]
     public async Task Empty_proxy_policy_does_not_trust_forwarded_headers()
     {
         await using var host = await SecurityTestHost.StartAsync("schedule.example.test");
@@ -184,6 +195,7 @@ public sealed class HttpBoundarySecurityTests
             var app = builder.Build();
             app.UseForwardedHeaders();
             app.UseHostFiltering();
+            app.UseMiddleware<SecurityResponseHeadersMiddleware>();
             app.UseMiddleware<ApiRequestOriginPolicyMiddleware>();
             app.MapMethods(
                 "/api/security-boundary",
