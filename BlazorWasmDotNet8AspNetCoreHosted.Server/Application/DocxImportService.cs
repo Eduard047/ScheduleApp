@@ -619,6 +619,31 @@ public sealed class DocxImportService
             lt => NormalizeText(lt.Name).ToUpperInvariant(),
             lt => lt,
             StringComparer.OrdinalIgnoreCase);
+        var canonicalLessonTypeNames = BuildCanonicalLessonTypeNames(modules, lessonTypeLookup);
+        foreach (var alias in canonicalLessonTypeNames)
+        {
+            if (!lessonTypeLookup.TryGetValue(alias.Key, out var sourceType))
+            {
+                continue;
+            }
+            var targetLookupKey = alias.Value.ToUpperInvariant();
+            if (!lessonTypeLookup.TryGetValue(targetLookupKey, out var targetType)
+                || sourceType.Id == targetType.Id)
+            {
+                continue;
+            }
+            try
+            {
+                await LessonTypeMergeService.MergeAsync(db, sourceType.Id, targetType.Id, ct);
+            }
+            catch (LessonTypeMergeException exception)
+            {
+                throw new DocxImportConflictException(
+                    $"Імпорт скасовано: тип заняття \"{sourceType.Name}\" схожий на випадковий дубль \"{targetType.Name}\", але безпечне об'єднання неможливе. {exception.Message}");
+            }
+            lessonTypeLookup.Remove(alias.Key);
+            AddLessonTypeNormalizationWarning(result, sourceType.Name, targetType.Name);
+        }
         foreach (var module in modules)
         {
             if (!existingModules.TryGetValue(module.Code, out var entity))
@@ -660,13 +685,31 @@ public sealed class DocxImportService
             foreach (var topic in module.Topics.OrderBy(t => t.Order))
             {
                 parsedCodes.Add(topic.TopicCode);
-                if (!lessonTypeLookup.TryGetValue(NormalizeText(topic.LessonTypeName).ToUpperInvariant(), out var lessonType))
+                var importedLessonTypeName = NormalizeText(topic.LessonTypeName);
+                var importedLessonTypeLookupKey = importedLessonTypeName.ToUpperInvariant();
+                var effectiveLessonTypeName = canonicalLessonTypeNames.TryGetValue(
+                    importedLessonTypeLookupKey,
+                    out var canonicalLessonTypeName)
+                        ? canonicalLessonTypeName
+                        : importedLessonTypeName;
+                var lessonTypeLookupKey = effectiveLessonTypeName.ToUpperInvariant();
+                if (!string.Equals(
+                        importedLessonTypeName,
+                        effectiveLessonTypeName,
+                        StringComparison.CurrentCultureIgnoreCase))
                 {
-                    // якщо типу немає — створюємо тимчасовий активний тип, що рахується в плані.
+                    AddLessonTypeNormalizationWarning(
+                        result,
+                        importedLessonTypeName,
+                        effectiveLessonTypeName);
+                }
+                if (!lessonTypeLookup.TryGetValue(lessonTypeLookupKey, out var lessonType))
+                {
+                    // Створюємо вже канонічне значення, визначене за всім документом, а не за порядком рядків.
                     lessonType = new LessonTypeRef
                     {
-                        Code = NormalizeText(topic.LessonTypeName).ToUpperInvariant().Replace(" ", "_"),
-                        Name = topic.LessonTypeName,
+                        Code = effectiveLessonTypeName.ToUpperInvariant().Replace(" ", "_"),
+                        Name = effectiveLessonTypeName,
                         IsActive = true,
                         RequiresRoom = true,
                         RequiresTeacher = true,
@@ -677,7 +720,7 @@ public sealed class DocxImportService
                     };
                     db.LessonTypes.Add(lessonType);
                     await db.SaveChangesAsync(ct);
-                    lessonTypeLookup[NormalizeText(topic.LessonTypeName).ToUpperInvariant()] = lessonType;
+                    lessonTypeLookup[lessonTypeLookupKey] = lessonType;
                 }
                 ModuleTopic entityTopic;
                 if (existingByCode.TryGetValue(topic.TopicCode, out var existingTopic))
@@ -837,6 +880,73 @@ public sealed class DocxImportService
             normalized.Append(character);
         }
         return normalized.ToString().Trim();
+    }
+
+    // Будує відповідності за всім документом, щоб результат не залежав від порядку модулів або тем.
+    private static Dictionary<string, string> BuildCanonicalLessonTypeNames(
+        IEnumerable<DocxImportModuleDto> modules,
+        IReadOnlyDictionary<string, LessonTypeRef> existingLessonTypes)
+    {
+        var importedNames = modules
+            .SelectMany(module => module.Topics)
+            .Select(topic => NormalizeText(topic.LessonTypeName))
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .GroupBy(name => name.ToUpperInvariant(), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => group.First(),
+                StringComparer.OrdinalIgnoreCase);
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var importedName in importedNames)
+        {
+            var collapsedName = CollapseAdjacentDuplicateWords(importedName.Value);
+            if (string.Equals(importedName.Value, collapsedName, StringComparison.CurrentCultureIgnoreCase))
+            {
+                continue;
+            }
+            var collapsedLookupKey = collapsedName.ToUpperInvariant();
+            if (importedNames.TryGetValue(collapsedLookupKey, out var canonicalImportedName))
+            {
+                result[importedName.Key] = canonicalImportedName;
+            }
+            else if (existingLessonTypes.TryGetValue(collapsedLookupKey, out var canonicalExistingType))
+            {
+                result[importedName.Key] = canonicalExistingType.Name;
+            }
+        }
+        return result;
+    }
+
+    private static void AddLessonTypeNormalizationWarning(
+        DocxImportResultDto result,
+        string importedName,
+        string canonicalName)
+    {
+        var warning = $"Тип заняття \"{importedName}\" нормалізовано до \"{canonicalName}\": видалено випадково повторене сусіднє слово.";
+        if (!result.Warnings.Contains(warning, StringComparer.CurrentCulture))
+        {
+            result.Warnings.Add(warning);
+        }
+    }
+
+    // Прибирає лише безпосередньо повторені слова; нормалізація діє лише за наявності канонічного варіанта.
+    private static string CollapseAdjacentDuplicateWords(string input)
+    {
+        var words = NormalizeText(input)
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (words.Length < 2)
+        {
+            return string.Join(' ', words);
+        }
+        var result = new List<string>(words.Length) { words[0] };
+        for (var index = 1; index < words.Length; index++)
+        {
+            if (!string.Equals(words[index], result[^1], StringComparison.CurrentCultureIgnoreCase))
+            {
+                result.Add(words[index]);
+            }
+        }
+        return string.Join(' ', result);
     }
 
     private static DocxImportResultDto CreateOversizedTextResult()

@@ -1,5 +1,7 @@
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Admin;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
+using System.Text.Json;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
@@ -476,6 +478,166 @@ public sealed class AdminControllerGuardrailTests
             .Where(type => type.Id == model.LessonType.Id)
             .Select(type => type.IsActive)
             .SingleAsync());
+    }
+
+    [Fact]
+    public async Task Lesson_type_merge_reassigns_references_and_saved_autogen_snapshots()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedRoomModelAsync(20, 20, 40);
+        var source = new LessonTypeRef
+        {
+            Code = "ROOM_ROOM",
+            Name = "Аудиторне Аудиторне заняття",
+            IsActive = true,
+            RequiresRoom = model.LessonType.RequiresRoom,
+            RequiresTeacher = model.LessonType.RequiresTeacher,
+            BlocksRoom = model.LessonType.BlocksRoom,
+            BlocksTeacher = model.LessonType.BlocksTeacher,
+            CountInPlan = model.LessonType.CountInPlan,
+            CountInLoad = model.LessonType.CountInLoad,
+            PreferredFirstInWeek = model.LessonType.PreferredFirstInWeek
+        };
+        var topic = new ModuleTopic
+        {
+            ModuleId = model.Module.Id,
+            LessonType = source,
+            TopicCode = "MERGE-1",
+            Order = 1,
+            TotalHours = 1,
+            AuditoriumHours = 1
+        };
+        fixture.Db.AddRange(source, topic);
+        await fixture.Db.SaveChangesAsync();
+
+        var date = new DateOnly(2026, 9, 7);
+        var draft = new TeacherDraftItem
+        {
+            Date = date,
+            DayOfWeek = date.DayOfWeek,
+            StartTime = new TimeOnly(8, 0),
+            EndTime = new TimeOnly(8, 45),
+            LessonTypeId = source.Id,
+            GroupId = model.FirstGroup.Id,
+            ModuleId = model.Module.Id,
+            ModuleTopicId = topic.Id,
+            RoomId = model.Room.Id,
+            BatchKey = $"rescheduled:123:{source.Id}"
+        };
+        var scheduleItem = new ScheduleItem
+        {
+            Date = date,
+            DayOfWeek = date.DayOfWeek,
+            StartTime = new TimeOnly(9, 0),
+            EndTime = new TimeOnly(9, 45),
+            LessonTypeId = source.Id,
+            GroupId = model.SecondGroup.Id,
+            ModuleId = model.Module.Id,
+            ModuleTopicId = topic.Id,
+            RoomId = model.Room.Id,
+            BatchKey = $"rescheduled:456:{source.Id}"
+        };
+        var now = DateTime.UtcNow;
+        var job = new AutoGenJobRun
+        {
+            JobId = "merge-test-job",
+            ClientPartitionKey = "merge-test",
+            RequestHash = "merge-test-hash",
+            Attempt = 1,
+            Version = 1,
+            Kind = 0,
+            State = 2,
+            Title = "Перевірка об'єднання",
+            CurrentStage = "completed",
+            CreatedAtUtc = now,
+            RangeStartDate = date,
+            RangeEndDate = date,
+            RequestJson = $"{{\"lessonTypeIds\":[{source.Id}]}}",
+            StatusJson = $"{{\"lessonTypeName\":\"{source.Name}\"}}",
+            ResultJson = $"{{\"lessonTypeId\":{source.Id},\"lessonTypeCode\":\"{source.Code}\"}}",
+            UpdatedAtUtc = now
+        };
+        var plan = new AutoGenDraftPlan
+        {
+            PlanId = "merge-test-plan",
+            AutoGenJobRun = job,
+            State = (int)AutoGenPlanState.Applied,
+            Version = 1,
+            CourseId = model.Course.Id,
+            RangeStartDate = date,
+            RangeEndDate = date,
+            Days = 1,
+            GroupIdsJson = $"[{model.FirstGroup.Id}]",
+            BeforeScopeRevision = Guid.NewGuid(),
+            InputFingerprint = "merge-test-fingerprint",
+            AppliedScopeRevision = Guid.NewGuid(),
+            AddCount = 1,
+            CreatedAtUtc = now,
+            ExpiresAtUtc = now.AddDays(1),
+            AppliedAtUtc = now
+        };
+        var mutation = new AutoGenDraftPlanMutation
+        {
+            Plan = plan,
+            Ordinal = 0,
+            Operation = (int)AutoGenPlanOperation.Add,
+            AppliedDraftId = draft.Id,
+            AppliedRevision = draft.Revision,
+            AfterJson = $"{{\"lessonTypeId\":{source.Id},\"lessonTypeName\":\"{source.Name}\",\"lessonTypeCode\":\"{source.Code}\"}}"
+        };
+        fixture.Db.AddRange(draft, scheduleItem, mutation);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+
+        var result = await LessonTypeMergeService.MergeAsync(
+            fixture.Db,
+            source.Id,
+            model.LessonType.Id);
+
+        fixture.Db.ChangeTracker.Clear();
+        Assert.Equal(1, result.ModuleTopicsUpdated);
+        Assert.Equal(1, result.TeacherDraftsUpdated);
+        Assert.Equal(1, result.ScheduleItemsUpdated);
+        Assert.Equal(2, result.RescheduleKeysUpdated);
+        Assert.Equal(1, result.PlanSnapshotsUpdated);
+        Assert.Equal(1, result.JobPayloadsUpdated);
+        Assert.False(await fixture.Db.LessonTypes.AnyAsync(type => type.Id == source.Id));
+        Assert.Equal(model.LessonType.Id, await fixture.Db.ModuleTopics
+            .Where(item => item.Id == topic.Id)
+            .Select(item => item.LessonTypeId)
+            .SingleAsync());
+        Assert.Equal(model.LessonType.Id, await fixture.Db.TeacherDraftItems
+            .Where(item => item.Id == draft.Id)
+            .Select(item => item.LessonTypeId)
+            .SingleAsync());
+        Assert.Equal($"rescheduled:123:{model.LessonType.Id}", await fixture.Db.TeacherDraftItems
+            .Where(item => item.Id == draft.Id)
+            .Select(item => item.BatchKey)
+            .SingleAsync());
+        Assert.Equal(model.LessonType.Id, await fixture.Db.ScheduleItems
+            .Where(item => item.Id == scheduleItem.Id)
+            .Select(item => item.LessonTypeId)
+            .SingleAsync());
+        Assert.Equal($"rescheduled:456:{model.LessonType.Id}", await fixture.Db.ScheduleItems
+            .Where(item => item.Id == scheduleItem.Id)
+            .Select(item => item.BatchKey)
+            .SingleAsync());
+
+        var savedAfterJson = await fixture.Db.AutoGenDraftPlanMutations
+            .Where(item => item.Id == mutation.Id)
+            .Select(item => item.AfterJson)
+            .SingleAsync();
+        using var afterDocument = JsonDocument.Parse(savedAfterJson!);
+        Assert.Equal(model.LessonType.Id, afterDocument.RootElement.GetProperty("lessonTypeId").GetInt32());
+        Assert.Equal(model.LessonType.Name, afterDocument.RootElement.GetProperty("lessonTypeName").GetString());
+        Assert.Equal(model.LessonType.Code, afterDocument.RootElement.GetProperty("lessonTypeCode").GetString());
+        var savedJob = await fixture.Db.AutoGenJobRuns.SingleAsync(item => item.Id == job.Id);
+        using var requestDocument = JsonDocument.Parse(savedJob.RequestJson);
+        using var statusDocument = JsonDocument.Parse(savedJob.StatusJson);
+        using var resultDocument = JsonDocument.Parse(savedJob.ResultJson!);
+        Assert.Equal(model.LessonType.Id, requestDocument.RootElement.GetProperty("lessonTypeIds")[0].GetInt32());
+        Assert.Equal(model.LessonType.Name, statusDocument.RootElement.GetProperty("lessonTypeName").GetString());
+        Assert.Equal(model.LessonType.Code, resultDocument.RootElement.GetProperty("lessonTypeCode").GetString());
     }
 
     [Fact]
