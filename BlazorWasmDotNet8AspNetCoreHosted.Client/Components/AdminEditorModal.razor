@@ -11,6 +11,7 @@
          aria-describedby="@(!string.IsNullOrWhiteSpace(Subtitle) ? _subtitleId : null)"
          tabindex="-1"
          @onkeydown="HandleKeyDown"
+         @onkeydown:stopPropagation="true"
          @onclick:stopPropagation="true">
         <div class="editor-modal-head">
             <div>

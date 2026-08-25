@@ -224,6 +224,23 @@ code {
     width: min(900px, 100%);
 }
 
+.module-editor {
+    width: min(1100px, 100%);
+}
+
+.topic-editor {
+    width: min(920px, 100%);
+}
+
+.lesson-editor {
+    width: min(720px, 100%);
+}
+
+.table-responsive[tabindex="0"]:focus-visible {
+    outline: 3px solid rgba(37, 99, 235, .35);
+    outline-offset: 2px;
+}
+
 .teacher-editor {
     width: min(1200px, 100%);
 }

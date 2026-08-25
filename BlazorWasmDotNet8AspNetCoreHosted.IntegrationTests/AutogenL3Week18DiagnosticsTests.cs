@@ -72,7 +72,7 @@ public sealed class AutogenL3Week18DiagnosticsTests
         WriteReport("source-current", new AutoGenResult(0, 0, new List<string>()), sourceReport);
         await WritePublishedSourceSummaryAsync(source, scenario);
 
-        await using var snapshot = await SqliteSnapshotFile.CreateFromSourceAsync(source);
+        await using var snapshot = await SqliteSnapshotFile.CreateFromSourceAsync(source, scenario.CourseId);
 
         await using var database = new SqliteTempDatabase(snapshot.Path);
         await using var db = database.CreateContext();

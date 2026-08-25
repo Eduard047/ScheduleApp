@@ -966,15 +966,11 @@ else
         @if (_editItem is not null)
         {
             var selected = _editItem!;
-            <div class="lesson-editor-overlay" @onclick="CloseEditor">
-                <div class="lesson-editor card p-3" @onclick:stopPropagation="true">
-                    <div class="lesson-editor-head">
-                        <div>
-                            <div class="fw-semibold">Редактор заняття</div>
-                            <div class="text-muted small">@selected.SourceLabel - ID @selected.Id</div>
-                        </div>
-                        <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="CloseEditor">x</button>
-                    </div>
+            <AdminEditorModal Title="Редактор заняття"
+                              Subtitle="@($"{selected.SourceLabel} — ID {selected.Id}")"
+                              CssClass="lesson-editor"
+                              Busy="@_editDeleting"
+                              OnClose="@CloseEditor">
                     <div class="lesson-editor-grid small">
                         <div>
                             <div class="lesson-editor-label">Дата</div>
@@ -1015,13 +1011,13 @@ else
                     </div>
                     @if (selected.NeedsManualAssignment)
                     {
-                        <div class="alert alert-warning mt-3 mb-0">
+                        <div class="alert alert-warning mt-3 mb-0" role="status">
                             Для цієї чернетки ще потрібно призначити: @selected.MissingAssignmentSummary.
                         </div>
                     }
                     @if (!string.IsNullOrWhiteSpace(_editError))
                     {
-                        <div class="alert alert-danger mt-2">@_editError</div>
+                        <div class="alert alert-danger mt-2" role="alert">@_editError</div>
                     }
                     <div class="d-flex flex-wrap gap-2 mt-3">
                         @if (selected.Source == TableItemSource.Draft)
@@ -1050,8 +1046,7 @@ else
                             Закрити
                         </button>
                     </div>
-                </div>
-            </div>
+            </AdminEditorModal>
         }
         }
     </div>

@@ -291,6 +291,7 @@ public sealed class TeacherDraftsAutogenService
         int IncompleteMissingRoomCount,
         int IncompleteMissingBothCount,
         int EmergencySingletonCount,
+        int? EmergencySingletonOwnerGroupId,
         int? LastPrimaryModuleId,
         int LessonTypeIndex);
     // Уніфіковані відповіді для API.
@@ -551,7 +552,12 @@ public sealed class TeacherDraftsAutogenService
     }
     // Створює чернетки на основі правил і доступних даних для заданого тижня.
     public async Task<ActionResult<AutoGenResult>> DraftAutoGen(DraftAutoGenRequest r, CancellationToken cancellationToken = default)
-        => await DraftAutoGenCore(r, useAmbientTransaction: false, executionBudget: null, cancellationToken);
+        => await DraftAutoGenCore(
+            r,
+            useAmbientTransaction: false,
+            executionBudget: null,
+            new AutogenRangeEmergencySingletonState(),
+            cancellationToken);
 
     internal async Task<ActionResult<AutoGenResult>> DraftAutoGenInAmbientTransaction(
         DraftAutoGenRequest r,
@@ -561,11 +567,13 @@ public sealed class TeacherDraftsAutogenService
             new DeterministicSearchBudget(
                 DefaultWholeOperationSearchNodes,
                 DefaultWholeOperationSearchTimeout),
+            new AutogenRangeEmergencySingletonState(),
             cancellationToken);
 
     internal async Task<ActionResult<AutoGenResult>> DraftAutoGenInAmbientTransactionWithBudget(
         DraftAutoGenRequest r,
         DeterministicSearchBudget executionBudget,
+        AutogenRangeEmergencySingletonState emergencySingletonState,
         CancellationToken cancellationToken = default)
     {
         if (_db.Database.CurrentTransaction is null)
@@ -574,15 +582,22 @@ public sealed class TeacherDraftsAutogenService
                 "Фонову автогенерацію не можна виконувати без активної зовнішньої транзакції.");
         }
 
-        return await DraftAutoGenCore(r, useAmbientTransaction: true, executionBudget, cancellationToken);
+        return await DraftAutoGenCore(
+            r,
+            useAmbientTransaction: true,
+            executionBudget,
+            emergencySingletonState,
+            cancellationToken);
     }
 
     private async Task<ActionResult<AutoGenResult>> DraftAutoGenCore(
         DraftAutoGenRequest r,
         bool useAmbientTransaction,
         DeterministicSearchBudget? executionBudget,
+        AutogenRangeEmergencySingletonState emergencySingletonState,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(emergencySingletonState);
         cancellationToken.ThrowIfCancellationRequested();
         // ЕТАП 1: збираємо типи занять і готуємо довідники правил.
         var types = await _db.LessonTypes.AsNoTracking().ToListAsync(cancellationToken);
@@ -2169,12 +2184,8 @@ public sealed class TeacherDraftsAutogenService
                     entry.State = EntityState.Deleted;
                 }
             }
-            // Один аварійний одиночний хвіст кращий за незавершений план, але доступний
-            // лише після потокових і repair-спроб та не може стати звичайною стратегією.
-            const int maxEmergencySingletonSharedLectures = 1;
             const int latestLectureSlotBeforeLongBreak = 6;
             const int earliestEmergencyLectureSlotOrder = 9;
-            var emergencySingletonSharedLecturesCreated = 0;
             int incompleteDraftsCreated = 0, incompleteMissingTeacherCount = 0, incompleteMissingRoomCount = 0, incompleteMissingBothCount = 0;
             // Збираємо попередження та деталі прогалин.
             var warnings = new List<string>();
@@ -2269,6 +2280,77 @@ public sealed class TeacherDraftsAutogenService
             bool CanShareAcrossGroups(int lessonTypeId)
                 => IsLectureType(lessonTypeId)
                    || preferredFirstTypeIds.Contains(lessonTypeId);
+            // Аварійні одиночні хвости доступні лише після потокових і repair-спроб.
+            // Загальна межа не перевищує одного групового еквівалента всіх налаштованих
+            // потокових годин, тому дозаповнення не перетворює лекції на звичайні індивідуальні заняття.
+            var emergencySingletonModuleIdsByCourse = activePlans
+                .GroupBy(plan => plan.CourseId)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group.Select(plan => plan.ModuleId).ToHashSet());
+            if (hasModuleHourOverrides && courseId is int requestedCourseId)
+            {
+                emergencySingletonModuleIdsByCourse[requestedCourseId] =
+                    moduleHoursByModuleId.Keys.ToHashSet();
+            }
+            // Межа аварійних одиночних потоків рахується окремо для курсу
+            // групи-власника, щоб запуск без фільтра курсу не позичав години
+            // з інших навчальних програм.
+            var maxEmergencySingletonSharedLecturesByCourse = courseIds.ToDictionary(
+                courseIdValue => courseIdValue,
+                courseIdValue =>
+                {
+                    if (!emergencySingletonModuleIdsByCourse.TryGetValue(
+                            courseIdValue,
+                            out var courseModuleIds))
+                    {
+                        return 0;
+                    }
+
+                    return GlobalCatchUpRepairPlanner.CalculateEmergencySingletonSharedLectureBudget(
+                        topicsByModule
+                            .Where(entry => courseModuleIds.Contains(entry.Key))
+                            .Select(entry =>
+                            {
+                                var shareableTopicHours =
+                                    GlobalCatchUpRepairPlanner.CalculateEmergencySingletonSharedLectureBudget(
+                                        entry.Value
+                                            .Where(topic => GetTopicUsageLimit(topic) > 0
+                                                            && TypeAllowed(topic.LessonTypeId)
+                                                            && CanShareAcrossGroups(topic.LessonTypeId))
+                                            .Select(GetTopicUsageLimit));
+                                return hasModuleHourOverrides
+                                       && moduleHoursByModuleId.TryGetValue(entry.Key, out var requestedHours)
+                                    ? Math.Min(Math.Max(0, requestedHours), shareableTopicHours)
+                                    : shareableTopicHours;
+                            }));
+                });
+            int EmergencySingletonSharedLectureBudgetForGroup(int groupId)
+                => selectedGroupsById.TryGetValue(groupId, out var group)
+                   && maxEmergencySingletonSharedLecturesByCourse.TryGetValue(
+                       group.CourseId,
+                       out var budget)
+                    ? budget
+                    : 0;
+            bool CanCreateEmergencySingletonSharedLecture(int groupId)
+                => GlobalCatchUpRepairPlanner.CanSpendEmergencySingletonSharedLectureBudget(
+                    emergencySingletonState.CreatedCount,
+                    EmergencySingletonSharedLectureBudgetForGroup(groupId),
+                    emergencySingletonState.OwnerGroupId,
+                    groupId);
+            void RecordEmergencySingletonSharedLecture(
+                int groupId,
+                CreatedDraftAccounting accounting)
+            {
+                if (!CanCreateEmergencySingletonSharedLecture(groupId))
+                {
+                    throw new InvalidOperationException(
+                        "Вичерпано безпечну межу аварійних одиночних потоків або змінено групу-власника.");
+                }
+                emergencySingletonState.OwnerGroupId ??= groupId;
+                emergencySingletonState.CreatedCount++;
+                accounting.EmergencySingletonCounted = true;
+            }
             // Заборона одиночного потоку потрібна лише тоді, коли в запуску
             // справді є інша вибрана група курсу, з якою можна об'єднати лекцію.
             bool RequiresSharedLecturePack(int courseId)
@@ -5944,6 +6026,9 @@ public sealed class TeacherDraftsAutogenService
                 .ThenBy(entry => entry.Group.Id)
                 .Select(entry => entry.Group)
                 .ToList();
+            var generationGroupIdSet = generationGroups
+                .Select(group => group.Id)
+                .ToHashSet();
             // Основний цикл генерації: обходимо всі групи.
             void RemoveDraftEntity(TeacherDraftItem draft)
             {
@@ -6069,9 +6154,13 @@ public sealed class TeacherDraftsAutogenService
                 {
                     incompleteMissingBothCount--;
                 }
-                if (accounting.EmergencySingletonCounted && emergencySingletonSharedLecturesCreated > 0)
+                if (accounting.EmergencySingletonCounted && emergencySingletonState.CreatedCount > 0)
                 {
-                    emergencySingletonSharedLecturesCreated--;
+                    emergencySingletonState.CreatedCount--;
+                    if (emergencySingletonState.CreatedCount == 0)
+                    {
+                        emergencySingletonState.OwnerGroupId = null;
+                    }
                 }
 
                 createdDraftAccounting.Remove(draft);
@@ -6532,6 +6621,211 @@ public sealed class TeacherDraftsAutogenService
                 }
                 return movedEvents;
             }
+            List<Group> PendingGroupsForSharedTail(
+                int courseIdCheck,
+                int moduleIdCheck,
+                ModuleTopic topic)
+            {
+                if (!selectedGroupsByCourse.TryGetValue(courseIdCheck, out var courseGroups))
+                {
+                    return new List<Group>();
+                }
+
+                return courseGroups
+                    .Where(group => generationGroupIdSet.Contains(group.Id)
+                                    && PlacementRemainingFor(group.Id, moduleIdCheck) > 0
+                                    && IsTopicStillPendingForGroup(group.Id, moduleIdCheck, topic))
+                    .OrderBy(group => group.Id)
+                    .ToList();
+            }
+
+            int ExistingJoinableSharedTailGroupCount(
+                int courseIdCheck,
+                int moduleIdCheck,
+                ModuleTopic topic,
+                DateOnly date,
+                TimeOnly start,
+                TimeOnly end)
+                => BusyForDate(date)
+                    .Where(slot => slot.JoinableDraft
+                                   && slot.ModuleId == moduleIdCheck
+                                   && slot.LessonTypeId == topic.LessonTypeId
+                                   && slot.ModuleTopicId == topic.Id
+                                   && slot.StartTime == start
+                                   && slot.EndTime == end
+                                   && selectedGroupsById.TryGetValue(slot.GroupId, out var group)
+                                   && group.CourseId == courseIdCheck)
+                    .Select(slot => slot.GroupId)
+                    .Distinct()
+                    .Count();
+
+            bool HasExistingJoinableSharedTailOccurrence(
+                int courseIdCheck,
+                int moduleIdCheck,
+                ModuleTopic topic,
+                IReadOnlyList<Group> pendingGroups)
+                => busy.Any(slot => slot.JoinableDraft
+                                    && slot.ModuleId == moduleIdCheck
+                                    && slot.LessonTypeId == topic.LessonTypeId
+                                    && slot.ModuleTopicId == topic.Id
+                                    && slot.Date >= rangeStartDate
+                                    && slot.Date < rangeEndDateExclusive
+                                    && SharedSlotsForDate(courseIdCheck, slot.Date).Any(candidate =>
+                                        candidate.Start == slot.StartTime
+                                        && candidate.End == slot.EndTime)
+                                    && selectedGroupsById.TryGetValue(slot.GroupId, out var group)
+                                    && group.CourseId == courseIdCheck
+                                    && CountGroupsWithModuleInSlot(
+                                           moduleIdCheck,
+                                           slot.Date,
+                                           slot.StartTime,
+                                           slot.EndTime)
+                                       + pendingGroups.Count
+                                       <= SlotGroupLimitForPlacement(
+                                           courseIdCheck,
+                                           topic.LessonTypeId,
+                                           isSelfStudyPlacement: false)
+                                    && pendingGroups.All(pendingGroup =>
+                                        IsWorking(slot.Date, pendingGroup)
+                                        && !ViolatesModuleSequenceForPlacement(
+                                            pendingGroup.Id,
+                                            pendingGroup.CourseId,
+                                            moduleIdCheck,
+                                            slot.Date,
+                                            slot.StartTime,
+                                            slot.EndTime)
+                                        && !ViolatesLectureBlockOrderForPlacement(
+                                            pendingGroup.Id,
+                                            slot.Date,
+                                            slot.StartTime,
+                                            slot.EndTime,
+                                            topic.LessonTypeId)
+                                        && !ViolatesTopicCalendarOrder(
+                                            pendingGroup.Id,
+                                            moduleIdCheck,
+                                            topic,
+                                            slot.Date,
+                                            slot.StartTime,
+                                            slot.EndTime)
+                                        && !HasBlockingGroupOverlapForSharedCheckpoint(
+                                            pendingGroup.Id,
+                                            moduleIdCheck,
+                                            topic.Id,
+                                            slot.Date,
+                                            slot.StartTime,
+                                            slot.EndTime)));
+
+            bool IsReadyPendingSharedTailFrontier(
+                int courseIdCheck,
+                int moduleIdCheck,
+                ModuleTopic topic,
+                IReadOnlyList<Group> pendingGroups)
+                => pendingGroups.Count > 0
+                   && pendingGroups.Count <= SlotGroupLimitForPlacement(
+                       courseIdCheck,
+                       topic.LessonTypeId,
+                       isSelfStudyPlacement: false)
+                   // Не відокремлюємо готові групи від тих, що ще йдуть до тієї самої
+                   // контрольної теми: атомарний repair має зберегти майбутній потік.
+                   && pendingGroups.All(group =>
+                       IsModuleSequenceReadyForGroup(group.Id, group.CourseId, moduleIdCheck)
+                       && SelectNextPendingTopic(group.Id, moduleIdCheck)?.Id == topic.Id);
+
+            int CountReadyPendingSharedTailFrontierRows()
+            {
+                if (generationGroups.Count <= 1)
+                {
+                    return 0;
+                }
+
+                var frontierRows = 0;
+                var simulatedSingletonCount = emergencySingletonState.CreatedCount;
+                var simulatedSingletonOwnerGroupId = emergencySingletonState.OwnerGroupId;
+                foreach (var courseEntry in selectedGroupsByCourse.OrderBy(entry => entry.Key))
+                {
+                    var generationCourseGroupCount = courseEntry.Value.Count(group =>
+                        generationGroupIdSet.Contains(group.Id));
+                    if (generationCourseGroupCount <= 1)
+                    {
+                        // Для одного generation-учасника курсу немає потокового
+                        // фронтиру, який атомарний repair міг би об'єднати.
+                        continue;
+                    }
+                    var moduleIds = remainingByGroupModule
+                        .Where(entry => entry.Value > 0
+                                        && selectedGroupsById.TryGetValue(entry.Key.GroupId, out var group)
+                                        && generationGroupIdSet.Contains(group.Id)
+                                        && group.CourseId == courseEntry.Key)
+                        .Select(entry => entry.Key.ModuleId)
+                        .Distinct()
+                        .ToList();
+                    var candidates = moduleIds
+                        .SelectMany(moduleId =>
+                            topicsByModule.TryGetValue(moduleId, out var moduleTopics)
+                                ? moduleTopics
+                                    .Where(topic => GetTopicUsageLimit(topic) > 0
+                                                    && CanShareAcrossGroups(topic.LessonTypeId))
+                                    .Select(topic => (ModuleId: moduleId, Topic: topic))
+                                : Enumerable.Empty<(int ModuleId, ModuleTopic Topic)>())
+                        .OrderBy(entry => entry.Topic.Order)
+                        .ThenBy(entry => entry.ModuleId)
+                        .ThenBy(entry => entry.Topic.Id);
+
+                    foreach (var candidate in candidates)
+                    {
+                        var pendingGroups = PendingGroupsForSharedTail(
+                            courseEntry.Key,
+                            candidate.ModuleId,
+                            candidate.Topic);
+                        if (!IsReadyPendingSharedTailFrontier(
+                                courseEntry.Key,
+                                candidate.ModuleId,
+                                candidate.Topic,
+                                pendingGroups))
+                        {
+                            continue;
+                        }
+                        if (pendingGroups.Count == 1)
+                        {
+                            if (HasExistingJoinableSharedTailOccurrence(
+                                    courseEntry.Key,
+                                    candidate.ModuleId,
+                                    candidate.Topic,
+                                    pendingGroups))
+                            {
+                                // Приєднання до вже створеного потоку не є аварійною
+                                // одиночною лекцією і не витрачає її глобальну квоту.
+                            }
+                            else if (!GlobalCatchUpRepairPlanner.CanSpendEmergencySingletonSharedLectureBudget(
+                                         simulatedSingletonCount,
+                                         EmergencySingletonSharedLectureBudgetForGroup(pendingGroups[0].Id),
+                                         simulatedSingletonOwnerGroupId,
+                                         pendingGroups[0].Id))
+                            {
+                                continue;
+                            }
+                            else
+                            {
+                                simulatedSingletonOwnerGroupId ??= pendingGroups[0].Id;
+                                simulatedSingletonCount++;
+                            }
+                        }
+
+                        frontierRows = frontierRows > int.MaxValue - pendingGroups.Count
+                            ? int.MaxValue
+                            : frontierRows + pendingGroups.Count;
+                    }
+                }
+
+                return frontierRows;
+            }
+
+            bool CanRunAtomicSharedTailRepairNow(int remainingPlacements)
+                => GlobalCatchUpRepairPlanner.CanRunAtomicSharedTailRepair(
+                    remainingPlacements,
+                    CountReadyPendingSharedTailFrontierRows(),
+                    generationGroups.Count);
+
             (int AssignedHours, int ReadyGroups) MeasureSharedBarrierProgress()
             {
                 var assignedHours = 0;
@@ -6565,33 +6859,83 @@ public sealed class TeacherDraftsAutogenService
             var atomicSharedTailRepairRequested = false;
             var atomicSharedTailRepairAttempted = false;
             var remainingAfterGlobalCatchUp = remainingByGroupModule.Values.Sum(value => Math.Max(0, value));
-            var maxGlobalCatchUpRounds = GlobalCatchUpRepairPlanner.CalculateMaxCatchUpRounds(
-                remainingAfterGlobalCatchUp);
-            var maxInterleavedDateRounds = generationGroups
-                .Select(group => DatesBetween(rangeStartDate, rangeEndDateExclusive).Count(date => IsWorking(date, group)))
+            var workingDatesByGenerationGroupId = generationGroups.ToDictionary(
+                group => group.Id,
+                group => DatesBetween(rangeStartDate, rangeEndDateExclusive)
+                    .Where(date => IsWorking(date, group)
+                                   && SharedSlotsForDate(group.CourseId, date).Count > 0)
+                    .ToList());
+            var maxInterleavedDateRounds = workingDatesByGenerationGroupId.Values
+                .Select(dates => dates.Count)
                 .DefaultIfEmpty(0)
                 .Max();
+            var maxGlobalCatchUpRounds = GlobalCatchUpRepairPlanner.CalculateMaxCatchUpRounds(
+                remainingAfterGlobalCatchUp,
+                maxInterleavedDateRounds);
             do
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 globalCatchUpRound++;
                 ReconcileManualQuotaAccounting();
                 var remainingBeforeGlobalCatchUp = remainingByGroupModule.Values.Sum(value => Math.Max(0, value));
+                var atomicSharedTailRepairAttemptedBeforeRound = atomicSharedTailRepairAttempted;
                 var continueAfterAtomicRepair = false;
                 var sharedBarrierProgressBefore = MeasureSharedBarrierProgress();
-                var groupRoundOffset = generationGroups.Count == 0
-                    ? 0
-                    : (globalCatchUpRound - 1) % generationGroups.Count;
-                var groupsForCatchUpRound = generationGroups
-                    .Skip(groupRoundOffset)
-                    .Concat(generationGroups.Take(groupRoundOffset))
+                var pendingGroupsForCatchUpRound = generationGroups
+                    .Where(group => remainingByGroupModule.Any(entry =>
+                        entry.Key.GroupId == group.Id && entry.Value > 0))
                     .ToList();
+                var maxPendingWorkingDateCount = pendingGroupsForCatchUpRound
+                    .Select(group => workingDatesByGenerationGroupId[group.Id].Count)
+                    .DefaultIfEmpty(0)
+                    .Max();
+                // Завершені групи не запускають повторно весь календарний optimizer:
+                // атомарний repair окремо може рухати їхні чернетки, якщо вони блокують хвіст.
+                var groupRoundOffset = pendingGroupsForCatchUpRound.Count == 0
+                    ? 0
+                    : (globalCatchUpRound - 1) % pendingGroupsForCatchUpRound.Count;
+                var groupsForCatchUpRound = pendingGroupsForCatchUpRound
+                    .Skip(groupRoundOffset)
+                    .Concat(pendingGroupsForCatchUpRound.Take(groupRoundOffset))
+                    .ToList();
+                IReadOnlyList<DateOnly> ResolveGenerationDatesForRound(Group group)
+                {
+                    var generationDates = workingDatesByGenerationGroupId[group.Id];
+                    if (GlobalCatchUpRepairPlanner.ShouldUseInterleavedDateRound(
+                            r.ClearExisting,
+                            pendingGroupsForCatchUpRound.Count,
+                            globalCatchUpRound,
+                            generationDates.Count))
+                    {
+                        return new[] { generationDates[globalCatchUpRound - 1] };
+                    }
+                    if (GlobalCatchUpRepairPlanner.ShouldSkipExhaustedGroupDuringInterleavedDateRounds(
+                            r.ClearExisting,
+                            pendingGroupsForCatchUpRound.Count,
+                            globalCatchUpRound,
+                            generationDates.Count,
+                            maxPendingWorkingDateCount))
+                    {
+                        return Array.Empty<DateOnly>();
+                    }
+                    return generationDates;
+                }
+                var generationDatesForRoundByGroupId = groupsForCatchUpRound.ToDictionary(
+                    group => group.Id,
+                    group => ResolveGenerationDatesForRound(group).ToList());
                 var groupIdsForCatchUpRound = groupsForCatchUpRound
+                    .Where(group => generationDatesForRoundByGroupId[group.Id].Count > 0)
                     .Select(group => group.Id)
                     .ToList();
                 foreach (var grp in groupsForCatchUpRound)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
+                    if (!groupIdsForCatchUpRound.Contains(grp.Id))
+                    {
+                        // У групи вже немає непереглянутих дат поточної
+                        // interleaved-фази; не будуємо для неї повторно весь optimizer.
+                        continue;
+                    }
                     // Обідня перерва для курсу або глобальна (якщо не задано для курсу).
                     var preferredFirstSlotLimit = preferredFirstSlotLimitsAll.FirstOrDefault(x => x.CourseId == grp.CourseId)
                                                ?? preferredFirstSlotLimitsAll.FirstOrDefault(x => x.CourseId == null);
@@ -8036,11 +8380,14 @@ public sealed class TeacherDraftsAutogenService
                     }
                     bool HasJoinableFutureShareableGroupOutside(
                         int moduleId,
+                        int lessonTypeId,
                         ModuleTopic? topic,
                         Room room,
                         DateOnly date,
                         TimeOnly start,
                         TimeOnly end,
+                        int maxModuleSegmentsAllowed,
+                        int newSharedGroupCount,
                         IReadOnlyCollection<int> currentGroupIds)
                     {
                         if (topic is null
@@ -8057,11 +8404,50 @@ public sealed class TeacherDraftsAutogenService
                             {
                                 continue;
                             }
+                            if (!IsWorking(date, otherGroup))
+                            {
+                                continue;
+                            }
                             if (PlacementRemainingFor(otherGroup.Id, moduleId) <= 0)
                             {
                                 continue;
                             }
+                            if (!IsModuleSequenceReadyForGroup(otherGroup.Id, otherGroup.CourseId, moduleId))
+                            {
+                                continue;
+                            }
+                            if (ViolatesModuleSequenceForPlacement(
+                                    otherGroup.Id,
+                                    otherGroup.CourseId,
+                                    moduleId,
+                                    date,
+                                    start,
+                                    end))
+                            {
+                                continue;
+                            }
+                            if (CountFor(otherGroup.Id, date) >= slots.Count)
+                            {
+                                continue;
+                            }
+                            if (!softFill && TopicsDepleted(otherGroup.Id, moduleId))
+                            {
+                                continue;
+                            }
                             if (!CanAssignSpecificTopic(otherGroup.Id, moduleId, topic))
+                            {
+                                continue;
+                            }
+                            if (ViolatesTopicCalendarOrder(otherGroup.Id, moduleId, topic, date, start, end))
+                            {
+                                continue;
+                            }
+                            if (ViolatesLectureBlockOrderForPlacement(
+                                    otherGroup.Id,
+                                    date,
+                                    start,
+                                    end,
+                                    lessonTypeId))
                             {
                                 continue;
                             }
@@ -8073,8 +8459,40 @@ public sealed class TeacherDraftsAutogenService
                             {
                                 continue;
                             }
+                            if (CountGroupsWithModuleInSlot(moduleId, date, start, end)
+                                + newSharedGroupCount
+                                + 1
+                                > SlotGroupLimitForPlacement(
+                                    grp.CourseId,
+                                    lessonTypeId,
+                                    isSelfStudyPlacement: false))
+                            {
+                                continue;
+                            }
                             var groupBusy = HasGroupOverlap(otherGroup.Id, date, start, end);
                             if (groupBusy)
+                            {
+                                continue;
+                            }
+                            if (ViolatesAnyModuleDayBlock(
+                                    otherGroup.Id,
+                                    date,
+                                    moduleId,
+                                    start,
+                                    end,
+                                    out _,
+                                    maxModuleSegmentsAllowed))
+                            {
+                                continue;
+                            }
+                            if (InsertionWouldSplitExistingModuleBlock(
+                                    otherGroup.Id,
+                                    date,
+                                    moduleId,
+                                    start,
+                                    end,
+                                    out _,
+                                    maxModuleSegmentsAllowed))
                             {
                                 continue;
                             }
@@ -8378,17 +8796,11 @@ public sealed class TeacherDraftsAutogenService
                             .ThenBy(moduleId => moduleId)
                             .First();
                     }
-                    var generationDates = DatesBetween(rangeStartDate, rangeEndDateExclusive)
-                        .Where(date => IsWorking(date, grp))
-                        .ToList();
+                    var generationDates = workingDatesByGenerationGroupId[grp.Id];
                     // Для кількох груп спочатку завершуємо один день для всього потоку,
                     // а вже потім переходимо до наступного. Так рання група не забирає
                     // дефіцитні слоти всього діапазону до початку роботи над пізніми.
-                    IReadOnlyList<DateOnly> datesForGenerationRound = r.ClearExisting
-                                                                       && generationGroups.Count > 1
-                                                                       && globalCatchUpRound <= generationDates.Count
-                        ? new[] { generationDates[globalCatchUpRound - 1] }
-                        : generationDates;
+                    var datesForGenerationRound = generationDatesForRoundByGroupId[grp.Id];
                     int CountPendingPreferredFirstPlacements()
                     {
                         if (preferredFirstTypeId == 0 || !TypeAllowed(preferredFirstTypeId))
@@ -9455,13 +9867,23 @@ public sealed class TeacherDraftsAutogenService
                                             && RequiresSharedLecturePack(grp.CourseId)
                                             && (!softFill
                                                 || !bypassCatchUpHold
-                                                || emergencySingletonSharedLecturesCreated >= maxEmergencySingletonSharedLectures))
+                                                || !CanCreateEmergencySingletonSharedLecture(grp.Id)))
                                         {
                                             continue;
                                         }
                                         if (isShareableLecturePlacement
                                             && allSharedGroupIds.Count > 0
-                                            && (HasJoinableFutureShareableGroupOutside(moduleId, topicSelection, rm, date, s, e, allSharedGroupIds)
+                                            && (HasJoinableFutureShareableGroupOutside(
+                                                    moduleId,
+                                                    ltypeId,
+                                                    topicSelection,
+                                                    rm,
+                                                    date,
+                                                    s,
+                                                    e,
+                                                    maxModuleSegmentsAllowed,
+                                                    newSharedGroupIds.Count,
+                                                    allSharedGroupIds)
                                                 || (allSharedGroupIds.Count == 1 && HasFuturePendingShareablePartner(moduleId, topicSelection))
                                                 || (!relaxed && HasFeasiblePendingShareablePartner(moduleId, topicSelection))))
                                         {
@@ -9710,7 +10132,7 @@ public sealed class TeacherDraftsAutogenService
                                     || !CanShareAcrossGroups(ltypeId)
                                     || (softFill
                                         && bypassCatchUpHold
-                                        && emergencySingletonSharedLecturesCreated < maxEmergencySingletonSharedLectures)))
+                                        && CanCreateEmergencySingletonSharedLecture(grp.Id))))
                             {
                                 var fallbackTeacherId = FindTeacherForIncompleteDraft();
                                 var fallbackRoom = FindRoomForIncompleteDraft();
@@ -9872,17 +10294,30 @@ public sealed class TeacherDraftsAutogenService
                         var writablePlacedGroupIds = placedGroupIds
                             .Where(selectedGroupsById.ContainsKey)
                             .ToList();
+                        var selectedTotalSharedGroupCount = selectedIncomplete is null
+                            ? best!.TotalSharedGroupCount
+                            : writablePlacedGroupIds.Count;
                         var selectedIsEmergencySingletonSharedLecture = !selectedIsSelfStudy
                                                                          && CanShareAcrossGroups(selectedLessonTypeId)
-                                                                         && writablePlacedGroupIds.Count <= 1
+                                                                         && selectedTotalSharedGroupCount <= 1
                                                                          && RequiresSharedLecturePack(grp.CourseId)
                                                                          && softFill
                                                                          && bypassCatchUpHold;
+                        if (selectedIsEmergencySingletonSharedLecture
+                            && !CanCreateEmergencySingletonSharedLecture(grp.Id))
+                        {
+                            RecordSlotFailureReason(
+                                date,
+                                selectedSlot,
+                                $"Безпечну межу одиночних потоків уже використано для іншої групи або вичерпано для модуля <{ModuleLabel()}>.");
+                            return false;
+                        }
                         if (!selectedIsSelfStudy
                             && selectedTopic is not null
                             && CanShareAcrossGroups(selectedLessonTypeId)
-                            && writablePlacedGroupIds.Count <= 1
-                            && RequiresSharedLecturePack(grp.CourseId))
+                            && selectedTotalSharedGroupCount <= 1
+                            && RequiresSharedLecturePack(grp.CourseId)
+                            && !selectedIsEmergencySingletonSharedLecture)
                         {
                             RecordSlotFailureReason(date, selectedSlot, $"Спільну лекційну тему модуля <{ModuleLabel()}> не створено одиночним потоком.");
                             return false;
@@ -10083,8 +10518,7 @@ public sealed class TeacherDraftsAutogenService
                         }
                         if (selectedIsEmergencySingletonSharedLecture)
                         {
-                            emergencySingletonSharedLecturesCreated++;
-                            currentGroupAccounting.EmergencySingletonCounted = true;
+                            RecordEmergencySingletonSharedLecture(grp.Id, currentGroupAccounting);
                         }
                         // Оновлюємо статистику використання аудиторій.
                         if (selectedRoom?.Id is int ridSelected)
@@ -12152,7 +12586,10 @@ public sealed class TeacherDraftsAutogenService
                         {
                             // Міжденний repair працює для поточної групи, але приймає зміну
                             // лише після глобальної перевірки всіх вибраних груп.
-                            if (!softFill || generationDates.Count < 2)
+                            if (!softFill
+                                || generationDates.Count < 2
+                                || !remainingByGroupModule.Any(entry =>
+                                    entry.Key.GroupId == grp.Id && entry.Value > 0))
                             {
                                 return false;
                             }
@@ -13699,7 +14136,7 @@ public sealed class TeacherDraftsAutogenService
 
                         async Task<int> MergeSplitSharedLectureOccurrencesAsync()
                         {
-                            if (!hasModuleHourOverrides || generationGroups.Count <= 1)
+                            if (generationGroups.Count <= 1)
                             {
                                 return 0;
                             }
@@ -14039,8 +14476,7 @@ public sealed class TeacherDraftsAutogenService
 
                         async Task<int> RotateSharedLectureOccurrencesTowardPendingTailsAsync()
                         {
-                            if (!hasModuleHourOverrides
-                                || generationGroups.Count <= 1)
+                            if (generationGroups.Count <= 1)
                             {
                                 return 0;
                             }
@@ -14620,8 +15056,7 @@ public sealed class TeacherDraftsAutogenService
 
                         async Task<int> TryPlacePendingSharedLectureTailsAsync()
                         {
-                            if (!hasModuleHourOverrides
-                                || generationGroups.Count <= 1)
+                            if (generationGroups.Count <= 1)
                             {
                                 return 0;
                             }
@@ -15812,7 +16247,14 @@ public sealed class TeacherDraftsAutogenService
                                 DateOnly targetDate,
                                 TimeSlot targetSlot)
                             {
-                                var emergencySingletonPlacement = pendingGroups.Count == 1;
+                                var emergencySingletonPlacement = pendingGroups.Count == 1
+                                                                  && ExistingJoinableSharedTailGroupCount(
+                                                                      courseId,
+                                                                      moduleId,
+                                                                      topic,
+                                                                      targetDate,
+                                                                      targetSlot.Start,
+                                                                      targetSlot.End) == 0;
                                 var invalidPendingGroups = pendingGroups
                                     .Where(group => group.CourseId != courseId
                                                     || !IsWorking(targetDate, group)
@@ -15870,7 +16312,7 @@ public sealed class TeacherDraftsAutogenService
                                     || !CanShareAcrossGroups(topic.LessonTypeId)
                                     || pendingGroups.Count == 0
                                     || emergencySingletonPlacement
-                                       && emergencySingletonSharedLecturesCreated >= maxEmergencySingletonSharedLectures
+                                       && !CanCreateEmergencySingletonSharedLecture(pendingGroups[0].Id)
                                     || invalidPendingGroups.Count > 0)
                                 {
                                     return false;
@@ -16102,8 +16544,7 @@ public sealed class TeacherDraftsAutogenService
                                     createdDraftAccounting.Add(item, accounting);
                                     if (emergencySingletonPlacement)
                                     {
-                                        emergencySingletonSharedLecturesCreated++;
-                                        accounting.EmergencySingletonCounted = true;
+                                        RecordEmergencySingletonSharedLecture(group.Id, accounting);
                                     }
                                     AddCurrentRangeFact(group.Id, moduleId);
                                     accounting.CurrentRangeFactIncremented = true;
@@ -16152,7 +16593,7 @@ public sealed class TeacherDraftsAutogenService
                             foreach (var courseEntry in selectedGroupsByCourse.OrderBy(entry => entry.Key))
                             {
                                 var courseGroups = courseEntry.Value
-                                    .Where(group => generationGroups.Any(selected => selected.Id == group.Id))
+                                    .Where(group => generationGroupIdSet.Contains(group.Id))
                                     .OrderBy(group => group.Id)
                                     .ToList();
                                 if (courseGroups.Count <= 1)
@@ -16175,18 +16616,24 @@ public sealed class TeacherDraftsAutogenService
                                             : Enumerable.Empty<(int ModuleId, ModuleTopic Topic)>())
                                     .Where(entry =>
                                     {
-                                        var pendingGroups = courseGroups
-                                            .Where(group => PlacementRemainingFor(group.Id, entry.ModuleId) > 0
-                                                            && IsTopicStillPendingForGroup(
-                                                                group.Id,
-                                                                entry.ModuleId,
-                                                                entry.Topic))
-                                            .ToList();
-                                        return pendingGroups.Count > 0
-                                               && pendingGroups.All(group => CanAssignSpecificTopic(
-                                                   group.Id,
+                                        var pendingGroups = PendingGroupsForSharedTail(
+                                            courseEntry.Key,
+                                            entry.ModuleId,
+                                            entry.Topic);
+                                        return IsReadyPendingSharedTailFrontier(
+                                                   courseEntry.Key,
                                                    entry.ModuleId,
-                                                   entry.Topic));
+                                                   entry.Topic,
+                                                   pendingGroups)
+                                               && (pendingGroups.Count > 1
+                                                   || HasExistingJoinableSharedTailOccurrence(
+                                                       courseEntry.Key,
+                                                       entry.ModuleId,
+                                                       entry.Topic,
+                                                       pendingGroups)
+                                                   || pendingGroups.Count == 1
+                                                   && CanCreateEmergencySingletonSharedLecture(
+                                                       pendingGroups[0].Id));
                                     })
                                     .OrderBy(entry => entry.Topic.Order)
                                     .ThenBy(entry => entry.ModuleId)
@@ -16196,19 +16643,23 @@ public sealed class TeacherDraftsAutogenService
                                 foreach (var pendingEntry in pendingTopics)
                                 {
                                     cancellationToken.ThrowIfCancellationRequested();
-                                    var pendingGroups = courseGroups
-                                        .Where(group => PlacementRemainingFor(group.Id, pendingEntry.ModuleId) > 0
-                                                        && IsTopicStillPendingForGroup(
-                                                            group.Id,
-                                                            pendingEntry.ModuleId,
-                                                            pendingEntry.Topic))
-                                        .OrderBy(group => group.Id)
-                                        .ToList();
-                                    if (pendingGroups.Count == 0
-                                        || pendingGroups.Count > SlotGroupLimitForPlacement(
+                                    var pendingGroups = PendingGroupsForSharedTail(
+                                        courseEntry.Key,
+                                        pendingEntry.ModuleId,
+                                        pendingEntry.Topic);
+                                    if (!IsReadyPendingSharedTailFrontier(
                                             courseEntry.Key,
-                                            pendingEntry.Topic.LessonTypeId,
-                                            isSelfStudyPlacement: false))
+                                            pendingEntry.ModuleId,
+                                            pendingEntry.Topic,
+                                            pendingGroups)
+                                        || pendingGroups.Count == 1
+                                        && !HasExistingJoinableSharedTailOccurrence(
+                                            courseEntry.Key,
+                                            pendingEntry.ModuleId,
+                                            pendingEntry.Topic,
+                                            pendingGroups)
+                                        && !CanCreateEmergencySingletonSharedLecture(
+                                            pendingGroups[0].Id))
                                     {
                                         continue;
                                     }
@@ -16230,6 +16681,17 @@ public sealed class TeacherDraftsAutogenService
                                             pendingEntry.Topic.LessonTypeId,
                                             target.Index + 1,
                                             preferredFirstMaxSlotOrder))
+                                        // Цілі до завершення попереднього блока послідовності
+                                        // однаково будуть відхилені під час commit, тому не витрачаємо
+                                        // на них обмежений бюджет атомарного пошуку.
+                                        .Where(target => pendingGroups.All(group =>
+                                            !ViolatesModuleSequenceForPlacement(
+                                                group.Id,
+                                                group.CourseId,
+                                                pendingEntry.ModuleId,
+                                                target.Date,
+                                                target.Slot.Start,
+                                                target.Slot.End)))
                                         .Where(target => pendingGroups.All(group =>
                                             !ViolatesLectureBlockOrderForPlacement(
                                                 group.Id,
@@ -16243,6 +16705,13 @@ public sealed class TeacherDraftsAutogenService
                                             target.Slot,
                                             target.Index,
                                             target.Position,
+                                            ExistingSharedGroupCount = ExistingJoinableSharedTailGroupCount(
+                                                courseEntry.Key,
+                                                pendingEntry.ModuleId,
+                                                pendingEntry.Topic,
+                                                target.Date,
+                                                target.Slot.Start,
+                                                target.Slot.End),
                                             TopicOrderBlockerCount = pendingGroups.Count(group =>
                                                 ViolatesTopicCalendarOrder(
                                                     group.Id,
@@ -16258,9 +16727,12 @@ public sealed class TeacherDraftsAutogenService
                                                     target.Slot.Start,
                                                     target.Slot.End))
                                         })
-                                        .OrderBy(target => target.TopicOrderBlockerCount)
+                                        .OrderByDescending(target => target.ExistingSharedGroupCount)
+                                        .ThenBy(target => target.TopicOrderBlockerCount)
                                         .ThenBy(target => target.OccupiedCount)
-                                        .ThenByDescending(target => target.Position)
+                                        // За однакової складності беремо найранішу ціль,
+                                        // щоб не відрізати календарну місткість наступних блоків послідовності.
+                                        .ThenBy(target => target.Position)
                                         .ToList();
 
                                     var repairContext = new SharedTailRepairContext(
@@ -16758,7 +17230,8 @@ public sealed class TeacherDraftsAutogenService
                                 incompleteMissingTeacherCount,
                                 incompleteMissingRoomCount,
                                 incompleteMissingBothCount,
-                                emergencySingletonSharedLecturesCreated,
+                                emergencySingletonState.CreatedCount,
+                                emergencySingletonState.OwnerGroupId,
                                 lastPrimaryModuleId,
                                 ltIndex);
                         }
@@ -16952,7 +17425,8 @@ public sealed class TeacherDraftsAutogenService
                             incompleteMissingTeacherCount = snapshot.IncompleteMissingTeacherCount;
                             incompleteMissingRoomCount = snapshot.IncompleteMissingRoomCount;
                             incompleteMissingBothCount = snapshot.IncompleteMissingBothCount;
-                            emergencySingletonSharedLecturesCreated = snapshot.EmergencySingletonCount;
+                            emergencySingletonState.CreatedCount = snapshot.EmergencySingletonCount;
+                            emergencySingletonState.OwnerGroupId = snapshot.EmergencySingletonOwnerGroupId;
                             lastPrimaryModuleId = snapshot.LastPrimaryModuleId;
                             ltIndex = snapshot.LessonTypeIndex;
                             RestoreFirstMainMarker();
@@ -17192,16 +17666,27 @@ public sealed class TeacherDraftsAutogenService
                         }
                         var atomicSharedTailRepairRan = false;
                         var atomicSharedTailRepairMadeProgress = false;
-                        if (date == generationDates[^1])
+                        if (date == datesForGenerationRound[^1])
                         {
-                            await TryCrossDateChronologyCompactionAsync();
+                            var remainingForCurrentGroup = remainingByGroupModule
+                                .Where(entry => entry.Key.GroupId == grp.Id)
+                                .Sum(entry => Math.Max(0, entry.Value));
+                            // Атомарний потоковий repair може працювати після кожного
+                            // міжгрупового дня, а дорогий міжденний optimizer — лише
+                            // після останньої оброблюваної дати поточної групи.
+                            if (GlobalCatchUpRepairPlanner.ShouldRunCrossDateChronologyCompaction(
+                                    remainingForCurrentGroup,
+                                    generationDates.Count,
+                                    date == generationDates[^1]))
+                            {
+                                await TryCrossDateChronologyCompactionAsync();
+                            }
                             if (GlobalCatchUpRepairPlanner.ShouldRunAtomicRepairAfterGroup(
                                     grp.Id,
                                     groupIdsForCatchUpRound,
                                     atomicSharedTailRepairRequested)
-                                && GlobalCatchUpRepairPlanner.CanRunAtomicSharedTailRepair(
-                                    remainingByGroupModule.Values.Sum(value => Math.Max(0, value)),
-                                    generationGroups.Count))
+                                && CanRunAtomicSharedTailRepairNow(
+                                    remainingByGroupModule.Values.Sum(value => Math.Max(0, value))))
                             {
                                 var remainingBeforeAtomicRepair = remainingByGroupModule.Values
                                     .Sum(value => Math.Max(0, value));
@@ -17241,9 +17726,7 @@ public sealed class TeacherDraftsAutogenService
                                 var remainingAfterAtomicRepair = remainingByGroupModule.Values
                                     .Sum(value => Math.Max(0, value));
                                 atomicSharedTailRepairRequested =
-                                    GlobalCatchUpRepairPlanner.CanRunAtomicSharedTailRepair(
-                                        remainingAfterAtomicRepair,
-                                        generationGroups.Count);
+                                    CanRunAtomicSharedTailRepairNow(remainingAfterAtomicRepair);
                                 atomicSharedTailRepairAttempted = false;
                                 continueAfterAtomicRepair = true;
                             }
@@ -17280,9 +17763,26 @@ public sealed class TeacherDraftsAutogenService
                 ReconcileManualQuotaAccounting();
                 remainingAfterGlobalCatchUp = remainingByGroupModule.Values.Sum(value => Math.Max(0, value));
                 var sharedBarrierProgressAfter = MeasureSharedBarrierProgress();
-                var hasPendingInterleavedDateRound = r.ClearExisting
-                                                     && generationGroups.Count > 1
-                                                     && globalCatchUpRound < maxInterleavedDateRounds;
+                if (GlobalCatchUpRepairPlanner.ShouldRearmAtomicRepairAfterProductiveRound(
+                        atomicSharedTailRepairAttemptedBeforeRound,
+                        remainingBeforeGlobalCatchUp,
+                        remainingAfterGlobalCatchUp))
+                {
+                    // Звичайний продуктивний прохід міг відкрити новий потоковий фронтир,
+                    // тому попередня невдала атомарна спроба не повинна блокувати його назавжди.
+                    atomicSharedTailRepairAttempted = false;
+                }
+                var pendingWorkingDateCountsForNextRound = generationGroups
+                    .Where(group => remainingByGroupModule.Any(entry =>
+                        entry.Key.GroupId == group.Id
+                        && entry.Value > 0))
+                    .Select(group => workingDatesByGenerationGroupId[group.Id].Count)
+                    .ToList();
+                var hasPendingInterleavedDateRound =
+                    GlobalCatchUpRepairPlanner.HasPendingInterleavedDateRound(
+                        clearExisting: r.ClearExisting,
+                        nextRound: globalCatchUpRound + 1,
+                        pendingWorkingDateCounts: pendingWorkingDateCountsForNextRound);
                 // Будь-яке зменшення незапланованого залишку виправдовує ще один
                 // обмежений глобальний прохід. Це дає repair-ланцюжкам використати
                 // позиції, звільнені попередньою групою, навіть без нової спільної лекції.
@@ -17296,9 +17796,7 @@ public sealed class TeacherDraftsAutogenService
                                         || sharedLecturesPlacedAfterCompaction > 0;
                 if (!globalCatchUpProgress
                     && remainingAfterGlobalCatchUp > 0
-                    && GlobalCatchUpRepairPlanner.CanRunAtomicSharedTailRepair(
-                        remainingAfterGlobalCatchUp,
-                        generationGroups.Count)
+                    && CanRunAtomicSharedTailRepairNow(remainingAfterGlobalCatchUp)
                     && !atomicSharedTailRepairAttempted)
                 {
                     // Атомарне об'єднання часткових потоків запускаємо лише після
@@ -17320,12 +17818,20 @@ public sealed class TeacherDraftsAutogenService
                         remainingPlacements: remainingAfterGlobalCatchUp);
                     globalCatchUpProgress = releasePlan.ContinueCatchUp;
                     atomicSharedTailRepairRequested = releasePlan.RequestAtomicRepair
-                                                      && GlobalCatchUpRepairPlanner.CanRunAtomicSharedTailRepair(
-                                                          remainingAfterGlobalCatchUp,
-                                                          generationGroups.Count);
+                                                      && CanRunAtomicSharedTailRepairNow(
+                                                          remainingAfterGlobalCatchUp);
                     if (releasePlan.AllowAtomicRepairRetry)
                     {
                         atomicSharedTailRepairAttempted = false;
+                    }
+                    if (releasePlan.ResetSearchLimitDiagnostics)
+                    {
+                        // Загальну node/time-квоту не поповнюємо, але фінальна
+                        // діагностика має описувати саме повтор після звільнення резервів,
+                        // а не застарілий ліміт із попередньої траєкторії пошуку.
+                        searchLimitedGroupDates.Clear();
+                        warnings.RemoveAll(warning =>
+                            warning.Contains("[search-limit]", StringComparison.Ordinal));
                     }
                     // Загальний бюджет завдання не поновлюється між repair-проходами:
                     // повторний пошук має залишатися в межах тієї самої квоти.

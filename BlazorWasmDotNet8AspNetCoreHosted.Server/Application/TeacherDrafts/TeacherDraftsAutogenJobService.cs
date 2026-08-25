@@ -46,7 +46,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
     private const int MaxOutstandingJobCountPerClient = 2;
     private const int MaxRetainedTerminalJobCount = 200;
     private const int MaxWholeJobSearchNodes = 2_000_000;
-    private const int MaxPersistedPayloadCharacters = 2_000_000;
+    internal const int MaxPersistedPayloadCharacters = 2_000_000;
     private const int DurableCleanupBatchSize = 200;
     private const string GlobalExecutionLockBaseName = "scheduleapp:teacher-drafts-autogen";
     private const string FullJobRollbackWarning =
@@ -59,6 +59,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
     private static readonly TimeSpan DefaultTerminalPersistenceHorizon = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan DurableTerminalJobRetention = TimeSpan.FromDays(45);
     private static readonly TimeSpan MaxJobDuration = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan PlanReadPersistenceHandoffTimeout = TimeSpan.FromSeconds(35);
     private static readonly TimeSpan SqliteExclusiveExecutionLeaseDuration = TimeSpan.FromHours(6);
     private static readonly HashSet<string> ProvisionalIntegratedWarningCodes = new(StringComparer.Ordinal)
     {
@@ -230,29 +231,49 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         }
     }
 
-    public AutoGenJobStatus? Get(string jobId)
-        => _jobs.TryGetValue(jobId, out var job) ? job.ToDto() : ReadPersistedStatus(jobId);
-
-    public AutoGenJobStatus? Cancel(string jobId)
+    public async Task<AutoGenJobStatus?> GetAsync(
+        string jobId,
+        CancellationToken cancellationToken = default)
     {
-        if (_sqliteExclusiveExecutions.ContainsKey(jobId)
-            && _jobs.TryGetValue(jobId, out var sqliteLocalJob))
+        var normalized = NormalizeJobId(jobId);
+        if (normalized is null)
+        {
+            return null;
+        }
+
+        return _jobs.TryGetValue(normalized, out var job)
+            ? job.ToDto()
+            : await ReadPersistedStatusAsync(normalized, cancellationToken);
+    }
+
+    public async Task<AutoGenJobStatus?> CancelAsync(
+        string jobId,
+        CancellationToken cancellationToken = default)
+    {
+        var normalized = NormalizeJobId(jobId);
+        if (normalized is null)
+        {
+            return null;
+        }
+
+        if (_sqliteExclusiveExecutions.ContainsKey(normalized)
+            && _jobs.TryGetValue(normalized, out var sqliteLocalJob))
         {
             sqliteLocalJob.RequestCancellationFor(AutoGenJobCancellationReason.UserRequested);
             return sqliteLocalJob.ToDto();
         }
 
-        var persistedStatus = RequestPersistedCancellation(jobId);
+        var persistedStatus = await RequestPersistedCancellationAsync(normalized, cancellationToken);
         if (persistedStatus is null)
         {
             return null;
         }
-        if (_jobs.TryGetValue(jobId, out var job))
+        if (_jobs.TryGetValue(normalized, out var job))
         {
             if (IsTerminalState(persistedStatus.State))
             {
                 job.RequestCancellationFor(AutoGenJobCancellationReason.LeaseLost);
-                _jobs.TryRemove(jobId, out _);
+                _jobs.TryRemove(normalized, out _);
                 return persistedStatus;
             }
             job.RequestCancellationFor(AutoGenJobCancellationReason.UserRequested);
@@ -273,6 +294,55 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         return details;
     }
 
+    public async Task PreparePlanReadAsync(
+        string jobId,
+        CancellationToken cancellationToken = default)
+    {
+        var normalized = NormalizeJobId(jobId);
+        if (normalized is null
+            || !_runningTasks.TryGetValue(normalized, out var runningTask))
+        {
+            return;
+        }
+
+        if (!_jobs.TryGetValue(normalized, out var job)
+            || !IsTerminalState(job.ToDto().State))
+        {
+            throw new AutoGenPlanConflictException(
+                "План автогенерації ще формується. Дочекайтеся завершення завдання та повторіть запит.");
+        }
+
+        try
+        {
+            await runningTask.WaitAsync(
+                PlanReadPersistenceHandoffTimeout,
+                cancellationToken);
+        }
+        catch (TimeoutException)
+        {
+            throw new AutoGenPlanConflictException(
+                "Завершення плану ще зберігається. Повторіть запит через кілька секунд.");
+        }
+    }
+
+    public async Task<AutoGenPlanDetailsDto> GetPlanPageAsync(
+        string jobId,
+        int changeOffset = 0,
+        int changeLimit = TeacherDraftsAutogenPlanService.DefaultChangePageSize,
+        CancellationToken cancellationToken = default)
+    {
+        await PreparePlanReadAsync(jobId, cancellationToken);
+        using var scope = _scopeFactory.CreateScope();
+        var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
+        var details = await plans.GetDetailsPageAsync(
+            jobId,
+            changeOffset,
+            changeLimit,
+            cancellationToken);
+        UpdateLocalPlanSummary(jobId, details.Summary);
+        return details;
+    }
+
     public async Task<AutoGenPlanDetailsDto?> GetLatestRollbackablePlanAsync(
         int? courseId,
         CancellationToken cancellationToken = default)
@@ -280,6 +350,21 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         using var scope = _scopeFactory.CreateScope();
         var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
         return await plans.GetLatestRollbackableAsync(courseId, cancellationToken);
+    }
+
+    public async Task<AutoGenPlanDetailsDto?> GetLatestRollbackablePlanPageAsync(
+        int? courseId,
+        int changeOffset = 0,
+        int changeLimit = TeacherDraftsAutogenPlanService.DefaultChangePageSize,
+        CancellationToken cancellationToken = default)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
+        return await plans.GetLatestRollbackablePageAsync(
+            courseId,
+            changeOffset,
+            changeLimit,
+            cancellationToken);
     }
 
     public async Task<AutoGenPlanDetailsDto> ApplyPlanAsync(
@@ -962,28 +1047,29 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         }
     }
 
-    private AutoGenJobStatus? ReadPersistedStatus(string jobId)
+    private async Task<AutoGenJobStatus?> ReadPersistedStatusAsync(
+        string jobId,
+        CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(jobId))
-        {
-            return null;
-        }
-
-        _persistenceGate.Wait();
+        await _persistenceGate.WaitAsync(cancellationToken);
         try
         {
             for (var retry = 0; retry < 3; retry++)
             {
                 using var scope = _scopeFactory.CreateScope();
                 var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-                var run = db.AutoGenJobRuns.FirstOrDefault(item => item.JobId == jobId);
+                var run = await LoadBoundedStatusRunAsync(db, jobId, cancellationToken);
                 if (run is null)
                 {
                     return null;
                 }
                 try
                 {
-                    return ExpireIfLeaseElapsed(db, run, _databaseUtcNow(db));
+                    return await ExpireIfLeaseElapsedAsync(
+                        db,
+                        run,
+                        await _databaseUtcNowAsync(db, cancellationToken),
+                        cancellationToken);
                 }
                 catch (DbUpdateConcurrencyException) when (retry < 2)
                 {
@@ -994,6 +1080,10 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         }
         catch (Exception ex)
         {
+            if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
             if (ex is AutoGenJobPersistenceException)
             {
                 throw;
@@ -1007,27 +1097,29 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         }
     }
 
-    private AutoGenJobStatus? RequestPersistedCancellation(string jobId)
-    {
-        if (string.IsNullOrWhiteSpace(jobId))
-        {
-            return null;
-        }
+    private static string? NormalizeJobId(string? jobId)
+        => Guid.TryParseExact(jobId?.Trim(), "N", out var parsed)
+            ? parsed.ToString("N")
+            : null;
 
-        _persistenceGate.Wait();
+    private async Task<AutoGenJobStatus?> RequestPersistedCancellationAsync(
+        string jobId,
+        CancellationToken cancellationToken)
+    {
+        await _persistenceGate.WaitAsync(cancellationToken);
         try
         {
             for (var retry = 0; retry < 3; retry++)
             {
                 using var scope = _scopeFactory.CreateScope();
                 var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-                var run = db.AutoGenJobRuns.FirstOrDefault(item => item.JobId == jobId);
+                var run = await LoadBoundedStatusRunAsync(db, jobId, cancellationToken);
                 if (run is null)
                 {
                     return null;
                 }
-                var now = _databaseUtcNow(db);
-                var current = ExpireIfLeaseElapsed(db, run, now);
+                var now = await _databaseUtcNowAsync(db, cancellationToken);
+                var current = await ExpireIfLeaseElapsedAsync(db, run, now, cancellationToken);
                 if (IsTerminalState(current.State))
                 {
                     return current;
@@ -1046,7 +1138,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                 run.StatusJson = JsonSerializer.Serialize(status, PersistenceJsonOptions);
                 try
                 {
-                    db.SaveChanges();
+                    await db.SaveChangesAsync(cancellationToken);
                     return status;
                 }
                 catch (DbUpdateConcurrencyException) when (retry < 2)
@@ -1058,6 +1150,10 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         }
         catch (Exception ex)
         {
+            if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
             if (ex is AutoGenJobPersistenceException)
             {
                 throw;
@@ -1068,6 +1164,83 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         finally
         {
             _persistenceGate.Release();
+        }
+    }
+
+    private static async Task<AutoGenJobRun?> LoadBoundedStatusRunAsync(
+        AppDbContext db,
+        string jobId,
+        CancellationToken cancellationToken)
+    {
+        var run = await db.AutoGenJobRuns
+            .AsNoTracking()
+            .Where(item => item.JobId == jobId)
+            .Select(item => new AutoGenJobRun
+            {
+                Id = item.Id,
+                JobId = item.JobId,
+                ClientPartitionKey = item.ClientPartitionKey,
+                RequestHash = item.RequestHash,
+                OwnerInstanceId = item.OwnerInstanceId,
+                Attempt = item.Attempt,
+                LeaseExpiresAtUtc = item.LeaseExpiresAtUtc,
+                Version = item.Version,
+                Kind = item.Kind,
+                State = item.State,
+                Title = item.Title,
+                CurrentStage = item.CurrentStage,
+                CreatedAtUtc = item.CreatedAtUtc,
+                StartedAtUtc = item.StartedAtUtc,
+                CompletedAtUtc = item.CompletedAtUtc,
+                RangeStartDate = item.RangeStartDate,
+                RangeEndDate = item.RangeEndDate,
+                TotalWeeks = item.TotalWeeks,
+                CompletedWeeks = item.CompletedWeeks,
+                CurrentWeekNumber = item.CurrentWeekNumber,
+                CurrentWeekStartDate = item.CurrentWeekStartDate,
+                CurrentRangeStartDate = item.CurrentRangeStartDate,
+                CurrentRangeEndDate = item.CurrentRangeEndDate,
+                CreatedCount = item.CreatedCount,
+                SkippedCount = item.SkippedCount,
+                WarningCount = item.WarningCount,
+                GapCount = item.GapCount,
+                DeficitCount = item.DeficitCount,
+                Percent = item.Percent,
+                CancellationRequested = item.CancellationRequested,
+                LastCompletedMessage = item.LastCompletedMessage,
+                Error = item.Error == null
+                    ? null
+                    : item.Error.Substring(0, MaxPersistedPayloadCharacters + 1),
+                RequestJson = string.Empty,
+                StatusJson = item.StatusJson.Substring(0, MaxPersistedPayloadCharacters + 1),
+                ResultJson = item.ResultJson == null
+                    ? null
+                    : item.ResultJson.Substring(0, MaxPersistedPayloadCharacters + 1),
+                ReportJson = item.ReportJson == null
+                    ? null
+                    : item.ReportJson.Substring(0, MaxPersistedPayloadCharacters + 1),
+                UpdatedAtUtc = item.UpdatedAtUtc
+            })
+            .SingleOrDefaultAsync(cancellationToken);
+        if (run is null)
+        {
+            return null;
+        }
+
+        EnsureBoundedPersistedRead(run.Error, "помилки");
+        EnsureBoundedPersistedRead(run.StatusJson, "статусу");
+        EnsureBoundedPersistedRead(run.ResultJson, "результату");
+        EnsureBoundedPersistedRead(run.ReportJson, "звіту");
+        db.Attach(run);
+        return run;
+    }
+
+    private static void EnsureBoundedPersistedRead(string? payload, string label)
+    {
+        if ((payload?.Length ?? 0) > MaxPersistedPayloadCharacters)
+        {
+            throw new AutoGenJobPersistenceException(
+                $"Збережений JSON {label} автогенерації перевищує безпечний ліміт {MaxPersistedPayloadCharacters} символів.");
         }
     }
 
@@ -1098,6 +1271,37 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         var expiredStatus = BuildStatusFromColumns(run);
         run.StatusJson = JsonSerializer.Serialize(expiredStatus, PersistenceJsonOptions);
         db.SaveChanges();
+        return expiredStatus;
+    }
+
+    private async Task<AutoGenJobStatus> ExpireIfLeaseElapsedAsync(
+        AppDbContext db,
+        AutoGenJobRun run,
+        DateTime databaseUtcNow,
+        CancellationToken cancellationToken)
+    {
+        var state = ToJobState(run.State);
+        if (IsTerminalState(state) || IsLegacyNonTerminalRun(run))
+        {
+            return DeserializeStatusOrFallback(run);
+        }
+        if (run.LeaseExpiresAtUtc is DateTime leaseExpiresAtUtc
+            && leaseExpiresAtUtc > databaseUtcNow)
+        {
+            return DeserializeStatusOrFallback(run);
+        }
+
+        run.State = (int)AutoGenJobState.Failed;
+        run.CompletedAtUtc ??= databaseUtcNow;
+        run.CurrentStage = "Втрачено lease власника завдання.";
+        run.Error = "Lease завдання автогенерації завершився. Результат виконання невідомий; автоматичний повтор не запускався.";
+        run.Percent = 100;
+        run.LeaseExpiresAtUtc = null;
+        run.UpdatedAtUtc = databaseUtcNow;
+        run.Version++;
+        var expiredStatus = BuildStatusFromColumns(run);
+        run.StatusJson = JsonSerializer.Serialize(expiredStatus, PersistenceJsonOptions);
+        await db.SaveChangesAsync(cancellationToken);
         return expiredStatus;
     }
 
@@ -1527,6 +1731,14 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             throw new AutoGenJobValidationException(
                 "Налаштування аудиторій груп не можуть містити порожні елементи.");
         }
+        if (request.GroupRoomPreferences is { } distinctRoomPreferences
+            && distinctRoomPreferences
+                .GroupBy(preference => preference.GroupId)
+                .Any(group => group.Count() > 1))
+        {
+            throw new AutoGenJobValidationException(
+                "Для кожної групи можна передати лише одне налаштування пріоритетних аудиторій.");
+        }
         if (request.GroupRoomPreferences is { } roomPreferences
             && roomPreferences.Any(preference => preference.RoomIds is { Count: > MaxPreferredRoomCountPerGroup }))
         {
@@ -1738,6 +1950,9 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                             job.Token.ThrowIfCancellationRequested();
 
                             job.StartWeek(runRange.WeekIndex, runRange.WeekStart, runRange.RangeStartDate, runRange.RangeEndDate);
+                            // Усі primary/fill/relaxed фази одного діапазону ділять одну
+                            // квоту аварійних одиночних потоків і одну групу-власника.
+                            var emergencySingletonState = new AutogenRangeEmergencySingletonState();
                             if (persistIntermediateProgress)
                             {
                                 await PersistProgressOrCancelAsync(job, "початок діапазону");
@@ -1763,6 +1978,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                             var action = await autogen.DraftAutoGenInAmbientTransactionWithBudget(
                                 request,
                                 wholeJobSearchBudget,
+                                emergencySingletonState,
                                 job.Token);
                             var (rangeSucceeded, rangeResult, fallbackWarning) = ExtractAutoGenResult(action);
                             if (rangeSucceeded
@@ -1785,6 +2001,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                                         PreflightOnly = false
                                     },
                                     wholeJobSearchBudget,
+                                    emergencySingletonState,
                                     job.Token);
                                 var (fillSucceeded, fillResult, fillFallbackWarning) =
                                     ExtractAutoGenResult(fillAction);
@@ -1795,6 +2012,10 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                                     && executionTransaction.SupportsSavepoints)
                                 {
                                     var savepointName = $"integrated_relaxed_fill_{runRange.WeekIndex}";
+                                    var emergencySingletonCountBeforeRelaxed =
+                                        emergencySingletonState.CreatedCount;
+                                    var emergencySingletonOwnerBeforeRelaxed =
+                                        emergencySingletonState.OwnerGroupId;
                                     await executionTransaction.CreateSavepointAsync(savepointName, job.Token);
                                     var relaxedFillAccepted = false;
                                     try
@@ -1816,6 +2037,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                                                 AllowIncompleteDrafts = true
                                             },
                                             wholeJobSearchBudget,
+                                            emergencySingletonState,
                                             job.Token);
                                         var (relaxedFillSucceeded, relaxedFillResult, _) =
                                             ExtractAutoGenResult(relaxedFillAction);
@@ -1852,6 +2074,10 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
 
                                         if (!relaxedFillAccepted)
                                         {
+                                            emergencySingletonState.CreatedCount =
+                                                emergencySingletonCountBeforeRelaxed;
+                                            emergencySingletonState.OwnerGroupId =
+                                                emergencySingletonOwnerBeforeRelaxed;
                                             await executionTransaction.RollbackToSavepointAsync(
                                                 savepointName,
                                                 CancellationToken.None);
@@ -1863,6 +2089,10 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                                     }
                                     catch
                                     {
+                                        emergencySingletonState.CreatedCount =
+                                            emergencySingletonCountBeforeRelaxed;
+                                        emergencySingletonState.OwnerGroupId =
+                                            emergencySingletonOwnerBeforeRelaxed;
                                         await executionTransaction.RollbackToSavepointAsync(
                                             savepointName,
                                             CancellationToken.None);

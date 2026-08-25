@@ -68,6 +68,56 @@ builder.Services.AddRateLimiter(options =>
                 QueueLimit = 0,
                 AutoReplenishment = true
             }));
+    options.AddPolicy("autogen-status", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ClientPartitionKey.Resolve(context),
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 240,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+    options.AddPolicy("autogen-plan-read", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ClientPartitionKey.Resolve(context),
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 30,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+    options.AddPolicy("autogen-plan-action", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ClientPartitionKey.Resolve(context),
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 12,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+    options.AddPolicy("week-validation", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ClientPartitionKey.Resolve(context),
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 30,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+    options.AddPolicy("module-sequence-save", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ClientPartitionKey.Resolve(context),
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 12,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
 });
 // Стискаємо JSON, WebAssembly та статичні ресурси під час передавання через HTTPS.
 builder.Services.AddResponseCompression(options => options.EnableForHttps = true);
@@ -107,6 +157,7 @@ builder.Services.AddScoped<TeacherDraftsWeekValidationService>();
 builder.Services.AddScoped<TeacherDraftsExportService>();
 builder.Services.AddScoped<TeacherDraftsAutogenService>();
 builder.Services.AddScoped<TeacherDraftsAutogenPlanService>();
+builder.Services.AddSingleton<ExpensiveOperationGate>();
 builder.Services.AddSingleton<TeacherDraftsAutogenJobService>();
 builder.Services.AddHostedService<TeacherDraftsAutogenJobService>(services =>
     services.GetRequiredService<TeacherDraftsAutogenJobService>());

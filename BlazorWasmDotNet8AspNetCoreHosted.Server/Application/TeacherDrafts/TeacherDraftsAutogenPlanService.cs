@@ -16,6 +16,8 @@ public sealed class AutoGenPlanPersistenceException(string message, Exception? i
 
 public sealed class AutoGenPlanCapacityException(string message) : Exception(message);
 
+public sealed class AutoGenPlanValidationException(string message) : Exception(message);
+
 internal sealed record AutoGenDraftSnapshot(
     int Id,
     Guid Revision,
@@ -87,10 +89,16 @@ internal sealed record AutoGenDraftPlanPayload(
 
 public sealed class TeacherDraftsAutogenPlanService
 {
+    public const int DefaultChangePageSize = 200;
+    public const int MaxChangePageSize = 250;
+    public const int MaxMutationsPerPlan = 2_000;
     private const int MaxRetainedPlanCount = 50;
     private const int MaxRetainedMutationCount = 10_000;
-    private const int MaxMutationsPerPlan = 2_000;
     private const int MaxSerializedSnapshotLength = 8_192;
+    private const int MaxGroupIdsJsonLength = 4_096;
+    internal const int CleanupPlanBatchSize = 50;
+    internal const int CleanupMutationBatchSize = 500;
+    internal const int MaxPublicationConsumedPlanCount = 50;
     private static readonly TimeSpan PreviewLifetime = TimeSpan.FromHours(24);
     private static readonly TimeSpan RollbackLifetime = TimeSpan.FromDays(7);
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
@@ -287,8 +295,33 @@ public sealed class TeacherDraftsAutogenPlanService
         CancellationToken cancellationToken = default)
     {
         await CleanupExpiredPlansAsync(_db, cancellationToken);
-        var plan = await LoadPlanAsync(planId, tracking: false, cancellationToken);
+        var plan = await LoadPlanAsync(
+            planId,
+            tracking: false,
+            includeMutations: true,
+            cancellationToken);
         return BuildDetails(plan, DateTime.UtcNow);
+    }
+
+    public async Task<AutoGenPlanDetailsDto> GetDetailsPageAsync(
+        string planId,
+        int changeOffset = 0,
+        int changeLimit = DefaultChangePageSize,
+        CancellationToken cancellationToken = default)
+    {
+        EnsurePageBounds(changeOffset, changeLimit);
+        await CleanupExpiredPlansAsync(_db, cancellationToken);
+        var plan = await LoadPlanAsync(
+            planId,
+            tracking: false,
+            includeMutations: false,
+            cancellationToken);
+        var totalChanges = await LoadMutationPageAsync(
+            plan,
+            changeOffset,
+            changeLimit,
+            cancellationToken);
+        return BuildDetails(plan, DateTime.UtcNow, changeOffset, totalChanges);
     }
 
     public async Task<AutoGenPlanDetailsDto?> GetLatestRollbackableAsync(
@@ -299,19 +332,69 @@ public sealed class TeacherDraftsAutogenPlanService
         var nowUtc = DateTime.UtcNow;
         var query = _db.AutoGenDraftPlans
             .AsNoTracking()
-            .Include(item => item.AutoGenJobRun)
-            .Include(item => item.Mutations)
             .Where(item => item.State == (int)AutoGenPlanState.Applied
                            && item.ExpiresAtUtc > nowUtc);
         if (courseId is > 0)
         {
             query = query.Where(item => item.CourseId == courseId.Value);
         }
-        var plan = await query
+        var planId = await query
             .OrderByDescending(item => item.AppliedAtUtc)
             .ThenByDescending(item => item.Id)
+            .Select(item => item.PlanId)
             .FirstOrDefaultAsync(cancellationToken);
-        return plan is null ? null : BuildDetails(plan, nowUtc);
+        if (planId is null)
+        {
+            return null;
+        }
+
+        var plan = await LoadPlanAsync(
+            planId,
+            tracking: false,
+            includeMutations: true,
+            cancellationToken);
+        return BuildDetails(plan, nowUtc);
+    }
+
+    public async Task<AutoGenPlanDetailsDto?> GetLatestRollbackablePageAsync(
+        int? courseId,
+        int changeOffset = 0,
+        int changeLimit = DefaultChangePageSize,
+        CancellationToken cancellationToken = default)
+    {
+        EnsurePageBounds(changeOffset, changeLimit);
+        await CleanupExpiredPlansAsync(_db, cancellationToken);
+        var nowUtc = DateTime.UtcNow;
+        var query = _db.AutoGenDraftPlans
+            .AsNoTracking()
+            .Where(item => item.State == (int)AutoGenPlanState.Applied
+                           && item.ExpiresAtUtc > nowUtc);
+        if (courseId is > 0)
+        {
+            query = query.Where(item => item.CourseId == courseId.Value);
+        }
+        var planId = await query
+            .OrderByDescending(item => item.AppliedAtUtc)
+            .ThenByDescending(item => item.Id)
+            .Select(item => item.PlanId)
+            .FirstOrDefaultAsync(cancellationToken);
+        if (planId is null)
+        {
+            return null;
+        }
+
+        var plan = await LoadPlanAsync(
+            planId,
+            tracking: false,
+            includeMutations: false,
+            cancellationToken);
+
+        var totalChanges = await LoadMutationPageAsync(
+            plan,
+            changeOffset,
+            changeLimit,
+            cancellationToken);
+        return BuildDetails(plan, nowUtc, changeOffset, totalChanges);
     }
 
     public async Task<AutoGenPlanDetailsDto> ApplyAsync(
@@ -325,7 +408,11 @@ public sealed class TeacherDraftsAutogenPlanService
         try
         {
             await CleanupExpiredPlansAsync(_db, cancellationToken);
-            var plan = await LoadPlanAsync(planId, tracking: true, cancellationToken);
+            var plan = await LoadPlanAsync(
+                planId,
+                tracking: true,
+                includeMutations: true,
+                cancellationToken);
             var state = EffectiveState(plan, DateTime.UtcNow);
             if (state == AutoGenPlanState.Applied)
             {
@@ -441,7 +528,11 @@ public sealed class TeacherDraftsAutogenPlanService
         try
         {
             await CleanupExpiredPlansAsync(_db, cancellationToken);
-            var plan = await LoadPlanAsync(planId, tracking: true, cancellationToken);
+            var plan = await LoadPlanAsync(
+                planId,
+                tracking: true,
+                includeMutations: true,
+                cancellationToken);
             var state = EffectiveState(plan, DateTime.UtcNow);
             if (state == AutoGenPlanState.RolledBack)
             {
@@ -536,6 +627,7 @@ public sealed class TeacherDraftsAutogenPlanService
     private async Task<AutoGenDraftPlan> LoadPlanAsync(
         string planId,
         bool tracking,
+        bool includeMutations,
         CancellationToken cancellationToken)
     {
         var normalized = planId?.Trim();
@@ -544,15 +636,211 @@ public sealed class TeacherDraftsAutogenPlanService
             throw new AutoGenPlanNotFoundException("План автогенерації не знайдено.");
         }
 
-        IQueryable<AutoGenDraftPlan> query = _db.AutoGenDraftPlans
-            .Include(item => item.AutoGenJobRun)
-            .Include(item => item.Mutations);
-        if (!tracking)
+        var plan = await _db.AutoGenDraftPlans
+            .AsNoTracking()
+            .Where(item => item.PlanId == normalized)
+            .Select(item => new AutoGenDraftPlan
+            {
+                Id = item.Id,
+                PlanId = item.PlanId,
+                AutoGenJobRunId = item.AutoGenJobRunId,
+                AutoGenJobRun = new AutoGenJobRun
+                {
+                    Id = item.AutoGenJobRun.Id,
+                    JobId = item.AutoGenJobRun.JobId,
+                    ClientPartitionKey = item.AutoGenJobRun.ClientPartitionKey,
+                    RequestHash = item.AutoGenJobRun.RequestHash,
+                    Version = item.AutoGenJobRun.Version,
+                    Title = item.AutoGenJobRun.Title,
+                    CurrentStage = item.AutoGenJobRun.CurrentStage,
+                    RequestJson = item.AutoGenJobRun.RequestJson.Substring(
+                        0,
+                        TeacherDraftsAutogenJobService.MaxPersistedPayloadCharacters + 1),
+                    StatusJson = item.AutoGenJobRun.StatusJson.Substring(
+                        0,
+                        TeacherDraftsAutogenJobService.MaxPersistedPayloadCharacters + 1),
+                    ResultJson = item.AutoGenJobRun.ResultJson == null
+                        ? null
+                        : item.AutoGenJobRun.ResultJson.Substring(
+                            0,
+                            TeacherDraftsAutogenJobService.MaxPersistedPayloadCharacters + 1),
+                    UpdatedAtUtc = item.AutoGenJobRun.UpdatedAtUtc
+                },
+                State = item.State,
+                Version = item.Version,
+                CourseId = item.CourseId,
+                RangeStartDate = item.RangeStartDate,
+                RangeEndDate = item.RangeEndDate,
+                Days = item.Days,
+                AllowIncompleteDrafts = item.AllowIncompleteDrafts,
+                GroupIdsJson = item.GroupIdsJson.Substring(0, MaxGroupIdsJsonLength + 1),
+                BeforeScopeRevision = item.BeforeScopeRevision,
+                InputFingerprint = item.InputFingerprint,
+                AppliedScopeRevision = item.AppliedScopeRevision,
+                AddCount = item.AddCount,
+                UpdateCount = item.UpdateCount,
+                DeleteCount = item.DeleteCount,
+                CreatedAtUtc = item.CreatedAtUtc,
+                ExpiresAtUtc = item.ExpiresAtUtc,
+                AppliedAtUtc = item.AppliedAtUtc,
+                RolledBackAtUtc = item.RolledBackAtUtc
+            })
+            .SingleOrDefaultAsync(cancellationToken)
+            ?? throw new AutoGenPlanNotFoundException("План автогенерації не знайдено.");
+        EnsureBoundedPlanRead(plan);
+        if (tracking)
         {
-            query = query.AsNoTracking();
+            _db.Attach(plan);
         }
-        return await query.SingleOrDefaultAsync(item => item.PlanId == normalized, cancellationToken)
-               ?? throw new AutoGenPlanNotFoundException("План автогенерації не знайдено.");
+        if (!includeMutations)
+        {
+            return plan;
+        }
+
+        plan.Mutations = await LoadBoundedMutationRowsAsync(
+            plan.Id,
+            changeOffset: 0,
+            changeLimit: MaxMutationsPerPlan + 1,
+            tracking,
+            cancellationToken);
+        ValidateMutationTotals(plan, plan.Mutations.Count);
+        return plan;
+    }
+
+    private static void EnsureBoundedPlanRead(AutoGenDraftPlan plan)
+    {
+        if (plan.GroupIdsJson.Length > MaxGroupIdsJsonLength)
+        {
+            throw CorruptPlan(
+                $"Склад груп збереженого плану перевищує безпечний ліміт {MaxGroupIdsJsonLength} символів.");
+        }
+
+        EnsureBoundedJobPayload(plan.AutoGenJobRun.RequestJson, "запиту");
+        EnsureBoundedJobPayload(plan.AutoGenJobRun.StatusJson, "статусу");
+        EnsureBoundedJobPayload(plan.AutoGenJobRun.ResultJson, "результату");
+    }
+
+    private static void EnsureBoundedJobPayload(string? payload, string label)
+    {
+        if ((payload?.Length ?? 0) > TeacherDraftsAutogenJobService.MaxPersistedPayloadCharacters)
+        {
+            throw CorruptPlan(
+                $"Збережений JSON {label} автогенерації перевищує безпечний ліміт {TeacherDraftsAutogenJobService.MaxPersistedPayloadCharacters} символів.");
+        }
+    }
+
+    private async Task<int> LoadMutationPageAsync(
+        AutoGenDraftPlan plan,
+        int changeOffset,
+        int changeLimit,
+        CancellationToken cancellationToken)
+    {
+        var query = _db.AutoGenDraftPlanMutations
+            .AsNoTracking()
+            .Where(item => item.AutoGenDraftPlanId == plan.Id);
+        var actualCount = await query
+            .OrderBy(item => item.Id)
+            .Take(MaxMutationsPerPlan + 1)
+            .CountAsync(cancellationToken);
+        ValidateMutationTotals(plan, actualCount);
+        plan.Mutations = await LoadBoundedMutationRowsAsync(
+            plan.Id,
+            changeOffset,
+            changeLimit,
+            tracking: false,
+            cancellationToken);
+        return actualCount;
+    }
+
+    private async Task<List<AutoGenDraftPlanMutation>> LoadBoundedMutationRowsAsync(
+        int planId,
+        int changeOffset,
+        int changeLimit,
+        bool tracking,
+        CancellationToken cancellationToken)
+    {
+        var rows = await _db.AutoGenDraftPlanMutations
+            .AsNoTracking()
+            .Where(item => item.AutoGenDraftPlanId == planId)
+            .OrderBy(item => item.Ordinal)
+            .ThenBy(item => item.Id)
+            .Skip(changeOffset)
+            .Take(changeLimit)
+            .Select(item => new MutationReadRow(
+                item.Id,
+                item.AutoGenDraftPlanId,
+                item.Ordinal,
+                item.Operation,
+                item.SourceDraftId,
+                item.AppliedDraftId,
+                item.BeforeRevision,
+                item.AppliedRevision,
+                item.BeforeJson == null
+                    ? null
+                    : item.BeforeJson.Substring(0, MaxSerializedSnapshotLength + 1),
+                item.AfterJson == null
+                    ? null
+                    : item.AfterJson.Substring(0, MaxSerializedSnapshotLength + 1)))
+            .ToListAsync(cancellationToken);
+        var mutations = rows.Select(row => new AutoGenDraftPlanMutation
+        {
+            Id = row.Id,
+            AutoGenDraftPlanId = row.AutoGenDraftPlanId,
+            Ordinal = row.Ordinal,
+            Operation = row.Operation,
+            SourceDraftId = row.SourceDraftId,
+            AppliedDraftId = row.AppliedDraftId,
+            BeforeRevision = row.BeforeRevision,
+            AppliedRevision = row.AppliedRevision,
+            BeforeJson = row.BeforeJson,
+            AfterJson = row.AfterJson
+        }).ToList();
+        if (tracking && mutations.Count > 0)
+        {
+            _db.AttachRange(mutations);
+        }
+        return mutations;
+    }
+
+    private static void EnsurePageBounds(int changeOffset, int changeLimit)
+    {
+        if (changeOffset < 0
+            || changeLimit <= 0
+            || changeLimit > MaxChangePageSize)
+        {
+            throw new AutoGenPlanValidationException(
+                $"Сторінка змін плану має починатися з невід'ємного індексу та містити від 1 до {MaxChangePageSize} записів.");
+        }
+    }
+
+    private static int ValidateMutationTotals(AutoGenDraftPlan plan, int actualCount)
+    {
+        if (plan.AddCount < 0 || plan.UpdateCount < 0 || plan.DeleteCount < 0)
+        {
+            throw CorruptPlan("Збережений план містить від'ємний лічильник змін.");
+        }
+
+        int persistedTotal;
+        try
+        {
+            persistedTotal = checked(plan.AddCount + plan.UpdateCount + plan.DeleteCount);
+        }
+        catch (OverflowException ex)
+        {
+            throw new AutoGenPlanPersistenceException(
+                "Лічильники змін збереженого плану пошкоджені.",
+                ex);
+        }
+
+        if (persistedTotal > MaxMutationsPerPlan
+            || actualCount > MaxMutationsPerPlan
+            || actualCount != persistedTotal)
+        {
+            throw CorruptPlan(
+                $"Збережений план містить неузгоджену кількість змін ({persistedTotal}/{actualCount}).");
+        }
+
+        return persistedTotal;
     }
 
     private async Task<List<TeacherDraftItem>> LoadTrackedScopeRowsAsync(
@@ -798,13 +1086,42 @@ public sealed class TeacherDraftsAutogenPlanService
         }
     }
 
-    internal static Task<int> CleanupExpiredPlansAsync(
+    internal static async Task<int> CleanupExpiredPlansAsync(
         AppDbContext db,
         CancellationToken cancellationToken = default)
     {
         var cutoffUtc = DateTime.UtcNow;
-        return db.AutoGenDraftPlans
+        var planIds = await db.AutoGenDraftPlans
+            .AsNoTracking()
             .Where(item => item.ExpiresAtUtc < cutoffUtc)
+            .OrderBy(item => item.ExpiresAtUtc)
+            .ThenBy(item => item.Id)
+            .Select(item => item.Id)
+            .Take(CleanupPlanBatchSize)
+            .ToListAsync(cancellationToken);
+        if (planIds.Count == 0)
+        {
+            return 0;
+        }
+
+        var mutationIds = await db.AutoGenDraftPlanMutations
+            .AsNoTracking()
+            .Where(item => planIds.Contains(item.AutoGenDraftPlanId))
+            .OrderBy(item => item.Id)
+            .Select(item => item.Id)
+            .Take(CleanupMutationBatchSize)
+            .ToListAsync(cancellationToken);
+        if (mutationIds.Count > 0)
+        {
+            await db.AutoGenDraftPlanMutations
+                .Where(item => mutationIds.Contains(item.Id))
+                .ExecuteDeleteAsync(cancellationToken);
+        }
+
+        return await db.AutoGenDraftPlans
+            .Where(item => planIds.Contains(item.Id)
+                           && !db.AutoGenDraftPlanMutations.Any(
+                               mutation => mutation.AutoGenDraftPlanId == item.Id))
             .ExecuteDeleteAsync(cancellationToken);
     }
 
@@ -824,25 +1141,96 @@ public sealed class TeacherDraftsAutogenPlanService
             .Where(planId => !string.IsNullOrWhiteSpace(planId))
             .Select(planId => planId!)
             .Distinct(StringComparer.Ordinal)
+            .Take(MaxPublicationConsumedPlanCount + 1)
             .ToList();
         if (publishedPlanIds.Count == 0)
         {
             return 0;
         }
+        if (publishedPlanIds.Count > MaxPublicationConsumedPlanCount)
+        {
+            throw new DraftValidationCapacityException(
+                $"Одна публікація може завершити не більше {MaxPublicationConsumedPlanCount} планів автогенерації.");
+        }
 
         var candidates = await db.AutoGenDraftPlans
-            .Include(plan => plan.AutoGenJobRun)
+            .AsNoTracking()
             .Where(plan => plan.State == (int)AutoGenPlanState.Applied
                            && plan.AppliedScopeRevision != null
                            && (plan.AddCount > 0 || plan.UpdateCount > 0)
                            && publishedPlanIds.Contains(plan.PlanId))
+            .OrderBy(plan => plan.Id)
+            .Take(MaxPublicationConsumedPlanCount + 1)
+            .Select(plan => new AutoGenDraftPlan
+            {
+                Id = plan.Id,
+                PlanId = plan.PlanId,
+                AutoGenJobRunId = plan.AutoGenJobRunId,
+                AutoGenJobRun = new AutoGenJobRun
+                {
+                    Id = plan.AutoGenJobRun.Id,
+                    JobId = plan.AutoGenJobRun.JobId,
+                    ClientPartitionKey = plan.AutoGenJobRun.ClientPartitionKey,
+                    RequestHash = plan.AutoGenJobRun.RequestHash,
+                    Version = plan.AutoGenJobRun.Version,
+                    Title = plan.AutoGenJobRun.Title,
+                    CurrentStage = plan.AutoGenJobRun.CurrentStage,
+                    RequestJson = string.Empty,
+                    StatusJson = plan.AutoGenJobRun.StatusJson.Substring(
+                        0,
+                        TeacherDraftsAutogenJobService.MaxPersistedPayloadCharacters + 1),
+                    UpdatedAtUtc = plan.AutoGenJobRun.UpdatedAtUtc
+                },
+                State = plan.State,
+                Version = plan.Version,
+                CourseId = plan.CourseId,
+                RangeStartDate = plan.RangeStartDate,
+                RangeEndDate = plan.RangeEndDate,
+                Days = plan.Days,
+                AllowIncompleteDrafts = plan.AllowIncompleteDrafts,
+                GroupIdsJson = string.Empty,
+                BeforeScopeRevision = plan.BeforeScopeRevision,
+                InputFingerprint = plan.InputFingerprint,
+                AppliedScopeRevision = plan.AppliedScopeRevision,
+                AddCount = plan.AddCount,
+                UpdateCount = plan.UpdateCount,
+                DeleteCount = plan.DeleteCount,
+                CreatedAtUtc = plan.CreatedAtUtc,
+                ExpiresAtUtc = plan.ExpiresAtUtc,
+                AppliedAtUtc = plan.AppliedAtUtc,
+                RolledBackAtUtc = plan.RolledBackAtUtc
+            })
             .ToListAsync(cancellationToken);
+        if (candidates.Count > MaxPublicationConsumedPlanCount)
+        {
+            throw new DraftValidationCapacityException(
+                $"Одна публікація може завершити не більше {MaxPublicationConsumedPlanCount} планів автогенерації.");
+        }
         var publishedPlanIdSet = publishedPlanIds.ToHashSet(StringComparer.Ordinal);
         var nowUtc = DateTime.UtcNow;
         var expiredCount = 0;
-        foreach (var plan in candidates)
+        foreach (var candidate in candidates)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            var trackedJob = db.AutoGenJobRuns.Local
+                .FirstOrDefault(item => item.Id == candidate.AutoGenJobRunId);
+            if (trackedJob is null)
+            {
+                trackedJob = candidate.AutoGenJobRun;
+                db.Attach(trackedJob);
+            }
+            var plan = db.AutoGenDraftPlans.Local
+                .FirstOrDefault(item => item.Id == candidate.Id);
+            if (plan is null)
+            {
+                plan = candidate;
+                plan.AutoGenJobRun = trackedJob;
+                db.Attach(plan);
+            }
+            else
+            {
+                plan.AutoGenJobRun = trackedJob;
+            }
             if (!publishedPlanIdSet.Contains(plan.PlanId))
             {
                 continue;
@@ -854,6 +1242,8 @@ public sealed class TeacherDraftsAutogenPlanService
             plan.ExpiresAtUtc = nowUtc;
             try
             {
+                EnsureBoundedJobPayload(candidate.AutoGenJobRun.StatusJson, "статусу");
+                trackedJob.StatusJson = candidate.AutoGenJobRun.StatusJson;
                 UpdatePersistedJobPlanStatus(plan);
             }
             catch (AutoGenPlanPersistenceException)
@@ -963,6 +1353,11 @@ public sealed class TeacherDraftsAutogenPlanService
         {
             return null;
         }
+        if (json.Length > MaxSerializedSnapshotLength)
+        {
+            throw CorruptPlan(
+                $"Знімок зміни плану перевищує безпечний ліміт {MaxSerializedSnapshotLength} символів.");
+        }
         try
         {
             return JsonSerializer.Deserialize<AutoGenDraftSnapshot>(json, JsonOptions)
@@ -985,10 +1380,29 @@ public sealed class TeacherDraftsAutogenPlanService
             : state;
     }
 
-    private static AutoGenPlanDetailsDto BuildDetails(AutoGenDraftPlan plan, DateTime nowUtc)
+    private sealed record MutationReadRow(
+        long Id,
+        int AutoGenDraftPlanId,
+        int Ordinal,
+        int Operation,
+        int? SourceDraftId,
+        int? AppliedDraftId,
+        Guid? BeforeRevision,
+        Guid? AppliedRevision,
+        string? BeforeJson,
+        string? AfterJson);
+
+    private static AutoGenPlanDetailsDto BuildDetails(
+        AutoGenDraftPlan plan,
+        DateTime nowUtc,
+        int changeOffset = 0,
+        int? totalChanges = null)
     {
         var state = EffectiveState(plan, nowUtc);
         var summary = BuildSummary(plan, state);
+        var validatedTotalChanges = ValidateMutationTotals(
+            plan,
+            totalChanges ?? plan.Mutations.Count);
         var changes = ReadMutationPayloads(plan)
             .Select(item => new AutoGenPlanChangeDto(
                 item.Entity.Ordinal,
@@ -1000,7 +1414,12 @@ public sealed class TeacherDraftsAutogenPlanService
             TryDeserializeResult(plan.AutoGenJobRun.ResultJson)
             ?? new AutoGenResult(0, 0, new List<string>()),
             state);
-        return new AutoGenPlanDetailsDto(summary, changes, result);
+        return new AutoGenPlanDetailsDto(
+            summary,
+            changes,
+            result,
+            changeOffset,
+            validatedTotalChanges);
     }
 
     private static AutoGenResult AdjustResultForState(AutoGenResult result, AutoGenPlanState state)
@@ -1134,6 +1553,7 @@ public sealed class TeacherDraftsAutogenPlanService
 
     private static void UpdatePersistedJobPlanStatus(AutoGenDraftPlan plan)
     {
+        EnsureBoundedJobPayload(plan.AutoGenJobRun.StatusJson, "статусу");
         AutoGenJobStatus? status;
         try
         {

@@ -6,17 +6,33 @@
 
 <PageTitle>Адмін • Календар</PageTitle>
 
-<h3 class="mb-3">Винятки календаря</h3>
+<h1 class="h3 mb-3">Винятки календаря</h1>
 
 @if (!string.IsNullOrWhiteSpace(error))
 {
-    <div class="alert alert-danger">@error</div>
+    <div class="alert alert-danger" role="alert">
+        @error
+        @if (loadFailed)
+        {
+            <div class="mt-2">
+                <button type="button" class="btn btn-sm btn-outline-danger" @onclick="RetryLoad" disabled="@(loading || mutationInProgress)">
+                    Повторити завантаження
+                </button>
+            </div>
+        }
+    </div>
 }
 @if (!string.IsNullOrWhiteSpace(ok))
 {
-    <div class="alert alert-success">@ok</div>
+    <div class="alert alert-success" role="status">@ok</div>
 }
 
+@if (loading)
+{
+    <div class="text-muted mb-3" role="status" aria-live="polite">Завантаження календаря…</div>
+}
+
+<fieldset class="border-0 p-0 m-0 w-100" disabled="@IsInteractionBlocked">
 <div class="d-flex justify-content-between align-items-start align-items-md-center flex-column flex-md-row gap-2 mb-3">
     <div>
         <h5 class="mb-1">Керування винятками</h5>
@@ -32,7 +48,7 @@
         <div class="text-muted small">Показано: @SortedAndFiltered.Count() з @items.Count</div>
         <AdminSearchBox @bind-Value="filter" Style="max-width:320px;" Placeholder="Id / дата / назва / курс / група / так/ні" />
     </div>
-    <div class="table-responsive">
+    <div class="table-responsive" role="region" aria-label="Список календарних винятків" tabindex="0">
         <table class="table table-sm align-middle">
             <thead>
                 <tr>
@@ -42,7 +58,7 @@
                     <SortableHeader Field="@GroupNameField" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Група</SortableHeader>
                     <SortableHeader Field="@nameof(CalendarExceptionEditDto.Name)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Назва</SortableHeader>
                     <SortableHeader Field="@nameof(CalendarExceptionEditDto.IsWorkingDay)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Робочий</SortableHeader>
-                    <th style="width:220px;"></th>
+                    <th style="width:220px;"><span class="visually-hidden">Дії</span></th>
                 </tr>
             </thead>
             <tbody>
@@ -65,30 +81,41 @@
         </table>
     </div>
 </div>
+</fieldset>
 
 @if (editorOpen)
 {
-    <div class="editor-overlay" @onclick="CloseEditor">
-        <div class="editor editor-modal calendar-editor" role="dialog" aria-modal="true" @onclick:stopPropagation="true">
-            <div class="editor-modal-head">
-                <div>
-                    <div class="editor-title">@EditorTitle</div>
-                    <div class="editor-subtitle">Укажіть дату, курс, за потреби групу та статус робочого дня.</div>
+    <AdminEditorModal Title="@EditorTitle"
+                      Subtitle="Укажіть дату, курс, за потреби групу та статус робочого дня."
+                      CssClass="calendar-editor"
+                      Busy="@(loading || mutationInProgress)"
+                      OnClose="@CloseEditor">
+            @if (loadFailed)
+            {
+                <div class="alert alert-danger" role="alert">
+                    <div class="fw-semibold">Операцію виконано, але дані не оновлено.</div>
+                    <div class="small mt-1">@error</div>
+                    <button type="button"
+                            class="btn btn-sm btn-outline-danger mt-2"
+                            @onclick="RetryLoad"
+                            disabled="@(loading || mutationInProgress)">
+                        @(loading ? "Завантаження…" : "Повторити лише завантаження")
+                    </button>
                 </div>
-                <button type="button" class="btn btn-outline-secondary editor-close" title="Закрити" @onclick="CloseEditor">×</button>
-            </div>
+            }
+            <fieldset class="border-0 p-0 m-0 w-100" disabled="@IsInteractionBlocked">
             <div class="calendar-editor-grid">
                 <div class="calendar-editor-field">
-                    <label class="form-label">Дата</label>
-                    <InputText class="form-control" type="date" @bind-Value="form.Date" />
+                    <label class="form-label" for="calendar-date">Дата</label>
+                    <InputText id="calendar-date" class="form-control" type="date" @bind-Value="form.Date" />
                 </div>
                 <div class="calendar-editor-field">
-                    <label class="form-label">Назва</label>
-                    <InputText class="form-control" @bind-Value="form.Name" />
+                    <label class="form-label" for="calendar-name">Назва</label>
+                    <InputText id="calendar-name" class="form-control" @bind-Value="form.Name" />
                 </div>
                 <div class="calendar-editor-field">
-                    <label class="form-label">Курс</label>
-                    <select class="form-select" value="@form.CourseId" @onchange="OnCourseChanged">
+                    <label class="form-label" for="calendar-course">Курс</label>
+                    <select id="calendar-course" class="form-select" value="@form.CourseId" @onchange="OnCourseChanged">
                         <option value="">Оберіть курс</option>
                         @foreach (var c in courses)
                         {
@@ -98,8 +125,8 @@
                     <div class="form-text">Виняток діє в межах вибраного курсу.</div>
                 </div>
                 <div class="calendar-editor-field">
-                    <label class="form-label">Група (необов'язково)</label>
-                    <select class="form-select"
+                    <label class="form-label" for="calendar-group">Група (необов'язково)</label>
+                    <select id="calendar-group" class="form-select"
                             value="@form.GroupId"
                             @onchange="OnGroupChanged"
                             disabled="@(form.CourseId is null)">
@@ -130,11 +157,11 @@
                 </div>
             </div>
             <div class="editor-actions">
-                <button class="btn btn-primary" @onclick="Save">Зберегти</button>
+                <button class="btn btn-primary" @onclick="Save">@(saving ? "Збереження…" : "Зберегти")</button>
                 <button class="btn btn-outline-secondary" @onclick="CloseEditor">Скасувати</button>
             </div>
-        </div>
-    </div>
+            </fieldset>
+    </AdminEditorModal>
 }
 
 @code {
@@ -156,6 +183,10 @@
         GroupId = null
     };
     private bool editorOpen;
+    private bool loading, saving, loadFailed, mutationInProgress;
+    private bool IsInteractionBlocked => loading || mutationInProgress || loadFailed;
+    private Action? pendingRefreshCompletion;
+    private string? pendingRefreshSuccessMessage;
     // Поточні параметри сортування та фільтрування.
     private const string CourseNameField = "CourseName";
     private const string GroupNameField = "GroupName";
@@ -165,18 +196,42 @@
     // Викликається під час ініціалізації сторінки та завантажує дані.
     protected override async Task OnInitializedAsync() => await Load();
     // Оновлює список винятків, очищаючи попередні повідомлення.
-    private async Task Load()
+    private async Task<bool> Load(bool clearMessages = true)
     {
+        error = null;
+        if (clearMessages) ok = null;
+        loading = true;
+        loadFailed = false;
         try
         {
-            error = ok = null;
-            items = await Admin.GetCalendar();
+            var loadedItems = await Admin.GetCalendar();
             var meta = await Admin.GetMeta();
+            var loadedGroups = await Admin.GetGroups();
+            items = loadedItems;
             courses = meta.Courses ?? new();
-            groups = await Admin.GetGroups();
+            groups = loadedGroups;
             NormalizeFormWithMeta();
+            return true;
         }
-        catch (Exception ex) { error = ex.Message; }
+        catch (Exception ex)
+        {
+            loadFailed = true;
+            error = $"Не вдалося завантажити календар: {ex.Message}";
+            return false;
+        }
+        finally { loading = false; }
+    }
+    // Повторює лише завантаження після вже виконаної серверної операції.
+    private async Task RetryLoad()
+    {
+        if (loading || mutationInProgress) return;
+        if (!await Load(clearMessages: false)) return;
+        var completion = pendingRefreshCompletion;
+        var successMessage = pendingRefreshSuccessMessage;
+        pendingRefreshCompletion = null;
+        pendingRefreshSuccessMessage = null;
+        completion?.Invoke();
+        if (!string.IsNullOrWhiteSpace(successMessage)) ok = successMessage;
     }
     // Повертає назву курсу для відображення.
     private string NameOfCourse(int? id)
@@ -304,6 +359,9 @@
     }
     private async Task Save()
     {
+        if (IsInteractionBlocked) return;
+        mutationInProgress = true;
+        saving = true;
         try
         {
             error = ok = null;
@@ -334,33 +392,66 @@
                 return;
             }
             var keepCourse = form.CourseId;
-            await Admin.UpsertCalendar(form);
-            await Load();
-            ok = "Збережено.";
-            form = NewBlankForm(keepCourse);
-            NormalizeFormWithMeta();
-            editorOpen = false;
+            form.Id = await Admin.UpsertCalendar(form);
+            await FinishMutationAsync(
+                "Виняток календаря збережено",
+                "Збережено.",
+                "повторно зберігати виняток не потрібно",
+                () =>
+                {
+                    form = NewBlankForm(keepCourse);
+                    NormalizeFormWithMeta();
+                    editorOpen = false;
+                });
         }
         catch (Exception ex) { error = ex.Message; }
+        finally
+        {
+            saving = false;
+            mutationInProgress = false;
+        }
     }
     // Видаляє запис за ідентифікатором та оновлює таблицю.
     private async Task Delete(int id)
     {
+        if (IsInteractionBlocked) return;
+        mutationInProgress = true;
         try
         {
+            error = ok = null;
             var item = items.FirstOrDefault(x => x.Id == id);
             var caption = item is null ? $"#{id}" : $"{item.Date} — {item.Name}";
             var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити виняток {caption}? Дію не можна скасувати.");
             if (!confirmed) return;
             await Admin.DeleteCalendar(id);
-            await Load();
-            ok = "Видалено.";
-            if (editorOpen && form.Id == id)
-            {
-                CloseEditor();
-            }
+            await FinishMutationAsync(
+                "Виняток календаря видалено",
+                "Видалено.",
+                "повторно видаляти виняток не потрібно",
+                editorOpen && form.Id == id ? CloseEditor : null);
         }
         catch (Exception ex) { error = ex.Message; }
+        finally { mutationInProgress = false; }
+    }
+    // Завершує мутацію лише після успішного оновлення локального списку.
+    private async Task FinishMutationAsync(
+        string completedAction,
+        string successMessage,
+        string repeatWarning,
+        Action? completion = null)
+    {
+        if (await Load(clearMessages: false))
+        {
+            completion?.Invoke();
+            ok = successMessage;
+            return;
+        }
+
+        var refreshError = error;
+        ok = null;
+        pendingRefreshCompletion = completion;
+        pendingRefreshSuccessMessage = successMessage;
+        error = $"{completedAction}, але оновити дані не вдалося. Повторіть завантаження; {repeatWarning}. Причина: {refreshError}";
     }
     // Безпечно перетворює рядок у DateOnly для сортування.
     private static DateOnly DO(string? s)

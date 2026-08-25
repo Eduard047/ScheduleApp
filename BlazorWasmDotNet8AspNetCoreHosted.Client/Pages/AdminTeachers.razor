@@ -6,11 +6,26 @@
 @inject HttpClient Http
 @inject IJSRuntime JS
 
-<h3>Викладачі</h3>
+<PageTitle>Адмін • Викладачі</PageTitle>
+
+<h1 class="h3">Викладачі</h1>
 
 @if (edit is null && !string.IsNullOrWhiteSpace(error))
 {
-    <div class="alert alert-danger" role="alert">@error</div>
+    <div class="alert alert-danger" role="alert">
+        @error
+        @if (listLoadFailed || metaLoadFailed)
+        {
+            <div class="mt-2">
+                <button type="button"
+                        class="btn btn-sm btn-outline-danger"
+                        disabled="@operationInProgress"
+                        @onclick="RetryListAsync">
+                    @RetryLoadLabel
+                </button>
+            </div>
+        }
+    </div>
 }
 @if (edit is null && !string.IsNullOrWhiteSpace(ok))
 {
@@ -24,61 +39,63 @@
 else
 {
     <div class="d-flex justify-content-between align-items-center mb-2 gap-2">
-        <button class="btn btn-primary" disabled="@operationInProgress" @onclick="CreateNew">Додати викладача</button>
+        <button class="btn btn-primary" disabled="@IsMutationBlocked" @onclick="CreateNew">Додати викладача</button>
         <AdminSearchBox @bind-Value="filter" Style="max-width:360px;" Placeholder="Id / ПІБ / кафедра / курс / ступінь / звання / модуль" />
     </div>
     <div class="small text-muted mb-2">Показано: @SortedAndFiltered.Count() з @list.Count</div>
-    <table class="table table-sm">
-        <thead>
-            <tr>
-                <SortableHeader Field="@nameof(TeacherViewDto.Id)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort" Style="width:80px;">#</SortableHeader>
-                <SortableHeader Field="@nameof(TeacherViewDto.FullName)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">ПІБ</SortableHeader>
-                <SortableHeader Field="@DepartmentField" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Кафедра</SortableHeader>
-                <SortableHeader Field="@nameof(TeacherViewDto.ScientificDegree)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Науковий ступінь</SortableHeader>
-                <SortableHeader Field="@nameof(TeacherViewDto.AcademicTitle)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Наукове звання</SortableHeader>
-                <SortableHeader Field="@ModulesField" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Модулі</SortableHeader>
-                <SortableHeader Field="@ActiveCoursesField" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Активні</SortableHeader>
-                <th scope="col" style="width:220px;"><span class="visually-hidden">Дії</span></th>
-            </tr>
-        </thead>
-        <tbody>
-            @if (!SortedAndFiltered.Any())
-            {
+    <div class="table-responsive" role="region" aria-label="Список викладачів" tabindex="0">
+        <table class="table table-sm">
+            <thead>
                 <tr>
-                    <td colspan="8" class="text-muted text-center">
-                        @(list.Count == 0 ? "Викладачів ще немає." : "За цим пошуком нічого не знайдено.")
-                    </td>
+                    <SortableHeader Field="@nameof(TeacherViewDto.Id)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort" Style="width:80px;">#</SortableHeader>
+                    <SortableHeader Field="@nameof(TeacherViewDto.FullName)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">ПІБ</SortableHeader>
+                    <SortableHeader Field="@DepartmentField" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Кафедра</SortableHeader>
+                    <SortableHeader Field="@nameof(TeacherViewDto.ScientificDegree)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Науковий ступінь</SortableHeader>
+                    <SortableHeader Field="@nameof(TeacherViewDto.AcademicTitle)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Наукове звання</SortableHeader>
+                    <SortableHeader Field="@ModulesField" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Модулі</SortableHeader>
+                    <SortableHeader Field="@ActiveCoursesField" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Активні</SortableHeader>
+                    <th scope="col" style="width:220px;"><span class="visually-hidden">Дії</span></th>
                 </tr>
-            }
-            else
-            {
-                @foreach (var t in SortedAndFiltered)
+            </thead>
+            <tbody>
+                @if (!SortedAndFiltered.Any())
                 {
                     <tr>
-                        <td>@t.Id</td>
-                        <td>@t.FullName</td>
-                        <td>@DepartmentCaption(t.DepartmentId)</td>
-                        <td>@t.ScientificDegree</td>
-                        <td>@t.AcademicTitle</td>
-                        <td>@ModulesCaption(t)</td>
-                        <td>@ActiveCoursesMarkup(t)</td>
-                        <td class="text-end text-nowrap">
-                            <button class="btn btn-sm btn-outline-primary me-2"
-                                    disabled="@operationInProgress"
-                                    @onclick="() => Edit(t.Id)">
-                                @(_editingId == t.Id ? "Відкриття…" : "Редагувати")
-                            </button>
-                            <button class="btn btn-sm btn-outline-danger"
-                                    disabled="@operationInProgress"
-                                    @onclick="() => Delete(t.Id)">
-                                @(deletingId == t.Id ? "Видалення…" : "Видалити")
-                            </button>
+                        <td colspan="8" class="text-muted text-center">
+                            @(list.Count == 0 ? "Викладачів ще немає." : "За цим пошуком нічого не знайдено.")
                         </td>
                     </tr>
                 }
-            }
-        </tbody>
-    </table>
+                else
+                {
+                    @foreach (var t in SortedAndFiltered)
+                    {
+                        <tr>
+                            <td>@t.Id</td>
+                            <td>@t.FullName</td>
+                            <td>@DepartmentCaption(t.DepartmentId)</td>
+                            <td>@t.ScientificDegree</td>
+                            <td>@t.AcademicTitle</td>
+                            <td>@ModulesCaption(t)</td>
+                            <td>@ActiveCoursesMarkup(t)</td>
+                            <td class="text-end text-nowrap">
+                                <button class="btn btn-sm btn-outline-primary me-2"
+                                        disabled="@IsMutationBlocked"
+                                        @onclick="() => Edit(t.Id)">
+                                    @(_editingId == t.Id ? "Відкриття…" : "Редагувати")
+                                </button>
+                                <button class="btn btn-sm btn-outline-danger"
+                                        disabled="@IsMutationBlocked"
+                                        @onclick="() => Delete(t.Id)">
+                                    @(deletingId == t.Id ? "Видалення…" : "Видалити")
+                                </button>
+                            </td>
+                        </tr>
+                    }
+                }
+            </tbody>
+        </table>
+    </div>
 }
 
 @if (edit != null)
@@ -91,7 +108,24 @@ else
             <div class="teacher-editor-body">
                 @if (!string.IsNullOrWhiteSpace(error))
                 {
-                    <div class="alert alert-danger" role="alert">@error</div>
+                    <div class="alert alert-danger" role="alert">
+                        @error
+                        @if (listLoadFailed || metaLoadFailed)
+                        {
+                            <div class="mt-2">
+                                <button type="button"
+                                        class="btn btn-sm btn-outline-danger"
+                                        disabled="@operationInProgress"
+                                        @onclick="RetryListAsync">
+                                    @RetryLoadLabel
+                                </button>
+                            </div>
+                        }
+                    </div>
+                }
+                @if (!string.IsNullOrWhiteSpace(ok))
+                {
+                    <div class="alert alert-success" role="status">@ok</div>
                 }
                 <div class="row g-3">
                     <div class="col-md-5">
@@ -268,7 +302,7 @@ else
                 </div>
             </div>
             <div class="editor-actions">
-                <button class="btn btn-success" disabled="@operationInProgress" @onclick="Save">
+                <button class="btn btn-success" disabled="@IsMutationBlocked" @onclick="Save">
                     @(operationInProgress ? "Збереження…" : "Зберегти")
                 </button>
                 <button class="btn btn-outline-secondary" disabled="@operationInProgress" @onclick="Cancel">Скасувати</button>
@@ -283,10 +317,25 @@ else
     private TeacherEditDto? edit;
     private bool loading = true;
     private bool operationInProgress;
+    private bool listLoadFailed;
+    private bool metaLoadFailed;
+    private bool closeEditorAfterListRetry;
     private int? _editingId;
     private int? deletingId;
     private string? error;
     private string? ok;
+    private string? completedMutationRefreshErrorPrefix;
+    private string? completedMutationRetrySuccessMessage;
+    private bool IsMutationBlocked => operationInProgress || listLoadFailed || metaLoadFailed;
+    private string RetryLoadLabel => metaLoadFailed && listLoadFailed
+        ? "Повторити завантаження даних"
+        : metaLoadFailed
+            ? "Повторити завантаження довідників"
+            : "Повторити завантаження списку";
+    private const string SaveRefreshErrorPrefix =
+        "Збереження викладача виконано, але список не оновлено; повторно зберігати не потрібно.";
+    private const string DeleteRefreshErrorPrefix =
+        "Видалення викладача виконано, але список не оновлено; повторно видаляти не потрібно.";
     private const string DepartmentField = "Department";
     private const string ModulesField = "ModulesCount";
     private const string ActiveCoursesField = "ActiveCourses";
@@ -305,7 +354,7 @@ else
         }
         catch (Exception ex)
         {
-            error = ErrorMessage(ex, "Не вдалося завантажити викладачів.");
+            error = BuildFailedLoadError(ex);
         }
         finally
         {
@@ -315,17 +364,93 @@ else
     // Завантажує довідники для форми викладача.
     private async Task LoadMeta()
     {
-        meta = await Http.GetFromJsonWithDetailsAsync<MetaResponseDto>("api/meta") ?? meta;
+        try
+        {
+            var loaded = await Http.GetFromJsonWithDetailsAsync<MetaResponseDto>("api/meta")
+                         ?? throw new InvalidOperationException("Сервер не повернув довідники викладачів.");
+            meta = loaded;
+            metaLoadFailed = false;
+        }
+        catch
+        {
+            metaLoadFailed = true;
+            throw;
+        }
     }
     // Завантажує список викладачів.
     private async Task LoadList()
     {
-        list = await Http.GetFromJsonWithDetailsAsync<List<TeacherViewDto>>("api/admin/teachers") ?? new();
+        try
+        {
+            var loaded = await Http.GetFromJsonWithDetailsAsync<List<TeacherViewDto>>("api/admin/teachers") ?? new();
+            list = loaded;
+            listLoadFailed = false;
+        }
+        catch
+        {
+            listLoadFailed = true;
+            throw;
+        }
+    }
+    // Повторює лише ті безпечні читання довідників або списку, які завершилися помилкою.
+    private async Task RetryListAsync()
+    {
+        if (operationInProgress) return;
+        var retryMeta = metaLoadFailed;
+        var retryList = listLoadFailed;
+        if (!retryMeta && !retryList) return;
+        operationInProgress = true;
+        error = null;
+        ok = null;
+        try
+        {
+            if (retryMeta && retryList)
+            {
+                await Task.WhenAll(LoadMeta(), LoadList());
+            }
+            else if (retryMeta)
+            {
+                await LoadMeta();
+            }
+            else
+            {
+                await LoadList();
+            }
+
+            if (completedMutationRefreshErrorPrefix is not null
+                || completedMutationRetrySuccessMessage is not null)
+            {
+                if (closeEditorAfterListRetry)
+                {
+                    edit = null;
+                }
+                closeEditorAfterListRetry = false;
+                ok = completedMutationRetrySuccessMessage ?? "Список викладачів оновлено.";
+                completedMutationRefreshErrorPrefix = null;
+                completedMutationRetrySuccessMessage = null;
+            }
+            else
+            {
+                ok = retryMeta && retryList
+                    ? "Довідники та список викладачів оновлено."
+                    : retryMeta
+                        ? "Довідники викладачів оновлено."
+                        : "Список викладачів оновлено.";
+            }
+        }
+        catch (Exception ex)
+        {
+            error = BuildFailedLoadError(ex);
+        }
+        finally
+        {
+            operationInProgress = false;
+        }
     }
     // Відкриває форму редагування викладача.
     private async Task Edit(int id)
     {
-        if (operationInProgress) return;
+        if (IsMutationBlocked) return;
         operationInProgress = true;
         _editingId = id;
         error = null;
@@ -353,7 +478,7 @@ else
     // Ініціалізує форму створення викладача.
     private void CreateNew()
     {
-        if (operationInProgress) return;
+        if (IsMutationBlocked) return;
         error = null;
         ok = null;
         var defaultWorkingHours = Enumerable.Range(0, 7)
@@ -374,7 +499,7 @@ else
     // Зберігає дані викладача через API.
     private async Task Save()
     {
-        if (edit is null || operationInProgress) return;
+        if (edit is null || IsMutationBlocked) return;
         operationInProgress = true;
         error = null;
         ok = null;
@@ -382,9 +507,26 @@ else
         {
             using var resp = await Http.PostAsJsonAsync("api/admin/teachers/upsert", edit);
             await resp.EnsureSuccessWithDetailsAsync();
-            edit = null;
-            await LoadList();
-            ok = "Збережено.";
+            try
+            {
+                var savedId = await resp.Content.ReadFromJsonAsync<int?>();
+                if (savedId is > 0)
+                {
+                    edit.Id = savedId.Value;
+                }
+            }
+            catch
+            {
+                // Мутація вже завершена; безпечне оновлення списку нижче визначить актуальний стан.
+            }
+            if (await RefreshAfterCompletedMutationAsync(
+                    SaveRefreshErrorPrefix,
+                    "Список викладачів оновлено; збереження вже було виконано.",
+                    closeEditorAfterRetry: true))
+            {
+                edit = null;
+                ok = "Збережено.";
+            }
         }
         catch (Exception ex)
         {
@@ -398,12 +540,12 @@ else
     // Видаляє викладача після підтвердження.
     private async Task Delete(int id)
     {
-        if (operationInProgress) return;
+        if (IsMutationBlocked) return;
         var teacher = list.FirstOrDefault(t => t.Id == id);
         var caption = teacher?.FullName ?? $"#{id}";
         var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити викладача {caption}? Дію не можна скасувати.");
         if (!confirmed) return;
-        if (operationInProgress) return;
+        if (IsMutationBlocked) return;
         operationInProgress = true;
         deletingId = id;
         error = null;
@@ -412,8 +554,14 @@ else
         {
             using var resp = await Http.DeleteAsync($"api/admin/teachers/{id}?confirm=true");
             await resp.EnsureSuccessWithDetailsAsync();
-            await LoadList();
-            ok = "Видалено.";
+            list.RemoveAll(teacher => teacher.Id == id);
+            if (await RefreshAfterCompletedMutationAsync(
+                    DeleteRefreshErrorPrefix,
+                    "Список викладачів оновлено; видалення вже було виконано.",
+                    closeEditorAfterRetry: false))
+            {
+                ok = "Видалено.";
+            }
         }
         catch (Exception ex)
         {
@@ -425,6 +573,52 @@ else
             operationInProgress = false;
         }
     }
+    // Окремо обробляє помилку читання після вже завершеної мутації.
+    private async Task<bool> RefreshAfterCompletedMutationAsync(
+        string errorPrefix,
+        string retrySuccessMessage,
+        bool closeEditorAfterRetry)
+    {
+        try
+        {
+            await LoadList();
+            completedMutationRefreshErrorPrefix = null;
+            completedMutationRetrySuccessMessage = null;
+            closeEditorAfterListRetry = false;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            completedMutationRefreshErrorPrefix = errorPrefix;
+            completedMutationRetrySuccessMessage = retrySuccessMessage;
+            closeEditorAfterListRetry = closeEditorAfterRetry;
+            ok = null;
+            error = BuildListRefreshError(ex);
+            return false;
+        }
+    }
+    // Формує повідомлення, яке прямо забороняє повторювати вже виконану мутацію.
+    private string BuildListRefreshError(Exception exception)
+    {
+        var reason = ErrorMessage(exception, "Не вдалося оновити список викладачів.");
+        return completedMutationRefreshErrorPrefix is null
+            ? $"Не вдалося оновити список викладачів. Причина: {reason}"
+            : $"{completedMutationRefreshErrorPrefix} Натисніть «Повторити завантаження списку». Причина: {reason}";
+    }
+    // Пояснює, який саме набір даних лишився недоступним, і зберігає попередження про виконану мутацію.
+    private string BuildFailedLoadError(Exception exception)
+    {
+        var reason = ErrorMessage(exception, "Не вдалося завантажити дані викладачів.");
+        if (metaLoadFailed && listLoadFailed)
+        {
+            return $"Не вдалося завантажити довідники та список викладачів. Причина: {reason}";
+        }
+        if (metaLoadFailed)
+        {
+            return $"Не вдалося завантажити довідники викладачів. Редагування заблоковано до успішного повторного завантаження. Причина: {reason}";
+        }
+        return BuildListRefreshError(exception);
+    }
     // Повертає найкорисніше повідомлення про помилку API.
     private static string ErrorMessage(Exception exception, string fallback)
         => exception is ApiErrorException apiError
@@ -435,7 +629,11 @@ else
     {
         if (operationInProgress) return;
         edit = null;
-        error = null;
+        if (!listLoadFailed)
+        {
+            error = null;
+        }
+        closeEditorAfterListRetry = false;
     }
     // Нормалізує значення прапорця.
     private static bool AsBool(object? v) => v is bool b ? b : bool.TryParse(v?.ToString(), out var bb) && bb;

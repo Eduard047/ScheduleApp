@@ -1,40 +1,62 @@
 @* Сторінка адміністрування типів занять *@
 @page "/admin/lesson-types"
+@using System.Net
 @using Microsoft.AspNetCore.Components.Forms
+@using BlazorWasmDotNet8AspNetCoreHosted.Client.Services
 @using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
 @inject BlazorWasmDotNet8AspNetCoreHosted.Client.Services.IAdminApi Api
 @inject IJSRuntime JS
 
 <PageTitle>Адмін • Типи занять</PageTitle>
 
-<h3 class="mb-3">Типи занять</h3>
+<h1 class="h3 mb-3">Типи занять</h1>
 
 @if (!string.IsNullOrWhiteSpace(error))
 {
-    <div class="alert alert-danger">@error</div>
+    <div class="alert alert-danger" role="alert">
+        @error
+        @if (loadFailed)
+        {
+            <div class="mt-2">
+                <button type="button" class="btn btn-sm btn-outline-danger" @onclick="RetryLoad" disabled="@(loading || mutationInProgress)">
+                    Повторити завантаження
+                </button>
+            </div>
+        }
+    </div>
 }
 @if (!string.IsNullOrWhiteSpace(ok))
 {
-    <div class="alert alert-success">@ok</div>
+    <div class="alert alert-success" role="status">@ok</div>
 }
+@if (loading)
+{
+    <div class="text-muted mb-3" role="status" aria-live="polite">Завантаження типів занять…</div>
+}
+else if (paletteRefreshInProgress)
+{
+    <div class="text-muted mb-3" role="status" aria-live="polite">Оновлення палітри кольорів…</div>
+}
+
+<fieldset class="border-0 p-0 m-0 w-100" disabled="@IsInteractionBlocked">
 <div class="row g-3">
     <div class="col-lg-5">
         <div class="card p-3">
             <div class="d-flex justify-content-between align-items-center mb-2">
-                <h6 class="m-0">@((form.Id is null ? "Додати тип" : $"Редагувати тип #{form.Id}"))</h6>
+                <h2 class="h6 m-0">@((form.Id is null ? "Додати тип" : $"Редагувати тип #{form.Id}"))</h2>
                 <button class="btn btn-sm btn-success" @onclick="NewItem">+ Новий</button>
             </div>
             <div class="mb-2">
-                <label class="form-label">Код</label>
-                <input class="form-control" @bind="form.Code" placeholder="LECTURE / SEMINAR / LAB / BREAK / CANCELED / PRACTICE / EXAM ..." />
+                <label class="form-label" for="lesson-type-code">Код</label>
+                <input id="lesson-type-code" class="form-control" @bind="form.Code" placeholder="LECTURE / SEMINAR / LAB / BREAK / CANCELED / PRACTICE / EXAM ..." />
             </div>
             <div class="mb-2">
-                <label class="form-label">Назва</label>
-                <input class="form-control" @bind="form.Name" />
+                <label class="form-label" for="lesson-type-name">Назва</label>
+                <input id="lesson-type-name" class="form-control" @bind="form.Name" />
             </div>
             <div class="row g-2">
-                <div class="col-12">
-                    <label class="form-label">Колір на розкладі</label>
+                <fieldset class="col-12">
+                    <legend class="form-label">Колір на розкладі</legend>
                     @if (palette.Count == 0)
                     {
                         <div class="form-text text-muted">Завантаження палітри…</div>
@@ -65,34 +87,34 @@
                         </InputRadioGroup>
                         <div class="small text-muted mt-1">Можна обрати будь-який колір. Зайняті позначені, але залишаються доступними.</div>
                     }
-                </div>
-                <div class="col-12">
-                    <label class="form-label d-block">Активний</label>
-                    <input type="checkbox" class="form-check-input" @bind="form.IsActive" />
+                </fieldset>
+                <div class="col-12 form-check ms-2">
+                    <input id="lesson-type-active" type="checkbox" class="form-check-input" @bind="form.IsActive" />
+                    <label class="form-check-label" for="lesson-type-active">Активний</label>
                 </div>
             </div>
             <hr />
             <div class="row row-cols-1 row-cols-md-2 g-2">
-                <div class="col"><div class="form-check"><input class="form-check-input" type="checkbox" @bind="form.RequiresRoom" /> <label class="form-check-label">Потребує аудиторію</label></div></div>
-                <div class="col"><div class="form-check"><input class="form-check-input" type="checkbox" @bind="form.RequiresTeacher" /> <label class="form-check-label">Потребує викладача</label></div></div>
-                <div class="col"><div class="form-check"><input class="form-check-input" type="checkbox" @bind="form.BlocksRoom" /> <label class="form-check-label">Блокує аудиторію</label></div></div>
-                <div class="col"><div class="form-check"><input class="form-check-input" type="checkbox" @bind="form.BlocksTeacher" /> <label class="form-check-label">Блокує викладача</label></div></div>
-                <div class="col"><div class="form-check"><input class="form-check-input" type="checkbox" @bind="form.CountInPlan" /> <label class="form-check-label">Рахується у плані</label></div></div>
-                <div class="col"><div class="form-check"><input class="form-check-input" type="checkbox" @bind="form.CountInLoad" /> <label class="form-check-label">Рахується у навант.</label></div></div>
-                <div class="col"><div class="form-check"><input class="form-check-input" type="checkbox" @bind="form.PreferredFirstInWeek" disabled="@PreferredFirstInWeekLocked" /> <label class="form-check-label">Бажано першим у тижні</label></div></div>
+                <div class="col"><div class="form-check"><input id="lesson-type-requires-room" class="form-check-input" type="checkbox" @bind="form.RequiresRoom" /> <label class="form-check-label" for="lesson-type-requires-room">Потребує аудиторію</label></div></div>
+                <div class="col"><div class="form-check"><input id="lesson-type-requires-teacher" class="form-check-input" type="checkbox" @bind="form.RequiresTeacher" /> <label class="form-check-label" for="lesson-type-requires-teacher">Потребує викладача</label></div></div>
+                <div class="col"><div class="form-check"><input id="lesson-type-blocks-room" class="form-check-input" type="checkbox" @bind="form.BlocksRoom" /> <label class="form-check-label" for="lesson-type-blocks-room">Блокує аудиторію</label></div></div>
+                <div class="col"><div class="form-check"><input id="lesson-type-blocks-teacher" class="form-check-input" type="checkbox" @bind="form.BlocksTeacher" /> <label class="form-check-label" for="lesson-type-blocks-teacher">Блокує викладача</label></div></div>
+                <div class="col"><div class="form-check"><input id="lesson-type-count-plan" class="form-check-input" type="checkbox" @bind="form.CountInPlan" /> <label class="form-check-label" for="lesson-type-count-plan">Рахується у плані</label></div></div>
+                <div class="col"><div class="form-check"><input id="lesson-type-count-load" class="form-check-input" type="checkbox" @bind="form.CountInLoad" /> <label class="form-check-label" for="lesson-type-count-load">Рахується у навант.</label></div></div>
+                <div class="col"><div class="form-check"><input id="lesson-type-first-week" class="form-check-input" type="checkbox" @bind="form.PreferredFirstInWeek" disabled="@PreferredFirstInWeekLocked" /> <label class="form-check-label" for="lesson-type-first-week">Бажано першим у тижні</label></div></div>
             </div>
             <div class="mt-3 d-grid">
-                <button class="btn btn-primary" @onclick="Save">Зберегти</button>
+                <button class="btn btn-primary" @onclick="Save">@(saving ? "Збереження…" : "Зберегти")</button>
             </div>
         </div>
     </div>
     <div class="col-lg-7">
         <div class="card p-3">
             <div class="d-flex justify-content-between align-items-center mb-2 gap-2">
-                <h6 class="m-0">Список типів</h6>
+                <h2 class="h6 m-0">Список типів</h2>
                 <AdminSearchBox @bind-Value="filter" Style="max-width:360px;" Placeholder="Id / код / назва / css" />
             </div>
-            <div class="table-responsive">
+            <div class="table-responsive" role="region" aria-label="Список типів занять" tabindex="0">
                 <table class="table table-sm align-middle">
                     <thead>
                         <tr>
@@ -108,7 +130,7 @@
                             <SortableHeader Field="@nameof(LessonTypeEditDto.CountInPlan)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort" Class="text-center" Title="Врах. у плані">Plan</SortableHeader>
                             <SortableHeader Field="@nameof(LessonTypeEditDto.CountInLoad)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort" Class="text-center" Title="Врах. у навантаж.">Load</SortableHeader>
                             <SortableHeader Field="@nameof(LessonTypeEditDto.PreferredFirstInWeek)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort" Class="text-center" Title="Першим у тижні">1st</SortableHeader>
-                            <th style="width:220px;"></th>
+                            <th style="width:220px;"><span class="visually-hidden">Дії</span></th>
                         </tr>
                     </thead>
                     <tbody>
@@ -143,9 +165,15 @@
         </div>
     </div>
 </div>
+</fieldset>
 
 @code {
     private string? error, ok;
+    private bool loading, saving, loadFailed, mutationInProgress, paletteRefreshInProgress;
+    private int paletteRefreshVersion;
+    private bool IsInteractionBlocked => loading || mutationInProgress || loadFailed || paletteRefreshInProgress;
+    private Action? pendingRefreshCompletion;
+    private string? pendingRefreshSuccessMessage;
     private List<LessonTypeEditDto> items = new();
     private LessonTypeEditDto form = NewForm();
     private List<LessonColorDto> palette = new();
@@ -187,20 +215,44 @@
         CssKey = x.CssKey
     };
     // Завантажує типи занять і палітру кольорів.
-    private async Task Load()
+    private async Task<bool> Load(bool clearMessages = true)
     {
+        error = null;
+        if (clearMessages) ok = null;
+        loading = true;
+        loadFailed = false;
         try
         {
-            error = ok = null;
-            items = await Api.GetLessonTypes();
-            palette = await Api.GetLessonColorPalette();
+            var loadedItems = await Api.GetLessonTypes();
+            var loadedPalette = await Api.GetLessonColorPalette();
+            items = loadedItems;
+            palette = loadedPalette;
             if (form.Id is null && string.IsNullOrWhiteSpace(form.CssKey))
             {
                 var free = palette.FirstOrDefault(p => !p.IsUsed);
                 if (free is not null) form.CssKey = free.Key;
             }
+            return true;
         }
-        catch (Exception ex) { error = ex.Message; }
+        catch (Exception ex)
+        {
+            loadFailed = true;
+            error = $"Не вдалося завантажити типи занять: {ex.Message}";
+            return false;
+        }
+        finally { loading = false; }
+    }
+    // Повторює лише завантаження після вже виконаної серверної операції.
+    private async Task RetryLoad()
+    {
+        if (loading || mutationInProgress) return;
+        if (!await Load(clearMessages: false)) return;
+        var completion = pendingRefreshCompletion;
+        var successMessage = pendingRefreshSuccessMessage;
+        pendingRefreshCompletion = null;
+        pendingRefreshSuccessMessage = null;
+        completion?.Invoke();
+        if (!string.IsNullOrWhiteSpace(successMessage)) ok = successMessage;
     }
     // Скидає форму для створення нового типу.
     private void NewItem()
@@ -210,47 +262,107 @@
         if (free is not null) form.CssKey = free.Key;
     }
     // Заповнює форму даними для редагування.
-    private void Edit(LessonTypeEditDto x)
+    private async Task Edit(LessonTypeEditDto x)
     {
+        if (IsInteractionBlocked) return;
+        error = ok = null;
         form = Clone(x);
-        _ = RefreshPalette();
+        await RefreshPalette();
     }
     // Оновлює палітру кольорів.
     private async Task RefreshPalette()
     {
-        try { palette = await Api.GetLessonColorPalette(); }
-        catch (Exception ex) { error = $"Не вдалося оновити палітру кольорів: {ex.Message}"; }
-        StateHasChanged();
+        var refreshVersion = ++paletteRefreshVersion;
+        paletteRefreshInProgress = true;
+        try
+        {
+            var loadedPalette = await Api.GetLessonColorPalette();
+            if (refreshVersion == paletteRefreshVersion)
+            {
+                palette = loadedPalette;
+            }
+        }
+        catch (Exception ex)
+        {
+            if (refreshVersion == paletteRefreshVersion)
+            {
+                ok = null;
+                error = $"Не вдалося оновити палітру кольорів: {ex.Message}";
+            }
+        }
+        finally
+        {
+            if (refreshVersion == paletteRefreshVersion)
+            {
+                paletteRefreshInProgress = false;
+            }
+        }
     }
     // Зберігає тип заняття через API.
     private async Task Save()
     {
+        if (IsInteractionBlocked) return;
+        mutationInProgress = true;
+        saving = true;
         try
         {
             error = ok = null;
             await Api.UpsertLessonType(form);
-            await Load();
-            ok = "Збережено.";
-            NewItem();
+            await FinishMutationAsync(
+                "Тип заняття збережено",
+                "Збережено.",
+                "повторно зберігати тип заняття не потрібно",
+                NewItem);
         }
-        catch (HttpRequestException ex) { error = ex.Message; }
         catch (Exception ex) { error = ex.Message; }
+        finally
+        {
+            saving = false;
+            mutationInProgress = false;
+        }
     }
     // Видаляє тип заняття після підтвердження.
     private async Task Delete(int id)
     {
+        if (IsInteractionBlocked) return;
+        mutationInProgress = true;
         try
         {
+            error = ok = null;
             if (!await JS.InvokeAsync<bool>("confirm", $"Видалити тип #{id}?")) return;
             await Api.DeleteLessonType(id);
-            await Load();
-            ok = "Видалено.";
+            await FinishMutationAsync(
+                "Тип заняття видалено",
+                "Видалено.",
+                "повторно видаляти тип заняття не потрібно",
+                form.Id == id ? NewItem : null);
         }
-        catch (HttpRequestException ex) when (ex.Message.Contains("409"))
+        catch (ApiErrorException ex) when (ex.StatusCode == HttpStatusCode.Conflict)
         {
             error = "Тип заняття використовується у розкладі. Видалення заборонено. Ви можете вимкнути його (IsActive = Ні).";
         }
         catch (Exception ex) { error = ex.Message; }
+        finally { mutationInProgress = false; }
+    }
+    // Завершує мутацію лише після успішного оновлення локального списку.
+    private async Task FinishMutationAsync(
+        string completedAction,
+        string successMessage,
+        string repeatWarning,
+        Action? completion = null)
+    {
+        if (await Load(clearMessages: false))
+        {
+            completion?.Invoke();
+            ok = successMessage;
+            return;
+        }
+
+        var refreshError = error;
+        ok = null;
+        pendingRefreshCompletion = completion;
+        pendingRefreshSuccessMessage = successMessage;
+        error = $"{completedAction}, але оновити дані не вдалося. Повторіть завантаження; {repeatWarning}. Причина: {refreshError}";
     }
     // Оновлює UI після вибору кольору.
     private void OnCssSelected() => StateHasChanged();

@@ -95,10 +95,10 @@ public class AdminTypesController(AppDbContext db) : ControllerBase
             return BadRequest(new { message = "Код та назва є обов'язковими." });
         var code = dto.Code.Trim().ToUpperInvariant();
         var name = dto.Name.Trim();
-        if (code.Length > 64)
-            return BadRequest(new { message = "Код типу заняття не може перевищувати 64 символи." });
-        if (name.Length > 200)
-            return BadRequest(new { message = "Назва типу заняття не може перевищувати 200 символів." });
+        if (code.Length > CurriculumInputLimits.CodeMaxLength)
+            return BadRequest(new { message = $"Код типу заняття не може перевищувати {CurriculumInputLimits.CodeMaxLength} символи." });
+        if (name.Length > CurriculumInputLimits.LessonTypeNameMaxLength)
+            return BadRequest(new { message = $"Назва типу заняття не може перевищувати {CurriculumInputLimits.LessonTypeNameMaxLength} символів." });
 
         await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         try

@@ -6,23 +6,34 @@
 
 <PageTitle>Адмін • Корпуси</PageTitle>
 
-<h3 class="mb-3">Корпуси</h3>
+<h1 class="h3 mb-3">Корпуси</h1>
 
 @if (!string.IsNullOrWhiteSpace(error))
 {
-    <div class="alert alert-danger">@error</div>
+    <div class="alert alert-danger" role="alert">
+        @error
+        @if (loadFailed)
+        {
+            <div class="mt-2">
+                <button type="button" class="btn btn-sm btn-outline-danger" @onclick="RetryLoad" disabled="@(loading || mutationInProgress)">
+                    Повторити завантаження
+                </button>
+            </div>
+        }
+    </div>
 }
 @if (!string.IsNullOrWhiteSpace(ok))
 {
-    <div class="alert alert-success">@ok</div>
+    <div class="alert alert-success" role="status">@ok</div>
 }
 
 @if (loading)
 {
-    <div class="alert alert-info">Завантаження…</div>
+    <div class="alert alert-info" role="status" aria-live="polite">Завантаження…</div>
 }
 else
 {
+    <fieldset class="border-0 p-0 m-0 w-100" disabled="@IsInteractionBlocked">
     <div class="card p-3 mb-3">
         <div class="d-flex justify-content-between align-items-center mb-2 gap-2 flex-wrap">
             <button class="btn btn-primary" @onclick="OpenCreateBuilding">Додати корпус</button>
@@ -90,6 +101,7 @@ else
             </table>
         </div>
     </div>
+    </fieldset>
 }
 
 @if (buildingEditorOpen)
@@ -97,21 +109,37 @@ else
     <AdminEditorModal Title="@BuildingEditorTitle"
                       Subtitle="Вкажіть назву корпусу та за потреби адресу."
                       CssClass="building-editor"
+                      Busy="@(loading || mutationInProgress)"
                       OnClose="@CloseBuildingEditor">
+        @if (loadFailed)
+        {
+            <div class="alert alert-danger" role="alert">
+                <div class="fw-semibold">Операцію виконано, але дані не оновлено.</div>
+                <div class="small mt-1">@error</div>
+                <button type="button"
+                        class="btn btn-sm btn-outline-danger mt-2"
+                        @onclick="RetryLoad"
+                        disabled="@(loading || mutationInProgress)">
+                    @(loading ? "Завантаження…" : "Повторити лише завантаження")
+                </button>
+            </div>
+        }
+        <fieldset class="border-0 p-0 m-0 w-100" disabled="@IsInteractionBlocked">
         <div class="row g-3">
             <div class="col-12">
-                <label class="form-label">Назва</label>
-                <input class="form-control" @bind="form.Name" />
+                <label class="form-label" for="building-name">Назва</label>
+                <input id="building-name" class="form-control" @bind="form.Name" />
             </div>
             <div class="col-12">
-                <label class="form-label">Адреса</label>
-                <input class="form-control" @bind="form.Address" />
+                <label class="form-label" for="building-address">Адреса</label>
+                <input id="building-address" class="form-control" @bind="form.Address" />
             </div>
         </div>
         <div class="editor-actions">
-            <button class="btn btn-primary" @onclick="SaveBuilding">Зберегти</button>
+            <button class="btn btn-primary" @onclick="SaveBuilding">@(saving ? "Збереження…" : "Зберегти")</button>
             <button class="btn btn-outline-secondary" @onclick="CloseBuildingEditor">Скасувати</button>
         </div>
+        </fieldset>
     </AdminEditorModal>
 }
 
@@ -120,11 +148,26 @@ else
     <AdminEditorModal Title="@TravelEditorTitle"
                       Subtitle="Виберіть корпуси та вкажіть час у хвилинах."
                       CssClass="travel-editor"
+                      Busy="@(loading || mutationInProgress)"
                       OnClose="@CloseTravelEditor">
+        @if (loadFailed)
+        {
+            <div class="alert alert-danger" role="alert">
+                <div class="fw-semibold">Операцію виконано, але дані не оновлено.</div>
+                <div class="small mt-1">@error</div>
+                <button type="button"
+                        class="btn btn-sm btn-outline-danger mt-2"
+                        @onclick="RetryLoad"
+                        disabled="@(loading || mutationInProgress)">
+                    @(loading ? "Завантаження…" : "Повторити лише завантаження")
+                </button>
+            </div>
+        }
+        <fieldset class="border-0 p-0 m-0 w-100" disabled="@IsInteractionBlocked">
         <div class="row g-3">
             <div class="col-12 col-md-5">
-                <label class="form-label">З корпусу</label>
-                <select class="form-select" @bind="travelFromId">
+                <label class="form-label" for="travel-from-building">З корпусу</label>
+                <select id="travel-from-building" class="form-select" @bind="travelFromId">
                     <option value="0">— Оберіть —</option>
                     @foreach (var b in buildings.OrderBy(x => x.Name))
                     {
@@ -133,8 +176,8 @@ else
                 </select>
             </div>
             <div class="col-12 col-md-5">
-                <label class="form-label">До корпусу</label>
-                <select class="form-select" @bind="travelToId">
+                <label class="form-label" for="travel-to-building">До корпусу</label>
+                <select id="travel-to-building" class="form-select" @bind="travelToId">
                     <option value="0">— Оберіть —</option>
                     @foreach (var b in buildings.OrderBy(x => x.Name))
                     {
@@ -143,14 +186,15 @@ else
                 </select>
             </div>
             <div class="col-12 col-md-2">
-                <label class="form-label">Хвилин</label>
-                <input type="number" min="0" class="form-control" @bind="travelMinutes" />
+                <label class="form-label" for="travel-minutes">Хвилин</label>
+                <input id="travel-minutes" type="number" min="0" class="form-control" @bind="travelMinutes" />
             </div>
         </div>
         <div class="editor-actions">
-            <button class="btn btn-primary" @onclick="SaveTravel">Зберегти</button>
+            <button class="btn btn-primary" @onclick="SaveTravel">@(saving ? "Збереження…" : "Зберегти")</button>
             <button class="btn btn-outline-secondary" @onclick="CloseTravelEditor">Скасувати</button>
         </div>
+        </fieldset>
     </AdminEditorModal>
 }
 
@@ -160,7 +204,10 @@ else
         public List<BuildingEditDto> buildings { get; set; } = new();
         public List<BuildingTravelEditDto> travels { get; set; } = new();
     }
-    private bool loading;
+    private bool loading, saving, loadFailed, mutationInProgress;
+    private bool IsInteractionBlocked => loading || mutationInProgress || loadFailed;
+    private Action? pendingRefreshCompletion;
+    private string? pendingRefreshSuccessMessage;
     private string? error, ok;
     private List<BuildingEditDto> buildings = new();
     private List<BuildingTravelEditDto> travels = new();
@@ -226,70 +273,151 @@ else
     // Початкове завантаження корпусів і маршрутів.
     protected override async Task OnInitializedAsync() => await Load();
     // Завантажує корпуси та маршрути з API.
-    private async Task Load()
+    private async Task<bool> Load(bool clearMessages = true)
     {
+        error = null;
+        if (clearMessages) ok = null;
+        loading = true;
+        loadFailed = false;
         try
         {
-            loading = true; error = ok = null;
-            buildings = await Admin.GetBuildings();
-            travels = await Admin.GetBuildingTravels();
+            var loadedBuildings = await Admin.GetBuildings();
+            var loadedTravels = await Admin.GetBuildingTravels();
+            buildings = loadedBuildings;
+            travels = loadedTravels;
+            return true;
         }
-        catch (Exception ex) { error = ex.Message; }
+        catch (Exception ex)
+        {
+            loadFailed = true;
+            error = $"Не вдалося завантажити корпуси та маршрути: {ex.Message}";
+            return false;
+        }
         finally { loading = false; }
+    }
+    // Повторює лише завантаження після вже виконаної серверної операції.
+    private async Task RetryLoad()
+    {
+        if (loading || mutationInProgress) return;
+        if (!await Load(clearMessages: false)) return;
+        var completion = pendingRefreshCompletion;
+        var successMessage = pendingRefreshSuccessMessage;
+        pendingRefreshCompletion = null;
+        pendingRefreshSuccessMessage = null;
+        completion?.Invoke();
+        if (!string.IsNullOrWhiteSpace(successMessage)) ok = successMessage;
     }
     // Зберігає корпус через API.
     private async Task SaveBuilding()
     {
+        if (IsInteractionBlocked) return;
+        mutationInProgress = true;
+        saving = true;
         try
         {
-            await Admin.UpsertBuilding(form);
-            await Load();
-            ok = "Збережено.";
-            CloseBuildingEditor();
+            error = ok = null;
+            form.Id = await Admin.UpsertBuilding(form);
+            await FinishMutationAsync(
+                "Корпус збережено",
+                "Збережено.",
+                "повторно зберігати корпус не потрібно",
+                CloseBuildingEditor);
         }
         catch (Exception ex) { error = ex.Message; }
+        finally
+        {
+            saving = false;
+            mutationInProgress = false;
+        }
     }
     // Видаляє корпус після підтвердження.
     private async Task DeleteBuilding(int id)
     {
+        if (IsInteractionBlocked) return;
+        mutationInProgress = true;
         try
         {
+            error = ok = null;
             var caption = NameOf(id);
             var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити корпус {caption}? Дію не можна скасувати.");
             if (!confirmed) return;
             await Admin.DeleteBuilding(id);
-            await Load();
-            ok = "Видалено.";
+            await FinishMutationAsync(
+                "Корпус видалено",
+                "Видалено.",
+                "повторно видаляти корпус не потрібно",
+                buildingEditorOpen && form.Id == id ? CloseBuildingEditor : null);
         }
         catch (Exception ex) { error = ex.Message; }
+        finally { mutationInProgress = false; }
     }
     // Зберігає маршрут між корпусами.
     private async Task SaveTravel()
     {
+        if (IsInteractionBlocked) return;
+        mutationInProgress = true;
+        saving = true;
         try
         {
+            error = ok = null;
             var dto = new BuildingTravelEditDto(travelFromId, travelToId, travelMinutes);
             await Admin.UpsertBuildingTravel(dto);
-            await Load();
-            ok = "Збережено.";
-            CloseTravelEditor();
+            await FinishMutationAsync(
+                "Маршрут збережено",
+                "Збережено.",
+                "повторно зберігати маршрут не потрібно",
+                CloseTravelEditor);
         }
         catch (Exception ex) { error = ex.Message; }
+        finally
+        {
+            saving = false;
+            mutationInProgress = false;
+        }
     }
     // Видаляє маршрут між корпусами.
     private async Task DeleteTravel(BuildingTravelEditDto t)
     {
+        if (IsInteractionBlocked) return;
+        mutationInProgress = true;
         try
         {
+            error = ok = null;
             var fromCaption = NameOf(t.FromBuildingId);
             var toCaption = NameOf(t.ToBuildingId);
             var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити маршрут {fromCaption} -> {toCaption}? Дію не можна скасувати.");
             if (!confirmed) return;
             await Admin.DeleteBuildingTravel(t.FromBuildingId, t.ToBuildingId);
-            await Load();
-            ok = "Видалено.";
+            await FinishMutationAsync(
+                "Маршрут видалено",
+                "Видалено.",
+                "повторно видаляти маршрут не потрібно",
+                travelEditorOpen && travelEditing && travelFromId == t.FromBuildingId && travelToId == t.ToBuildingId
+                    ? CloseTravelEditor
+                    : null);
         }
         catch (Exception ex) { error = ex.Message; }
+        finally { mutationInProgress = false; }
+    }
+    // Завершує мутацію лише після успішного оновлення локальних списків.
+    private async Task FinishMutationAsync(
+        string completedAction,
+        string successMessage,
+        string repeatWarning,
+        Action? completion = null)
+    {
+        if (await Load(clearMessages: false))
+        {
+            completion?.Invoke();
+            ok = successMessage;
+            return;
+        }
+
+        var refreshError = error;
+        ok = null;
+        pendingRefreshCompletion = completion;
+        pendingRefreshSuccessMessage = successMessage;
+        error = $"{completedAction}, але оновити дані не вдалося. Повторіть завантаження; {repeatWarning}. Причина: {refreshError}";
     }
     // Повертає назву корпусу за ідентифікатором.
     private string NameOf(int id) => buildings.FirstOrDefault(b => b.Id == id)?.Name ?? $"#{id}";

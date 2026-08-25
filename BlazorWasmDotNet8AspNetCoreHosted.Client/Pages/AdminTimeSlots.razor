@@ -1,24 +1,30 @@
 @* Сторінка адміністрування часових слотів *@
 @page "/admin/time-slots"
+@using Microsoft.AspNetCore.Components.Routing
 @using BlazorWasmDotNet8AspNetCoreHosted.Client.Services
 @using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
-@inject HttpClient Http
 @inject BlazorWasmDotNet8AspNetCoreHosted.Client.Services.TimeSlotsApi Api
 @inject BlazorWasmDotNet8AspNetCoreHosted.Client.Services.IAdminApi AdminApi
 @inject IJSRuntime JS
 
-<h3>Слоти часу</h3>
+<PageTitle>Адмін • Слоти часу</PageTitle>
+
+<NavigationLock ConfirmExternalNavigation="@HasUnsavedChanges"
+                OnBeforeInternalNavigation="HandleBeforeInternalNavigation" />
+
+<h1 class="h3">Слоти часу</h1>
 
 <div class="mb-3">
-    <label class="form-label">Рівень</label>
+    <label class="form-label" for="time-slot-scope">Рівень</label>
     <div class="d-flex gap-2 flex-wrap">
-        <select class="form-select" style="max-width: 280px" @bind="_scope" @bind:after="OnScopeChangedAsync">
+        <select id="time-slot-scope" class="form-select" style="max-width: 280px" @bind="_scope" @bind:after="OnScopeChangedAsync" disabled="@AreContextControlsDisabled">
             <option value="Global">Глобально (для всіх курсів)</option>
             <option value="Course">Тільки для обраного курсу</option>
         </select>
         @if (_scope == Scope.Course)
         {
-            <select class="form-select" style="max-width: 360px" @bind="_courseId" @bind:after="OnCourseChangedAsync">
+            <label class="visually-hidden" for="time-slot-course">Курс</label>
+            <select id="time-slot-course" class="form-select" style="max-width: 360px" @bind="_courseId" @bind:after="OnCourseChangedAsync" disabled="@AreContextControlsDisabled">
                 <option value="">- оберіть курс -</option>
                 @foreach (var c in _courses)
                 {
@@ -26,14 +32,15 @@
                 }
             </select>
         }
-        <select class="form-select" style="max-width: 240px" @bind="_dayOfWeek" @bind:after="OnDayChangedAsync">
+        <label class="visually-hidden" for="time-slot-day">День тижня</label>
+        <select id="time-slot-day" class="form-select" style="max-width: 240px" @bind="_dayOfWeek" @bind:after="OnDayChangedAsync" disabled="@AreContextControlsDisabled">
             <option value="">Усі дні (за замовчуванням)</option>
             @foreach (var day in DayOptions)
             {
                 <option value="@day.Value">@day.Label</option>
             }
         </select>
-        <button class="btn btn-outline-secondary" @onclick="RefreshAsync">Оновити</button>
+        <button class="btn btn-outline-secondary" @onclick="RefreshAsync" disabled="@AreContextControlsDisabled">Оновити</button>
     </div>
     <div class="form-text">Редагуєте: <strong>@GetContextLabel()</strong>.</div>
 </div>
@@ -43,8 +50,8 @@
         <div class="fw-semibold mb-2">Копіювання з шаблону</div>
         <div class="row g-2 align-items-end">
             <div class="col-12 col-lg-6">
-                <label class="form-label mb-1">Шаблон-джерело</label>
-                <select class="form-select" @bind="_copySourceMode" @bind:after="OnCopySettingsChangedAsync">
+                <label class="form-label mb-1" for="time-slot-copy-source">Шаблон-джерело</label>
+                <select id="time-slot-copy-source" class="form-select" @bind="_copySourceMode" @bind:after="OnCopySettingsChangedAsync" disabled="@AreContextControlsDisabled">
                     <option value="@CopySourceMode.CurrentScopeOnly">Шаблон поточного рівня</option>
                     @if (_scope == Scope.Course)
                     {
@@ -64,16 +71,56 @@
         <div class="form-text mt-2">Шаблон — це слоти без прив'язки до дня (режим «Усі дні»).</div>
         <div class="form-text">Щоб створити шаблон: підготуйте слоти у редакторі нижче, потім натисніть «Створити/оновити шаблон».</div>
         <div class="form-text">@GetCopyHint()</div>
+        @if (_copyPreviewError is not null)
+        {
+            <div class="alert alert-danger py-2 mt-2 mb-0" role="alert">
+                @_copyPreviewError
+                <div class="mt-2">
+                    <button type="button"
+                            class="btn btn-sm btn-outline-danger"
+                            @onclick="LoadCopyPreviewAsync"
+                            disabled="@(_copyPreviewLoading || !CanMutateSlotEditor)">
+                        Повторити завантаження шаблону
+                    </button>
+                </div>
+            </div>
+        }
     </div>
 </div>
 
 @if (_error is not null)
 {
-    <div class="alert alert-danger">@_error</div>
+    <div class="alert alert-danger" role="alert">
+        @_error
+        @if (_initialLoadFailed)
+        {
+            <div class="mt-2">
+                <button type="button" class="btn btn-sm btn-outline-danger" @onclick="InitializeAsync" disabled="@_initializing">
+                    Повторити завантаження
+                </button>
+            </div>
+        }
+        else if (SlotsLoadFailed)
+        {
+            <div class="mt-2">
+                <button type="button" class="btn btn-sm btn-outline-danger" @onclick="RetrySlotsLoadAsync" disabled="@_slotsLoading">
+                    Повторити завантаження слотів
+                </button>
+            </div>
+        }
+    </div>
 }
 @if (_ok is not null)
 {
-    <div class="alert alert-success">@_ok</div>
+    <div class="alert alert-success" role="status">@_ok</div>
+}
+@if (_initializing)
+{
+    <div class="text-muted mb-3" role="status" aria-live="polite">Завантаження налаштувань слотів…</div>
+}
+else if (_slotsLoading)
+{
+    <div class="text-muted mb-3" role="status" aria-live="polite">Завантаження слотів поточного контексту…</div>
 }
 
 <div class="card mb-3">
@@ -87,11 +134,44 @@
             </div>
             <div class="d-flex align-items-center gap-2">
                 <label class="form-label mb-0" for="preferredFirstSlotLimit">До слота</label>
-                <input id="preferredFirstSlotLimit" class="form-control" style="width:110px"
-                       type="number" min="0" step="1" @bind="_preferredFirstMaxSlotOrder" />
-                <button class="btn btn-outline-primary" @onclick="SavePreferredFirstSlotLimit">Зберегти ліміт</button>
+                @if (_hasLoadedPreferredFirstLimit)
+                {
+                    <input id="preferredFirstSlotLimit" class="form-control" style="width:110px"
+                           type="number" min="0" step="1"
+                           aria-invalid="@(_preferredFirstLimitLoadError is not null)"
+                           disabled="@(!CanEditPreferredFirstLimit)"
+                           @bind="_preferredFirstMaxSlotOrder" />
+                }
+                else
+                {
+                    <input id="preferredFirstSlotLimit" class="form-control text-muted" style="width:110px"
+                           type="number" placeholder="—" aria-label="Ліміт не завантажено" disabled />
+                }
+                <button class="btn btn-outline-primary"
+                        @onclick="SavePreferredFirstSlotLimit"
+                        disabled="@(!CanSavePreferredFirstLimit)">
+                    Зберегти ліміт
+                </button>
             </div>
         </div>
+        @if (_preferredFirstLimitLoading)
+        {
+            <div class="form-text mt-2" role="status" aria-live="polite">Завантаження ліміту…</div>
+        }
+        else if (_preferredFirstLimitLoadError is not null)
+        {
+            <div class="alert alert-danger py-2 mt-2 mb-0" role="alert">
+                @_preferredFirstLimitLoadError
+                <div class="mt-2">
+                    <button type="button"
+                            class="btn btn-sm btn-outline-danger"
+                            @onclick="RetryPreferredFirstSlotLimitAsync"
+                            disabled="@(_preferredFirstLimitLoading || IsMutationInProgress)">
+                        Повторити завантаження ліміту
+                    </button>
+                </div>
+            </div>
+        }
     </div>
 </div>
 
@@ -105,8 +185,8 @@
                 <div class="form-text mt-1">@GetEditorStateHint()</div>
             </div>
             <div>
-                <button class="btn btn-sm btn-outline-primary me-2" @onclick="AddRow" disabled="@IsScopeSelectionIncomplete">Додати слот</button>
-                <button class="btn btn-sm btn-outline-secondary me-2" @onclick="RevertChanges" disabled="@(!HasUnsavedChanges)">Скасувати зміни</button>
+                <button class="btn btn-sm btn-outline-primary me-2" @onclick="AddRow" disabled="@(!CanMutateSlotEditor)">Додати слот</button>
+                <button class="btn btn-sm btn-outline-secondary me-2" @onclick="RevertChanges" disabled="@(!HasUnsavedChanges || !CanMutateSlotEditor)">Скасувати зміни</button>
                 <button class="btn btn-sm btn-primary" @onclick="Save" disabled="@(!CanSaveChanges)">Зберегти</button>
             </div>
         </div>
@@ -122,36 +202,49 @@
                 @if (HasExplicitLunchForCurrentScope())
                 {
                     <button class="btn btn-sm btn-outline-danger mt-2"
-                            disabled="@_removeExplicitLunchRequested"
+                            disabled="@(_removeExplicitLunchRequested || !CanMutateSlotEditor)"
                             @onclick="RequestExplicitLunchRemoval">
                         @(_removeExplicitLunchRequested ? "Перерву буде прибрано" : "Прибрати власну перерву")
                     </button>
                 }
             }
-            else
+            else if (CanMutateSlotEditor)
             {
                 <div class="small mt-1">
                     У режимі окремого дня перерва лише відображається і не змінюється.
                     Налаштування доступне в режимі «Усі дні».
                 </div>
-                <button class="btn btn-sm btn-outline-primary mt-2" @onclick="OpenCommonLunchEditorAsync">
+                <button class="btn btn-sm btn-outline-primary mt-2" @onclick="OpenCommonLunchEditorAsync" disabled="@(!CanMutateSlotEditor)">
                     Перейти до «Усі дні»
                 </button>
             }
         </div>
+        <div class="table-responsive" role="region" aria-label="Редактор часових слотів" tabindex="0">
         <table class="table table-sm align-middle">
             <thead>
                 <tr>
-                    <th style="width:90px">№</th>
-                    <th style="width:140px">Старт</th>
-                    <th style="width:140px">Фініш</th>
-                    <th style="width:140px">Активний</th>
-                    <th style="width:110px">Обід</th>
-                    <th></th>
+                    <th scope="col" style="width:90px">№</th>
+                    <th scope="col" style="width:140px">Старт</th>
+                    <th scope="col" style="width:140px">Фініш</th>
+                    <th scope="col" style="width:140px">Активний</th>
+                    <th scope="col" style="width:110px">Обід</th>
+                    <th scope="col"><span class="visually-hidden">Дії</span></th>
                 </tr>
             </thead>
             <tbody>
-                @if (_rows.Count == 0)
+                @if (_slotsLoading)
+                {
+                    <tr><td colspan="6" class="text-muted"><span role="status">Завантаження слотів…</span></td></tr>
+                }
+                else if (IsScopeSelectionIncomplete)
+                {
+                    <tr><td colspan="6" class="text-muted">Оберіть курс, щоб відкрити редактор слотів.</td></tr>
+                }
+                else if (!_slotsLoadSucceeded)
+                {
+                    <tr><td colspan="6" class="text-danger">Слоти недоступні. Повторіть завантаження.</td></tr>
+                }
+                else if (_rows.Count == 0)
                 {
                     <tr><td colspan="6" class="text-muted">Немає слотів</td></tr>
                 }
@@ -162,25 +255,25 @@
                         <tr>
                             <td>
                                 <input class="form-control form-control-sm" style="width:90px"
-                                       type="number" min="0" @bind="r.SortOrder" />
+                                       type="number" min="0" aria-label="Порядковий номер слота @r.SortOrder" disabled="@(!CanMutateSlotEditor)" @bind="r.SortOrder" />
                             </td>
                             <td>
                                 <input class="form-control form-control-sm" style="width:120px"
-                                       placeholder="09:00" @bind="r.Start" />
+                                       placeholder="09:00" aria-label="Час початку слота @r.SortOrder" disabled="@(!CanMutateSlotEditor)" @bind="r.Start" />
                             </td>
                             <td>
                                 <input class="form-control form-control-sm" style="width:120px"
-                                       placeholder="09:45" @bind="r.End" />
+                                       placeholder="09:45" aria-label="Час завершення слота @r.SortOrder" disabled="@(!CanMutateSlotEditor)" @bind="r.End" />
                             </td>
                             <td>
-                                <input class="form-check-input" type="checkbox" @bind="r.IsActive" />
+                                <input class="form-check-input" type="checkbox" aria-label="Активувати слот @r.SortOrder" disabled="@(!CanMutateSlotEditor)" @bind="r.IsActive" />
                             </td>
                             <td>
                                 @if (CanManageLunch)
                                 {
                                     <input class="form-check-input" type="checkbox"
                                            checked="@r.IsLunch"
-                                           disabled="@(!r.IsActive)"
+                                           disabled="@(!r.IsActive || !CanMutateSlotEditor)"
                                            aria-label="Позначити слот @r.SortOrder як обід"
                                            @onchange="args => ToggleLunch(r, args)" />
                                 }
@@ -190,13 +283,14 @@
                                 }
                             </td>
                             <td class="text-end">
-                                <button class="btn btn-sm btn-outline-danger" @onclick="() => RemoveRow(r)">Видалити</button>
+                                <button class="btn btn-sm btn-outline-danger" @onclick="() => RemoveRow(r)" disabled="@(!CanMutateSlotEditor)">Видалити</button>
                             </td>
                         </tr>
                     }
                 }
             </tbody>
         </table>
+        </div>
         <div class="form-text">
             Порада: тримайте тривалості однаковими (наприклад, 45 хвилин). Автогенерація використовує
             активні слоти та виключає ті, що перетинаються зі спільною обідньою перервою.
@@ -230,6 +324,7 @@
     private List<TimeSlotDto> _loadedRowsSnapshot = new();
     private List<TimeSlotDto> _copyPreviewRows = new();
     private int _preferredFirstMaxSlotOrder;
+    private int _loadedPreferredFirstMaxSlotOrder;
     private bool _removeExplicitLunchRequested;
     private int _contextLoadVersion;
     private int _copyPreviewLoadVersion;
@@ -239,27 +334,125 @@
     private int? _loadedDayOfWeek;
     private string? _error;
     private string? _ok;
+    private string? _copyPreviewError;
+    private string? _preferredFirstLimitLoadError;
+    private bool _initializing;
+    private bool _initialLoadFailed;
+    private bool _metaLoadSucceeded;
+    private bool _slotsLoading;
+    private bool _slotsLoadSucceeded;
+    private bool _copyPreviewLoading;
+    private bool _preferredFirstLimitLoading;
+    private bool _savingSlots;
+    private bool _savingTemplate;
+    private bool _savingPreferredFirstLimit;
+    private bool _hasLoadedPreferredFirstLimit;
+    private int? _preferredFirstLimitCourseId;
+    private bool IsMutationInProgress => _savingSlots || _savingTemplate || _savingPreferredFirstLimit;
     private bool IsScopeSelectionIncomplete => _scope == Scope.Course && _courseId is null;
-    private bool CanCopyToEditor => !IsScopeSelectionIncomplete
+    private bool SlotsLoadFailed => _metaLoadSucceeded
+                                    && !IsScopeSelectionIncomplete
+                                    && !_slotsLoading
+                                    && !_slotsLoadSucceeded
+                                    && _error is not null;
+    private bool CanMutateSlotEditor => !_initializing
+                                        && _metaLoadSucceeded
+                                        && !IsScopeSelectionIncomplete
+                                        && _slotsLoadSucceeded
+                                        && !_slotsLoading
+                                        && !IsMutationInProgress;
+    private bool AreContextControlsDisabled => _initializing
+                                               || !_metaLoadSucceeded
+                                               || _slotsLoading
+                                               || IsMutationInProgress;
+    private bool CanCopyToEditor => CanMutateSlotEditor
+                                    && !_copyPreviewLoading
+                                    && _copyPreviewError is null
                                     && _copyPreviewRows.Count > 0;
-    private bool CanSaveEditorAsTemplate => !IsScopeSelectionIncomplete && _rows.Count > 0;
-    private bool HasUnsavedChanges => _removeExplicitLunchRequested
-                                      || !AreRowsEquivalent(_rows, _loadedRowsSnapshot);
-    private bool CanSaveChanges => !IsScopeSelectionIncomplete && HasUnsavedChanges;
-    private bool CanManageLunch => !IsScopeSelectionIncomplete && _dayOfWeek is null;
+    private bool CanSaveEditorAsTemplate => CanMutateSlotEditor
+                                             && _rows.Count > 0;
+    private bool HasUnsavedSlotChanges => _removeExplicitLunchRequested
+                                          || !AreRowsEquivalent(_rows, _loadedRowsSnapshot);
+    private bool HasUnsavedPreferredFirstLimit
+        => _hasLoadedPreferredFirstLimit
+           && _preferredFirstMaxSlotOrder != _loadedPreferredFirstMaxSlotOrder;
+    private bool HasUnsavedChanges => HasUnsavedSlotChanges || HasUnsavedPreferredFirstLimit;
+    private bool CanSaveChanges => CanMutateSlotEditor
+                                   && HasUnsavedSlotChanges;
+    private bool CanEditPreferredFirstLimit => !IsScopeSelectionIncomplete
+                                               && _hasLoadedPreferredFirstLimit
+                                               && !_preferredFirstLimitLoading
+                                               && !IsMutationInProgress
+                                               && _preferredFirstLimitLoadError is null;
+    private bool CanSavePreferredFirstLimit => CanEditPreferredFirstLimit && HasUnsavedPreferredFirstLimit;
+    private bool CanManageLunch => CanMutateSlotEditor && _dayOfWeek is null;
     // Завантажує метадані курсів при старті сторінки.
     protected override async Task OnInitializedAsync()
     {
-        var meta = await Http.GetFromJsonWithDetailsAsync<MetaResponseDto>("api/meta");
-        _courses = meta?.Courses ?? new();
-        await LoadRaw();
+        await InitializeAsync();
+    }
+    // Безпечно завантажує довідники та початковий контекст із можливістю повторної спроби.
+    private async Task InitializeAsync()
+    {
+        if (_initializing) return;
+        _initializing = true;
+        _initialLoadFailed = false;
+        _metaLoadSucceeded = false;
+        _error = _ok = null;
+        MetaResponseDto meta;
+        try
+        {
+            meta = await AdminApi.GetMeta();
+        }
+        catch (ApiErrorException ex)
+        {
+            _initialLoadFailed = true;
+            var details = ex.Errors.FirstOrDefault() ?? ex.Message;
+            _error = $"Не вдалося завантажити довідник курсів: {details}";
+            _initializing = false;
+            return;
+        }
+        catch (Exception ex)
+        {
+            _initialLoadFailed = true;
+            _error = $"Не вдалося завантажити довідник курсів: {ex.Message}";
+            _initializing = false;
+            return;
+        }
+        _metaLoadSucceeded = true;
+        _courses = meta.Courses ?? new();
+        try
+        {
+            await LoadRaw();
+        }
+        catch (Exception ex)
+        {
+            _slotsLoading = false;
+            _slotsLoadSucceeded = false;
+            _error = $"Не вдалося завантажити слоти: {ex.Message}";
+        }
+        finally
+        {
+            _initializing = false;
+        }
+    }
+    // Не дозволяє внутрішню навігацію без підтвердження, якщо редактор змінено.
+    private async Task HandleBeforeInternalNavigation(LocationChangingContext context)
+    {
+        if (!HasUnsavedChanges) return;
+        var discard = await JS.InvokeAsync<bool>(
+            "confirm",
+            "У редакторі є незбережені зміни. Залишити сторінку та відкинути їх?");
+        if (!discard)
+        {
+            context.PreventNavigation();
+        }
     }
     // Оновлює контекст при перемиканні рівня.
     private async Task OnScopeChangedAsync()
     {
-        if (!await ConfirmDiscardChangesAsync())
+        if (!await BeginSlotsContextTransitionAsync(restoreContextOnCancel: true))
         {
-            RestoreLoadedContext();
             return;
         }
         if (_scope == Scope.Global)
@@ -272,9 +465,8 @@
     // Оновлює дані після вибору курсу.
     private async Task OnCourseChangedAsync()
     {
-        if (!await ConfirmDiscardChangesAsync())
+        if (!await BeginSlotsContextTransitionAsync(restoreContextOnCancel: true))
         {
-            RestoreLoadedContext();
             return;
         }
         await LoadRaw();
@@ -282,9 +474,8 @@
     // Оновлює дані після вибору дня.
     private async Task OnDayChangedAsync()
     {
-        if (!await ConfirmDiscardChangesAsync())
+        if (!await BeginSlotsContextTransitionAsync(restoreContextOnCancel: true))
         {
-            RestoreLoadedContext();
             return;
         }
         await LoadRaw();
@@ -292,7 +483,55 @@
     // Оновлює редактор лише після явного підтвердження втрати незбережених змін.
     private async Task RefreshAsync()
     {
-        if (!await ConfirmDiscardChangesAsync())
+        if (!await BeginSlotsContextTransitionAsync(restoreContextOnCancel: false))
+        {
+            return;
+        }
+        await LoadRaw();
+    }
+    // Блокує редактор одразу після зміни селектора або запуску оновлення.
+    private async Task<bool> BeginSlotsContextTransitionAsync(bool restoreContextOnCancel)
+    {
+        if (_slotsLoading || IsMutationInProgress)
+        {
+            if (restoreContextOnCancel)
+            {
+                RestoreLoadedContext();
+            }
+            return false;
+        }
+        var previouslySucceeded = _slotsLoadSucceeded;
+        _slotsLoading = true;
+        _slotsLoadSucceeded = false;
+        try
+        {
+            if (await ConfirmDiscardChangesAsync())
+            {
+                return true;
+            }
+        }
+        catch
+        {
+            if (restoreContextOnCancel)
+            {
+                RestoreLoadedContext();
+            }
+            _slotsLoading = false;
+            _slotsLoadSucceeded = previouslySucceeded;
+            throw;
+        }
+        if (restoreContextOnCancel)
+        {
+            RestoreLoadedContext();
+        }
+        _slotsLoading = false;
+        _slotsLoadSucceeded = previouslySucceeded;
+        return false;
+    }
+    // Повторно завантажує поточний контекст після видимої помилки.
+    private async Task RetrySlotsLoadAsync()
+    {
+        if (_slotsLoading || IsMutationInProgress || IsScopeSelectionIncomplete)
         {
             return;
         }
@@ -326,9 +565,40 @@
     // Перевіряє, що відповідь ще належить поточним селекторам редактора.
     private bool IsCurrentContext(Scope scope, int? courseId, int? dayOfWeek)
         => _scope == scope && _courseId == courseId && _dayOfWeek == dayOfWeek;
+    // Не дозволяє завершенню старого запиту змінити вже відкритий новий контекст.
+    private bool IsCurrentMutationContext(int contextLoadVersion, Scope scope, int? courseId, int? dayOfWeek)
+        => contextLoadVersion == _contextLoadVersion
+           && IsCurrentContext(scope, courseId, dayOfWeek);
+    // Готує стан ліміту до завантаження та не переносить значення між курсами.
+    private void PreparePreferredFirstLimitContext(int? courseId)
+    {
+        if (!_hasLoadedPreferredFirstLimit || _preferredFirstLimitCourseId != courseId)
+        {
+            _preferredFirstMaxSlotOrder = 0;
+            _loadedPreferredFirstMaxSlotOrder = 0;
+            _hasLoadedPreferredFirstLimit = false;
+            _preferredFirstLimitCourseId = courseId;
+        }
+        _preferredFirstLimitLoadError = null;
+        _preferredFirstLimitLoading = true;
+    }
+    // Скидає ліміт, коли контекст курсу ще не обрано.
+    private void ResetPreferredFirstLimitContext()
+    {
+        _preferredFirstMaxSlotOrder = 0;
+        _loadedPreferredFirstMaxSlotOrder = 0;
+        _hasLoadedPreferredFirstLimit = false;
+        _preferredFirstLimitCourseId = null;
+        _preferredFirstLimitLoadError = null;
+        _preferredFirstLimitLoading = false;
+    }
     // Оновлює попередній перегляд після зміни джерела копіювання.
     private async Task OnCopySettingsChangedAsync()
     {
+        if (!CanMutateSlotEditor)
+        {
+            return;
+        }
         await LoadCopyPreviewAsync();
     }
     // Завантажує сирі слоти для обраного рівня.
@@ -339,13 +609,24 @@
         var requestedCourseId = _courseId;
         var requestedDayOfWeek = _dayOfWeek;
         var apiCourseId = requestedScope == Scope.Global ? null : requestedCourseId;
+        bool IsStillCurrent()
+            => loadVersion == _contextLoadVersion
+               && IsCurrentContext(requestedScope, requestedCourseId, requestedDayOfWeek);
+        _slotsLoading = true;
+        _slotsLoadSucceeded = false;
         _error = _ok = null;
+        _copyPreviewLoadVersion++;
+        _copyPreviewRows = new();
+        _copyPreviewError = null;
+        _copyPreviewLoading = true;
+        PreparePreferredFirstLimitContext(apiCourseId);
         if (IsScopeSelectionIncomplete)
         {
             _rows = new();
             _loadedRowsSnapshot = new();
-            _copyPreviewRows = new();
-            _preferredFirstMaxSlotOrder = 0;
+            _slotsLoading = false;
+            _copyPreviewLoading = false;
+            ResetPreferredFirstLimitContext();
             _removeExplicitLunchRequested = false;
             RememberLoadedContext(requestedScope, requestedCourseId, requestedDayOfWeek);
             return;
@@ -355,8 +636,7 @@
             var rowsTask = Api.GetRawAsync(apiCourseId, requestedDayOfWeek);
             var lunchesTask = AdminApi.GetLunch();
             await Task.WhenAll(rowsTask, lunchesTask);
-            if (loadVersion != _contextLoadVersion
-                || !IsCurrentContext(requestedScope, requestedCourseId, requestedDayOfWeek))
+            if (!IsStillCurrent())
             {
                 return;
             }
@@ -366,32 +646,49 @@
             _removeExplicitLunchRequested = false;
             RememberLoadedContext(requestedScope, requestedCourseId, requestedDayOfWeek);
             await LoadPreferredFirstSlotLimit(apiCourseId, loadVersion);
+            if (!IsStillCurrent())
+            {
+                return;
+            }
             await LoadCopyPreviewAsync();
+            if (!IsStillCurrent())
+            {
+                return;
+            }
+            _slotsLoadSucceeded = true;
+            _slotsLoading = false;
         }
         catch (BlazorWasmDotNet8AspNetCoreHosted.Client.Services.ApiErrorException ex)
         {
-            if (loadVersion != _contextLoadVersion
-                || !IsCurrentContext(requestedScope, requestedCourseId, requestedDayOfWeek))
+            if (!IsStillCurrent())
             {
                 return;
             }
             _rows = new();
             _loadedRowsSnapshot = new();
+            _slotsLoadSucceeded = false;
+            _slotsLoading = false;
             _copyPreviewRows = new();
-            _error = ex.Errors.FirstOrDefault() ?? ex.Message;
+            _copyPreviewLoading = false;
+            _preferredFirstLimitLoading = false;
+            var details = ex.Errors.FirstOrDefault() ?? ex.Message;
+            _error = $"Не вдалося завантажити слоти: {details}";
             RememberLoadedContext(requestedScope, requestedCourseId, requestedDayOfWeek);
         }
         catch (Exception ex)
         {
-            if (loadVersion != _contextLoadVersion
-                || !IsCurrentContext(requestedScope, requestedCourseId, requestedDayOfWeek))
+            if (!IsStillCurrent())
             {
                 return;
             }
             _rows = new();
             _loadedRowsSnapshot = new();
+            _slotsLoadSucceeded = false;
+            _slotsLoading = false;
             _copyPreviewRows = new();
-            _error = ex.Message;
+            _copyPreviewLoading = false;
+            _preferredFirstLimitLoading = false;
+            _error = $"Не вдалося завантажити слоти: {ex.Message}";
             RememberLoadedContext(requestedScope, requestedCourseId, requestedDayOfWeek);
         }
     }
@@ -403,42 +700,68 @@
         var requestedCourseId = _courseId;
         var requestedDayOfWeek = _dayOfWeek;
         var sourceCourseId = ResolveCopySourceCourseId();
+        bool IsStillCurrent()
+            => previewVersion == _copyPreviewLoadVersion
+               && IsCurrentContext(requestedScope, requestedCourseId, requestedDayOfWeek)
+               && sourceCourseId == ResolveCopySourceCourseId();
         if (IsScopeSelectionIncomplete)
         {
             _copyPreviewRows = new();
+            _copyPreviewError = null;
+            _copyPreviewLoading = false;
             return;
         }
+        _copyPreviewRows = new();
+        _copyPreviewError = null;
+        _copyPreviewLoading = true;
         try
         {
             var rows = await Api.GetRawAsync(sourceCourseId, dayOfWeek: null);
-            if (previewVersion != _copyPreviewLoadVersion
-                || !IsCurrentContext(requestedScope, requestedCourseId, requestedDayOfWeek)
-                || sourceCourseId != ResolveCopySourceCourseId())
+            if (!IsStillCurrent())
             {
                 return;
             }
             _copyPreviewRows = rows;
         }
-        catch
+        catch (ApiErrorException ex)
         {
-            if (previewVersion == _copyPreviewLoadVersion
-                && IsCurrentContext(requestedScope, requestedCourseId, requestedDayOfWeek)
-                && sourceCourseId == ResolveCopySourceCourseId())
+            if (IsStillCurrent())
             {
                 _copyPreviewRows = new();
+                var details = ex.Errors.FirstOrDefault() ?? ex.Message;
+                _copyPreviewError = $"Не вдалося завантажити шаблон «{GetCopySourceLabel()}»: {details}";
+            }
+        }
+        catch (Exception ex)
+        {
+            if (IsStillCurrent())
+            {
+                _copyPreviewRows = new();
+                _copyPreviewError = $"Не вдалося завантажити шаблон «{GetCopySourceLabel()}»: {ex.Message}";
+            }
+        }
+        finally
+        {
+            if (IsStillCurrent())
+            {
+                _copyPreviewLoading = false;
             }
         }
     }
     // Копіює шаблон-джерело у поточний контекст редактора.
     private async Task CopyTemplateToEditor()
     {
+        if (!CanMutateSlotEditor)
+        {
+            return;
+        }
         _error = _ok = null;
         if (IsScopeSelectionIncomplete)
         {
             _error = "Оберіть курс для копіювання шаблону.";
             return;
         }
-        if (HasUnsavedChanges)
+        if (HasUnsavedSlotChanges)
         {
             var confirmed = await JS.InvokeAsync<bool>("confirm", "У редакторі є незбережені зміни. Замінити їх шаблоном?");
             if (!confirmed) return;
@@ -478,6 +801,10 @@
     // Зберігає поточні слоти редактора як шаблон (без прив'язки до дня).
     private async Task SaveEditorAsTemplateAsync()
     {
+        if (!CanMutateSlotEditor)
+        {
+            return;
+        }
         _error = _ok = null;
         if (IsScopeSelectionIncomplete)
         {
@@ -491,48 +818,85 @@
         }
         _error = Validate();
         if (_error is not null) return;
+        var contextLoadVersion = _contextLoadVersion;
+        var requestedScope = _scope;
+        var requestedCourseId = _courseId;
+        var requestedDayOfWeek = _dayOfWeek;
+        var courseId = CurrentCourseId();
+        var removeExplicitLunchRequested = _removeExplicitLunchRequested;
+        var templateRows = CloneRows(_rows);
+        bool IsStillCurrent()
+            => IsCurrentMutationContext(
+                contextLoadVersion,
+                requestedScope,
+                requestedCourseId,
+                requestedDayOfWeek);
+        foreach (var row in templateRows)
+        {
+            row.CourseId = courseId;
+            row.DayOfWeek = null;
+        }
+        if (requestedDayOfWeek is not null && !TryPreserveExplicitLunch(templateRows, courseId))
+        {
+            _error = "Поточна обідня перерва не збігається з жодним активним слотом редактора. Відкрийте режим «Усі дні» та оберіть слот обіду вручну.";
+            return;
+        }
+        _savingTemplate = true;
         try
         {
-            var courseId = CurrentCourseId();
-            var templateRows = CloneRows(_rows);
-            foreach (var row in templateRows)
+            var existingTemplate = await Api.GetRawAsync(courseId, dayOfWeek: null);
+            if (!IsStillCurrent())
             {
-                row.CourseId = courseId;
-                row.DayOfWeek = null;
-            }
-            if (_dayOfWeek is not null && !TryPreserveExplicitLunch(templateRows, courseId))
-            {
-                _error = "Поточна обідня перерва не збігається з жодним активним слотом редактора. Відкрийте режим «Усі дні» та оберіть слот обіду вручну.";
                 return;
             }
-            var existingTemplate = await Api.GetRawAsync(courseId, dayOfWeek: null);
             if (existingTemplate.Count > 0)
             {
-                if (!_removeExplicitLunchRequested && AreRowsEquivalent(existingTemplate, templateRows))
+                if (!removeExplicitLunchRequested && AreRowsEquivalent(existingTemplate, templateRows))
                 {
                     _copySourceMode = CopySourceMode.CurrentScopeOnly;
                     await LoadCopyPreviewAsync();
-                    _ok = "Шаблон вже актуальний.";
+                    if (IsStillCurrent())
+                    {
+                        _ok = "Шаблон вже актуальний.";
+                    }
                     return;
                 }
                 var confirmed = await JS.InvokeAsync<bool>("confirm", "Шаблон вже існує. Перезаписати його поточними слотами?");
-                if (!confirmed) return;
+                if (!confirmed || !IsStillCurrent()) return;
             }
             await Api.SaveAsync(courseId, templateRows, dayOfWeek: null);
+            if (!IsStillCurrent())
+            {
+                return;
+            }
             _copySourceMode = CopySourceMode.CurrentScopeOnly;
-            await LoadRaw();
-            if (_error is null)
+            await ReloadContextPreservingPreferredFirstDraftAsync(
+                requestedScope,
+                requestedCourseId,
+                requestedDayOfWeek);
+            if (IsCurrentContext(requestedScope, requestedCourseId, requestedDayOfWeek)
+                && _error is null)
             {
                 _ok = "Шаблон збережено. Тепер його можна копіювати у будь-який день.";
             }
         }
         catch (BlazorWasmDotNet8AspNetCoreHosted.Client.Services.ApiErrorException ex)
         {
-            _error = ex.Errors.FirstOrDefault() ?? ex.Message;
+            if (IsStillCurrent())
+            {
+                _error = ex.Errors.FirstOrDefault() ?? ex.Message;
+            }
         }
         catch (Exception ex)
         {
-            _error = ex.Message;
+            if (IsStillCurrent())
+            {
+                _error = ex.Message;
+            }
+        }
+        finally
+        {
+            _savingTemplate = false;
         }
     }
     // Обчислює наступний слот з урахуванням перерв.
@@ -555,6 +919,10 @@
     // Додає новий рядок слота.
     private void AddRow()
     {
+        if (!CanMutateSlotEditor)
+        {
+            return;
+        }
         var maxOrder = _rows.Count == 0 ? 1 : _rows.Max(x => x.SortOrder) + 1;
         var (start, end) = CalculateNextSlot();
         _rows.Add(new TimeSlotDto
@@ -571,6 +939,10 @@
     // Видаляє рядок слота зі списку.
     private void RemoveRow(TimeSlotDto r)
     {
+        if (!CanMutateSlotEditor)
+        {
+            return;
+        }
         if (r.IsLunch && HasExplicitLunchForCurrentScope())
         {
             _removeExplicitLunchRequested = true;
@@ -580,8 +952,9 @@
     // Повертає редактор до останньої завантаженої/збереженої версії.
     private void RevertChanges()
     {
-        if (!HasUnsavedChanges) return;
+        if (!CanMutateSlotEditor || !HasUnsavedChanges) return;
         _rows = CloneRows(_loadedRowsSnapshot);
+        _preferredFirstMaxSlotOrder = _loadedPreferredFirstMaxSlotOrder;
         _removeExplicitLunchRequested = false;
         _ok = "Зміни в редакторі скасовано.";
     }
@@ -659,6 +1032,10 @@
     // Відкриває шаблон «Усі дні», де дозволено змінювати спільну перерву.
     private async Task OpenCommonLunchEditorAsync()
     {
+        if (!CanMutateSlotEditor)
+        {
+            return;
+        }
         if (!await ConfirmDiscardChangesAsync())
         {
             return;
@@ -747,6 +1124,22 @@
         {
             return "Оберіть курс, щоб працювати з копіюванням.";
         }
+        if (_slotsLoading)
+        {
+            return "Завантаження поточного контексту слотів…";
+        }
+        if (!_slotsLoadSucceeded)
+        {
+            return "Копіювання недоступне, доки слоти поточного контексту не буде успішно завантажено.";
+        }
+        if (_copyPreviewLoading)
+        {
+            return $"Завантаження шаблону «{GetCopySourceLabel()}»…";
+        }
+        if (_copyPreviewError is not null)
+        {
+            return $"Попередній перегляд шаблону «{GetCopySourceLabel()}» недоступний.";
+        }
         if (_copyPreviewRows.Count == 0)
         {
             return $"У шаблоні «{GetCopySourceLabel()}» немає слотів. Спочатку створіть шаблон кнопкою вище.";
@@ -755,9 +1148,23 @@
     }
     // Повертає короткий статус редактора слотів.
     private string GetEditorStateHint()
-        => HasUnsavedChanges
+    {
+        if (IsScopeSelectionIncomplete)
+        {
+            return "Оберіть курс, щоб відкрити редактор.";
+        }
+        if (_slotsLoading)
+        {
+            return "Завантаження слотів поточного контексту…";
+        }
+        if (!_slotsLoadSucceeded)
+        {
+            return "Редактор недоступний: повторіть завантаження слотів.";
+        }
+        return HasUnsavedChanges
             ? $"Є незбережені зміни. Слотів у редакторі: {_rows.Count}."
             : $"Слотів у редакторі: {_rows.Count}.";
+    }
     // Повертає явну або успадковану обідню перерву для поточного рівня.
     private LunchConfigEditDto? GetEffectiveLunch()
     {
@@ -803,6 +1210,14 @@
         {
             return "Оберіть курс, щоб побачити його власну або успадковану перерву.";
         }
+        if (_slotsLoading)
+        {
+            return "Завантаження налаштування обідньої перерви…";
+        }
+        if (!_slotsLoadSucceeded)
+        {
+            return "Налаштування обідньої перерви недоступне, доки слоти не буде успішно завантажено.";
+        }
         if (_removeExplicitLunchRequested)
         {
             var globalLunch = _scope == Scope.Course
@@ -838,29 +1253,91 @@
     // Завантажує ліміт слота для типу з прапорцем "Бажано першим у тижні".
     private async Task LoadPreferredFirstSlotLimit(int? courseId, int contextLoadVersion)
     {
+        bool IsStillCurrent()
+            => contextLoadVersion == _contextLoadVersion && courseId == CurrentCourseId();
+        if (!IsStillCurrent())
+        {
+            return;
+        }
+        if (_preferredFirstLimitCourseId != courseId)
+        {
+            PreparePreferredFirstLimitContext(courseId);
+        }
+        else
+        {
+            _preferredFirstLimitLoadError = null;
+            _preferredFirstLimitLoading = true;
+        }
         try
         {
             var dto = await Api.GetPreferredFirstSlotLimitAsync(courseId);
-            if (contextLoadVersion == _contextLoadVersion && courseId == CurrentCourseId())
+            if (IsStillCurrent())
             {
                 _preferredFirstMaxSlotOrder = Math.Max(0, dto.MaxSlotOrder);
+                _loadedPreferredFirstMaxSlotOrder = _preferredFirstMaxSlotOrder;
+                _preferredFirstLimitCourseId = courseId;
+                _hasLoadedPreferredFirstLimit = true;
             }
         }
-        catch
+        catch (ApiErrorException ex)
         {
-            if (contextLoadVersion == _contextLoadVersion && courseId == CurrentCourseId())
+            if (IsStillCurrent())
             {
-                _preferredFirstMaxSlotOrder = 0;
+                var details = ex.Errors.FirstOrDefault() ?? ex.Message;
+                _preferredFirstLimitLoadError = $"Не вдалося завантажити ліміт слота: {details}";
             }
+        }
+        catch (Exception ex)
+        {
+            if (IsStillCurrent())
+            {
+                _preferredFirstLimitLoadError = $"Не вдалося завантажити ліміт слота: {ex.Message}";
+            }
+        }
+        finally
+        {
+            if (IsStillCurrent())
+            {
+                _preferredFirstLimitLoading = false;
+            }
+        }
+    }
+    // Повторно завантажує ліміт, не стираючи введену користувачем чернетку.
+    private async Task RetryPreferredFirstSlotLimitAsync()
+    {
+        if (IsScopeSelectionIncomplete || _preferredFirstLimitLoading || IsMutationInProgress)
+        {
+            return;
+        }
+        var courseId = CurrentCourseId();
+        var contextLoadVersion = _contextLoadVersion;
+        var draft = _preferredFirstMaxSlotOrder;
+        var preserveDraft = HasUnsavedPreferredFirstLimit;
+        await LoadPreferredFirstSlotLimit(courseId, contextLoadVersion);
+        if (preserveDraft
+            && _preferredFirstLimitLoadError is null
+            && contextLoadVersion == _contextLoadVersion
+            && courseId == CurrentCourseId())
+        {
+            _preferredFirstMaxSlotOrder = draft;
         }
     }
     // Зберігає ліміт слота для типу з прапорцем "Бажано першим у тижні".
     private async Task SavePreferredFirstSlotLimit()
     {
+        if (IsMutationInProgress)
+        {
+            return;
+        }
         _error = _ok = null;
         if (_scope == Scope.Course && _courseId is null)
         {
             _error = "Вибери курс.";
+            return;
+        }
+        if (!CanEditPreferredFirstLimit)
+        {
+            _error = "Спочатку успішно завантажте поточний ліміт і повторіть збереження.";
             return;
         }
         if (_preferredFirstMaxSlotOrder < 0)
@@ -868,22 +1345,53 @@
             _error = "Ліміт слота не може бути від'ємним.";
             return;
         }
+        var contextLoadVersion = _contextLoadVersion;
+        var requestedScope = _scope;
+        var requestedCourseId = _courseId;
+        var requestedDayOfWeek = _dayOfWeek;
+        var courseId = CurrentCourseId();
+        var savedValue = _preferredFirstMaxSlotOrder;
+        bool IsStillCurrent()
+            => IsCurrentMutationContext(
+                contextLoadVersion,
+                requestedScope,
+                requestedCourseId,
+                requestedDayOfWeek);
+        _savingPreferredFirstLimit = true;
         try
         {
-            await Api.SavePreferredFirstSlotLimitAsync(CurrentCourseId(), _preferredFirstMaxSlotOrder);
-            _ok = "Ліміт збережено.";
+            await Api.SavePreferredFirstSlotLimitAsync(courseId, savedValue);
+            if (IsStillCurrent())
+            {
+                _loadedPreferredFirstMaxSlotOrder = savedValue;
+                _ok = "Ліміт збережено.";
+            }
         }
         catch (BlazorWasmDotNet8AspNetCoreHosted.Client.Services.ApiErrorException ex)
         {
-            _error = ex.Errors.FirstOrDefault() ?? ex.Message;
+            if (IsStillCurrent())
+            {
+                _error = ex.Errors.FirstOrDefault() ?? ex.Message;
+            }
         }
         catch (Exception ex)
         {
-            _error = ex.Message;
+            if (IsStillCurrent())
+            {
+                _error = ex.Message;
+            }
+        }
+        finally
+        {
+            _savingPreferredFirstLimit = false;
         }
     }
     private async Task Save()
     {
+        if (!CanMutateSlotEditor)
+        {
+            return;
+        }
         _error = _ok = null;
         if (!CanSaveChanges)
         {
@@ -892,34 +1400,81 @@
         }
         _error = Validate();
         if (_error is not null) return;
+        var contextLoadVersion = _contextLoadVersion;
+        var requestedScope = _scope;
+        var requestedCourseId = _courseId;
+        var requestedDayOfWeek = _dayOfWeek;
+        var courseId = CurrentCourseId();
+        var rowsToSave = CloneRows(_rows);
+        bool IsStillCurrent()
+            => IsCurrentMutationContext(
+                contextLoadVersion,
+                requestedScope,
+                requestedCourseId,
+                requestedDayOfWeek);
+        foreach (var row in rowsToSave)
+        {
+            row.CourseId = courseId;
+            row.DayOfWeek = requestedDayOfWeek;
+            if (requestedDayOfWeek is not null)
+            {
+                row.IsLunch = false;
+            }
+        }
+        _savingSlots = true;
         try
         {
-            var courseId = CurrentCourseId();
-            var dayOfWeek = _dayOfWeek;
-            var rowsToSave = CloneRows(_rows);
-            foreach (var row in rowsToSave)
+            await Api.SaveAsync(courseId, rowsToSave, requestedDayOfWeek);
+            if (!IsStillCurrent())
             {
-                row.CourseId = courseId;
-                row.DayOfWeek = dayOfWeek;
-                if (dayOfWeek is not null)
-                {
-                    row.IsLunch = false;
-                }
+                return;
             }
-            await Api.SaveAsync(courseId, rowsToSave, dayOfWeek);
-            await LoadRaw();
-            if (_error is null)
+            await ReloadContextPreservingPreferredFirstDraftAsync(
+                requestedScope,
+                requestedCourseId,
+                requestedDayOfWeek);
+            if (IsCurrentContext(requestedScope, requestedCourseId, requestedDayOfWeek)
+                && _error is null)
             {
                 _ok = "Збережено.";
             }
         }
         catch (BlazorWasmDotNet8AspNetCoreHosted.Client.Services.ApiErrorException ex)
         {
-            _error = ex.Errors.FirstOrDefault() ?? ex.Message;
+            if (IsStillCurrent())
+            {
+                _error = ex.Errors.FirstOrDefault() ?? ex.Message;
+            }
         }
         catch (Exception ex)
         {
-            _error = ex.Message;
+            if (IsStillCurrent())
+            {
+                _error = ex.Message;
+            }
+        }
+        finally
+        {
+            _savingSlots = false;
+        }
+    }
+    // Оновлює слоти після їх збереження, не втрачаючи окремо незбережений ліміт.
+    private async Task ReloadContextPreservingPreferredFirstDraftAsync(
+        Scope requestedScope,
+        int? requestedCourseId,
+        int? requestedDayOfWeek)
+    {
+        var draft = _preferredFirstMaxSlotOrder;
+        var preserveDraft = HasUnsavedPreferredFirstLimit;
+        var preferredFirstCourseId = CurrentCourseId();
+        var expectedLoadVersion = _contextLoadVersion + 1;
+        await LoadRaw();
+        if (preserveDraft
+            && expectedLoadVersion == _contextLoadVersion
+            && IsCurrentContext(requestedScope, requestedCourseId, requestedDayOfWeek)
+            && preferredFirstCourseId == CurrentCourseId())
+        {
+            _preferredFirstMaxSlotOrder = draft;
         }
     }
 }

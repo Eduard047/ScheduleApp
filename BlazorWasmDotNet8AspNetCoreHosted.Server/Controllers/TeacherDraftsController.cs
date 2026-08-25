@@ -67,17 +67,47 @@ public sealed class TeacherDraftsController : ControllerBase
         return Ok(await _queryService.GetAsync(weekStart, teacherId, groupId, roomId));
     }
     [HttpGet("validate-week")]
+    [EnableRateLimiting("week-validation")]
     // Повторно перевіряє всі чернетки тижня незалежно від активних фільтрів клієнта.
     public async Task<ActionResult<DraftValidationReportDto>> ValidateWeek(
         [FromQuery] DateOnly weekStart,
         [FromServices] TeacherDraftsWeekValidationService validationService,
+        [FromServices] ExpensiveOperationGate operationGate,
         CancellationToken cancellationToken)
     {
         if (!DateHelpers.IsSupportedScheduleDate(weekStart))
         {
             return BadRequest(new { message = DateHelpers.SupportedScheduleDateMessage });
         }
-        return Ok(await validationService.ValidateAsync(weekStart, cancellationToken));
+        using var lease = await operationGate.TryEnterAsync(
+            ExpensiveOperationKind.WeekValidation,
+            cancellationToken);
+        if (lease is null)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status429TooManyRequests,
+                title: "Забагато одночасних перевірок тижня",
+                detail: "Дочекайтеся завершення поточних перевірок і повторіть запит.");
+        }
+
+        try
+        {
+            return Ok(await validationService.ValidateAsync(weekStart, cancellationToken));
+        }
+        catch (DraftValidationCapacityException ex)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status422UnprocessableEntity,
+                title: "Обсяг тижня перевищує безпечний ліміт",
+                detail: ex.Message);
+        }
+        catch (DraftValidationTimeoutException ex)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status503ServiceUnavailable,
+                title: "Перевірка тижня не завершилася вчасно",
+                detail: ex.Message);
+        }
     }
     [HttpGet("export")]
     [EnableRateLimiting("xlsx-export")]
@@ -1091,11 +1121,33 @@ public sealed class TeacherDraftsController : ControllerBase
         }
     }
     [HttpGet("autogen/jobs/{jobId}")]
-    public ActionResult<AutoGenJobStatus> GetAutoGenJob(string jobId)
+    [EnableRateLimiting("autogen-status")]
+    public async Task<ActionResult<AutoGenJobStatus>> GetAutoGenJob(
+        string jobId,
+        [FromServices] ExpensiveOperationGate operationGate,
+        CancellationToken cancellationToken)
     {
+        if (!Guid.TryParseExact(jobId?.Trim(), "N", out var parsedJobId))
+        {
+            return NotFound(new { message = "Завдання автогенерації не знайдено." });
+        }
+
+        using var lease = await operationGate.TryEnterAsync(
+            ExpensiveOperationKind.AutoGenStatus,
+            cancellationToken);
+        if (lease is null)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status429TooManyRequests,
+                title: "Забагато одночасних перевірок стану",
+                detail: "Дочекайтеся завершення поточних перевірок і повторіть запит.");
+        }
+
         try
         {
-            return _autogenJobService.Get(jobId) is { } status
+            return await _autogenJobService.GetAsync(
+                       parsedJobId.ToString("N"),
+                       cancellationToken) is { } status
                 ? Ok(status)
                 : NotFound(new { message = "Завдання автогенерації не знайдено." });
         }
@@ -1108,11 +1160,33 @@ public sealed class TeacherDraftsController : ControllerBase
         }
     }
     [HttpPost("autogen/jobs/{jobId}/cancel")]
-    public ActionResult<AutoGenJobStatus> CancelAutoGenJob(string jobId)
+    [EnableRateLimiting("autogen-status")]
+    public async Task<ActionResult<AutoGenJobStatus>> CancelAutoGenJob(
+        string jobId,
+        [FromServices] ExpensiveOperationGate operationGate,
+        CancellationToken cancellationToken)
     {
+        if (!Guid.TryParseExact(jobId?.Trim(), "N", out var parsedJobId))
+        {
+            return NotFound(new { message = "Завдання автогенерації не знайдено." });
+        }
+
+        using var lease = await operationGate.TryEnterAsync(
+            ExpensiveOperationKind.AutoGenStatus,
+            cancellationToken);
+        if (lease is null)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status429TooManyRequests,
+                title: "Забагато одночасних запитів скасування",
+                detail: "Дочекайтеся завершення поточних операцій і повторіть запит.");
+        }
+
         try
         {
-            return _autogenJobService.Cancel(jobId) is { } status
+            return await _autogenJobService.CancelAsync(
+                       parsedJobId.ToString("N"),
+                       cancellationToken) is { } status
                 ? Ok(status)
                 : NotFound(new { message = "Завдання автогенерації не знайдено." });
         }
@@ -1125,19 +1199,89 @@ public sealed class TeacherDraftsController : ControllerBase
         }
     }
     [HttpGet("autogen/jobs/{jobId}/plan")]
+    [EnableRateLimiting("autogen-plan-read")]
     public async Task<ActionResult<AutoGenPlanDetailsDto>> GetAutoGenPlan(
         string jobId,
+        [FromQuery] int changeOffset,
+        [FromQuery] int? changeLimit,
+        [FromServices] ExpensiveOperationGate operationGate,
         CancellationToken cancellationToken)
     {
+        var resolvedChangeLimit = changeLimit
+                                  ?? TeacherDraftsAutogenPlanService.DefaultChangePageSize;
+        if (changeOffset < 0
+            || resolvedChangeLimit <= 0
+            || resolvedChangeLimit > TeacherDraftsAutogenPlanService.MaxChangePageSize)
+        {
+            return BadRequest(new
+            {
+                message = $"Сторінка змін має містити від 1 до {TeacherDraftsAutogenPlanService.MaxChangePageSize} записів."
+            });
+        }
+
+        using (var handoffLease = await operationGate.TryEnterAsync(
+                   ExpensiveOperationKind.AutoGenPlanHandoff,
+                   cancellationToken))
+        {
+            if (handoffLease is null)
+            {
+                return Problem(
+                    statusCode: StatusCodes.Status429TooManyRequests,
+                    title: "Забагато очікувань завершення плану",
+                    detail: "Дочекайтеся завершення поточних планів і повторіть запит.");
+            }
+            try
+            {
+                await _autogenJobService.PreparePlanReadAsync(jobId, cancellationToken);
+            }
+            catch (AutoGenPlanConflictException ex)
+            {
+                return Problem(
+                    statusCode: StatusCodes.Status409Conflict,
+                    title: "План автогенерації ще не готовий",
+                    detail: ex.Message);
+            }
+        }
+
+        using var lease = await operationGate.TryEnterAsync(
+            ExpensiveOperationKind.AutoGenPlanRead,
+            cancellationToken);
+        if (lease is null)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status429TooManyRequests,
+                title: "Забагато одночасних читань плану",
+                detail: "Дочекайтеся завершення поточних читань і повторіть запит.");
+        }
+
         try
         {
-            return Ok(await _autogenJobService.GetPlanAsync(jobId, cancellationToken));
+            var plan = await _autogenJobService.GetPlanPageAsync(
+                jobId,
+                changeOffset,
+                resolvedChangeLimit,
+                cancellationToken);
+            if (!changeLimit.HasValue && plan.HasMoreChanges)
+            {
+                return Problem(
+                    statusCode: StatusCodes.Status409Conflict,
+                    title: "Клієнт має підтримувати сторінки плану",
+                    detail: "Оновіть клієнт і повторіть запит із параметрами changeOffset та changeLimit.");
+            }
+            return Ok(plan);
         }
         catch (AutoGenPlanNotFoundException ex)
         {
             return Problem(
                 statusCode: StatusCodes.Status404NotFound,
                 title: "План автогенерації не знайдено",
+                detail: ex.Message);
+        }
+        catch (AutoGenPlanConflictException ex)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status409Conflict,
+                title: "План автогенерації ще не готовий",
                 detail: ex.Message);
         }
         catch (AutoGenPlanPersistenceException ex)
@@ -1149,13 +1293,51 @@ public sealed class TeacherDraftsController : ControllerBase
         }
     }
     [HttpGet("autogen/plans/latest-rollbackable")]
+    [EnableRateLimiting("autogen-plan-read")]
     public async Task<ActionResult<AutoGenPlanDetailsDto>> GetLatestRollbackableAutoGenPlan(
         [FromQuery] int? courseId,
+        [FromQuery] int changeOffset,
+        [FromQuery] int? changeLimit,
+        [FromServices] ExpensiveOperationGate operationGate,
         CancellationToken cancellationToken)
     {
+        var resolvedChangeLimit = changeLimit
+                                  ?? TeacherDraftsAutogenPlanService.DefaultChangePageSize;
+        if (changeOffset < 0
+            || resolvedChangeLimit <= 0
+            || resolvedChangeLimit > TeacherDraftsAutogenPlanService.MaxChangePageSize)
+        {
+            return BadRequest(new
+            {
+                message = $"Сторінка змін має містити від 1 до {TeacherDraftsAutogenPlanService.MaxChangePageSize} записів."
+            });
+        }
+
+        using var lease = await operationGate.TryEnterAsync(
+            ExpensiveOperationKind.AutoGenPlanRead,
+            cancellationToken);
+        if (lease is null)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status429TooManyRequests,
+                title: "Забагато одночасних читань плану",
+                detail: "Дочекайтеся завершення поточних читань і повторіть запит.");
+        }
+
         try
         {
-            var plan = await _autogenJobService.GetLatestRollbackablePlanAsync(courseId, cancellationToken);
+            var plan = await _autogenJobService.GetLatestRollbackablePlanPageAsync(
+                courseId,
+                changeOffset,
+                resolvedChangeLimit,
+                cancellationToken);
+            if (!changeLimit.HasValue && plan?.HasMoreChanges == true)
+            {
+                return Problem(
+                    statusCode: StatusCodes.Status409Conflict,
+                    title: "Клієнт має підтримувати сторінки плану",
+                    detail: "Оновіть клієнт і повторіть запит із параметрами changeOffset та changeLimit.");
+            }
             return plan is null ? NoContent() : Ok(plan);
         }
         catch (AutoGenPlanPersistenceException ex)
@@ -1167,23 +1349,71 @@ public sealed class TeacherDraftsController : ControllerBase
         }
     }
     [HttpPost("autogen/jobs/{jobId}/apply")]
+    [EnableRateLimiting("autogen-plan-action")]
     public async Task<ActionResult<AutoGenPlanDetailsDto>> ApplyAutoGenPlan(
         string jobId,
         [FromBody] AutoGenPlanActionRequest request,
+        [FromServices] ExpensiveOperationGate operationGate,
         CancellationToken cancellationToken)
         => await ExecuteAutoGenPlanActionAsync(
-            () => _autogenJobService.ApplyPlanAsync(jobId, request, cancellationToken));
+            jobId,
+            () => _autogenJobService.ApplyPlanAsync(jobId, request, cancellationToken),
+            operationGate,
+            cancellationToken);
     [HttpPost("autogen/jobs/{jobId}/rollback")]
+    [EnableRateLimiting("autogen-plan-action")]
     public async Task<ActionResult<AutoGenPlanDetailsDto>> RollbackAutoGenPlan(
         string jobId,
         [FromBody] AutoGenPlanActionRequest request,
+        [FromServices] ExpensiveOperationGate operationGate,
         CancellationToken cancellationToken)
         => await ExecuteAutoGenPlanActionAsync(
-            () => _autogenJobService.RollbackPlanAsync(jobId, request, cancellationToken));
+            jobId,
+            () => _autogenJobService.RollbackPlanAsync(jobId, request, cancellationToken),
+            operationGate,
+            cancellationToken);
 
     private async Task<ActionResult<AutoGenPlanDetailsDto>> ExecuteAutoGenPlanActionAsync(
-        Func<Task<AutoGenPlanDetailsDto>> action)
+        string jobId,
+        Func<Task<AutoGenPlanDetailsDto>> action,
+        ExpensiveOperationGate operationGate,
+        CancellationToken cancellationToken)
     {
+        using (var handoffLease = await operationGate.TryEnterAsync(
+                   ExpensiveOperationKind.AutoGenPlanHandoff,
+                   cancellationToken))
+        {
+            if (handoffLease is null)
+            {
+                return Problem(
+                    statusCode: StatusCodes.Status429TooManyRequests,
+                    title: "Забагато очікувань завершення плану",
+                    detail: "Дочекайтеся завершення поточних планів і повторіть запит.");
+            }
+            try
+            {
+                await _autogenJobService.PreparePlanReadAsync(jobId, cancellationToken);
+            }
+            catch (AutoGenPlanConflictException ex)
+            {
+                return Problem(
+                    statusCode: StatusCodes.Status409Conflict,
+                    title: "План автогенерації ще не готовий",
+                    detail: ex.Message);
+            }
+        }
+
+        using var lease = await operationGate.TryEnterAsync(
+            ExpensiveOperationKind.AutoGenPlanAction,
+            cancellationToken);
+        if (lease is null)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status429TooManyRequests,
+                title: "Інша дія з планом уже виконується",
+                detail: "Дочекайтеся завершення поточної дії та повторіть запит.");
+        }
+
         try
         {
             return Ok(await action());
@@ -1226,7 +1456,17 @@ public sealed class TeacherDraftsController : ControllerBase
                 title: "Потрібна актуальна перевірка тижня",
                 detail: "Перед публікацією повторно перевірте тиждень і передайте його актуальну версію.");
         }
-        return await _publishService.PublishWeekAsync(r);
+        try
+        {
+            return await _publishService.PublishWeekAsync(r);
+        }
+        catch (DraftValidationCapacityException ex)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status422UnprocessableEntity,
+                title: "Обсяг тижня перевищує безпечний ліміт",
+                detail: ex.Message);
+        }
     }
 
     private ObjectResult LegacyAutogenEndpointDisabled()

@@ -2,9 +2,11 @@ using System.Reflection;
 using BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -44,7 +46,7 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
     {
         await using var source = ServerConfigurationFactory.CreateSourceContext();
         var scenario = await LoadScenarioAsync(source);
-        await using var snapshot = await SqliteSnapshotFile.CreateFromSourceAsync(source);
+        await using var snapshot = await SqliteSnapshotFile.CreateFromSourceAsync(source, scenario.CourseId);
         await using var database = new SqliteTempDatabase(snapshot.Path);
         await using var db = database.CreateContext();
 
@@ -261,7 +263,7 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
     {
         await using var source = ServerConfigurationFactory.CreateSourceContext();
         var scenario = await LoadScenarioAsync(source);
-        await using var snapshot = await SqliteSnapshotFile.CreateFromSourceAsync(source);
+        await using var snapshot = await SqliteSnapshotFile.CreateFromSourceAsync(source, scenario.CourseId);
         await using var database = new SqliteTempDatabase(snapshot.Path);
         var services = new ServiceCollection();
         services.AddScoped(_ => database.CreateContext());
@@ -684,4 +686,78 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
         bool PreferredFirstInWeek,
         bool RequiresTeacher,
         bool RequiresRoom);
+}
+
+public sealed class DatabaseSnapshotSecurityTests
+{
+    [Fact]
+    public void Snapshot_allowlist_excludes_working_and_autogen_state()
+    {
+        Assert.DoesNotContain(typeof(ScheduleItem), DatabaseSnapshotCopier.AllowedTypes);
+        Assert.DoesNotContain(typeof(TeacherDraftItem), DatabaseSnapshotCopier.AllowedTypes);
+        Assert.DoesNotContain(typeof(AutoGenJobRun), DatabaseSnapshotCopier.AllowedTypes);
+        Assert.DoesNotContain(typeof(AutoGenDraftPlan), DatabaseSnapshotCopier.AllowedTypes);
+        Assert.DoesNotContain(typeof(AutoGenDraftPlanMutation), DatabaseSnapshotCopier.AllowedTypes);
+    }
+
+    [Fact]
+    public async Task Snapshot_sanitizes_personal_fields_and_removes_private_temp_directory()
+    {
+        await using var sourceConnection = new SqliteConnection("Data Source=:memory:");
+        await sourceConnection.OpenAsync();
+        var sourceOptions = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(sourceConnection)
+            .Options;
+        await using var source = new AppDbContext(sourceOptions);
+        await source.Database.EnsureCreatedAsync();
+        var department = new Department { Name = "Кафедра" };
+        source.Teachers.Add(new Teacher
+        {
+            FullName = "Персональне ім'я",
+            ScientificDegree = "ступінь",
+            AcademicTitle = "звання",
+            Department = department
+        });
+        source.Buildings.Add(new Building
+        {
+            Name = "Корпус",
+            Address = "Приватна адреса"
+        });
+        await source.SaveChangesAsync();
+
+        var snapshot = await SqliteSnapshotFile.CreateFromSourceAsync(source);
+        var snapshotPath = snapshot.Path;
+        var snapshotDirectory = Assert.IsType<DirectoryInfo>(Directory.GetParent(snapshotPath)).FullName;
+        try
+        {
+            Assert.True(File.Exists(snapshotPath));
+            if (!OperatingSystem.IsWindows())
+            {
+                var fileMode = File.GetUnixFileMode(snapshotPath);
+                Assert.Equal(
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite,
+                    fileMode & (UnixFileMode)0x1FF);
+            }
+
+            await using var snapshotConnection = new SqliteConnection(
+                new SqliteConnectionStringBuilder { DataSource = snapshotPath }.ToString());
+            await snapshotConnection.OpenAsync();
+            var snapshotOptions = new DbContextOptionsBuilder<AppDbContext>()
+                .UseSqlite(snapshotConnection)
+                .Options;
+            await using var copied = new AppDbContext(snapshotOptions);
+            var teacher = await copied.Teachers.AsNoTracking().SingleAsync();
+            var building = await copied.Buildings.AsNoTracking().SingleAsync();
+            Assert.Equal($"Викладач {teacher.Id}", teacher.FullName);
+            Assert.Null(teacher.ScientificDegree);
+            Assert.Null(teacher.AcademicTitle);
+            Assert.Null(building.Address);
+        }
+        finally
+        {
+            await snapshot.DisposeAsync();
+        }
+
+        Assert.False(Directory.Exists(snapshotDirectory));
+    }
 }

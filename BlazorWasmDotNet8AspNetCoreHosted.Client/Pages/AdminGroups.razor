@@ -1,6 +1,5 @@
 ﻿@* Сторінка адміністрування навчальних груп *@
 @page "/admin/groups"
-@using System.Net
 @using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
 @using BlazorWasmDotNet8AspNetCoreHosted.Client.Services
 @inject IAdminApi Api
@@ -8,24 +7,40 @@
 
 <PageTitle>Адмін • Групи</PageTitle>
 
-<h3 class="mb-3">Групи</h3>
+<h1 class="h3 mb-3">Групи</h1>
 
 @if (!string.IsNullOrWhiteSpace(error))
 {
-    <div class="alert alert-danger">@error</div>
+    <div class="alert alert-danger" role="alert">
+        @error
+        @if (loadFailed)
+        {
+            <div class="mt-2">
+                <button type="button" class="btn btn-sm btn-outline-danger" @onclick="RetryLoad" disabled="@(loading || mutationInProgress)">
+                    Повторити завантаження
+                </button>
+            </div>
+        }
+    </div>
 }
 @if (!string.IsNullOrWhiteSpace(ok))
 {
-    <div class="alert alert-success">@ok</div>
+    <div class="alert alert-success" role="status">@ok</div>
 }
 
+@if (loading)
+{
+    <div class="text-muted mb-3" role="status" aria-live="polite">Завантаження груп…</div>
+}
+
+<fieldset class="border-0 p-0 m-0 w-100" disabled="@IsInteractionBlocked">
 <div class="card p-3">
     <div class="d-flex justify-content-between align-items-center mb-2 gap-2 flex-wrap">
         <button class="btn btn-primary" @onclick="OpenCreate">Додати групу</button>
         <AdminSearchBox @bind-Value="filter" Class="ms-auto" Style="max-width:320px;" Placeholder="Id / назва / студенти / курс" />
         <div class="text-muted small">Показано: @SortedAndFiltered.Count() з @items.Count</div>
     </div>
-    <div class="table-responsive">
+    <div class="table-responsive" role="region" aria-label="Список груп" tabindex="0">
         <table class="table table-sm align-middle">
             <thead>
                 <tr>
@@ -33,7 +48,7 @@
                     <SortableHeader Field="@nameof(GroupEditDto.Name)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Назва</SortableHeader>
                     <SortableHeader Field="@nameof(GroupEditDto.StudentsCount)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Студентів</SortableHeader>
                     <SortableHeader Field="@CourseField" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Курс</SortableHeader>
-                    <th style="width:220px;"></th>
+                    <th style="width:220px;"><span class="visually-hidden">Дії</span></th>
                 </tr>
             </thead>
             <tbody>
@@ -60,25 +75,41 @@
         </table>
     </div>
 </div>
+</fieldset>
 
 @if (editorOpen)
 {
     <AdminEditorModal Title="@GroupEditorTitle"
                       Subtitle="Оберіть курс і вкажіть кількість студентів."
                       CssClass="group-editor"
+                      Busy="@(loading || mutationInProgress)"
                       OnClose="@CloseEditor">
+        @if (loadFailed)
+        {
+            <div class="alert alert-danger" role="alert">
+                <div class="fw-semibold">Операцію виконано, але дані не оновлено.</div>
+                <div class="small mt-1">@error</div>
+                <button type="button"
+                        class="btn btn-sm btn-outline-danger mt-2"
+                        @onclick="RetryLoad"
+                        disabled="@(loading || mutationInProgress)">
+                    @(loading ? "Завантаження…" : "Повторити лише завантаження")
+                </button>
+            </div>
+        }
+        <fieldset class="border-0 p-0 m-0 w-100" disabled="@IsInteractionBlocked">
         <div class="row g-3">
             <div class="col-12 col-md-4">
-                <label class="form-label">Назва</label>
-                <input class="form-control" @bind="form.Name" />
+                <label class="form-label" for="group-name">Назва</label>
+                <input id="group-name" class="form-control" @bind="form.Name" />
             </div>
             <div class="col-12 col-md-4">
-                <label class="form-label">Студентів</label>
-                <input type="number" min="0" class="form-control" @bind="form.StudentsCount" />
+                <label class="form-label" for="group-students">Студентів</label>
+                <input id="group-students" type="number" min="0" class="form-control" @bind="form.StudentsCount" />
             </div>
             <div class="col-12 col-md-4">
-                <label class="form-label">Курс</label>
-                <select class="form-select" @bind="form.CourseId">
+                <label class="form-label" for="group-course">Курс</label>
+                <select id="group-course" class="form-select" @bind="form.CourseId">
                     <option value="0">— Оберіть —</option>
                     @foreach (var c in courses)
                     {
@@ -88,9 +119,10 @@
             </div>
         </div>
         <div class="editor-actions">
-            <button class="btn btn-primary" @onclick="Save">Зберегти</button>
+            <button class="btn btn-primary" @onclick="Save">@(saving ? "Збереження…" : "Зберегти")</button>
             <button class="btn btn-outline-secondary" @onclick="CloseEditor">Скасувати</button>
         </div>
+        </fieldset>
     </AdminEditorModal>
 }
 
@@ -101,6 +133,10 @@
     private GroupEditDto form = NewForm();
     private List<LookupDto> courses = new();
     private bool editorOpen;
+    private bool loading, saving, loadFailed, mutationInProgress;
+    private bool IsInteractionBlocked => loading || mutationInProgress || loadFailed;
+    private Action? pendingRefreshCompletion;
+    private string? pendingRefreshSuccessMessage;
     private const string CourseField = "CourseName";
     private string sortField = nameof(GroupEditDto.Name);
     private bool sortAsc = true;
@@ -127,59 +163,122 @@
     // Початкове завантаження груп і курсів.
     protected override async Task OnInitializedAsync() => await Load();
     // Завантажує список груп і довідник курсів.
-    private async Task Load()
+    private async Task<bool> Load(bool clearMessages = true)
     {
+        error = null;
+        if (clearMessages) ok = null;
+        loading = true;
+        loadFailed = false;
         try
         {
-            error = ok = null;
-            items = await Api.GetGroups();
+            var loadedItems = await Api.GetGroups();
             var meta = await Api.GetMeta();
-            courses = meta.Courses;
+            items = loadedItems;
+            courses = meta.Courses ?? new();
+            return true;
         }
-        catch (Exception ex) { error = ex.Message; }
+        catch (Exception ex)
+        {
+            loadFailed = true;
+            error = $"Не вдалося завантажити групи: {ex.Message}";
+            return false;
+        }
+        finally { loading = false; }
+    }
+    // Повторює лише завантаження після вже виконаної серверної операції.
+    private async Task RetryLoad()
+    {
+        if (loading || mutationInProgress) return;
+        if (!await Load(clearMessages: false)) return;
+        var completion = pendingRefreshCompletion;
+        var successMessage = pendingRefreshSuccessMessage;
+        pendingRefreshCompletion = null;
+        pendingRefreshSuccessMessage = null;
+        completion?.Invoke();
+        if (!string.IsNullOrWhiteSpace(successMessage)) ok = successMessage;
     }
     // Повертає назву курсу за ідентифікатором.
     private string NameOfCourse(int id) => courses.FirstOrDefault(c => c.Id == id)?.Name ?? $"#{id}";
     // Зберігає групу через API.
     private async Task Save()
     {
+        if (IsInteractionBlocked) return;
+        mutationInProgress = true;
+        saving = true;
         try
         {
-            await Api.UpsertGroup(form);
-            await Load();
-            ok = "Збережено.";
-            CloseEditor();
+            error = ok = null;
+            form.Id = await Api.UpsertGroup(form);
+            await FinishMutationAsync(
+                "Групу збережено",
+                "Збережено.",
+                "повторно зберігати групу не потрібно",
+                CloseEditor);
         }
         catch (Exception ex) { error = ex.Message; }
+        finally
+        {
+            saving = false;
+            mutationInProgress = false;
+        }
     }
     // Видаляє групу з підтвердженням та можливим force.
     private async Task Delete(int id)
     {
+        if (IsInteractionBlocked) return;
+        mutationInProgress = true;
         error = ok = null;
-        var group = items.FirstOrDefault(g => g.Id == id);
-        var caption = group?.Name ?? $"#{id}";
-        var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити групу {caption}? Дію не можна скасувати.");
-        if (!confirmed) return;
         try
         {
+            var group = items.FirstOrDefault(g => g.Id == id);
+            var caption = group?.Name ?? $"#{id}";
+            var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити групу {caption}? Дію не можна скасувати.");
+            if (!confirmed) return;
             try
             {
                 await Api.DeleteGroup(id);
-                await Load();
-                ok = "Видалено.";
+                await FinishMutationAsync(
+                    "Групу видалено",
+                    "Видалено.",
+                    "повторно видаляти групу не потрібно",
+                    editorOpen && form.Id == id ? CloseEditor : null);
                 return;
             }
-            catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Conflict || ex.Message.Contains("409"))
+            catch (ApiErrorException ex) when (ex.StatusCode == System.Net.HttpStatusCode.Conflict)
             {
                 var sure = await JS.InvokeAsync<bool>("confirm",
                     "Група використовується у розкладі. Видалити всі пов’язані заняття?");
                 if (!sure) { error = "Дію скасовано користувачем."; return; }
                 await Api.DeleteGroup(id, force: true);
-                await Load();
-                ok = "Групу та пов’язані записи видалено.";
+                await FinishMutationAsync(
+                    "Групу та пов’язані записи видалено",
+                    "Групу та пов’язані записи видалено.",
+                    "повторно видаляти групу не потрібно",
+                    editorOpen && form.Id == id ? CloseEditor : null);
             }
         }
         catch (Exception ex) { error = ex.Message; }
+        finally { mutationInProgress = false; }
+    }
+    // Завершує мутацію лише після успішного оновлення локального списку.
+    private async Task FinishMutationAsync(
+        string completedAction,
+        string successMessage,
+        string repeatWarning,
+        Action? completion = null)
+    {
+        if (await Load(clearMessages: false))
+        {
+            completion?.Invoke();
+            ok = successMessage;
+            return;
+        }
+
+        var refreshError = error;
+        ok = null;
+        pendingRefreshCompletion = completion;
+        pendingRefreshSuccessMessage = successMessage;
+        error = $"{completedAction}, але оновити дані не вдалося. Повторіть завантаження; {repeatWarning}. Причина: {refreshError}";
     }
     // Фільтрує групи за пошуковим рядком.
     private IEnumerable<GroupEditDto> ApplyFilter(IEnumerable<GroupEditDto> seq)

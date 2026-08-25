@@ -14,6 +14,7 @@ using Microsoft.EntityFrameworkCore;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 
+[Collection(DocxImportTestCollection.Name)]
 public sealed class ScheduleEndpointCorrectnessTests
 {
     private static readonly DateOnly Monday = new(2026, 5, 4);
@@ -1108,9 +1109,21 @@ public sealed class ScheduleEndpointCorrectnessTests
             Module = module,
             ModuleTopic = topic
         };
-        fixture.Db.AddRange(canonicalType, draft);
+        var scheduleItem = new ScheduleItem
+        {
+            Date = new DateOnly(2026, 9, 7),
+            DayOfWeek = DayOfWeek.Monday,
+            StartTime = new TimeOnly(10, 0),
+            EndTime = new TimeOnly(10, 45),
+            LessonType = duplicateType,
+            Group = group,
+            Module = module,
+            ModuleTopic = topic
+        };
+        fixture.Db.AddRange(canonicalType, draft, scheduleItem);
         await fixture.Db.SaveChangesAsync();
         var draftRevision = draft.Revision;
+        var scheduleRevision = scheduleItem.Revision;
         var bytes = CreateTopicImportDocx(
             new[] { "1", duplicateType.Name, "1", "1", "0", "1.1 Перша тема" },
             new[] { "2", canonicalType.Name, "1", "1", "0", "1.2 Друга тема" });
@@ -1130,10 +1143,32 @@ public sealed class ScheduleEndpointCorrectnessTests
             .Where(item => item.Id == draft.Id)
             .Select(item => item.LessonTypeId)
             .SingleAsync());
-        Assert.Equal(draftRevision, await fixture.Db.TeacherDraftItems
+        Assert.NotEqual(draftRevision, await fixture.Db.TeacherDraftItems
             .Where(item => item.Id == draft.Id)
             .Select(item => item.Revision)
             .SingleAsync());
+        var staleDraftDelete = await new TeacherDraftsController(
+                fixture.Db,
+                new RulesService(fixture.Db),
+                queryService: null!,
+                exportService: null!,
+                autogenService: null!,
+                autogenJobService: null!,
+                publishService: null!)
+            .Delete(draft.Id, draftRevision);
+        Assert.IsType<ConflictObjectResult>(staleDraftDelete);
+        Assert.True(await fixture.Db.TeacherDraftItems.AnyAsync(item => item.Id == draft.Id));
+        Assert.Equal(canonicalType.Id, await fixture.Db.ScheduleItems
+            .Where(item => item.Id == scheduleItem.Id)
+            .Select(item => item.LessonTypeId)
+            .SingleAsync());
+        Assert.NotEqual(scheduleRevision, await fixture.Db.ScheduleItems
+            .Where(item => item.Id == scheduleItem.Id)
+            .Select(item => item.Revision)
+            .SingleAsync());
+        var staleDelete = await CreateController(fixture.Db).Delete(scheduleItem.Id, scheduleRevision);
+        Assert.IsType<ConflictObjectResult>(staleDelete);
+        Assert.True(await fixture.Db.ScheduleItems.AnyAsync(item => item.Id == scheduleItem.Id));
         Assert.All(
             await fixture.Db.ModuleTopics.AsNoTracking().ToListAsync(),
             importedTopic => Assert.Equal(canonicalType.Id, importedTopic.LessonTypeId));
@@ -1247,12 +1282,14 @@ public sealed class ScheduleEndpointCorrectnessTests
         await using var stream = new MemoryStream(bytes);
         var file = new FormFile(stream, 0, bytes.Length, "file", "КН-1.docx");
 
-        await Assert.ThrowsAsync<DbUpdateException>(() => new DocxImportService().ImportAsync(
+        var result = await new DocxImportService().ImportAsync(
             file,
             fixture.Db,
             apply: true,
-            CancellationToken.None));
+            CancellationToken.None);
 
+        Assert.NotNull(result.Error);
+        Assert.Contains("Імпорт скасовано", result.Error, StringComparison.OrdinalIgnoreCase);
         Assert.False(fixture.Db.ChangeTracker.HasChanges());
         Assert.Empty(await fixture.Db.Modules.ToListAsync());
         Assert.Empty(await fixture.Db.ModuleCourses.ToListAsync());

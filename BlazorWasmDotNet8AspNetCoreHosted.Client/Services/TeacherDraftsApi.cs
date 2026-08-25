@@ -6,6 +6,8 @@ using System.Net;
 // API-клієнт для роботи з викладацькими чернетками
 public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
 {
+    private const int MaxAutogenPlanChanges = 2_000;
+
     // Завантажує чернетки тижня для викладача.
     public async Task<List<TeacherDraftItemDto>> GetWeek(DateOnly weekStart, int? teacherId)
     {
@@ -68,10 +70,8 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
     }
     public async Task<AutoGenPlanDetailsDto> GetAutogenPlan(string jobId)
     {
-        var res = await http.GetAsync($"api/teacher-drafts/autogen/jobs/{Uri.EscapeDataString(jobId)}/plan");
-        await res.EnsureSuccessWithDetailsAsync();
-        return await res.Content.ReadFromJsonAsync<AutoGenPlanDetailsDto>()
-               ?? throw new InvalidOperationException("Сервер не повернув попередній план автогенерації.");
+        var firstPage = await GetAutogenPlanPage(jobId, changeOffset: 0);
+        return await LoadRemainingAutogenPlanChanges(jobId, firstPage);
     }
     public async Task<AutoGenPlanDetailsDto> ApplyAutogenPlan(string jobId, AutoGenPlanActionRequest request)
     {
@@ -95,15 +95,91 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
     {
         var url = ApiClientHelpers.WithQuery(
             "api/teacher-drafts/autogen/plans/latest-rollbackable",
-            ("courseId", courseId?.ToString()));
+            ("courseId", courseId?.ToString()),
+            ("changeOffset", "0"),
+            ("changeLimit", "200"));
         var res = await http.GetAsync(url);
         if (res.StatusCode is HttpStatusCode.NoContent or HttpStatusCode.NotFound)
         {
             return null;
         }
         await res.EnsureSuccessWithDetailsAsync();
+        var firstPage = await res.Content.ReadFromJsonAsync<AutoGenPlanDetailsDto>()
+                        ?? throw new InvalidOperationException("Сервер не повернув доступний план для відкоту автогенерації.");
+        return await LoadRemainingAutogenPlanChanges(firstPage.Summary.PlanId, firstPage);
+    }
+
+    private async Task<AutoGenPlanDetailsDto> GetAutogenPlanPage(string jobId, int changeOffset)
+    {
+        var url = ApiClientHelpers.WithQuery(
+            $"api/teacher-drafts/autogen/jobs/{Uri.EscapeDataString(jobId)}/plan",
+            ("changeOffset", changeOffset.ToString()),
+            ("changeLimit", "200"));
+        var res = await http.GetAsync(url);
+        await res.EnsureSuccessWithDetailsAsync();
         return await res.Content.ReadFromJsonAsync<AutoGenPlanDetailsDto>()
-               ?? throw new InvalidOperationException("Сервер не повернув доступний план для відкоту автогенерації.");
+               ?? throw new InvalidOperationException("Сервер не повернув попередній план автогенерації.");
+    }
+
+    private async Task<AutoGenPlanDetailsDto> LoadRemainingAutogenPlanChanges(
+        string jobId,
+        AutoGenPlanDetailsDto firstPage)
+    {
+        if (firstPage.TotalChanges is null)
+        {
+            if (firstPage.ChangeOffset != 0
+                || firstPage.Changes.Count > MaxAutogenPlanChanges)
+            {
+                throw new InvalidOperationException(
+                    "Сервер повернув некоректну застарілу відповідь плану автогенерації.");
+            }
+            return firstPage with { TotalChanges = firstPage.Changes.Count };
+        }
+
+        var totalChanges = firstPage.TotalChanges.Value;
+        if (firstPage.ChangeOffset != 0
+            || totalChanges is < 0 or > MaxAutogenPlanChanges
+            || firstPage.Changes.Count > totalChanges)
+        {
+            throw new InvalidOperationException(
+                "Сервер повернув некоректну кількість змін плану автогенерації.");
+        }
+        if (!firstPage.HasMoreChanges)
+        {
+            return firstPage;
+        }
+
+        var changes = new List<AutoGenPlanChangeDto>(totalChanges);
+        changes.AddRange(firstPage.Changes);
+        var offset = firstPage.ChangeOffset + firstPage.Changes.Count;
+        while (offset < totalChanges)
+        {
+            var page = await GetAutogenPlanPage(jobId, offset);
+            if (page.ChangeOffset != offset
+                || page.TotalChanges != totalChanges
+                || page.Summary.PlanId != firstPage.Summary.PlanId
+                || page.Summary.Version != firstPage.Summary.Version
+                || page.Changes.Count == 0
+                || page.Changes.Count > totalChanges - offset)
+            {
+                throw new InvalidOperationException(
+                    "Сервер повернув неузгоджену сторінку змін плану автогенерації.");
+            }
+
+            changes.AddRange(page.Changes);
+            offset += page.Changes.Count;
+        }
+        if (changes.Count != totalChanges)
+        {
+            throw new InvalidOperationException(
+                "Сервер повернув неповний план автогенерації.");
+        }
+
+        return firstPage with
+        {
+            Changes = changes,
+            ChangeOffset = 0
+        };
     }
     // Виконує попередню перевірку ресурсів без запису чернеток.
     public async Task<AutoGenResult> AutogenPreflightWeek(AutoGenRequest req)

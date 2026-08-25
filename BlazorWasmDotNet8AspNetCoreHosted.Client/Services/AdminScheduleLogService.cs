@@ -30,11 +30,15 @@ public sealed class AdminScheduleLogService
             {
                 return new();
             }
-            var items = JsonSerializer.Deserialize<List<AdminScheduleLogEntry>>(stored, JsonOptions);
-            return items ?? new();
+            var items = JsonSerializer.Deserialize<List<AdminScheduleLogEntry?>>(stored, JsonOptions);
+            return (items ?? new())
+                .Where(entry => entry is not null)
+                .Select(entry => NormalizeEntry(entry!))
+                .ToList();
         }
-        catch (JSException)
+        catch (Exception ex) when (ex is JsonException or NotSupportedException)
         {
+            await RemoveCorruptedStorageAsync();
             return new();
         }
     }
@@ -71,15 +75,21 @@ public sealed class AdminScheduleLogService
     }
 
     public async Task ClearAsync()
-    {
-        try
+        => await _js.InvokeVoidAsync("localStorage.removeItem", StorageKey);
+
+    // Видаляє пошкоджене локальне значення, щоб наступне відкриття журналу не падало повторно.
+    private async Task RemoveCorruptedStorageAsync()
+        => await _js.InvokeVoidAsync("localStorage.removeItem", StorageKey);
+
+    // Нормалізує записи зі старих версій схеми, де колекції могли бути відсутніми.
+    private static AdminScheduleLogEntry NormalizeEntry(AdminScheduleLogEntry entry)
+        => entry with
         {
-            await _js.InvokeVoidAsync("localStorage.removeItem", StorageKey);
-        }
-        catch (JSException)
-        {
-        }
-    }
+            ModuleHours = entry.ModuleHours ?? new(),
+            Warnings = entry.Warnings ?? new(),
+            GapDetails = entry.GapDetails ?? new(),
+            Lessons = entry.Lessons ?? new()
+        };
 }
 
 public sealed record AdminScheduleLogEntry(

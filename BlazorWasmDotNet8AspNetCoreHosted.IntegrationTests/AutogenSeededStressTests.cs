@@ -86,6 +86,17 @@ public sealed class AutogenSeededStressTests
         }
     }
 
+    [Fact(Timeout = 180_000)]
+    [Trait("Category", "AutogenQuality")]
+    public async Task Seeded_deficit_matrix_reports_each_expected_constraint()
+    {
+        var shortageCount = Enum.GetValues<StressShortageKind>().Length;
+
+        var completed = await RunDeficitMatrixAsync(FirstSeed + 40_000, shortageCount);
+
+        Assert.Equal(shortageCount, completed);
+    }
+
     [AutogenStressFact(Timeout = 3_600_000)]
     [Trait("Category", "AutogenStress")]
     public async Task Seeded_synthetic_stress_matrix_covers_thousands_of_distinct_inputs()
@@ -156,18 +167,27 @@ public sealed class AutogenSeededStressTests
             FirstSeed + 30_000,
             minimum: 1,
             maximum: 1_000_000);
+        // Scale-властивості залежать від позиції seed у shard (парність, кожен
+        // третій Large та кожен сьомий locked). Offset дає точний одноseedовий
+        // replay без повторного запуску всіх попередніх сценаріїв shard.
+        var firstScenarioIndex = ReadBoundedCount(
+            "AUTOGEN_STRESS_SCALE_INDEX_OFFSET",
+            0,
+            minimum: 0,
+            maximum: 41);
         var totalCreated = 0;
 
         for (var index = 0; index < scenarioCount; index++)
         {
             var seed = firstSeed + index;
+            var scenarioIndex = firstScenarioIndex + index;
             var scenario = StressScenario.CreateFeasible(
                 seed,
-                allowLockedSeed: index % 7 == 0,
-                forcedScale: index % 3 == 0 ? StressScale.Large : StressScale.Medium);
+                allowLockedSeed: scenarioIndex % 7 == 0,
+                forcedScale: scenarioIndex % 3 == 0 ? StressScale.Large : StressScale.Medium);
             var snapshot = await RunFeasibleScenarioAsync(
                 seed,
-                reverseInputOrder: index % 2 == 1,
+                reverseInputOrder: scenarioIndex % 2 == 1,
                 scenario);
             totalCreated += snapshot.Created;
         }
@@ -343,8 +363,8 @@ public sealed class AutogenSeededStressTests
             executionDb.ChangeTracker.Clear();
             var after = await executionDb.TeacherDraftItems.AsNoTracking().CountAsync();
             var diagnosticCount = (result.Preflight?.Count ?? 0)
-                                  + (result.GapDetails?.Count ?? 0)
-                                  + result.Warnings.Count;
+                                  + (result.GapDetails?.Count ?? 0);
+            var expectedCode = ExpectedDeficitCode(shortage);
 
             Assert.True(
                 result.Created == 0 && before == after,
@@ -354,6 +374,11 @@ public sealed class AutogenSeededStressTests
                 diagnosticCount > 0,
                 $"Seed {seed}: дефіцит {shortage} не отримав жодної структурованої діагностики.");
             Assert.True(
+                result.Preflight?.Any(item => item.Count > 0
+                                               && string.Equals(item.Code, expectedCode, StringComparison.Ordinal)) == true,
+                $"Seed {seed}: дефіцит {shortage} не повернув очікуваний код {expectedCode}. " +
+                $"Отримано: {string.Join(", ", result.Preflight?.Select(item => item.Code) ?? [])}.");
+            Assert.True(
                 result.GapDetails is null
                 || result.GapDetails.All(gap =>
                     AutoGenGapReasonClassifier.Classify(gap).Code is not AutoGenGapReasonCodes.Unknown),
@@ -362,6 +387,18 @@ public sealed class AutogenSeededStressTests
 
         return scenarioCount;
     }
+
+    private static string ExpectedDeficitCode(StressShortageKind shortage)
+        => shortage switch
+        {
+            StressShortageKind.Teacher => "teacher",
+            StressShortageKind.Room => "room",
+            StressShortageKind.Slot => "slot",
+            StressShortageKind.TeacherHours => "teacher",
+            StressShortageKind.RoomCapacity => "room",
+            StressShortageKind.Calendar => "calendar-capacity",
+            _ => throw new ArgumentOutOfRangeException(nameof(shortage), shortage, null)
+        };
 
     private static async Task RunLifecycleScenarioAsync(int seed)
     {
@@ -475,7 +512,7 @@ public sealed class AutogenSeededStressTests
     {
         for (var attempt = 0; attempt < 1_200; attempt++)
         {
-            var status = service.Get(jobId);
+            var status = await service.GetAsync(jobId);
             if (status?.State is not (AutoGenJobState.Queued or AutoGenJobState.Running))
             {
                 return Assert.IsType<AutoGenJobStatus>(status);
@@ -906,7 +943,9 @@ public sealed class AutogenSeededStressTests
                 RangeStartDate: rangeStart,
                 RangeEndDate: rangeEnd,
                 PreferredFirstMaxSlotOrderOverride: slotCount,
-                GroupRoomPreferences: preferences,
+                GroupRoomPreferences: shortage is StressShortageKind.Room or StressShortageKind.RoomCapacity
+                    ? null
+                    : preferences,
                 SoftOptions: new DraftAutoGenSoftOptions(
                     MaxParallelGroupsPerModuleInSlot: groupCount,
                     RecentRepeatWindowDays: 0,
@@ -972,7 +1011,7 @@ public sealed class AutogenSeededStressTests
                     Request = scenario.Request with
                     {
                         GroupIds = scenario.Request.GroupIds!.AsEnumerable().Reverse().ToList(),
-                        GroupRoomPreferences = scenario.Request.GroupRoomPreferences!
+                        GroupRoomPreferences = scenario.Request.GroupRoomPreferences?
                             .AsEnumerable()
                             .Reverse()
                             .ToList(),
@@ -1218,20 +1257,29 @@ public sealed class AutogenSeededStressTests
                 }
             }
 
-            if (scenario.Shortage is not StressShortageKind.TeacherHours)
+            foreach (var teacherId in teacherIds)
             {
-                foreach (var teacherId in teacherIds)
+                if (scenario.Shortage is StressShortageKind.TeacherHours)
                 {
-                    for (var dayIndex = 0; dayIndex < dayCount; dayIndex++)
+                    Db.TeacherWorkingHours.Add(new TeacherWorkingHour
                     {
-                        Db.TeacherWorkingHours.Add(new TeacherWorkingHour
-                        {
-                            TeacherId = teacherId,
-                            DayOfWeek = (DayOfWeek)((int)DayOfWeek.Monday + dayIndex),
-                            Start = starts[0],
-                            End = starts[^1].AddHours(1)
-                        });
-                    }
+                        TeacherId = teacherId,
+                        DayOfWeek = DayOfWeek.Sunday,
+                        Start = starts[0],
+                        End = starts[^1].AddHours(1)
+                    });
+                    continue;
+                }
+
+                for (var dayIndex = 0; dayIndex < dayCount; dayIndex++)
+                {
+                    Db.TeacherWorkingHours.Add(new TeacherWorkingHour
+                    {
+                        TeacherId = teacherId,
+                        DayOfWeek = (DayOfWeek)((int)DayOfWeek.Monday + dayIndex),
+                        Start = starts[0],
+                        End = starts[^1].AddHours(1)
+                    });
                 }
             }
 

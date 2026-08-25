@@ -9,17 +9,33 @@
 
 <PageTitle>Адмін • Кафедри</PageTitle>
 
-<h3 class="mb-3">Кафедри</h3>
+<h1 class="h3 mb-3">Кафедри</h1>
 
 @if (!string.IsNullOrWhiteSpace(error))
 {
-    <div class="alert alert-danger">@error</div>
+    <div class="alert alert-danger" role="alert">
+        @error
+        @if (loadFailed)
+        {
+            <div class="mt-2">
+                <button type="button" class="btn btn-sm btn-outline-danger" @onclick="RetryLoad" disabled="@(loading || mutationInProgress)">
+                    Повторити завантаження
+                </button>
+            </div>
+        }
+    </div>
 }
 @if (!string.IsNullOrWhiteSpace(ok))
 {
-    <div class="alert alert-success">@ok</div>
+    <div class="alert alert-success" role="status">@ok</div>
 }
 
+@if (loading)
+{
+    <div class="text-muted mb-3" role="status" aria-live="polite">Завантаження кафедр…</div>
+}
+
+<fieldset class="border-0 p-0 m-0 w-100" disabled="@IsInteractionBlocked">
 <div class="card p-3">
     <div class="d-flex justify-content-between align-items-center mb-2 gap-2 flex-wrap">
         <button class="btn btn-primary" @onclick="OpenCreate">Додати кафедру</button>
@@ -64,17 +80,33 @@
         </table>
     </div>
 </div>
+</fieldset>
 
 @if (editorOpen)
 {
     <AdminEditorModal Title="@DepartmentEditorTitle"
                       Subtitle="Вкажіть назву кафедри та її статус."
                       CssClass="department-editor"
+                      Busy="@(loading || mutationInProgress)"
                       OnClose="@CloseEditor">
+        @if (loadFailed)
+        {
+            <div class="alert alert-danger" role="alert">
+                <div class="fw-semibold">Операцію виконано, але дані не оновлено.</div>
+                <div class="small mt-1">@error</div>
+                <button type="button"
+                        class="btn btn-sm btn-outline-danger mt-2"
+                        @onclick="RetryLoad"
+                        disabled="@(loading || mutationInProgress)">
+                    @(loading ? "Завантаження…" : "Повторити лише завантаження")
+                </button>
+            </div>
+        }
+        <fieldset class="border-0 p-0 m-0 w-100" disabled="@IsInteractionBlocked">
         <div class="row g-3 align-items-end">
             <div class="col-12 col-md-8">
-                <label class="form-label">Назва</label>
-                <input class="form-control" @bind="form.Name" />
+                <label class="form-label" for="department-name">Назва</label>
+                <input id="department-name" class="form-control" @bind="form.Name" />
             </div>
             <div class="col-12 col-md-4">
                 <div class="form-check mt-4">
@@ -84,9 +116,10 @@
             </div>
         </div>
         <div class="editor-actions">
-            <button class="btn btn-primary" @onclick="Save">Зберегти</button>
+            <button class="btn btn-primary" @onclick="Save">@(saving ? "Збереження…" : "Зберегти")</button>
             <button class="btn btn-outline-secondary" @onclick="CloseEditor">Скасувати</button>
         </div>
+        </fieldset>
     </AdminEditorModal>
 }
 
@@ -95,6 +128,10 @@
     private List<DepartmentEditDto> items = new();
     private DepartmentEditDto form = NewForm();
     private bool editorOpen;
+    private bool loading, saving, loadFailed, mutationInProgress;
+    private bool IsInteractionBlocked => loading || mutationInProgress || loadFailed;
+    private Action? pendingRefreshCompletion;
+    private string? pendingRefreshSuccessMessage;
     private string? filter;
     private string sortField = nameof(DepartmentEditDto.Name);
     private bool sortAsc = true;
@@ -120,39 +157,71 @@
     // Початкове завантаження списку кафедр.
     protected override async Task OnInitializedAsync() => await Load();
     // Завантажує кафедри з API.
-    private async Task Load()
+    private async Task<bool> Load(bool clearMessages = true)
     {
+        error = null;
+        if (clearMessages) ok = null;
+        loading = true;
+        loadFailed = false;
         try
         {
-            error = ok = null;
-            items = await Http.GetFromJsonWithDetailsAsync<List<DepartmentEditDto>>("api/admin/departments") ?? new();
+            var loadedItems = await Http.GetFromJsonWithDetailsAsync<List<DepartmentEditDto>>("api/admin/departments") ?? new();
+            items = loadedItems;
+            return true;
         }
         catch (Exception ex)
         {
-            error = ex.Message;
+            loadFailed = true;
+            error = $"Не вдалося завантажити кафедри: {ex.Message}";
+            return false;
         }
+        finally { loading = false; }
+    }
+    // Повторює лише завантаження після вже виконаної серверної операції.
+    private async Task RetryLoad()
+    {
+        if (loading || mutationInProgress) return;
+        if (!await Load(clearMessages: false)) return;
+        var completion = pendingRefreshCompletion;
+        var successMessage = pendingRefreshSuccessMessage;
+        pendingRefreshCompletion = null;
+        pendingRefreshSuccessMessage = null;
+        completion?.Invoke();
+        if (!string.IsNullOrWhiteSpace(successMessage)) ok = successMessage;
     }
     // Зберігає кафедру через API.
     private async Task Save()
     {
+        if (IsInteractionBlocked) return;
+        mutationInProgress = true;
+        saving = true;
         try
         {
             error = null;
             ok = null;
             var resp = await Http.PostAsJsonAsync("api/admin/departments/upsert", form);
             await resp.EnsureSuccessWithDetailsAsync();
-            await Load();
-            ok = "Збережено.";
-            CloseEditor();
+            await FinishMutationAsync(
+                "Кафедру збережено",
+                "Збережено.",
+                "повторно зберігати кафедру не потрібно",
+                CloseEditor);
         }
         catch (Exception ex)
         {
             error = ex.Message;
         }
+        finally
+        {
+            saving = false;
+            mutationInProgress = false;
+        }
     }
     // Видаляє кафедру з підтвердженням та force-режимом.
     private async Task Delete(int id)
     {
+        if (IsInteractionBlocked) return;
+        mutationInProgress = true;
         try
         {
             error = null;
@@ -171,13 +240,37 @@
                 resp = await Http.DeleteAsync($"api/admin/departments/{id}?confirm=true&force=true");
             }
             await resp.EnsureSuccessWithDetailsAsync();
-            await Load();
-            ok = "Видалено.";
+            await FinishMutationAsync(
+                "Кафедру видалено",
+                "Видалено.",
+                "повторно видаляти кафедру не потрібно",
+                editorOpen && form.Id == id ? CloseEditor : null);
         }
         catch (Exception ex)
         {
             error = ex.Message;
         }
+        finally { mutationInProgress = false; }
+    }
+    // Завершує мутацію лише після успішного оновлення локального списку.
+    private async Task FinishMutationAsync(
+        string completedAction,
+        string successMessage,
+        string repeatWarning,
+        Action? completion = null)
+    {
+        if (await Load(clearMessages: false))
+        {
+            completion?.Invoke();
+            ok = successMessage;
+            return;
+        }
+
+        var refreshError = error;
+        ok = null;
+        pendingRefreshCompletion = completion;
+        pendingRefreshSuccessMessage = successMessage;
+        error = $"{completedAction}, але оновити дані не вдалося. Повторіть завантаження; {repeatWarning}. Причина: {refreshError}";
     }
     // Перемикає напрямок сортування.
     private void ToggleSort(string field)

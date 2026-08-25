@@ -16,11 +16,37 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 
 public sealed class AutogenLecturePackingTests
 {
+    [Fact]
+    public async Task Hard_rule_validator_fails_closed_for_reversed_date_range()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        await using var db = new AppDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+
+        var result = await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(
+            new TeacherDraftsAutogenHardRuleValidationRequest(
+                CourseId: 1,
+                GroupIds: Array.Empty<int>(),
+                From: new DateOnly(2026, 9, 8),
+                To: new DateOnly(2026, 9, 7)));
+
+        Assert.True(result.HasViolations);
+        Assert.Contains(
+            result.Violations,
+            violation => violation.Contains("кінцева дата передує початковій", StringComparison.Ordinal));
+    }
+
     [Fact]
     public void Global_catch_up_atomic_repair_waits_for_last_group_in_rotated_round()
     {
@@ -41,6 +67,132 @@ public sealed class AutogenLecturePackingTests
     }
 
     [Theory]
+    [InlineData(true, 2, 1, 5, true)]
+    [InlineData(true, 2, 5, 5, true)]
+    [InlineData(true, 2, 6, 5, false)]
+    [InlineData(true, 1, 1, 5, false)]
+    [InlineData(false, 2, 1, 5, false)]
+    [InlineData(true, 2, 0, 5, false)]
+    [InlineData(true, 2, 1, 0, false)]
+    public void Global_catch_up_interleaves_dates_only_while_multiple_groups_remain(
+        bool clearExisting,
+        int pendingGroupCount,
+        int round,
+        int workingDateCount,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            GlobalCatchUpRepairPlanner.ShouldUseInterleavedDateRound(
+                clearExisting,
+                pendingGroupCount,
+                round,
+                workingDateCount));
+    }
+
+    [Theory]
+    [InlineData(1, 2, true, true)]
+    [InlineData(0, 2, true, false)]
+    [InlineData(1, 1, true, false)]
+    [InlineData(1, 2, false, false)]
+    public void Global_catch_up_runs_cross_date_compaction_once_on_final_processable_date(
+        int remainingPlacements,
+        int processableDateCount,
+        bool isFinalProcessableDate,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            GlobalCatchUpRepairPlanner.ShouldRunCrossDateChronologyCompaction(
+                remainingPlacements,
+                processableDateCount,
+                isFinalProcessableDate));
+    }
+
+    [Theory]
+    [InlineData(true, 6, new[] { 5, 85 }, true)]
+    [InlineData(true, 86, new[] { 5, 85 }, false)]
+    [InlineData(true, 6, new[] { 5 }, false)]
+    [InlineData(false, 6, new[] { 5, 85 }, false)]
+    public void Global_catch_up_continues_only_for_pending_groups_with_unvisited_dates(
+        bool clearExisting,
+        int nextRound,
+        int[] pendingWorkingDateCounts,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            GlobalCatchUpRepairPlanner.HasPendingInterleavedDateRound(
+                clearExisting,
+                nextRound,
+                pendingWorkingDateCounts));
+    }
+
+    [Theory]
+    [InlineData(true, 2, 6, 5, 85, true)]
+    [InlineData(true, 2, 5, 5, 85, false)]
+    [InlineData(true, 1, 6, 5, 85, false)]
+    [InlineData(true, 2, 86, 5, 85, false)]
+    [InlineData(false, 2, 6, 5, 85, false)]
+    public void Global_catch_up_does_not_rescan_short_calendar_during_long_peer_rounds(
+        bool clearExisting,
+        int pendingGroupCount,
+        int round,
+        int groupWorkingDateCount,
+        int maxPendingWorkingDateCount,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            GlobalCatchUpRepairPlanner.ShouldSkipExhaustedGroupDuringInterleavedDateRounds(
+                clearExisting,
+                pendingGroupCount,
+                round,
+                groupWorkingDateCount,
+                maxPendingWorkingDateCount));
+    }
+
+    [Theory]
+    [InlineData(new int[] { }, 0)]
+    [InlineData(new[] { 1 }, 1)]
+    [InlineData(new[] { 1, 1, 1, 1, 1 }, 5)]
+    [InlineData(new[] { 2, 0, -4, 3 }, 5)]
+    [InlineData(new[] { int.MaxValue, 1 }, int.MaxValue)]
+    public void Global_catch_up_bounds_emergency_singletons_by_one_group_curriculum(
+        int[] shareableTopicUsageLimits,
+        int expected)
+    {
+        Assert.Equal(
+            expected,
+            GlobalCatchUpRepairPlanner.CalculateEmergencySingletonSharedLectureBudget(
+                shareableTopicUsageLimits));
+    }
+
+    [Theory]
+    [InlineData(0, 5, null, 12, true)]
+    [InlineData(1, 5, 12, 12, true)]
+    [InlineData(1, 5, 12, 13, false)]
+    [InlineData(5, 5, 12, 12, false)]
+    [InlineData(0, 0, null, 12, false)]
+    [InlineData(-1, 5, null, 12, false)]
+    [InlineData(0, 5, null, 0, false)]
+    public void Global_catch_up_allows_emergency_singletons_only_for_same_owner_group(
+        int createdCount,
+        int maximumCount,
+        int? ownerGroupId,
+        int candidateGroupId,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            GlobalCatchUpRepairPlanner.CanSpendEmergencySingletonSharedLectureBudget(
+                createdCount,
+                maximumCount,
+                ownerGroupId,
+                candidateGroupId));
+    }
+
+    [Theory]
     [InlineData(false, 5, false)]
     [InlineData(true, 0, false)]
     [InlineData(true, 5, true)]
@@ -56,7 +208,7 @@ public sealed class AutogenLecturePackingTests
         Assert.Equal(retryExpected, plan.ContinueCatchUp);
         Assert.Equal(retryExpected, plan.RequestAtomicRepair);
         Assert.Equal(retryExpected, plan.AllowAtomicRepairRetry);
-        Assert.Equal(retryExpected, plan.ResetExhaustedSearchBudgets);
+        Assert.Equal(retryExpected, plan.ResetSearchLimitDiagnostics);
     }
 
     [Theory]
@@ -72,14 +224,38 @@ public sealed class AutogenLecturePackingTests
     }
 
     [Theory]
-    [InlineData(0, 1, false)]
-    [InlineData(1, 0, false)]
-    [InlineData(8, 1, true)]
-    [InlineData(9, 1, false)]
-    [InlineData(21, 7, true)]
-    [InlineData(22, 7, false)]
+    [InlineData(true, 12, 11, true)]
+    [InlineData(true, 11, 11, false)]
+    [InlineData(true, 10, 11, false)]
+    [InlineData(false, 12, 11, false)]
+    [InlineData(true, -1, 0, false)]
+    public void Global_catch_up_rearms_atomic_repair_only_after_productive_progress(
+        bool repairAttempted,
+        int remainingBeforeRound,
+        int remainingAfterRound,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            GlobalCatchUpRepairPlanner.ShouldRearmAtomicRepairAfterProductiveRound(
+                repairAttempted,
+                remainingBeforeRound,
+                remainingAfterRound));
+    }
+
+    [Theory]
+    [InlineData(0, 1, 1, false)]
+    [InlineData(1, 1, 0, false)]
+    [InlineData(1, 0, 1, false)]
+    [InlineData(8, 8, 1, true)]
+    [InlineData(9, 9, 1, false)]
+    [InlineData(21, 21, 7, true)]
+    [InlineData(22, 22, 7, false)]
+    [InlineData(60, 2, 17, true)]
+    [InlineData(60, 52, 17, false)]
     public void Global_catch_up_atomic_repair_runs_only_for_bounded_tail(
         int remainingPlacements,
+        int pendingSharedTailFrontierRows,
         int selectedGroupCount,
         bool expected)
     {
@@ -87,19 +263,25 @@ public sealed class AutogenLecturePackingTests
             expected,
             GlobalCatchUpRepairPlanner.CanRunAtomicSharedTailRepair(
                 remainingPlacements,
+                pendingSharedTailFrontierRows,
                 selectedGroupCount));
     }
 
     [Theory]
-    [InlineData(2, 5)]
-    [InlineData(3, 6)]
+    [InlineData(2, 0, 5)]
+    [InlineData(3, 1, 6)]
+    [InlineData(2, 85, 88)]
+    [InlineData(int.MaxValue, 85, int.MaxValue)]
     public void Global_catch_up_round_limit_reserves_atomic_transition_retries(
         int remainingPlacements,
+        int minimumProductiveRounds,
         int expectedRoundLimit)
     {
         Assert.Equal(
             expectedRoundLimit,
-            GlobalCatchUpRepairPlanner.CalculateMaxCatchUpRounds(remainingPlacements));
+            GlobalCatchUpRepairPlanner.CalculateMaxCatchUpRounds(
+                remainingPlacements,
+                minimumProductiveRounds));
     }
 
     [Fact]
@@ -787,6 +969,605 @@ public sealed class AutogenLecturePackingTests
                 data.Date,
                 data.Date.AddDays(1)));
         Assert.Empty(hardRuleValidation.Violations);
+    }
+
+    [Fact]
+    public async Task Draft_autogen_does_not_hold_ready_shared_pack_for_sequence_unready_group()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        await using var db = new AppDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+
+        var date = new DateOnly(2026, 6, 1);
+        const int courseId = 8_101;
+        var groupIds = new[] { 8_111, 8_112, 8_113 };
+        const int prerequisiteModuleId = 8_121;
+        const int lectureModuleId = 8_122;
+        const int practiceTypeId = 8_131;
+        const int lectureTypeId = 8_132;
+        const int lectureTeacherId = 8_141;
+        const int buildingId = 8_151;
+        var roomIds = new[] { 8_161, 8_162, 8_163 };
+        const int prerequisiteTopicId = 8_171;
+        const int lectureTopicId = 8_172;
+
+        db.Courses.Add(new Course
+        {
+            Id = courseId,
+            Name = "Курс із групою, що відстає",
+            DurationWeeks = 1,
+            AcademicPeriodStartDate = date
+        });
+        db.Groups.AddRange(groupIds.Select((groupId, index) => new Group
+        {
+            Id = groupId,
+            CourseId = courseId,
+            Name = $"Група {index + 1}",
+            StudentsCount = 20
+        }));
+        db.LessonTypes.AddRange(
+            new LessonTypeRef
+            {
+                Id = practiceTypeId,
+                Code = "PRACTICE",
+                Name = "Практичне заняття",
+                IsActive = true,
+                CountInPlan = true,
+                RequiresTeacher = true,
+                RequiresRoom = false,
+                BlocksTeacher = false,
+                BlocksRoom = false
+            },
+            new LessonTypeRef
+            {
+                Id = lectureTypeId,
+                Code = "LECTURE",
+                Name = "Лекція",
+                IsActive = true,
+                CountInPlan = true,
+                PreferredFirstInWeek = true,
+                RequiresTeacher = true,
+                RequiresRoom = true,
+                BlocksTeacher = true,
+                BlocksRoom = true
+            });
+        db.Modules.AddRange(
+            new Module
+            {
+                Id = prerequisiteModuleId,
+                CourseId = courseId,
+                Code = "PRE",
+                Title = "Попередній модуль",
+                Credits = 1
+            },
+            new Module
+            {
+                Id = lectureModuleId,
+                CourseId = courseId,
+                Code = "LECT",
+                Title = "Наступний лекційний модуль",
+                Credits = 1
+            });
+        db.ModulePlans.AddRange(
+            new ModulePlan
+            {
+                CourseId = courseId,
+                ModuleId = prerequisiteModuleId,
+                TargetHours = 1,
+                IsActive = true
+            },
+            new ModulePlan
+            {
+                CourseId = courseId,
+                ModuleId = lectureModuleId,
+                TargetHours = 1,
+                IsActive = true
+            });
+        db.ModuleTopics.AddRange(
+            new ModuleTopic
+            {
+                Id = prerequisiteTopicId,
+                ModuleId = prerequisiteModuleId,
+                Order = 1,
+                TopicCode = "PRE.1",
+                LessonTypeId = practiceTypeId,
+                TotalHours = 1,
+                AuditoriumHours = 1
+            },
+            new ModuleTopic
+            {
+                Id = lectureTopicId,
+                ModuleId = lectureModuleId,
+                Order = 1,
+                TopicCode = "LECT.1",
+                LessonTypeId = lectureTypeId,
+                TotalHours = 1,
+                AuditoriumHours = 1
+            });
+        db.ModuleSequenceItems.AddRange(
+            new ModuleSequenceItem
+            {
+                CourseId = courseId,
+                ModuleId = prerequisiteModuleId,
+                GroupOrder = 1,
+                Order = 1
+            },
+            new ModuleSequenceItem
+            {
+                CourseId = courseId,
+                ModuleId = lectureModuleId,
+                GroupOrder = 2,
+                Order = 2
+            });
+        db.Buildings.Add(new Building { Id = buildingId, Name = "Навчальний корпус" });
+        db.Rooms.AddRange(roomIds.Select((roomId, index) => new Room
+        {
+            Id = roomId,
+            BuildingId = buildingId,
+            Name = $"Аудиторія {index + 1}",
+            Capacity = 100
+        }));
+        db.ModuleRooms.AddRange(roomIds.Select(roomId => new ModuleRoom
+        {
+            ModuleId = lectureModuleId,
+            RoomId = roomId
+        }));
+        db.Teachers.Add(new Teacher { Id = lectureTeacherId, FullName = "Викладач лекції" });
+        db.TeacherModules.Add(new TeacherModule
+        {
+            TeacherId = lectureTeacherId,
+            ModuleId = lectureModuleId
+        });
+        db.TeacherWorkingHours.Add(new TeacherWorkingHour
+        {
+            TeacherId = lectureTeacherId,
+            DayOfWeek = DayOfWeek.Tuesday,
+            Start = new TimeOnly(8, 0),
+            End = new TimeOnly(9, 0)
+        });
+        db.TimeSlots.AddRange(
+            new TimeSlot
+            {
+                Id = 8_181,
+                CourseId = courseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0),
+                SortOrder = 1,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                Id = 8_182,
+                CourseId = courseId,
+                DayOfWeek = DayOfWeek.Tuesday,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0),
+                SortOrder = 1,
+                IsActive = true
+            });
+        db.ScheduleItems.AddRange(groupIds.Take(2).Select(groupId => new ScheduleItem
+        {
+            Date = date,
+            DayOfWeek = DayOfWeek.Monday,
+            StartTime = new TimeOnly(8, 0),
+            EndTime = new TimeOnly(9, 0),
+            GroupId = groupId,
+            ModuleId = prerequisiteModuleId,
+            ModuleTopicId = prerequisiteTopicId,
+            TeacherId = lectureTeacherId,
+            LessonTypeId = practiceTypeId
+        }));
+        await db.SaveChangesAsync();
+
+        var request = new DraftAutoGenRequest(
+            WeekStart: date,
+            ClearExisting: false,
+            CourseId: courseId,
+            GroupIds: groupIds.ToList(),
+            Days: WeekPreset.MonFri,
+            ModuleHours: new Dictionary<int, int>
+            {
+                [prerequisiteModuleId] = 1,
+                [lectureModuleId] = 1
+            },
+            SoftFill: true,
+            AllowIncompleteDrafts: false,
+            RangeStartDate: date,
+            RangeEndDate: date.AddDays(1),
+            PreferredFirstMaxSlotOrderOverride: 1,
+            GroupRoomPreferences: groupIds.Select((groupId, index) => new GroupRoomPreferenceDto(
+                groupId,
+                buildingId,
+                new List<int> { roomIds[index] })).ToList(),
+            SoftOptions: new DraftAutoGenSoftOptions(
+                MaxParallelGroupsPerModuleInSlot: groupIds.Length,
+                RecentRepeatWindowDays: 0));
+
+        var action = await new TeacherDraftsAutogenService(db).DraftAutoGen(request);
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+        var lectureDrafts = await db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => item.ModuleId == lectureModuleId)
+            .OrderBy(item => item.GroupId)
+            .ToListAsync();
+
+        Assert.Equal(2, result.Created);
+        Assert.Equal(groupIds.Take(2), lectureDrafts.Select(item => item.GroupId));
+        Assert.All(lectureDrafts, item =>
+        {
+            Assert.Equal(date.AddDays(1), item.Date);
+            Assert.Equal(lectureTopicId, item.ModuleTopicId);
+        });
+        Assert.Single(lectureDrafts.Select(item => new
+        {
+            item.Date,
+            item.StartTime,
+            item.EndTime,
+            item.TeacherId,
+            item.RoomId
+        }).Distinct());
+        Assert.DoesNotContain(lectureDrafts, item => item.GroupId == groupIds[2]);
+        Assert.NotEmpty(result.GapDetails ?? []);
+        Assert.All(result.GapDetails!, gap => Assert.Equal(groupIds[2], gap.GroupId));
+    }
+
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    public async Task Draft_autogen_atomic_shared_tail_uses_early_equal_target_to_preserve_later_sequence_capacity(
+        bool useModuleHourOverrides,
+        bool clearExisting)
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        await using var db = new AppDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+
+        var monday = new DateOnly(2026, 6, 1);
+        var tuesday = monday.AddDays(1);
+        var wednesday = monday.AddDays(2);
+        const int courseId = 8_201;
+        const int completedGroupId = 8_211;
+        const int laggingGroupId = 8_212;
+        const int prerequisiteModuleId = 8_221;
+        const int sharedModuleId = 8_222;
+        const int laterModuleId = 8_223;
+        const int practiceTypeId = 8_231;
+        const int lectureTypeId = 8_232;
+        const int lectureTeacherId = 8_241;
+        const int buildingId = 8_251;
+        const int roomId = 8_261;
+        const int prerequisiteTopicId = 8_271;
+        const int sharedTopicId = 8_272;
+        const int laterTopicId = 8_273;
+
+        db.Courses.Add(new Course
+        {
+            Id = courseId,
+            Name = "Курс із завершальним потоковим хвостом",
+            DurationWeeks = 1,
+            AcademicPeriodStartDate = monday
+        });
+        db.Groups.AddRange(
+            new Group
+            {
+                Id = completedGroupId,
+                CourseId = courseId,
+                Name = "Група із завершеним планом",
+                StudentsCount = 20
+            },
+            new Group
+            {
+                Id = laggingGroupId,
+                CourseId = courseId,
+                Name = "Група із потоковим хвостом",
+                StudentsCount = 20
+            });
+        db.LessonTypes.AddRange(
+            new LessonTypeRef
+            {
+                Id = practiceTypeId,
+                Code = "PRACTICE",
+                Name = "Практичне заняття",
+                IsActive = true,
+                CountInPlan = true,
+                RequiresTeacher = false,
+                RequiresRoom = false,
+                BlocksTeacher = false,
+                BlocksRoom = false
+            },
+            new LessonTypeRef
+            {
+                Id = lectureTypeId,
+                Code = "LECTURE",
+                Name = "Лекція",
+                IsActive = true,
+                CountInPlan = true,
+                PreferredFirstInWeek = true,
+                RequiresTeacher = true,
+                RequiresRoom = true,
+                BlocksTeacher = true,
+                BlocksRoom = true
+            });
+        db.Modules.AddRange(
+            new Module
+            {
+                Id = prerequisiteModuleId,
+                CourseId = courseId,
+                Code = "PRE",
+                Title = "Попередній модуль",
+                Credits = 1
+            },
+            new Module
+            {
+                Id = sharedModuleId,
+                CourseId = courseId,
+                Code = "SHARED",
+                Title = "Спільний контрольний модуль",
+                Credits = 1
+            },
+            new Module
+            {
+                Id = laterModuleId,
+                CourseId = courseId,
+                Code = "LATER",
+                Title = "Наступний модуль",
+                Credits = 1
+            });
+        db.ModulePlans.AddRange(
+            new ModulePlan
+            {
+                CourseId = courseId,
+                ModuleId = prerequisiteModuleId,
+                TargetHours = 1,
+                IsActive = true
+            },
+            new ModulePlan
+            {
+                CourseId = courseId,
+                ModuleId = sharedModuleId,
+                TargetHours = 1,
+                IsActive = true
+            },
+            new ModulePlan
+            {
+                CourseId = courseId,
+                ModuleId = laterModuleId,
+                TargetHours = 8,
+                IsActive = true
+            });
+        db.ModuleTopics.AddRange(
+            new ModuleTopic
+            {
+                Id = prerequisiteTopicId,
+                ModuleId = prerequisiteModuleId,
+                Order = 1,
+                TopicCode = "PRE.1",
+                LessonTypeId = practiceTypeId,
+                TotalHours = 1,
+                AuditoriumHours = 1
+            },
+            new ModuleTopic
+            {
+                Id = sharedTopicId,
+                ModuleId = sharedModuleId,
+                Order = 1,
+                TopicCode = "SHARED.1",
+                LessonTypeId = lectureTypeId,
+                TotalHours = 1,
+                AuditoriumHours = 1
+            },
+            new ModuleTopic
+            {
+                Id = laterTopicId,
+                ModuleId = laterModuleId,
+                Order = 1,
+                TopicCode = "LATER.1",
+                LessonTypeId = practiceTypeId,
+                TotalHours = 8,
+                AuditoriumHours = 8
+            });
+        db.ModuleSequenceItems.AddRange(
+            new ModuleSequenceItem
+            {
+                CourseId = courseId,
+                ModuleId = prerequisiteModuleId,
+                GroupOrder = 1,
+                Order = 1
+            },
+            new ModuleSequenceItem
+            {
+                CourseId = courseId,
+                ModuleId = sharedModuleId,
+                GroupOrder = 2,
+                Order = 2
+            },
+            new ModuleSequenceItem
+            {
+                CourseId = courseId,
+                ModuleId = laterModuleId,
+                GroupOrder = 3,
+                Order = 3
+            });
+        db.Buildings.Add(new Building { Id = buildingId, Name = "Навчальний корпус" });
+        db.Rooms.Add(new Room
+        {
+            Id = roomId,
+            BuildingId = buildingId,
+            Name = "Потокова аудиторія",
+            Capacity = 100
+        });
+        db.ModuleRooms.Add(new ModuleRoom { ModuleId = sharedModuleId, RoomId = roomId });
+        db.Teachers.Add(new Teacher { Id = lectureTeacherId, FullName = "Викладач лекції" });
+        db.TeacherModules.Add(new TeacherModule
+        {
+            TeacherId = lectureTeacherId,
+            ModuleId = sharedModuleId
+        });
+        db.TeacherWorkingHours.AddRange(new[]
+            {
+                DayOfWeek.Monday,
+                DayOfWeek.Tuesday,
+                DayOfWeek.Wednesday
+            }
+            .Select(dayOfWeek => new TeacherWorkingHour
+            {
+                TeacherId = lectureTeacherId,
+                DayOfWeek = dayOfWeek,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(10, 0)
+            }));
+        db.TimeSlots.AddRange(
+            new TimeSlot
+            {
+                Id = 8_281,
+                CourseId = courseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0),
+                SortOrder = 1,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                Id = 8_282,
+                CourseId = courseId,
+                DayOfWeek = DayOfWeek.Monday,
+                Start = new TimeOnly(9, 0),
+                End = new TimeOnly(10, 0),
+                SortOrder = 2,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                Id = 8_283,
+                CourseId = courseId,
+                DayOfWeek = DayOfWeek.Tuesday,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0),
+                SortOrder = 1,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                Id = 8_284,
+                CourseId = courseId,
+                DayOfWeek = DayOfWeek.Wednesday,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 0),
+                SortOrder = 1,
+                IsActive = true
+            });
+        db.ScheduleItems.AddRange(
+            new ScheduleItem
+            {
+                Date = monday,
+                DayOfWeek = DayOfWeek.Monday,
+                StartTime = new TimeOnly(8, 0),
+                EndTime = new TimeOnly(9, 0),
+                GroupId = completedGroupId,
+                ModuleId = prerequisiteModuleId,
+                ModuleTopicId = prerequisiteTopicId,
+                LessonTypeId = practiceTypeId
+            },
+            new ScheduleItem
+            {
+                Date = monday,
+                DayOfWeek = DayOfWeek.Monday,
+                StartTime = new TimeOnly(9, 0),
+                EndTime = new TimeOnly(10, 0),
+                GroupId = completedGroupId,
+                ModuleId = sharedModuleId,
+                ModuleTopicId = sharedTopicId,
+                LessonTypeId = lectureTypeId,
+                TeacherId = lectureTeacherId,
+                RoomId = roomId
+            },
+            new ScheduleItem
+            {
+                Date = monday,
+                DayOfWeek = DayOfWeek.Monday,
+                StartTime = new TimeOnly(9, 0),
+                EndTime = new TimeOnly(10, 0),
+                GroupId = laggingGroupId,
+                ModuleId = prerequisiteModuleId,
+                ModuleTopicId = prerequisiteTopicId,
+                LessonTypeId = practiceTypeId
+            });
+        var completedLaterPlacements = new[]
+        {
+            (Date: tuesday, Start: new TimeOnly(8, 0)),
+            (Date: wednesday, Start: new TimeOnly(8, 0)),
+            (Date: monday.AddDays(7), Start: new TimeOnly(8, 0)),
+            (Date: monday.AddDays(7), Start: new TimeOnly(9, 0)),
+            (Date: monday.AddDays(8), Start: new TimeOnly(8, 0)),
+            (Date: monday.AddDays(9), Start: new TimeOnly(8, 0)),
+            (Date: monday.AddDays(14), Start: new TimeOnly(8, 0)),
+            (Date: monday.AddDays(14), Start: new TimeOnly(9, 0))
+        };
+        db.ScheduleItems.AddRange(completedLaterPlacements.Select(placement => new ScheduleItem
+        {
+            Date = placement.Date,
+            DayOfWeek = placement.Date.DayOfWeek,
+            StartTime = placement.Start,
+            EndTime = placement.Start.AddHours(1),
+            GroupId = completedGroupId,
+            ModuleId = laterModuleId,
+            ModuleTopicId = laterTopicId,
+            LessonTypeId = practiceTypeId
+        }));
+        await db.SaveChangesAsync();
+
+        var request = new DraftAutoGenRequest(
+            WeekStart: monday,
+            ClearExisting: clearExisting,
+            CourseId: courseId,
+            GroupIds: new List<int> { completedGroupId, laggingGroupId },
+            Days: WeekPreset.MonFri,
+            ModuleHours: useModuleHourOverrides
+                ? new Dictionary<int, int>
+                {
+                    [prerequisiteModuleId] = 1,
+                    [sharedModuleId] = 1,
+                    [laterModuleId] = 8
+                }
+                : null,
+            SoftFill: true,
+            AllowIncompleteDrafts: false,
+            RangeStartDate: monday,
+            RangeEndDate: monday.AddDays(16),
+            PreferredFirstMaxSlotOrderOverride: 1,
+            SoftOptions: new DraftAutoGenSoftOptions(
+                MaxParallelGroupsPerModuleInSlot: 2,
+                RecentRepeatWindowDays: 0));
+
+        var action = await new TeacherDraftsAutogenService(db).DraftAutoGen(request);
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+        var generatedForLaggingGroup = await db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => item.GroupId == laggingGroupId)
+            .OrderBy(item => item.Date)
+            .ThenBy(item => item.StartTime)
+            .ToListAsync();
+
+        Assert.Equal(9, result.Created);
+        Assert.Equal(sharedTopicId, generatedForLaggingGroup[0].ModuleTopicId);
+        Assert.All(
+            generatedForLaggingGroup.Skip(1),
+            item => Assert.Equal(laterTopicId, item.ModuleTopicId));
+        Assert.Equal(tuesday, generatedForLaggingGroup[0].Date);
+        Assert.Empty(result.GapDetails ?? []);
     }
 
     [Fact]
@@ -1797,6 +2578,454 @@ public sealed class AutogenLecturePackingTests
         Assert.Equal(status, persistedProtected.Status);
         Assert.Equal(isLocked, persistedProtected.IsLocked);
         Assert.Equal(batchKey, persistedProtected.BatchKey);
+    }
+
+    [Fact]
+    public async Task Draft_autogen_normal_repair_joins_one_pending_group_to_existing_shared_occurrence()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        await using var db = new AppDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var data = await SeedSevenGroupLectureScenarioAsync(db);
+        var date = new DateOnly(2026, 4, 27);
+        var pendingGroupId = data.GroupIds[^1];
+        var lectureTypeId = await db.ModuleTopics
+            .Where(topic => topic.Id == data.LectureTopicId)
+            .Select(topic => topic.LessonTypeId)
+            .SingleAsync();
+        var workTopic = await db.ModuleTopics
+            .SingleAsync(topic => topic.ModuleId == data.WorkModuleId);
+
+        foreach (var groupId in data.GroupIds.Take(data.GroupIds.Count - 1))
+        {
+            db.TeacherDraftItems.Add(new TeacherDraftItem
+            {
+                Date = date,
+                DayOfWeek = date.DayOfWeek,
+                StartTime = new TimeOnly(8, 0),
+                EndTime = new TimeOnly(9, 20),
+                GroupId = groupId,
+                ModuleId = data.LectureModuleId,
+                ModuleTopicId = data.LectureTopicId,
+                LessonTypeId = lectureTypeId,
+                TeacherId = 1,
+                RoomId = 1,
+                Status = DraftStatus.Draft,
+                IsLocked = false
+            });
+        }
+        db.TeacherDraftItems.Add(new TeacherDraftItem
+        {
+            Date = date,
+            DayOfWeek = date.DayOfWeek,
+            StartTime = new TimeOnly(9, 40),
+            EndTime = new TimeOnly(11, 0),
+            GroupId = pendingGroupId,
+            ModuleId = data.WorkModuleId,
+            ModuleTopicId = workTopic.Id,
+            LessonTypeId = workTopic.LessonTypeId,
+            TeacherId = 16,
+            RoomId = 16,
+            Status = DraftStatus.Draft,
+            IsLocked = true
+        });
+        await db.SaveChangesAsync();
+
+        var service = new TeacherDraftsAutogenService(db);
+        var action = await service.DraftAutoGen(new DraftAutoGenRequest(
+            WeekStart: date,
+            ClearExisting: false,
+            CourseId: data.CourseId,
+            GroupIds: data.GroupIds,
+            Days: WeekPreset.MonFri,
+            ModuleHours: new Dictionary<int, int> { [data.LectureModuleId] = 1 },
+            SoftFill: true,
+            RangeStartDate: date,
+            RangeEndDate: date,
+            SoftOptions: new DraftAutoGenSoftOptions(
+                RecentRepeatWindowDays: 0,
+                MaxParallelGroupsPerModuleInSlot: data.GroupIds.Count)));
+
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+        var lectureCluster = await db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => data.GroupIds.Contains(item.GroupId)
+                           && item.ModuleId == data.LectureModuleId
+                           && item.ModuleTopicId == data.LectureTopicId
+                           && item.Date == date
+                           && item.StartTime == new TimeOnly(8, 0)
+                           && item.EndTime == new TimeOnly(9, 20)
+                           && item.TeacherId == 1
+                           && item.RoomId == 1)
+            .ToListAsync();
+
+        Assert.Equal(1, result.Created);
+        Assert.Equal(data.GroupIds.Count, lectureCluster.Select(item => item.GroupId).Distinct().Count());
+        Assert.Empty(result.GapDetails ?? new List<AutoGenGapDetail>());
+        Assert.DoesNotContain(
+            result.Warnings,
+            warning => warning.Contains("Атомарний repair-pass", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Draft_autogen_normal_repair_uses_bounded_singleton_for_same_lagging_group()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        await using var db = new AppDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var data = await SeedSevenGroupLectureScenarioAsync(db);
+        var monday = new DateOnly(2026, 4, 27);
+        var tuesday = monday.AddDays(1);
+        var selectedGroupIds = data.GroupIds.Take(2).ToList();
+        var lectureTypeId = await db.ModuleTopics
+            .Where(topic => topic.Id == data.LectureTopicId)
+            .Select(topic => topic.LessonTypeId)
+            .SingleAsync();
+        var workTopic = await db.ModuleTopics
+            .SingleAsync(topic => topic.ModuleId == data.WorkModuleId);
+        var lectureSequence = await db.ModuleSequenceItems
+            .SingleAsync(item => item.ModuleId == data.LectureModuleId);
+        lectureSequence.GroupOrder = 2;
+        db.TimeSlots.AddRange(
+            new TimeSlot
+            {
+                Id = 1001,
+                CourseId = data.CourseId,
+                DayOfWeek = DayOfWeek.Tuesday,
+                Start = new TimeOnly(8, 0),
+                End = new TimeOnly(9, 20),
+                SortOrder = 1,
+                IsActive = true
+            },
+            new TimeSlot
+            {
+                Id = 1002,
+                CourseId = data.CourseId,
+                DayOfWeek = DayOfWeek.Tuesday,
+                Start = new TimeOnly(9, 40),
+                End = new TimeOnly(11, 0),
+                SortOrder = 2,
+                IsActive = true
+            });
+        db.TeacherDraftItems.AddRange(
+            new TeacherDraftItem
+            {
+                Date = monday.AddDays(-3),
+                DayOfWeek = monday.AddDays(-3).DayOfWeek,
+                StartTime = new TimeOnly(8, 0),
+                EndTime = new TimeOnly(9, 20),
+                GroupId = selectedGroupIds[0],
+                ModuleId = data.WorkModuleId,
+                ModuleTopicId = workTopic.Id,
+                LessonTypeId = workTopic.LessonTypeId,
+                TeacherId = 10,
+                RoomId = 10,
+                Status = DraftStatus.Draft,
+                IsLocked = true
+            },
+            new TeacherDraftItem
+            {
+                Date = monday,
+                DayOfWeek = monday.DayOfWeek,
+                StartTime = new TimeOnly(9, 40),
+                EndTime = new TimeOnly(11, 0),
+                GroupId = selectedGroupIds[0],
+                ModuleId = data.LectureModuleId,
+                ModuleTopicId = data.LectureTopicId,
+                LessonTypeId = lectureTypeId,
+                TeacherId = 1,
+                RoomId = 1,
+                Status = DraftStatus.Draft,
+                IsLocked = false
+            },
+            new TeacherDraftItem
+            {
+                Date = monday,
+                DayOfWeek = monday.DayOfWeek,
+                StartTime = new TimeOnly(8, 0),
+                EndTime = new TimeOnly(9, 20),
+                GroupId = selectedGroupIds[1],
+                ModuleId = data.WorkModuleId,
+                ModuleTopicId = workTopic.Id,
+                LessonTypeId = workTopic.LessonTypeId,
+                TeacherId = 11,
+                RoomId = 11,
+                Status = DraftStatus.Draft,
+                IsLocked = true
+            });
+        await db.SaveChangesAsync();
+
+        var action = await new TeacherDraftsAutogenService(db).DraftAutoGen(
+            new DraftAutoGenRequest(
+                WeekStart: monday,
+                ClearExisting: false,
+                CourseId: data.CourseId,
+                GroupIds: selectedGroupIds,
+                Days: WeekPreset.MonFri,
+                ModuleHours: new Dictionary<int, int> { [data.LectureModuleId] = 1 },
+                SoftFill: true,
+                RangeStartDate: monday,
+                RangeEndDate: tuesday,
+                SoftOptions: new DraftAutoGenSoftOptions(
+                    RecentRepeatWindowDays: 0,
+                    MaxParallelGroupsPerModuleInSlot: selectedGroupIds.Count)));
+
+        Assert.True(
+            action.Result is OkObjectResult,
+            action.Result is ObjectResult response
+                ? System.Text.Json.JsonSerializer.Serialize(response.Value)
+                : action.Result?.ToString() ?? "<null>");
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+        var singleton = await db.TeacherDraftItems
+            .AsNoTracking()
+            .SingleAsync(item => item.GroupId == selectedGroupIds[1]
+                                 && item.ModuleId == data.LectureModuleId);
+        var hardRules = await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(
+            new TeacherDraftsAutogenHardRuleValidationRequest(
+                data.CourseId,
+                selectedGroupIds,
+                monday,
+                tuesday));
+
+        Assert.Equal(1, result.Created);
+        Assert.Equal(tuesday, singleton.Date);
+        Assert.Equal(new TimeOnly(8, 0), singleton.StartTime);
+        Assert.Empty(result.GapDetails ?? new List<AutoGenGapDetail>());
+        Assert.Empty(hardRules.Violations);
+        Assert.DoesNotContain(
+            result.Warnings,
+            warning => warning.Contains("Атомарний repair-pass", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Job_integrated_fill_keeps_one_emergency_singleton_owner_across_phases()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        var monday = new DateOnly(2026, 4, 27);
+        var thursday = monday.AddDays(3);
+        SevenGroupLectureSeed data;
+        const int secondLectureModuleId = 9;
+        const int secondLectureTopicId = 3;
+
+        await using (var db = new AppDbContext(options))
+        {
+            await db.Database.EnsureCreatedAsync();
+            data = await SeedSevenGroupLectureScenarioAsync(db);
+            var course = await db.Courses.SingleAsync(item => item.Id == data.CourseId);
+            course.AcademicPeriodStartDate = monday.AddDays(-7);
+            course.DurationWeeks = 2;
+            var selectedGroupIds = data.GroupIds.Take(2).ToList();
+            var lectureSequence = await db.ModuleSequenceItems
+                .SingleAsync(item => item.ModuleId == data.LectureModuleId);
+            lectureSequence.GroupOrder = 2;
+            db.Modules.Add(new Module
+            {
+                Id = secondLectureModuleId,
+                CourseId = data.CourseId,
+                Code = "4",
+                Title = "Second lecture tail",
+                Credits = 1
+            });
+            db.ModuleTopics.Add(new ModuleTopic
+            {
+                Id = secondLectureTopicId,
+                ModuleId = secondLectureModuleId,
+                Order = 1,
+                TopicCode = "4.1.1.1",
+                LessonTypeId = 1,
+                TotalHours = 1,
+                AuditoriumHours = 1
+            });
+            db.ModuleSequenceItems.Add(new ModuleSequenceItem
+            {
+                CourseId = data.CourseId,
+                ModuleId = secondLectureModuleId,
+                GroupOrder = 2,
+                Order = 3
+            });
+            db.TeacherModules.Add(new TeacherModule
+            {
+                TeacherId = 1,
+                ModuleId = secondLectureModuleId
+            });
+            var nextSlotId = 1001;
+            foreach (var date in Enumerable.Range(1, 3).Select(offset => monday.AddDays(offset)))
+            {
+                db.TimeSlots.AddRange(
+                    new TimeSlot
+                    {
+                        Id = nextSlotId++,
+                        CourseId = data.CourseId,
+                        DayOfWeek = date.DayOfWeek,
+                        Start = new TimeOnly(8, 0),
+                        End = new TimeOnly(9, 20),
+                        SortOrder = 1,
+                        IsActive = true
+                    },
+                    new TimeSlot
+                    {
+                        Id = nextSlotId++,
+                        CourseId = data.CourseId,
+                        DayOfWeek = date.DayOfWeek,
+                        Start = new TimeOnly(9, 40),
+                        End = new TimeOnly(11, 0),
+                        SortOrder = 2,
+                        IsActive = true
+                    });
+            }
+            db.TeacherDraftItems.AddRange(
+                new TeacherDraftItem
+                {
+                    Date = monday.AddDays(-3),
+                    DayOfWeek = monday.AddDays(-3).DayOfWeek,
+                    StartTime = new TimeOnly(8, 0),
+                    EndTime = new TimeOnly(9, 20),
+                    GroupId = selectedGroupIds[0],
+                    ModuleId = data.WorkModuleId,
+                    ModuleTopicId = 2,
+                    LessonTypeId = 2,
+                    TeacherId = 10,
+                    RoomId = 10,
+                    Status = DraftStatus.Draft,
+                    IsLocked = true
+                },
+                new TeacherDraftItem
+                {
+                    Date = monday,
+                    DayOfWeek = monday.DayOfWeek,
+                    StartTime = new TimeOnly(9, 40),
+                    EndTime = new TimeOnly(11, 0),
+                    GroupId = selectedGroupIds[0],
+                    ModuleId = secondLectureModuleId,
+                    ModuleTopicId = secondLectureTopicId,
+                    LessonTypeId = 1,
+                    TeacherId = 1,
+                    RoomId = 1,
+                    Status = DraftStatus.Draft,
+                    IsLocked = true
+                },
+                new TeacherDraftItem
+                {
+                    Date = monday,
+                    DayOfWeek = monday.DayOfWeek,
+                    StartTime = new TimeOnly(8, 0),
+                    EndTime = new TimeOnly(9, 20),
+                    GroupId = selectedGroupIds[1],
+                    ModuleId = data.WorkModuleId,
+                    ModuleTopicId = 2,
+                    LessonTypeId = 2,
+                    TeacherId = 11,
+                    RoomId = 11,
+                    Status = DraftStatus.Draft,
+                    IsLocked = true
+                },
+                new TeacherDraftItem
+                {
+                    Date = monday.AddDays(1),
+                    DayOfWeek = monday.AddDays(1).DayOfWeek,
+                    StartTime = new TimeOnly(9, 40),
+                    EndTime = new TimeOnly(11, 0),
+                    GroupId = selectedGroupIds[1],
+                    ModuleId = data.LectureModuleId,
+                    ModuleTopicId = data.LectureTopicId,
+                    LessonTypeId = 1,
+                    TeacherId = 1,
+                    RoomId = 1,
+                    Status = DraftStatus.Draft,
+                    IsLocked = true
+                });
+            await db.SaveChangesAsync();
+        }
+
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(options));
+        services.AddScoped<TeacherDraftsAutogenService>();
+        services.AddScoped<TeacherDraftsAutogenPlanService>();
+        await using var provider = services.BuildServiceProvider();
+        var jobService = new TeacherDraftsAutogenJobService(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<TeacherDraftsAutogenJobService>.Instance);
+        var selectedGroups = data.GroupIds.Take(2).ToList();
+        var request = new AutoGenJobRequest(
+            AutoGenJobKind.Generate,
+            monday,
+            thursday,
+            data.CourseId,
+            selectedGroups,
+            new Dictionary<int, int>
+            {
+                [data.LectureModuleId] = 1,
+                [secondLectureModuleId] = 1
+            },
+            WeekPreset.MonFri,
+            ClearExisting: false,
+            SoftFill: true,
+            PreflightOnly: false,
+            AllowIncompleteDrafts: false,
+            SoftOptions: new AutoGenSoftOptionsDto(
+                MaxParallelGroupsPerModuleInSlot: selectedGroups.Count,
+                RecentRepeatWindowDays: 0),
+            PreviewOnly: true);
+        var runtimeType = typeof(TeacherDraftsAutogenJobService)
+            .GetNestedType("AutoGenJobRuntime", System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(runtimeType);
+        var runtime = Activator.CreateInstance(
+            runtimeType,
+            System.Reflection.BindingFlags.Instance
+            | System.Reflection.BindingFlags.Public
+            | System.Reflection.BindingFlags.NonPublic,
+            binder: null,
+            args: new object[] { request },
+            culture: null);
+        Assert.NotNull(runtime);
+        var runMethod = typeof(TeacherDraftsAutogenJobService)
+            .GetMethod(
+                "RunAsync",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(runMethod);
+        await Assert.IsAssignableFrom<Task>(runMethod.Invoke(jobService, new[] { runtime }));
+        var statusMethod = runtimeType.GetMethod(
+            "ToDto",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
+        Assert.NotNull(statusMethod);
+        var status = Assert.IsType<AutoGenJobStatus>(statusMethod.Invoke(runtime, null));
+
+        Assert.True(
+            status.State == AutoGenJobState.Succeeded,
+            $"state={status.State}; error={status.Error ?? "<none>"}; "
+            + $"warnings={string.Join(" | ", status.Result?.Warnings ?? [])}");
+        Assert.NotNull(status.Plan);
+        var plan = await jobService.GetPlanAsync(status.Plan.PlanId, CancellationToken.None);
+        var emergencySingletonAdds = plan.Changes
+            .Where(change => change.Operation == AutoGenPlanOperation.Add
+                             && change.After is not null
+                             && selectedGroups.Contains(change.After.GroupId)
+                             && (change.After.ModuleId == data.LectureModuleId
+                                 || change.After.ModuleId == secondLectureModuleId))
+            .ToList();
+        var singletonAdd = Assert.Single(emergencySingletonAdds);
+        Assert.True(
+            singletonAdd.After is not null
+            && (singletonAdd.After.GroupId == selectedGroups[0]
+                && singletonAdd.After.ModuleId == data.LectureModuleId
+                || singletonAdd.After.GroupId == selectedGroups[1]
+                && singletonAdd.After.ModuleId == secondLectureModuleId));
+        Assert.NotEmpty(plan.Result.GapDetails ?? []);
+        Assert.Single(emergencySingletonAdds.Select(change => change.After!.GroupId).Distinct());
     }
 
     [Fact]

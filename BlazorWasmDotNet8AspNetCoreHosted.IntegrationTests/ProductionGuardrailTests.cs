@@ -2117,7 +2117,7 @@ public sealed class ProductionGuardrailTests
         for (var attempt = 0; attempt < 1200 && status?.State is AutoGenJobState.Queued or AutoGenJobState.Running; attempt++)
         {
             await Task.Delay(25);
-            status = jobService.Get(started.JobId);
+            status = await jobService.GetAsync(started.JobId);
         }
 
         Assert.NotNull(status);
@@ -2231,7 +2231,7 @@ public sealed class ProductionGuardrailTests
              attempt++)
         {
             await Task.Delay(25);
-            status = jobService.Get(started.JobId);
+            status = await jobService.GetAsync(started.JobId);
         }
 
         Assert.NotNull(status);
@@ -2367,7 +2367,7 @@ public sealed class ProductionGuardrailTests
         using var provider = services.BuildServiceProvider();
         var service = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
 
-        var status = service.Get(jobId);
+        var status = await service.GetAsync(jobId);
 
         Assert.NotNull(status);
         Assert.Equal(AutoGenJobState.Failed, status.State);
@@ -2547,10 +2547,10 @@ public sealed class ProductionGuardrailTests
             gateReleased = true;
 
             await WaitUntilAsync(
-                () => service.Get(request.ClientJobId!)?.State == AutoGenJobState.Failed,
+                async () => (await service.GetAsync(request.ClientJobId!))?.State == AutoGenJobState.Failed,
                 TimeSpan.FromSeconds(5));
 
-            var status = service.Get(request.ClientJobId!);
+            var status = await service.GetAsync(request.ClientJobId!);
             Assert.NotNull(status);
             Assert.Contains("навчального періоду", status.Error, StringComparison.OrdinalIgnoreCase);
             Assert.Empty(await fixture.Db.TeacherDraftItems.AsNoTracking().ToListAsync());
@@ -2757,7 +2757,7 @@ public sealed class ProductionGuardrailTests
             before = await db.AutoGenJobRuns.AsNoTracking().SingleAsync(item => item.JobId == request.ClientJobId);
         }
 
-        var status = service.Get(request.ClientJobId!);
+        var status = await service.GetAsync(request.ClientJobId!);
 
         Assert.NotNull(status);
         Assert.Equal(AutoGenJobState.Running, status.State);
@@ -2789,13 +2789,13 @@ public sealed class ProductionGuardrailTests
         {
             ownerService.Start(request);
 
-            var cancellationStatus = remoteService.Cancel(request.ClientJobId!);
+            var cancellationStatus = await remoteService.CancelAsync(request.ClientJobId!);
 
             Assert.NotNull(cancellationStatus);
             Assert.True(cancellationStatus.CancellationRequested);
             Assert.NotEqual(AutoGenJobState.Canceled, cancellationStatus.State);
             await WaitUntilAsync(
-                () => ownerService.Get(request.ClientJobId!)?.CancellationRequested == true,
+                async () => (await ownerService.GetAsync(request.ClientJobId!))?.CancellationRequested == true,
                 TimeSpan.FromSeconds(7));
             await ownerService.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
             ownerStopped = true;
@@ -2833,7 +2833,7 @@ public sealed class ProductionGuardrailTests
         await using var provider = fixture.CreateProvider();
         var service = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
 
-        var recovered = service.Get(request.ClientJobId!);
+        var recovered = await service.GetAsync(request.ClientJobId!);
         var retry = service.Start(request);
 
         Assert.NotNull(recovered);
@@ -2909,7 +2909,7 @@ public sealed class ProductionGuardrailTests
         await using var provider = fixture.CreateProvider();
         var service = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
 
-        var readOnlyStatus = service.Get(legacyRequest.ClientJobId!);
+        var readOnlyStatus = await service.GetAsync(legacyRequest.ClientJobId!);
         var sameId = service.Start(legacyRequest with { Title = "Повтор legacy-запиту" });
         var blocked = Assert.Throws<AutoGenJobPersistenceException>(() => service.Start(
             CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") }));
@@ -2964,7 +2964,7 @@ public sealed class ProductionGuardrailTests
             TimeSpan.FromSeconds(1),
             databaseUtcNow);
 
-        var expired = service.Get(staleRequest.ClientJobId!);
+        var expired = await service.GetAsync(staleRequest.ClientJobId!);
 
         Assert.NotNull(expired);
         Assert.Equal(AutoGenJobState.Failed, expired.State);
@@ -3150,7 +3150,7 @@ public sealed class ProductionGuardrailTests
     }
 
     [Fact]
-    public void Autogen_job_local_sqlite_cancel_bypasses_blocked_writer_connection()
+    public async Task Autogen_job_local_sqlite_cancel_bypasses_blocked_writer_connection()
     {
         var service = CreateAutogenJobService(new RejectingScopeFactory());
         var request = CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") };
@@ -3158,7 +3158,7 @@ public sealed class ProductionGuardrailTests
         AddAutogenJobRuntime(service, request.ClientJobId!, runtime);
         AddSqliteExclusiveExecutionMarker(service, request.ClientJobId!);
 
-        var status = service.Cancel(request.ClientJobId!);
+        var status = await service.CancelAsync(request.ClientJobId!);
 
         Assert.NotNull(status);
         Assert.True(status.CancellationRequested);
@@ -3289,7 +3289,7 @@ public sealed class ProductionGuardrailTests
                         .SetProperty(item => item.LeaseExpiresAtUtc, DateTime.UtcNow.AddMinutes(-1))
                         .SetProperty(item => item.Version, item => item.Version + 1));
             }
-            var expired = observerService.Get(request.ClientJobId!);
+            var expired = await observerService.GetAsync(request.ClientJobId!);
             Assert.NotNull(expired);
             Assert.Equal(AutoGenJobState.Failed, expired.State);
         }
@@ -3298,7 +3298,7 @@ public sealed class ProductionGuardrailTests
             persistenceGate.Release();
         }
 
-        var canceled = ownerService.Cancel(request.ClientJobId!);
+        var canceled = await ownerService.CancelAsync(request.ClientJobId!);
 
         Assert.NotNull(canceled);
         Assert.Equal(AutoGenJobState.Failed, canceled.State);
@@ -3323,15 +3323,22 @@ public sealed class ProductionGuardrailTests
     }
 
     [Fact]
-    public void Autogen_job_controller_maps_persistence_failures_to_service_unavailable()
+    public async Task Autogen_job_controller_maps_persistence_failures_to_service_unavailable()
     {
         var service = CreateAutogenJobService(new RejectingScopeFactory());
         var controller = CreateTeacherDraftsController(service);
         var request = CreateValidAutoGenJobRequest() with { PreviewOnly = true };
 
         var start = Assert.IsType<ObjectResult>(controller.StartAutoGenJob(request).Result);
-        var get = Assert.IsType<ObjectResult>(controller.GetAutoGenJob("missing-job").Result);
-        var cancel = Assert.IsType<ObjectResult>(controller.CancelAutoGenJob("missing-job").Result);
+        using var operationGate = new ExpensiveOperationGate();
+        var get = Assert.IsType<ObjectResult>((await controller.GetAutoGenJob(
+            Guid.NewGuid().ToString("N"),
+            operationGate,
+            CancellationToken.None)).Result);
+        var cancel = Assert.IsType<ObjectResult>((await controller.CancelAutoGenJob(
+            Guid.NewGuid().ToString("N"),
+            operationGate,
+            CancellationToken.None)).Result);
 
         Assert.Equal(503, start.StatusCode);
         Assert.Equal(503, get.StatusCode);
@@ -3613,6 +3620,19 @@ public sealed class ProductionGuardrailTests
     {
         var deadline = DateTime.UtcNow.Add(timeout);
         while (!condition())
+        {
+            if (DateTime.UtcNow >= deadline)
+            {
+                throw new TimeoutException("Умова тесту не виконалася у відведений час.");
+            }
+            await Task.Delay(25);
+        }
+    }
+
+    private static async Task WaitUntilAsync(Func<Task<bool>> condition, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow.Add(timeout);
+        while (!await condition())
         {
             if (DateTime.UtcNow >= deadline)
             {

@@ -113,8 +113,8 @@ public sealed class AdminPlansController : ControllerBase
         var dto = items?.FirstOrDefault();
         if (dto is null)
             return BadRequest(new { message = "Некоректні дані" });
-        if (dto.TargetHours is < 0 or > 299999)
-            return BadRequest(new { message = "Планові години мають бути в діапазоні від 0 до 299999." });
+        if (dto.TargetHours is < 0 or > CurriculumInputLimits.PlanHoursMax)
+            return BadRequest(new { message = $"Планові години мають бути в діапазоні від 0 до {CurriculumInputLimits.PlanHoursMax}." });
         var plan = await _db.ModulePlans
             .FirstOrDefaultAsync(p => p.CourseId == resolvedCourseId && p.ModuleId == moduleId);
         if (plan is null)

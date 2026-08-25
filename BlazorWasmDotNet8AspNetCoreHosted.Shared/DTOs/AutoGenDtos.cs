@@ -203,8 +203,13 @@ public record AutoGenPlanChangeDto(
 public record AutoGenPlanDetailsDto(
     AutoGenPlanSummaryDto Summary,
     List<AutoGenPlanChangeDto> Changes,
-    AutoGenResult Result
-);
+    AutoGenResult Result,
+    int ChangeOffset = 0,
+    int? TotalChanges = null)
+{
+    public bool HasMoreChanges => TotalChanges is int totalChanges
+                                  && ChangeOffset + Changes.Count < totalChanges;
+}
 
 public record AutoGenPlanActionRequest(long ExpectedVersion);
 
