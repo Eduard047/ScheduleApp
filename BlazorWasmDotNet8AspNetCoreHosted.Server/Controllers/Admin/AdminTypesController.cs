@@ -4,6 +4,7 @@ using Microsoft.EntityFrameworkCore;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Admin;
@@ -94,10 +95,10 @@ public class AdminTypesController(AppDbContext db) : ControllerBase
             return BadRequest(new { message = "Код та назва є обов'язковими." });
         var code = dto.Code.Trim().ToUpperInvariant();
         var name = dto.Name.Trim();
-        if (code.Length > 64)
-            return BadRequest(new { message = "Код типу заняття не може перевищувати 64 символи." });
-        if (name.Length > 200)
-            return BadRequest(new { message = "Назва типу заняття не може перевищувати 200 символів." });
+        if (code.Length > CurriculumInputLimits.CodeMaxLength)
+            return BadRequest(new { message = $"Код типу заняття не може перевищувати {CurriculumInputLimits.CodeMaxLength} символи." });
+        if (name.Length > CurriculumInputLimits.LessonTypeNameMaxLength)
+            return BadRequest(new { message = $"Назва типу заняття не може перевищувати {CurriculumInputLimits.LessonTypeNameMaxLength} символів." });
 
         await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         try
@@ -221,6 +222,31 @@ public class AdminTypesController(AppDbContext db) : ControllerBase
         {
             await tx.RollbackAsync(CancellationToken.None);
             throw;
+        }
+    }
+
+    [HttpPost("lesson/{sourceId:int}/merge/{targetId:int}")]
+    [RequireDeletionConfirmation(
+        "дубль типу заняття",
+        TargetArgumentName = nameof(sourceId),
+        Message = "Підтвердіть об'єднання: усі залежні записи буде перенесено до канонічного типу, а дубль буде остаточно видалено.")]
+    // Об'єднує дубль типу заняття з канонічним типом в одній транзакції.
+    public async Task<ActionResult<LessonTypeMergeResult>> LessonMerge(
+        int sourceId,
+        int targetId,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return Ok(await LessonTypeMergeService.MergeAsync(
+                db,
+                sourceId,
+                targetId,
+                cancellationToken));
+        }
+        catch (LessonTypeMergeException ex)
+        {
+            return Conflict(new { message = ex.Message });
         }
     }
 

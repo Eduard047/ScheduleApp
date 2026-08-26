@@ -251,7 +251,7 @@ public static class AutoGenGapReasonClassifier
             AutoGenGapReasonCodes.Teacher => new(code, "Немає доступного викладача"),
             AutoGenGapReasonCodes.Room => new(code, "Немає доступної аудиторії"),
             AutoGenGapReasonCodes.Travel => new(code, "Недостатньо часу на перехід"),
-            AutoGenGapReasonCodes.TopicOrder => new(code, "Порядок тем не дозволив слот"),
+            AutoGenGapReasonCodes.TopicOrder => new(code, "Немає доступних годин тем"),
             AutoGenGapReasonCodes.ModuleBlock => new(code, "Модуль має йти суцільним блоком"),
             AutoGenGapReasonCodes.Limit => new(code, "Спрацювали денні або слотні ліміти"),
             AutoGenGapReasonCodes.SearchLimit => new(code, "Досягнуто безпечної межі пошуку"),

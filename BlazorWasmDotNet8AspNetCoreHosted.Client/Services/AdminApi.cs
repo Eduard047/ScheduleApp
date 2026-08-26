@@ -23,11 +23,11 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         }
         // Отримує метадані для довідників клієнта.
         public async Task<MetaResponseDto> GetMeta()
-            => await _http.GetFromJsonAsync<MetaResponseDto>("api/meta")
+            => await _http.GetFromJsonWithDetailsAsync<MetaResponseDto>("api/meta")
                ?? ApiClientHelpers.EmptyMeta();
         // Календар винятків (свята, перенесення).
         public async Task<List<CalendarExceptionEditDto>> GetCalendar()
-            => await _http.GetFromJsonAsync<List<CalendarExceptionEditDto>>("api/admin/config/calendar") ?? new();
+            => await _http.GetFromJsonWithDetailsAsync<List<CalendarExceptionEditDto>>("api/admin/config/calendar") ?? new();
         // Створює або оновлює календарний виняток.
         public async Task<int> UpsertCalendar(CalendarExceptionEditDto dto)
             => await PostForId("api/admin/config/calendar/upsert", dto);
@@ -36,7 +36,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
             => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/config/calendar/{id}")));
         // Налаштування обідніх перерв.
         public async Task<List<LunchConfigEditDto>> GetLunch()
-            => await _http.GetFromJsonAsync<List<LunchConfigEditDto>>("api/admin/config/lunch") ?? new();
+            => await _http.GetFromJsonWithDetailsAsync<List<LunchConfigEditDto>>("api/admin/config/lunch") ?? new();
         // Створює або оновлює обідню перерву.
         public async Task<int> UpsertLunch(LunchConfigEditDto dto)
             => await PostForId("api/admin/config/lunch/upsert", dto);
@@ -45,10 +45,10 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
             => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/config/lunch/{id}")));
         // Довідник викладачів.
         public async Task<List<TeacherViewDto>> GetTeachers()
-            => await _http.GetFromJsonAsync<List<TeacherViewDto>>("api/admin/teachers") ?? new();
+            => await _http.GetFromJsonWithDetailsAsync<List<TeacherViewDto>>("api/admin/teachers") ?? new();
         // Отримує викладача для редагування.
         public async Task<TeacherEditDto?> GetTeacher(int id)
-            => await _http.GetFromJsonAsync<TeacherEditDto>($"api/admin/teachers/{id}");
+            => await _http.GetFromJsonWithDetailsAsync<TeacherEditDto>($"api/admin/teachers/{id}");
         // Створює або оновлює викладача.
         public async Task<int> UpsertTeacher(TeacherEditDto dto)
             => await PostForId("api/admin/teachers/upsert", dto);
@@ -57,7 +57,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
             => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/teachers/{id}")));
         // Довідник навчальних груп.
         public async Task<List<GroupEditDto>> GetGroups()
-            => await _http.GetFromJsonAsync<List<GroupEditDto>>("api/admin/groups") ?? new();
+            => await _http.GetFromJsonWithDetailsAsync<List<GroupEditDto>>("api/admin/groups") ?? new();
         // Створює або оновлює групу.
         public async Task<int> UpsertGroup(GroupEditDto dto)
             => await PostForId("api/admin/groups/upsert", dto);
@@ -71,7 +71,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         }
         // Довідник модулів.
         public async Task<List<ModuleEditDto>> GetModules()
-            => await _http.GetFromJsonAsync<List<ModuleEditDto>>("api/admin/modules") ?? new();
+            => await _http.GetFromJsonWithDetailsAsync<List<ModuleEditDto>>("api/admin/modules") ?? new();
         // Створює або оновлює модуль.
         public async Task<int> UpsertModule(ModuleEditDto dto)
             => await PostForId("api/admin/modules/upsert", dto);
@@ -87,7 +87,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         }
         // Теми модуля для вибору в навчальних планах.
         public async Task<List<ModuleTopicViewDto>> GetModuleTopics(int moduleId)
-            => await _http.GetFromJsonAsync<List<ModuleTopicViewDto>>($"api/admin/modules/{moduleId}/topics") ?? new();
+            => await _http.GetFromJsonWithDetailsAsync<List<ModuleTopicViewDto>>($"api/admin/modules/{moduleId}/topics") ?? new();
         // Створює або оновлює тему модуля.
         public async Task<int> UpsertModuleTopic(int moduleId, ModuleTopicDto dto)
             => await PostForId($"api/admin/modules/{moduleId}/topics/upsert", dto);
@@ -96,7 +96,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
             => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/modules/{moduleId}/topics/{topicId}")));
         // Довідник аудиторій.
         public async Task<List<RoomEditDto>> GetRooms()
-            => await _http.GetFromJsonAsync<List<RoomEditDto>>("api/admin/rooms") ?? new();
+            => await _http.GetFromJsonWithDetailsAsync<List<RoomEditDto>>("api/admin/rooms") ?? new();
         // Створює або оновлює аудиторію.
         public async Task<int> UpsertRoom(RoomEditDto dto)
             => await PostForId("api/admin/rooms/upsert", dto);
@@ -107,7 +107,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         private sealed record BuildingsVm(List<BuildingEditDto> buildings, List<BuildingTravelEditDto> travels);
         // Читає корпуси та переходи одним запитом без кешування.
         private async Task<BuildingsVm> GetBuildingsVm()
-            => await _http.GetFromJsonAsync<BuildingsVm>("api/admin/buildings") ?? new(new(), new());
+            => await _http.GetFromJsonWithDetailsAsync<BuildingsVm>("api/admin/buildings") ?? new(new(), new());
         // Довідник будівель.
         public async Task<List<BuildingEditDto>> GetBuildings()
             => (await GetBuildingsVm()).buildings;
@@ -133,7 +133,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
                 new BuildingTravelEditDto(fromId, toId, 0)));
         // Довідник курсів.
         public async Task<List<CourseEditDto>> GetCourses()
-            => await _http.GetFromJsonAsync<List<CourseEditDto>>("api/admin/courses") ?? new();
+            => await _http.GetFromJsonWithDetailsAsync<List<CourseEditDto>>("api/admin/courses") ?? new();
         // Створює або оновлює курс.
         public async Task<int> UpsertCourse(CourseEditDto dto)
             => await PostForId("api/admin/courses/upsert", dto);
@@ -147,7 +147,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         }
         // Довідник типів занять.
         public async Task<List<LessonTypeEditDto>> GetLessonTypes()
-            => await _http.GetFromJsonAsync<List<LessonTypeEditDto>>("api/admin/types/lesson") ?? new();
+            => await _http.GetFromJsonWithDetailsAsync<List<LessonTypeEditDto>>("api/admin/types/lesson") ?? new();
         // Створює або оновлює тип заняття.
         public async Task UpsertLessonType(LessonTypeEditDto dto)
             => await Ensure(await _http.PostAsJsonAsync("api/admin/types/lesson/upsert", dto));
@@ -156,14 +156,14 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
             => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/types/lesson/{id}")));
         // Палітра кольорів для типів занять.
         public async Task<List<LessonColorDto>> GetLessonColorPalette()
-            => await _http.GetFromJsonAsync<List<LessonColorDto>>("api/admin/types/lesson/palette") ?? new();
+            => await _http.GetFromJsonWithDetailsAsync<List<LessonColorDto>>("api/admin/types/lesson/palette") ?? new();
         // Планування модулів із можливим фільтром за курсом.
         public async Task<List<CourseModulePlanDto>> GetModulePlans(int moduleId, int? courseId = null)
         {
             var url = courseId is int cid && cid > 0
                 ? $"api/admin/plans/module/{moduleId}?courseId={cid}"
                 : $"api/admin/plans/module/{moduleId}";
-            return await _http.GetFromJsonAsync<List<CourseModulePlanDto>>(url) ?? new();
+            return await _http.GetFromJsonWithDetailsAsync<List<CourseModulePlanDto>>(url) ?? new();
         }
         // Зберігає плани модулів для курсу.
         public async Task UpsertModulePlans(int moduleId, int? courseId, List<SaveCourseModulePlanDto> rows)
@@ -185,7 +185,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
             => await UpsertModulePlans(moduleId, courseId, new List<SaveCourseModulePlanDto> { dto });
         // Послідовність модулів у межах курсу.
         public async Task<ModuleSequenceConfigDto?> GetModuleSequence(int courseId)
-            => await _http.GetFromJsonAsync<ModuleSequenceConfigDto>($"api/admin/module-sequence/{courseId}");
+            => await _http.GetFromJsonWithDetailsAsync<ModuleSequenceConfigDto>($"api/admin/module-sequence/{courseId}");
         // Зберігає послідовність модулів.
         public async Task SaveModuleSequence(ModuleSequenceSaveRequestDto dto)
             => await Ensure(await _http.PostAsJsonAsync("api/admin/module-sequence/save", dto));

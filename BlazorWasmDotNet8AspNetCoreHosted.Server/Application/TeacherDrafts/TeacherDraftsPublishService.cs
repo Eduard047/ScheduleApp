@@ -57,6 +57,19 @@ public sealed class TeacherDraftsPublishService
         {
             return new BadRequestObjectResult(new { message = DateHelpers.SupportedScheduleDateMessage });
         }
+        if (r.ExpectedScopeRevision is not Guid expectedScopeRevision
+            || expectedScopeRevision == Guid.Empty)
+        {
+            return new ObjectResult(new ProblemDetails
+            {
+                Status = StatusCodes.Status428PreconditionRequired,
+                Title = "Потрібна актуальна перевірка тижня",
+                Detail = "Перед публікацією повторно перевірте тиждень і передайте його актуальну версію."
+            })
+            {
+                StatusCode = StatusCodes.Status428PreconditionRequired
+            };
+        }
         var start = r.WeekStart;
         var end = start.AddDays(7);
         await using var tx = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
@@ -69,21 +82,18 @@ public sealed class TeacherDraftsPublishService
             .ThenBy(x => x.GroupId)
             .ThenBy(x => x.Id)
             .ToListAsync();
-        if (r.ExpectedScopeRevision is Guid expectedScopeRevision)
+        var actualScopeRevision = LogicalRevisionToken.Combine(weekDrafts.Select(item =>
+            new KeyValuePair<int, Guid>(item.Id, item.Revision)));
+        if (actualScopeRevision != expectedScopeRevision)
         {
-            var actualScopeRevision = LogicalRevisionToken.Combine(weekDrafts.Select(item =>
-                new KeyValuePair<int, Guid>(item.Id, item.Revision)));
-            if (actualScopeRevision != expectedScopeRevision)
-            {
-                await tx.RollbackAsync();
-                return new OkObjectResult(new PublishWeekResults(
-                    0,
-                    weekDrafts.Count,
-                    new List<string>
-                    {
-                        "Публікацію скасовано: чернетки змінилися після останньої перевірки. Дані оновлено — перегляньте тиждень і повторіть публікацію."
-                    }));
-            }
+            await tx.RollbackAsync();
+            return new OkObjectResult(new PublishWeekResults(
+                0,
+                weekDrafts.Count,
+                new List<string>
+                {
+                    "Публікацію скасовано: чернетки змінилися після останньої перевірки. Дані оновлено — перегляньте тиждень і повторіть публікацію."
+                }));
         }
         var drafts = r.TeacherId is int teacherId
             ? ExpandTeacherPublishSelection(weekDrafts, teacherId)
@@ -134,20 +144,25 @@ public sealed class TeacherDraftsPublishService
                 candidate.BatchKey))
             .ToList();
         var hardRuleValidator = new TeacherDraftsAutogenHardRuleValidator(_db);
-        var publishedGroupIds = drafts.Select(draft => draft.GroupId).Distinct().ToList();
         foreach (var courseId in drafts.Select(draft => draft.Group.CourseId).Distinct().OrderBy(id => id))
         {
+            var courseGroupIds = drafts
+                .Where(draft => draft.Group.CourseId == courseId)
+                .Select(draft => draft.GroupId)
+                .Distinct()
+                .ToList();
             var hardRuleResult = await hardRuleValidator.ValidateAsync(
                 new TeacherDraftsAutogenHardRuleValidationRequest(
                     CourseId: courseId,
-                    GroupIds: publishedGroupIds,
+                    GroupIds: courseGroupIds,
                     From: start,
                     To: end.AddDays(-1),
                     Days: WeekPreset.MonSun,
                     AllowIncompleteDrafts: false,
                     PendingDrafts: pendingDrafts,
                     IncludeStoredDrafts: false,
-                    ScopePendingDraftsToCourse: true));
+                    ScopePendingDraftsToCourse: true,
+                    MaxStoredContextRows: TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount));
             violations.AddRange(hardRuleResult.Violations);
         }
 
@@ -257,11 +272,37 @@ public sealed class TeacherDraftsPublishService
         var modules = await db.Modules
             .AsNoTracking()
             .Where(module => moduleIds.Contains(module.Id))
-            .Include(module => module.ModuleCourses)
-            .Include(module => module.AllowedRooms)
-            .Include(module => module.AllowedBuildings)
-            .AsSplitQuery()
             .ToDictionaryAsync(module => module.Id, cancellationToken);
+        var moduleCourses = await db.ModuleCourses
+            .AsNoTracking()
+            .Where(link => moduleIds.Contains(link.ModuleId))
+            .OrderBy(link => link.ModuleId)
+            .ThenBy(link => link.CourseId)
+            .Take(TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount + 1)
+            .ToListAsync(cancellationToken);
+        EnsureWeekContextCapacity(moduleCourses.Count, "зв'язків модулів із курсами");
+        var moduleRooms = await db.ModuleRooms
+            .AsNoTracking()
+            .Where(link => moduleIds.Contains(link.ModuleId))
+            .OrderBy(link => link.ModuleId)
+            .ThenBy(link => link.RoomId)
+            .Take(TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount + 1)
+            .ToListAsync(cancellationToken);
+        EnsureWeekContextCapacity(moduleRooms.Count, "дозволених аудиторій модулів");
+        var moduleBuildings = await db.ModuleBuildings
+            .AsNoTracking()
+            .Where(link => moduleIds.Contains(link.ModuleId))
+            .OrderBy(link => link.ModuleId)
+            .ThenBy(link => link.BuildingId)
+            .Take(TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount + 1)
+            .ToListAsync(cancellationToken);
+        EnsureWeekContextCapacity(moduleBuildings.Count, "дозволених корпусів модулів");
+        foreach (var module in modules.Values)
+        {
+            module.ModuleCourses = moduleCourses.Where(link => link.ModuleId == module.Id).ToList();
+            module.AllowedRooms = moduleRooms.Where(link => link.ModuleId == module.Id).ToList();
+            module.AllowedBuildings = moduleBuildings.Where(link => link.ModuleId == module.Id).ToList();
+        }
         var topicIds = drafts
             .Select(draft => draft.ModuleTopicId)
             .OfType<int>()
@@ -270,7 +311,10 @@ public sealed class TeacherDraftsPublishService
         var moduleTopics = await db.ModuleTopics
             .AsNoTracking()
             .Where(topic => moduleIds.Contains(topic.ModuleId) || topicIds.Contains(topic.Id))
+            .OrderBy(topic => topic.Id)
+            .Take(TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount + 1)
             .ToListAsync(cancellationToken);
+        EnsureWeekContextCapacity(moduleTopics.Count, "тем модулів");
         var topicsById = moduleTopics.ToDictionary(topic => topic.Id);
         var modulesWithAuditoriumTopics = moduleTopics
             .Where(topic => topic.AuditoriumHours > 0)
@@ -306,12 +350,18 @@ public sealed class TeacherDraftsPublishService
             .AsNoTracking()
             .Where(slot => slot.CourseId == null
                            || courseIds.Contains(slot.CourseId.Value))
+            .OrderBy(slot => slot.Id)
+            .Take(TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount + 1)
             .ToListAsync(cancellationToken);
+        EnsureWeekContextCapacity(timeSlots.Count, "часових слотів");
         var lunches = await db.LunchConfigs
             .AsNoTracking()
             .Where(lunch => lunch.CourseId == null
                             || courseIds.Contains(lunch.CourseId.Value))
+            .OrderBy(lunch => lunch.Id)
+            .Take(TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount + 1)
             .ToListAsync(cancellationToken);
+        EnsureWeekContextCapacity(lunches.Count, "обідніх перерв");
         var rangeStart = drafts.Min(draft => draft.Date) < start
             ? drafts.Min(draft => draft.Date)
             : start;
@@ -321,8 +371,15 @@ public sealed class TeacherDraftsPublishService
             : endExclusive;
         var calendar = await db.CalendarExceptions
             .AsNoTracking()
-            .Where(item => item.Date >= rangeStart && item.Date < rangeEndExclusive)
+            .Where(item => item.Date >= rangeStart
+                           && item.Date < rangeEndExclusive
+                           && ((item.CourseId == null && item.GroupId == null)
+                               || (item.CourseId != null && courseIds.Contains(item.CourseId.Value))
+                               || (item.GroupId != null && groupIds.Contains(item.GroupId.Value))))
+            .OrderBy(item => item.Id)
+            .Take(TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount + 1)
             .ToListAsync(cancellationToken);
+        EnsureWeekContextCapacity(calendar.Count, "календарних винятків");
         var officialItems = await db.ScheduleItems
             .AsNoTracking()
             .Where(item => item.Date >= rangeStart && item.Date < rangeEndExclusive)
@@ -330,24 +387,46 @@ public sealed class TeacherDraftsPublishService
             .Include(item => item.LessonType)
             .Include(item => item.Room)
             .ThenInclude(room => room!.Building)
+            .OrderBy(item => item.Id)
+            .Take(TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount + 1)
             .ToListAsync(cancellationToken);
+        if (officialItems.Count > TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount)
+        {
+            throw new DraftValidationCapacityException(
+                $"За один тиждень можна перевірити не більше {TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount} записів офіційного розкладу.");
+        }
         var officialByDate = officialItems
             .GroupBy(item => item.Date)
             .ToDictionary(group => group.Key, group => group.ToList());
-        var travelMinutes = roomIds.Count == 0
-            ? new Dictionary<(int FromBuildingId, int ToBuildingId), int>()
+        var involvedBuildingIds = rooms.Values
+            .Select(room => room.BuildingId)
+            .Concat(officialItems
+                .Where(item => item.Room is not null)
+                .Select(item => item.Room!.BuildingId))
+            .Distinct()
+            .ToList();
+        var travelRows = involvedBuildingIds.Count == 0
+            ? []
             : await db.BuildingTravels
                 .AsNoTracking()
-                .ToDictionaryAsync(
-                    item => new ValueTuple<int, int>(item.FromBuildingId, item.ToBuildingId),
-                    item => item.Minutes,
-                    cancellationToken);
+                .Where(item => involvedBuildingIds.Contains(item.FromBuildingId)
+                               && involvedBuildingIds.Contains(item.ToBuildingId))
+                .OrderBy(item => item.Id)
+                .Take(TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount + 1)
+                .ToListAsync(cancellationToken);
+        EnsureWeekContextCapacity(travelRows.Count, "переходів між корпусами");
+        var travelMinutes = travelRows.ToDictionary(
+            item => (item.FromBuildingId, item.ToBuildingId),
+            item => item.Minutes);
         var teacherWorkingHours = teacherIds.Count == 0
             ? new List<TeacherWorkingHour>()
             : await db.TeacherWorkingHours
                 .AsNoTracking()
                 .Where(item => teacherIds.Contains(item.TeacherId))
+                .OrderBy(item => item.Id)
+                .Take(TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount + 1)
                 .ToListAsync(cancellationToken);
+        EnsureWeekContextCapacity(teacherWorkingHours.Count, "робочих інтервалів викладачів");
         var workingHoursByTeacher = teacherWorkingHours
             .GroupBy(item => item.TeacherId)
             .ToDictionary(group => group.Key, group => group.ToList());
@@ -591,6 +670,15 @@ public sealed class TeacherDraftsPublishService
             violations.Distinct(StringComparer.Ordinal).ToList());
     }
 
+    private static void EnsureWeekContextCapacity(int rowCount, string scopeLabel)
+    {
+        if (rowCount > TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount)
+        {
+            throw new DraftValidationCapacityException(
+                $"Перевірка {scopeLabel} підтримує не більше {TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount} записів.");
+        }
+    }
+
     // Розширює вибір викладача лише до рядків того самого BatchKey і сигнатури в межах запитаного тижня.
     private static List<TeacherDraftItem> ExpandTeacherPublishSelection(
         IReadOnlyList<TeacherDraftItem> weekDrafts,
@@ -652,29 +740,49 @@ public sealed class TeacherDraftsPublishService
         }
     }
 
-    // Вимагає повторного цілісного схвалення для legacy-пакетів зі змішаними статусами рядків.
+    // Вимагає повторного цілісного схвалення для явних і консервативно розпізнаних legacy-подій.
     private static IEnumerable<string> FindMixedStatusLogicalEventViolations(
         IReadOnlyList<TeacherDraftItem> drafts)
     {
-        foreach (var mixedEvent in drafts
-                     .Where(draft => !string.IsNullOrWhiteSpace(draft.BatchKey))
-                     .GroupBy(draft => new
-                     {
-                         draft.BatchKey,
-                         draft.Date,
-                         draft.StartTime,
-                         draft.EndTime,
-                         draft.GroupId,
-                         draft.ModuleId,
-                         draft.LessonTypeId
-                     })
-                     .Where(group => group
-                         .Select(draft => draft.Status)
-                         .Distinct()
-                         .Skip(1)
-                         .Any()))
+        var logicalEvents = drafts
+            .Where(draft => !string.IsNullOrWhiteSpace(draft.BatchKey))
+            .GroupBy(draft => new
+            {
+                draft.BatchKey,
+                draft.Date,
+                draft.StartTime,
+                draft.EndTime,
+                draft.GroupId,
+                draft.ModuleId,
+                draft.LessonTypeId
+            })
+            .Select(group => group.ToList())
+            .ToList();
+        logicalEvents.AddRange(drafts
+            .Where(draft => string.IsNullOrWhiteSpace(draft.BatchKey))
+            .GroupBy(draft => new
+            {
+                draft.Date,
+                draft.StartTime,
+                draft.EndTime,
+                draft.GroupId,
+                draft.ModuleId,
+                draft.LessonTypeId
+            })
+            .Where(group => group
+                .Select(draft => new { draft.ModuleTopicId, draft.TeacherId })
+                .Distinct()
+                .Skip(1)
+                .Any())
+            .Select(group => group.ToList()));
+        foreach (var mixedEvent in logicalEvents.Where(rows => rows
+                     .Select(draft => draft.Status)
+                     .Distinct()
+                     .Skip(1)
+                     .Any()))
         {
-            yield return $"{mixedEvent.Key.Date:yyyy-MM-dd} {mixedEvent.Key.StartTime:HH\\:mm}-{mixedEvent.Key.EndTime:HH\\:mm}: логічне заняття має змішані статуси рядків. Повторно схваліть заняття цілісним пакетом перед публікацією.";
+            var first = mixedEvent[0];
+            yield return $"{first.Date:yyyy-MM-dd} {first.StartTime:HH\\:mm}-{first.EndTime:HH\\:mm}: логічне заняття має змішані статуси рядків. Повторно схваліть заняття цілісним пакетом перед публікацією.";
         }
     }
 

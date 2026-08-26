@@ -29,6 +29,57 @@ public static class CurriculumScheduleAggregation
         IEnumerable<CurriculumScheduleRow> rows)
         => Collapse(rows, preserveTopic: true);
 
+    // Для навантаження кожен викладач отримує тривалість логічного заняття один раз,
+    // навіть якщо його рядок повторено для кількох тем тієї самої події.
+    public static IReadOnlyList<CurriculumScheduleRow> CollapseForTeacherLoad(
+        IEnumerable<CurriculumScheduleRow> rows)
+    {
+        var indexedRows = rows
+            .Select((row, index) => new IndexedRow(index, row))
+            .ToList();
+        var collapsed = indexedRows
+            .Where(item => !string.IsNullOrWhiteSpace(item.Row.BatchKey))
+            .GroupBy(item => new TeacherLoadBatchLogicalEventKey(
+                item.Row.CourseId,
+                item.Row.BatchKey!,
+                item.Row.Date,
+                item.Row.StartTime,
+                item.Row.EndTime,
+                item.Row.GroupId,
+                item.Row.ModuleId,
+                item.Row.LessonTypeId,
+                item.Row.TeacherId))
+            .Select(group => group.First())
+            .ToList();
+
+        foreach (var legacyGroup in indexedRows
+                     .Where(item => string.IsNullOrWhiteSpace(item.Row.BatchKey))
+                     .GroupBy(item => BuildLegacyKey(item.Row)))
+        {
+            var legacyRows = legacyGroup.ToList();
+            var isLogicalEvent = legacyRows.Count > 1
+                                 && legacyRows
+                                     .Select(item => (item.Row.ModuleTopicId, item.Row.TeacherId))
+                                     .Distinct()
+                                     .Skip(1)
+                                     .Any();
+            if (!isLogicalEvent)
+            {
+                collapsed.AddRange(legacyRows);
+                continue;
+            }
+
+            collapsed.AddRange(legacyRows
+                .GroupBy(item => item.Row.TeacherId)
+                .Select(group => group.First()));
+        }
+
+        return collapsed
+            .OrderBy(item => item.Index)
+            .Select(item => item.Row)
+            .ToList();
+    }
+
     // Перетворює тривалість заняття на ту саму цілу кількість годин, яку зберігають агрегати.
     public static int ScheduledHours(TimeOnly start, TimeOnly end)
     {
@@ -120,6 +171,17 @@ public static class CurriculumScheduleAggregation
         int ModuleId,
         int LessonTypeId,
         int? ModuleTopicId);
+
+    private readonly record struct TeacherLoadBatchLogicalEventKey(
+        int CourseId,
+        string BatchKey,
+        DateOnly Date,
+        TimeOnly StartTime,
+        TimeOnly EndTime,
+        int GroupId,
+        int ModuleId,
+        int LessonTypeId,
+        int? TeacherId);
 
     private readonly record struct LegacyLogicalEventKey(
         int CourseId,

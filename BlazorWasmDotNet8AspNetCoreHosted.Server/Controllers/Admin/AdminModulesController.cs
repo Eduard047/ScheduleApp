@@ -12,6 +12,7 @@ using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.RateLimiting;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Admin;
 
@@ -50,16 +51,26 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
         var title = dto.Title?.Trim() ?? string.Empty;
         if (string.IsNullOrWhiteSpace(code) || string.IsNullOrWhiteSpace(title))
             return BadRequest(new { message = "Код і назва модуля є обов'язковими." });
-        if (code.Length > 64)
-            return BadRequest(new { message = "Код модуля не може перевищувати 64 символи." });
+        if (code.Length > CurriculumInputLimits.CodeMaxLength)
+            return BadRequest(new { message = $"Код модуля не може перевищувати {CurriculumInputLimits.CodeMaxLength} символи." });
+        if (title.Length > CurriculumInputLimits.ModuleTitleMaxLength)
+            return BadRequest(new { message = $"Назва модуля не може перевищувати {CurriculumInputLimits.ModuleTitleMaxLength} символів." });
         if (dto.CourseId <= 0)
             return BadRequest(new { message = "Потрібно вибрати коректний курс." });
-        if (dto.Credits is < 0 or > 9999.99m)
-            return BadRequest(new { message = "Кількість кредитів має бути від 0 до 9999,99." });
+        if (dto.Credits is < 0 or > CurriculumInputLimits.ModuleCreditsMax)
+            return BadRequest(new { message = $"Кількість кредитів має бути від 0 до {CurriculumInputLimits.ModuleCreditsMax}." });
+        if (!CurriculumInputLimits.HasSupportedModuleCreditScale(dto.Credits))
+            return BadRequest(new { message = $"Кількість кредитів може містити не більше {CurriculumInputLimits.ModuleCreditsScale} знаків після коми." });
         var requestedRoomIds = (dto.AllowedRoomIds ?? new List<int>()).Distinct().ToList();
         var requestedBuildingIds = (dto.AllowedBuildingIds ?? new List<int>()).Distinct().ToList();
-        if (requestedRoomIds.Count > 500 || requestedBuildingIds.Count > 500)
-            return BadRequest(new { message = "Для одного модуля можна вибрати не більше 500 аудиторій або корпусів." });
+        if (requestedRoomIds.Count > CurriculumInputLimits.ModuleAssociationCountMax
+            || requestedBuildingIds.Count > CurriculumInputLimits.ModuleAssociationCountMax)
+        {
+            return BadRequest(new
+            {
+                message = $"Для одного модуля можна вибрати не більше {CurriculumInputLimits.ModuleAssociationCountMax} аудиторій або корпусів."
+            });
+        }
         if (requestedRoomIds.Any(id => id <= 0) || requestedBuildingIds.Any(id => id <= 0))
             return BadRequest(new { message = "Ідентифікатори аудиторій і корпусів мають бути додатними числами." });
 
@@ -541,17 +552,23 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
         var trimmedTopicCode = dto.TopicCode?.Trim() ?? string.Empty;
         if (string.IsNullOrWhiteSpace(trimmedTopicCode))
             return BadRequest(new { message = "Код теми є обов'язковим." });
-        if (trimmedTopicCode.Length > 64)
-            return BadRequest(new { message = "Код теми не може перевищувати 64 символи." });
+        if (trimmedTopicCode.Length > CurriculumInputLimits.CodeMaxLength)
+            return BadRequest(new { message = $"Код теми не може перевищувати {CurriculumInputLimits.CodeMaxLength} символи." });
         var normalizedTopicCode = trimmedTopicCode;
-        if (dto.AuditoriumHours < 0 || dto.SelfStudyHours < 0)
+        if (dto.TotalHours < 0 || dto.AuditoriumHours < 0 || dto.SelfStudyHours < 0)
         {
             return BadRequest(new { message = "Кількість годин теми не може бути від'ємною." });
         }
         var requestedTotalHours = (long)dto.AuditoriumHours + dto.SelfStudyHours;
-        if (requestedTotalHours > int.MaxValue)
+        if (dto.TotalHours > CurriculumInputLimits.TopicHoursMax
+            || dto.AuditoriumHours > CurriculumInputLimits.TopicHoursMax
+            || dto.SelfStudyHours > CurriculumInputLimits.TopicHoursMax
+            || requestedTotalHours > CurriculumInputLimits.TopicHoursMax)
         {
-            return BadRequest(new { message = "Сума годин теми перевищує підтримуване значення." });
+            return BadRequest(new
+            {
+                message = $"Кількість годин теми перевищує підтримувану межу {CurriculumInputLimits.TopicHoursMax}."
+            });
         }
         var topicId = dto.Id ?? 0;
         var duplicateExists = await topicsQuery
@@ -566,7 +583,9 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
             if (topicId > 0) return NotFound();
             entity = new ModuleTopic
             {
-                ModuleId = moduleId
+                ModuleId = moduleId,
+                Order = ModuleTopicOrdering.FindUnusedTemporaryOrder(
+                    await topicsQuery.Select(topic => topic.Order).ToListAsync())
             };
             db.ModuleTopics.Add(entity);
         }
@@ -585,12 +604,6 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
                 });
             }
         }
-        var desiredOrder = dto.Order > 0
-            ? dto.Order
-            : topicId > 0
-                ? entity.Order
-                : (await topicsQuery.MaxAsync(t => (int?)t.Order) ?? 0) + 1;
-        entity.Order = desiredOrder;
         entity.TopicCode = normalizedTopicCode;
         entity.LessonTypeId = dto.LessonTypeId;
         entity.DepartmentId = normalizedDepartmentId;
@@ -625,10 +638,11 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
         return NoContent();
     }
     [HttpPost("import-docx")]
+    [EnableRateLimiting("docx-import")]
     [RequestSizeLimit(11 * 1024 * 1024)]
     [RequestFormLimits(MultipartBodyLengthLimit = 11 * 1024 * 1024)]
     // Імпортує модулі та теми з DOCX.
-    public async Task<ActionResult<DocxImportResultDto>> ImportDocx([FromForm] IFormFile file, [FromQuery] bool apply = false, CancellationToken ct = default)
+    public async Task<ActionResult<DocxImportResultDto>> ImportDocx(IFormFile file, [FromQuery] bool apply = false, CancellationToken ct = default)
     {
         var service = new DocxImportService();
         var result = await service.ImportAsync(file, db, apply, ct);
@@ -1139,10 +1153,7 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
         {
             return;
         }
-        for (var i = 0; i < topics.Count; i++)
-        {
-            topics[i].Order = 1000 + i;
-        }
+        ModuleTopicOrdering.AssignCollisionFreeTemporaryOrders(topics);
         await db.SaveChangesAsync();
         for (var i = 0; i < topics.Count; i++)
         {

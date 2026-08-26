@@ -3,15 +3,32 @@ name: ScheduleApp quality
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      autogen_profile:
+        description: Autogeneration verification profile
+        required: true
+        default: nightly
+        type: choice
+        options:
+          - quality
+          - nightly
+          - weekly
+      target_ref:
+        description: Git ref для перевірки
+        required: true
+        default: test
+        type: string
   schedule:
     - cron: "17 2 * * *"
+    - cron: "43 1 * * 0"
 
 permissions:
   contents: read
 
 jobs:
   build-and-test:
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -34,10 +51,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
           dotnet-version: 8.0.x
 
@@ -51,6 +70,9 @@ jobs:
 
       - name: Restore repository tools
         run: dotnet tool restore
+
+      - name: Перевірити включення всіх tracked тестових файлів
+        run: bash .github/scripts/verify-test-compile-items.sh
 
       - name: Build
         run: dotnet build BlazorWasmDotNet8AspNetCoreHosted.Server.sln --configuration Release --no-restore
@@ -143,8 +165,14 @@ jobs:
             --results-directory "$quality_results" \
             --logger "console;verbosity=normal" \
             --logger "trx;LogFileName=autogen-quality.trx"
-          if ! grep --quiet '<UnitTestResult ' "$quality_results/autogen-quality.trx"; then
-            echo "::error::Фільтр Category=AutogenQuality не знайшов жодного тесту."
+          quality_trx="$quality_results/autogen-quality.trx"
+          result_count=$(grep --count '<UnitTestResult ' "$quality_trx" 2>/dev/null || true)
+          passed_count=$(grep '<UnitTestResult ' "$quality_trx" 2>/dev/null | grep --count 'outcome="Passed"' || true)
+          result_count=${result_count:-0}
+          passed_count=${passed_count:-0}
+          if [ "$result_count" -ne 7 ] || [ "$passed_count" -ne 7 ]; then
+            echo "::error::Фільтр Category=AutogenQuality мав завершити 7/7 тестів успішно; отримано всього $result_count, успішних $passed_count."
+            grep -o '<Counters[^>]*/>' "$quality_trx" 2>/dev/null || true
             exit 1
           fi
 
@@ -161,23 +189,35 @@ jobs:
         run: dotnet list BlazorWasmDotNet8AspNetCoreHosted.Server.sln package --vulnerable --include-transitive
 
   autogen-quality-nightly:
-    if: github.event_name == 'schedule'
+    if: >-
+      github.event.schedule == '17 2 * * *' ||
+      (github.event_name == 'workflow_dispatch' && inputs.autogen_profile == 'quality')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'test' || inputs.target_ref }}
+          persist-credentials: false
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
           dotnet-version: 8.0.x
+
+      - name: Перевірити включення всіх tracked тестових файлів
+        run: bash .github/scripts/verify-test-compile-items.sh
 
       - name: Restore quality matrix
         run: >-
           dotnet restore
           BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj
+          -p:NuGetAudit=true
+          -p:NuGetAuditMode=all
+          -p:NuGetAuditLevel=low
+          -p:WarningsAsErrors=NU1900%3BNU1901%3BNU1902%3BNU1903%3BNU1904%3BNU1905
 
       - name: Build quality matrix
         run: >-
@@ -202,8 +242,185 @@ jobs:
               --results-directory "$quality_results" \
               --logger "console;verbosity=normal" \
               --logger "trx;LogFileName=autogen-quality.trx"
-            if ! grep --quiet '<UnitTestResult ' "$quality_results/autogen-quality.trx"; then
-              echo "::error::Фільтр Category=AutogenQuality не знайшов жодного тесту під час повтору $replay."
+            quality_trx="$quality_results/autogen-quality.trx"
+            result_count=$(grep --count '<UnitTestResult ' "$quality_trx" 2>/dev/null || true)
+            passed_count=$(grep '<UnitTestResult ' "$quality_trx" 2>/dev/null | grep --count 'outcome="Passed"' || true)
+            result_count=${result_count:-0}
+            passed_count=${passed_count:-0}
+            if [ "$result_count" -ne 7 ] || [ "$passed_count" -ne 7 ]; then
+              echo "::error::Повтор $replay Category=AutogenQuality мав завершити 7/7 тестів успішно; отримано всього $result_count, успішних $passed_count."
+              grep -o '<Counters[^>]*/>' "$quality_trx" 2>/dev/null || true
               exit 1
             fi
           done
+
+
+  autogen-stress-nightly:
+    if: >-
+      github.event.schedule == '17 2 * * *' ||
+      (github.event_name == 'workflow_dispatch' && inputs.autogen_profile == 'nightly')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'test' || inputs.target_ref }}
+          persist-credentials: false
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Перевірити включення всіх tracked тестових файлів
+        run: bash .github/scripts/verify-test-compile-items.sh
+
+      - name: Restore stress matrix
+        run: >-
+          dotnet restore
+          BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj
+          -p:NuGetAudit=true
+          -p:NuGetAuditMode=all
+          -p:NuGetAuditLevel=low
+          -p:WarningsAsErrors=NU1900%3BNU1901%3BNU1902%3BNU1903%3BNU1904%3BNU1905
+
+      - name: Build stress matrix
+        run: >-
+          dotnet build
+          BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj
+          --configuration Release
+          --no-restore
+
+      - name: Run nightly shard
+        shell: bash
+        env:
+          RUN_AUTOGEN_STRESS: "1"
+          AUTOGEN_STRESS_SCENARIOS: "2500"
+          AUTOGEN_STRESS_DEFICIT_SCENARIOS: "500"
+          AUTOGEN_STRESS_LIFECYCLE_SCENARIOS: "125"
+          AUTOGEN_STRESS_SCALE_SCENARIOS: "2"
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: |
+          export AUTOGEN_STRESS_FIRST_SEED=$((50000 + SHARD_INDEX * 100000))
+          export AUTOGEN_STRESS_LIFECYCLE_FIRST_SEED=$((60000 + SHARD_INDEX * 100000))
+          export AUTOGEN_STRESS_SCALE_FIRST_SEED=$((80000 + SHARD_INDEX * 100000))
+          stress_results="$RUNNER_TEMP/autogen-stress-nightly-$SHARD_INDEX"
+          mkdir -p "$stress_results"
+          dotnet test \
+            BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj \
+            --configuration Release \
+            --no-build \
+            --no-restore \
+            --filter "Category=AutogenStress" \
+            --results-directory "$stress_results" \
+            --logger "console;verbosity=normal" \
+            --logger "trx;LogFileName=autogen-stress.trx"
+          stress_trx="$stress_results/autogen-stress.trx"
+          result_count=$(grep --count '<UnitTestResult ' "$stress_trx" 2>/dev/null || true)
+          passed_count=$(grep '<UnitTestResult ' "$stress_trx" 2>/dev/null | grep --count 'outcome="Passed"' || true)
+          result_count=${result_count:-0}
+          passed_count=${passed_count:-0}
+          if [ "$result_count" -ne 3 ] || [ "$passed_count" -ne 3 ]; then
+            echo "::error::Фільтр Category=AutogenStress мав завершити 3/3 тести успішно; отримано всього $result_count, успішних $passed_count."
+            grep -o '<Counters[^>]*/>' "$stress_trx" 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Upload nightly diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: autogen-stress-nightly-${{ matrix.shard }}
+          path: ${{ runner.temp }}/autogen-stress-nightly-${{ matrix.shard }}
+          retention-days: 14
+
+  autogen-stress-weekly:
+    if: >-
+      github.event.schedule == '43 1 * * 0' ||
+      (github.event_name == 'workflow_dispatch' && inputs.autogen_profile == 'weekly')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'test' || inputs.target_ref }}
+          persist-credentials: false
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Перевірити включення всіх tracked тестових файлів
+        run: bash .github/scripts/verify-test-compile-items.sh
+
+      - name: Restore soak matrix
+        run: >-
+          dotnet restore
+          BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj
+          -p:NuGetAudit=true
+          -p:NuGetAuditMode=all
+          -p:NuGetAuditLevel=low
+          -p:WarningsAsErrors=NU1900%3BNU1901%3BNU1902%3BNU1903%3BNU1904%3BNU1905
+
+      - name: Build soak matrix
+        run: >-
+          dotnet build
+          BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj
+          --configuration Release
+          --no-restore
+
+      - name: Run weekly soak shard
+        shell: bash
+        env:
+          RUN_AUTOGEN_STRESS: "1"
+          AUTOGEN_STRESS_SCENARIOS: "6250"
+          AUTOGEN_STRESS_DEFICIT_SCENARIOS: "1250"
+          AUTOGEN_STRESS_LIFECYCLE_SCENARIOS: "250"
+          AUTOGEN_STRESS_SCALE_SCENARIOS: "13"
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: |
+          export AUTOGEN_STRESS_FIRST_SEED=$((50000 + SHARD_INDEX * 100000))
+          export AUTOGEN_STRESS_LIFECYCLE_FIRST_SEED=$((60000 + SHARD_INDEX * 100000))
+          export AUTOGEN_STRESS_SCALE_FIRST_SEED=$((80000 + SHARD_INDEX * 100000))
+          stress_results="$RUNNER_TEMP/autogen-stress-weekly-$SHARD_INDEX"
+          mkdir -p "$stress_results"
+          dotnet test \
+            BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj \
+            --configuration Release \
+            --no-build \
+            --no-restore \
+            --filter "Category=AutogenStress" \
+            --results-directory "$stress_results" \
+            --logger "console;verbosity=normal" \
+            --logger "trx;LogFileName=autogen-stress.trx"
+          stress_trx="$stress_results/autogen-stress.trx"
+          result_count=$(grep --count '<UnitTestResult ' "$stress_trx" 2>/dev/null || true)
+          passed_count=$(grep '<UnitTestResult ' "$stress_trx" 2>/dev/null | grep --count 'outcome="Passed"' || true)
+          result_count=${result_count:-0}
+          passed_count=${passed_count:-0}
+          if [ "$result_count" -ne 3 ] || [ "$passed_count" -ne 3 ]; then
+            echo "::error::Фільтр Category=AutogenStress мав завершити 3/3 тести успішно; отримано всього $result_count, успішних $passed_count."
+            grep -o '<Counters[^>]*/>' "$stress_trx" 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Upload weekly diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: autogen-stress-weekly-${{ matrix.shard }}
+          path: ${{ runner.temp }}/autogen-stress-weekly-${{ matrix.shard }}
+          retention-days: 30

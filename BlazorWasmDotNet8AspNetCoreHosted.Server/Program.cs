@@ -1,6 +1,8 @@
 using System.Net;
+using System.Threading.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.HttpOverrides;
+using Microsoft.AspNetCore.RateLimiting;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using Pomelo.EntityFrameworkCore.MySql.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
@@ -20,8 +22,108 @@ builder.Services.AddProblemDetails(options =>
         context.ProblemDetails.Extensions["traceId"] = context.HttpContext.TraceIdentifier;
 });
 builder.Services.AddHealthChecks();
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.OnRejected = async (context, cancellationToken) =>
+    {
+        if (context.HttpContext.Response.HasStarted)
+        {
+            return;
+        }
+
+        await Results.Problem(
+                statusCode: StatusCodes.Status429TooManyRequests,
+                title: "Забагато дорогих операцій",
+                detail: "Зачекайте перед повторним запуском цієї операції.")
+            .ExecuteAsync(context.HttpContext);
+    };
+    options.AddPolicy("autogen-start", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ClientPartitionKey.Resolve(context),
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 4,
+                Window = TimeSpan.FromMinutes(3),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+    options.AddPolicy("docx-import", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ClientPartitionKey.Resolve(context),
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 2,
+                Window = TimeSpan.FromMinutes(5),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+    options.AddPolicy("xlsx-export", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ClientPartitionKey.Resolve(context),
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 6,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+    options.AddPolicy("autogen-status", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ClientPartitionKey.Resolve(context),
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 240,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+    options.AddPolicy("autogen-plan-read", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ClientPartitionKey.Resolve(context),
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 30,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+    options.AddPolicy("autogen-plan-action", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ClientPartitionKey.Resolve(context),
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 12,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+    options.AddPolicy("week-validation", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ClientPartitionKey.Resolve(context),
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 30,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+    options.AddPolicy("module-sequence-save", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            ClientPartitionKey.Resolve(context),
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 12,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
+});
 // Стискаємо JSON, WebAssembly та статичні ресурси під час передавання через HTTPS.
 builder.Services.AddResponseCompression(options => options.EnableForHttps = true);
+
+var allowedHosts = AllowedHostPolicy.Parse(builder.Configuration["AllowedHosts"]);
+builder.Services.AddHostFiltering(options => AllowedHostPolicy.Apply(options, allowedHosts));
 
 var trustedProxyAddresses = builder.Configuration
     .GetSection("ReverseProxy:KnownProxies")
@@ -55,6 +157,7 @@ builder.Services.AddScoped<TeacherDraftsWeekValidationService>();
 builder.Services.AddScoped<TeacherDraftsExportService>();
 builder.Services.AddScoped<TeacherDraftsAutogenService>();
 builder.Services.AddScoped<TeacherDraftsAutogenPlanService>();
+builder.Services.AddSingleton<ExpensiveOperationGate>();
 builder.Services.AddSingleton<TeacherDraftsAutogenJobService>();
 builder.Services.AddHostedService<TeacherDraftsAutogenJobService>(services =>
     services.GetRequiredService<TeacherDraftsAutogenJobService>());
@@ -66,6 +169,12 @@ var app = builder.Build();
 
 // Приймаємо схему та адресу клієнта лише від явно довірених reverse proxy.
 app.UseForwardedHeaders();
+app.UseHostFiltering();
+app.UseMiddleware<SecurityResponseHeadersMiddleware>();
+// Перевіряємо браузерне походження всіх API-запитів, що можуть змінювати стан.
+app.UseMiddleware<ApiRequestOriginPolicyMiddleware>();
+app.UseRouting();
+app.UseRateLimiter();
 
 if (app.Environment.IsDevelopment())
 {
@@ -81,9 +190,13 @@ else
     app.UseHsts();
 }
 
-app.UseWhen(
-    context => !context.Request.Path.StartsWithSegments("/health"),
-    branch => branch.UseHttpsRedirection());
+if (!app.Environment.IsDevelopment())
+{
+    // Локальний HTTP-профіль не має HTTPS-порту; у робочому середовищі перенаправлення залишається обов'язковим.
+    app.UseWhen(
+        context => !context.Request.Path.StartsWithSegments("/health"),
+        branch => branch.UseHttpsRedirection());
+}
 
 app.UseResponseCompression();
 app.UseBlazorFrameworkFiles();

@@ -23,7 +23,7 @@ public sealed class PublishGuardrailTests
             CreateDraft(model, model.IndependentLessonTypeId, new TimeOnly(8, 0), new TimeOnly(9, 0), batchKey: "event-b"));
         await fixture.Db.SaveChangesAsync();
 
-        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null));
+        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var payload = ReadPayload(result);
         Assert.Equal(0, payload.Created);
@@ -56,7 +56,7 @@ public sealed class PublishGuardrailTests
                 new TimeOnly(10, 10)));
         await fixture.Db.SaveChangesAsync();
 
-        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null));
+        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var payload = ReadPayload(result);
         Assert.Equal(0, payload.Created);
@@ -88,7 +88,7 @@ public sealed class PublishGuardrailTests
             teacherId: teacher.Id));
         await fixture.Db.SaveChangesAsync();
 
-        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null));
+        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var payload = ReadPayload(result);
         Assert.Equal(0, payload.Created);
@@ -131,7 +131,7 @@ public sealed class PublishGuardrailTests
                 roomId: secondRoom.Id));
         await fixture.Db.SaveChangesAsync();
 
-        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null));
+        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var payload = ReadPayload(result);
         Assert.Equal(0, payload.Created);
@@ -152,7 +152,7 @@ public sealed class PublishGuardrailTests
             new TimeOnly(9, 0)));
         await fixture.Db.SaveChangesAsync();
 
-        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null));
+        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var payload = ReadPayload(result);
         Assert.Equal(1, payload.Created);
@@ -172,7 +172,7 @@ public sealed class PublishGuardrailTests
             CreateDraft(model, model.IndependentLessonTypeId, new TimeOnly(8, 0), new TimeOnly(9, 0)));
         await fixture.Db.SaveChangesAsync();
 
-        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null));
+        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var payload = ReadPayload(result);
         Assert.Equal(0, payload.Created);
@@ -207,7 +207,7 @@ public sealed class PublishGuardrailTests
         fixture.Db.TeacherDraftItems.Add(draft);
         await fixture.Db.SaveChangesAsync();
 
-        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null));
+        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var payload = ReadPayload(result);
         Assert.Equal(1, payload.Created);
@@ -248,7 +248,7 @@ public sealed class PublishGuardrailTests
         });
         await fixture.Db.SaveChangesAsync();
 
-        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null));
+        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var payload = ReadPayload(result);
         Assert.Equal(0, payload.Created);
@@ -291,7 +291,7 @@ public sealed class PublishGuardrailTests
             });
         await fixture.Db.SaveChangesAsync();
 
-        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null));
+        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var payload = ReadPayload(result);
         Assert.Equal(2, payload.Created);
@@ -340,7 +340,7 @@ public sealed class PublishGuardrailTests
             .ToListAsync();
         Assert.Equal(new[] { DraftStatus.Published, DraftStatus.Published }, statuses);
 
-        var publish = await service.PublishWeekAsync(new PublishWeekRequest(Monday, firstTeacher.Id));
+        var publish = await service.PublishWeekAsync(new PublishWeekRequest(Monday, firstTeacher.Id, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var payload = ReadPayload(publish);
         Assert.Equal(2, payload.Created);
@@ -350,13 +350,16 @@ public sealed class PublishGuardrailTests
         Assert.Equal(2, await fixture.Db.ScheduleItems.CountAsync());
     }
 
-    [Fact]
-    public async Task PublishWeek_rejects_legacy_mixed_status_logical_event_until_full_reapproval()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PublishWeek_rejects_explicit_and_legacy_mixed_status_logical_event_until_full_reapproval(
+        bool withBatchKey)
     {
         await using var fixture = await TestDatabase.CreateAsync();
         var model = await fixture.SeedAsync();
         var (firstTopic, secondTopic, firstTeacher, secondTeacher) = await SeedLogicalEventDetailsAsync(fixture.Db, model);
-        const string batchKey = "logical-event-mixed-status";
+        var batchKey = withBatchKey ? "logical-event-mixed-status" : null;
         var publishedRow = CreateDraft(
             model,
             model.TeacherLessonTypeId,
@@ -378,7 +381,7 @@ public sealed class PublishGuardrailTests
         await fixture.Db.SaveChangesAsync();
         var service = CreateService(fixture.Db);
 
-        var blockedPublish = await service.PublishWeekAsync(new PublishWeekRequest(Monday, firstTeacher.Id));
+        var blockedPublish = await service.PublishWeekAsync(new PublishWeekRequest(Monday, firstTeacher.Id, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var blockedPayload = ReadPayload(blockedPublish);
         Assert.Equal(0, blockedPayload.Created);
@@ -392,7 +395,7 @@ public sealed class PublishGuardrailTests
         var approval = await service.ApproveWeekAsync(new ApproveWeekRequest(Monday, firstTeacher.Id));
         Assert.IsType<OkResult>(approval);
 
-        var successfulPublish = await service.PublishWeekAsync(new PublishWeekRequest(Monday, firstTeacher.Id));
+        var successfulPublish = await service.PublishWeekAsync(new PublishWeekRequest(Monday, firstTeacher.Id, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var successfulPayload = ReadPayload(successfulPublish);
         Assert.Equal(2, successfulPayload.Created);
@@ -428,7 +431,7 @@ public sealed class PublishGuardrailTests
                 batchKey: batchKey));
         await fixture.Db.SaveChangesAsync();
 
-        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, firstTeacher.Id));
+        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, firstTeacher.Id, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var payload = ReadPayload(result);
         Assert.Equal(2, payload.Created);
@@ -483,7 +486,7 @@ public sealed class PublishGuardrailTests
         await fixture.Db.SaveChangesAsync();
 
         var result = await CreateService(fixture.Db).PublishWeekAsync(
-            new PublishWeekRequest(Monday, firstTeacher.Id));
+            new PublishWeekRequest(Monday, firstTeacher.Id, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var payload = ReadPayload(result);
         Assert.Equal(2, payload.Created);
@@ -536,7 +539,7 @@ public sealed class PublishGuardrailTests
                 batchKey: "outside-event"));
         await fixture.Db.SaveChangesAsync();
 
-        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null));
+        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var payload = ReadPayload(result);
         Assert.Equal(0, payload.Created);
@@ -583,7 +586,7 @@ public sealed class PublishGuardrailTests
         await fixture.Db.SaveChangesAsync();
 
         var result = await CreateService(fixture.Db).PublishWeekAsync(
-            new PublishWeekRequest(Monday, firstTeacher.Id));
+            new PublishWeekRequest(Monday, firstTeacher.Id, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var payload = ReadPayload(result);
         Assert.Equal(0, payload.Created);
@@ -620,7 +623,7 @@ public sealed class PublishGuardrailTests
                 batchKey: "one-event"));
         await fixture.Db.SaveChangesAsync();
 
-        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null));
+        var result = await CreateService(fixture.Db).PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var payload = ReadPayload(result);
         Assert.Equal(0, payload.Created);

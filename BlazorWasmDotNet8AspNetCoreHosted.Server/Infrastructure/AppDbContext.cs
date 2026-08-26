@@ -294,6 +294,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         {
             e.HasKey(x => x.Id);
             e.Property(x => x.JobId).HasMaxLength(64).IsRequired();
+            e.Property(x => x.ClientPartitionKey).HasMaxLength(64).HasDefaultValue("legacy").IsRequired();
             e.Property(x => x.RequestHash).HasMaxLength(64).IsRequired();
             e.Property(x => x.OwnerInstanceId).HasMaxLength(64);
             e.Property(x => x.Version).IsConcurrencyToken();
@@ -308,6 +309,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             e.Property(x => x.TotalWeeks).HasDefaultValue(1);
             e.HasIndex(x => x.JobId).IsUnique();
             e.HasIndex(x => x.State);
+            e.HasIndex(x => new { x.ClientPartitionKey, x.State });
             e.HasIndex(x => new { x.State, x.LeaseExpiresAtUtc });
             e.HasIndex(x => x.CreatedAtUtc);
             e.HasIndex(x => x.UpdatedAtUtc);

@@ -1,9 +1,12 @@
 using System.Reflection;
 using BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.Infrastructure;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -15,17 +18,14 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
     private static readonly IReadOnlyDictionary<string, int> ModuleHoursByCode =
         new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
         {
-            ["1"] = 8,
+            ["1"] = 7,
             ["2"] = 9,
-            ["3"] = 13,
+            ["3"] = 36,
             ["4"] = 10,
             ["5"] = 6,
-            ["6"] = 8,
-            ["7"] = 6,
+            ["6"] = 5,
             ["8"] = 7,
-            ["9"] = 6,
-            ["10"] = 7,
-            ["11"] = 5,
+            ["10"] = 5,
             ["12"] = 5,
             ["13"] = 3
         };
@@ -46,7 +46,7 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
     {
         await using var source = ServerConfigurationFactory.CreateSourceContext();
         var scenario = await LoadScenarioAsync(source);
-        await using var snapshot = await SqliteSnapshotFile.CreateFromSourceAsync(source);
+        await using var snapshot = await SqliteSnapshotFile.CreateFromSourceAsync(source, scenario.CourseId);
         await using var database = new SqliteTempDatabase(snapshot.Path);
         await using var db = database.CreateContext();
 
@@ -109,7 +109,6 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
             .OrderBy(item => item.GroupId)
             .ThenBy(item => item.ModuleId)
             .ToListAsync();
-
         var expected = scenario.GroupIds.Count * scenario.ModuleHours.Values.Sum();
         var diagnostics =
             $"result={action.Result?.GetType().Name ?? "<null>"}; created={result.Created}; skipped={result.Skipped}; " +
@@ -120,14 +119,18 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
                 $"{scenario.ModuleIdsByCode.Single(entry => entry.Value == item.ModuleId).Key}:{item.Count}"))}; " +
             $"groupModules={string.Join(", ", createdByGroupModule.Select(item =>
                 $"{item.GroupId}/{scenario.ModuleIdsByCode.Single(entry => entry.Value == item.ModuleId).Key}:{item.Count}"))}; " +
+            $"gapSlots={string.Join(", ", (result.GapDetails ?? [])
+                .Select(gap => $"{gap.GroupName}/{gap.Date:MM-dd}/{gap.Start:HH\\:mm}/m{gap.ModuleId}/{gap.ReasonCode}/{gap.ConstraintCode}"))}; " +
             $"gapReasons={string.Join(" | ", (result.GapDetails ?? new List<AutoGenGapDetail>())
                 .GroupBy(item => item.Reason ?? "<none>")
                 .OrderByDescending(group => group.Count())
-                .Select(group => $"{group.Count()}x {group.Key}"))}; " +
+                .Take(12)
+                .Select(group => $"{group.Count()}x {CompactDiagnostic(group.Key)}"))}; " +
             $"fillGapReasons={string.Join(" | ", (fillResult.GapDetails ?? new List<AutoGenGapDetail>())
                 .GroupBy(item => item.Reason ?? "<none>")
                 .OrderByDescending(group => group.Count())
-                .Select(group => $"{group.Count()}x {group.Key}"))}; " +
+                .Take(12)
+                .Select(group => $"{group.Count()}x {CompactDiagnostic(group.Key)}"))}; " +
             $"warnings={string.Join(" | ", result.Warnings
                 .Where(item => item.Contains("Фінальна перевірка", StringComparison.Ordinal))
                 .Take(50))}; " +
@@ -138,7 +141,6 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
         Assert.True(action.Result is OkObjectResult, diagnostics);
         Assert.True(fillAction.Result is OkObjectResult, diagnostics);
         Assert.True(result.Created + result.Skipped <= expected, diagnostics);
-        Assert.True(result.Created >= 615, diagnostics);
         if (result.Created + result.Skipped < expected)
         {
             Assert.True(fillResult.Created > 0, diagnostics);
@@ -185,7 +187,7 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
                 Assert.True(actual?.Count == moduleHours.Value, diagnostics);
             }
         }
-        foreach (var moduleCode in new[] { "9", "10" })
+        foreach (var moduleCode in new[] { "3", "10" })
         {
             var moduleId = scenario.ModuleIdsByCode[moduleCode];
             var secondWeekCount = await db.TeacherDraftItems
@@ -235,6 +237,7 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
                 AllowIncompleteDrafts: false,
                 MaxParallelGroupsPerModuleInSlot: AutoGenRecommendedProfile.MaxParallelGroupsPerModuleInSlot));
         Assert.Empty(hardRuleValidation.Violations);
+        await AssertSchedulePolicyAsync(db, scenario, expected, diagnostics);
 
         var fingerprintBeforeIdempotenceCheck = await LoadScheduleFingerprintAsync(
             db,
@@ -260,7 +263,7 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
     {
         await using var source = ServerConfigurationFactory.CreateSourceContext();
         var scenario = await LoadScenarioAsync(source);
-        await using var snapshot = await SqliteSnapshotFile.CreateFromSourceAsync(source);
+        await using var snapshot = await SqliteSnapshotFile.CreateFromSourceAsync(source, scenario.CourseId);
         await using var database = new SqliteTempDatabase(snapshot.Path);
         var services = new ServiceCollection();
         services.AddScoped(_ => database.CreateContext());
@@ -423,6 +426,145 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
         Assert.True(
             hardRuleValidation.Violations.Count == 0,
             $"{diagnostics}; violations={string.Join(" | ", hardRuleValidation.Violations)}");
+        await AssertSchedulePolicyAsync(verificationDb, scenario, expected, diagnostics);
+    }
+
+
+    private static async Task AssertSchedulePolicyAsync(
+        AppDbContext db,
+        L3Scenario scenario,
+        int expected,
+        string diagnostics)
+    {
+        var persistedRows = await db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => scenario.GroupIds.Contains(item.GroupId)
+                           && item.Date >= new DateOnly(2026, 9, 1)
+                           && item.Date <= new DateOnly(2026, 9, 12))
+            .Select(item => new
+            {
+                item.GroupId,
+                item.ModuleId,
+                item.ModuleTopicId,
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                item.TeacherId,
+                item.RoomId,
+                item.IsSelfStudy,
+                item.LessonType.Code,
+                item.LessonType.Name,
+                item.LessonType.PreferredFirstInWeek,
+                item.LessonType.RequiresTeacher,
+                item.LessonType.RequiresRoom
+            })
+            .ToListAsync();
+        var rows = persistedRows
+            .Select(item => new ScheduledLesson(
+                item.GroupId,
+                item.ModuleId,
+                item.ModuleTopicId,
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                item.TeacherId,
+                item.RoomId,
+                item.IsSelfStudy,
+                item.Code,
+                item.Name,
+                item.PreferredFirstInWeek,
+                item.RequiresTeacher,
+                item.RequiresRoom))
+            .ToList();
+        Assert.True(rows.Count == expected, $"{diagnostics}; persistedRows={rows.Count}");
+
+        foreach (var row in rows)
+        {
+            if (row.RequiresTeacher)
+            {
+                Assert.True(row.TeacherId is not null, $"{diagnostics}; missingTeacher={row.GroupId}/{row.Date:yyyy-MM-dd}/{row.Start:HH\\:mm}");
+            }
+            if (row.RequiresRoom)
+            {
+                Assert.True(row.RoomId is not null, $"{diagnostics}; missingRoom={row.GroupId}/{row.Date:yyyy-MM-dd}/{row.Start:HH\\:mm}");
+            }
+        }
+
+        var topicLimits = await db.ModuleTopics
+            .AsNoTracking()
+            .Where(topic => scenario.ModuleHours.Keys.Contains(topic.ModuleId))
+            .ToDictionaryAsync(topic => topic.Id, topic => Math.Max(0, topic.AuditoriumHours));
+        foreach (var usage in rows
+                     .Where(row => row.ModuleTopicId is not null)
+                     .GroupBy(row => new { row.GroupId, TopicId = row.ModuleTopicId!.Value }))
+        {
+            Assert.True(topicLimits.TryGetValue(usage.Key.TopicId, out var limit), $"{diagnostics}; unknownTopic={usage.Key.TopicId}");
+            Assert.True(
+                usage.Count() <= limit,
+                $"{diagnostics}; topicLimit={usage.Key.GroupId}/{usage.Key.TopicId}:{usage.Count()}/{limit}");
+        }
+
+        var timeSlots = await db.TimeSlots
+            .AsNoTracking()
+            .Where(slot => slot.CourseId == null || slot.CourseId == scenario.CourseId)
+            .ToListAsync();
+        var lunches = await db.LunchConfigs
+            .AsNoTracking()
+            .Where(lunch => lunch.CourseId == null || lunch.CourseId == scenario.CourseId)
+            .ToListAsync();
+        var resolvedSlots = TimeSlotsResolver.ResolveForWeek(timeSlots, scenario.CourseId, lunches);
+        foreach (var day in rows.GroupBy(row => new { row.GroupId, row.Date }))
+        {
+            var slots = resolvedSlots[day.Key.Date.DayOfWeek].Slots;
+            var seenNonLecture = false;
+            foreach (var row in day.OrderBy(item => item.Start).ThenBy(item => item.End))
+            {
+                var slotIndex = slots.FindIndex(slot => slot.Start == row.Start && slot.End == row.End);
+                Assert.True(slotIndex >= 0, $"{diagnostics}; nonCanonicalSlot={row.GroupId}/{row.Date:yyyy-MM-dd}/{row.Start:HH\\:mm}");
+                if (IsLecture(row))
+                {
+                    Assert.True(
+                        slotIndex + 1 <= AutoGenRecommendedProfile.PreferredFirstMaxSlotOrderOverride,
+                        $"{diagnostics}; lateLecture={row.GroupId}/{row.Date:yyyy-MM-dd}/pair{slotIndex + 1}");
+                    Assert.False(
+                        seenNonLecture,
+                        $"{diagnostics}; lectureAfterOtherType={row.GroupId}/{row.Date:yyyy-MM-dd}/{row.Start:HH\\:mm}");
+                }
+                else
+                {
+                    seenNonLecture = true;
+                }
+            }
+        }
+
+        var moduleThreeId = scenario.ModuleIdsByCode["3"];
+        foreach (var groupId in scenario.GroupIds)
+        {
+            var moduleThreeRows = rows
+                .Where(row => row.GroupId == groupId && row.ModuleId == moduleThreeId)
+                .ToList();
+            Assert.True(moduleThreeRows.Count == 36, $"{diagnostics}; module3={groupId}/{moduleThreeRows.Count}");
+            Assert.True(moduleThreeRows.Count(IsLecture) == 26, $"{diagnostics}; module3Lectures={groupId}/{moduleThreeRows.Count(IsLecture)}");
+            Assert.True(moduleThreeRows.Count(row => !IsLecture(row)) == 10, $"{diagnostics}; module3Other={groupId}/{moduleThreeRows.Count(row => !IsLecture(row))}");
+        }
+    }
+
+    private static bool IsLecture(ScheduledLesson row)
+    {
+        if (row.IsSelfStudy || row.PreferredFirstInWeek)
+        {
+            return !row.IsSelfStudy;
+        }
+        var code = row.LessonTypeCode.Trim().ToUpperInvariant();
+        if (code is "LECTURE" or "LECT" or "LEC")
+        {
+            return true;
+        }
+        var name = row.LessonTypeName.Trim().ToUpperInvariant();
+        return name.Contains("LECTURE", StringComparison.Ordinal)
+               || name.Contains("ЛЕКЦ", StringComparison.Ordinal)
+               || name.Contains("ЛЕКЦІ", StringComparison.Ordinal)
+               || name.Contains("ЛЕКЦІЇ", StringComparison.Ordinal);
     }
 
 
@@ -471,6 +613,9 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
             ObjectResult { Value: AutoGenResult result } => result,
             _ => throw new InvalidOperationException("Автогенерація не повернула очікуваний результат.")
         };
+
+    private static string CompactDiagnostic(string value)
+        => value.Length <= 300 ? value : $"{value[..300]}…";
 
     private static DraftAutoGenSoftOptions MapSoftOptions(AutoGenSoftOptionsDto options)
         => new(
@@ -525,4 +670,94 @@ public sealed class AutogenL3SeptemberTwoWeekScenarioTests
         List<int> GroupIds,
         Dictionary<int, int> ModuleHours,
         Dictionary<string, int> ModuleIdsByCode);
+
+    private sealed record ScheduledLesson(
+        int GroupId,
+        int ModuleId,
+        int? ModuleTopicId,
+        DateOnly Date,
+        TimeOnly Start,
+        TimeOnly End,
+        int? TeacherId,
+        int? RoomId,
+        bool IsSelfStudy,
+        string LessonTypeCode,
+        string LessonTypeName,
+        bool PreferredFirstInWeek,
+        bool RequiresTeacher,
+        bool RequiresRoom);
+}
+
+public sealed class DatabaseSnapshotSecurityTests
+{
+    [Fact]
+    public void Snapshot_allowlist_excludes_working_and_autogen_state()
+    {
+        Assert.DoesNotContain(typeof(ScheduleItem), DatabaseSnapshotCopier.AllowedTypes);
+        Assert.DoesNotContain(typeof(TeacherDraftItem), DatabaseSnapshotCopier.AllowedTypes);
+        Assert.DoesNotContain(typeof(AutoGenJobRun), DatabaseSnapshotCopier.AllowedTypes);
+        Assert.DoesNotContain(typeof(AutoGenDraftPlan), DatabaseSnapshotCopier.AllowedTypes);
+        Assert.DoesNotContain(typeof(AutoGenDraftPlanMutation), DatabaseSnapshotCopier.AllowedTypes);
+    }
+
+    [Fact]
+    public async Task Snapshot_sanitizes_personal_fields_and_removes_private_temp_directory()
+    {
+        await using var sourceConnection = new SqliteConnection("Data Source=:memory:");
+        await sourceConnection.OpenAsync();
+        var sourceOptions = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(sourceConnection)
+            .Options;
+        await using var source = new AppDbContext(sourceOptions);
+        await source.Database.EnsureCreatedAsync();
+        var department = new Department { Name = "Кафедра" };
+        source.Teachers.Add(new Teacher
+        {
+            FullName = "Персональне ім'я",
+            ScientificDegree = "ступінь",
+            AcademicTitle = "звання",
+            Department = department
+        });
+        source.Buildings.Add(new Building
+        {
+            Name = "Корпус",
+            Address = "Приватна адреса"
+        });
+        await source.SaveChangesAsync();
+
+        var snapshot = await SqliteSnapshotFile.CreateFromSourceAsync(source);
+        var snapshotPath = snapshot.Path;
+        var snapshotDirectory = Assert.IsType<DirectoryInfo>(Directory.GetParent(snapshotPath)).FullName;
+        try
+        {
+            Assert.True(File.Exists(snapshotPath));
+            if (!OperatingSystem.IsWindows())
+            {
+                var fileMode = File.GetUnixFileMode(snapshotPath);
+                Assert.Equal(
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite,
+                    fileMode & (UnixFileMode)0x1FF);
+            }
+
+            await using var snapshotConnection = new SqliteConnection(
+                new SqliteConnectionStringBuilder { DataSource = snapshotPath }.ToString());
+            await snapshotConnection.OpenAsync();
+            var snapshotOptions = new DbContextOptionsBuilder<AppDbContext>()
+                .UseSqlite(snapshotConnection)
+                .Options;
+            await using var copied = new AppDbContext(snapshotOptions);
+            var teacher = await copied.Teachers.AsNoTracking().SingleAsync();
+            var building = await copied.Buildings.AsNoTracking().SingleAsync();
+            Assert.Equal($"Викладач {teacher.Id}", teacher.FullName);
+            Assert.Null(teacher.ScientificDegree);
+            Assert.Null(teacher.AcademicTitle);
+            Assert.Null(building.Address);
+        }
+        finally
+        {
+            await snapshot.DisposeAsync();
+        }
+
+        Assert.False(Directory.Exists(snapshotDirectory));
+    }
 }

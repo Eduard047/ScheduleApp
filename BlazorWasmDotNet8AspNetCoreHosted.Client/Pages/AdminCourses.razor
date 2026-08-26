@@ -1,27 +1,45 @@
 ﻿@* Сторінка адміністрування курсів *@
 @page "/admin/courses"
+@using System.Net
 @using BlazorWasmDotNet8AspNetCoreHosted.Client.Services
 @using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
 @inject IAdminApi Api
 @inject IJSRuntime JS
 
-<h3 class="mb-3">Курси</h3>
+<PageTitle>Адмін • Курси</PageTitle>
+
+<h1 class="h3 mb-3">Курси</h1>
 
 @if (!string.IsNullOrEmpty(error))
 {
-    <div class="alert alert-danger">@error</div>
+    <div class="alert alert-danger" role="alert">
+        @error
+        @if (loadFailed)
+        {
+            <div class="mt-2">
+                <button type="button" class="btn btn-sm btn-outline-danger" @onclick="RetryLoad" disabled="@(loading || mutationInProgress)">
+                    Повторити завантаження
+                </button>
+            </div>
+        }
+    </div>
 }
 @if (!string.IsNullOrEmpty(ok))
 {
-    <div class="alert alert-success">@ok</div>
+    <div class="alert alert-success" role="status">@ok</div>
+}
+@if (loading)
+{
+    <div class="text-muted mb-3" role="status" aria-live="polite">Завантаження курсів…</div>
 }
 
 <div class="row">
     <div class="col-md-6">
         <div class="d-flex justify-content-between align-items-center mb-2 gap-2">
-            <button class="btn btn-primary" @onclick="New">+ Додати курс</button>
+            <button class="btn btn-primary" @onclick="New" disabled="@IsInteractionBlocked">+ Додати курс</button>
             <AdminSearchBox @bind-Value="filter" Style="max-width:280px;" Placeholder="Id / назва / тижні / період" />
         </div>
+        <div class="table-responsive" role="region" aria-label="Список курсів" tabindex="0">
         <table class="table table-sm table-striped align-middle">
             <thead>
                 <tr>
@@ -29,7 +47,7 @@
                     <SortableHeader Field="@nameof(CourseEditDto.Name)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Назва</SortableHeader>
                     <SortableHeader Field="@nameof(CourseEditDto.DurationWeeks)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Тривалість (тижнів)</SortableHeader>
                     <SortableHeader Field="@nameof(CourseEditDto.AcademicPeriodStartDate)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Початок навчального періоду</SortableHeader>
-                    <th style="width:220px;"></th>
+                    <th style="width:220px;"><span class="visually-hidden">Дії</span></th>
                 </tr>
             </thead>
             <tbody>
@@ -41,13 +59,14 @@
                         <td>@c.DurationWeeks</td>
                         <td>@(c.AcademicPeriodStartDate?.ToString("yyyy-MM-dd") ?? "—")</td>
                         <td class="text-end text-nowrap">
-                            <button class="btn btn-sm btn-outline-secondary me-2" @onclick="() => Edit(c)">Редагувати</button>
-                            <button class="btn btn-sm btn-outline-danger" @onclick="() => Delete(c.Id!.Value)">Видалити</button>
+                            <button class="btn btn-sm btn-outline-secondary me-2" @onclick="() => Edit(c)" disabled="@IsInteractionBlocked">Редагувати</button>
+                            <button class="btn btn-sm btn-outline-danger" @onclick="() => Delete(c.Id!.Value)" disabled="@IsInteractionBlocked">Видалити</button>
                         </td>
                     </tr>
                 }
             </tbody>
         </table>
+        </div>
         <div class="text-muted small">
             Показано: @SortedAndFilteredItems.Count() з @items.Count
         </div>
@@ -55,36 +74,38 @@
     <div class="col-md-6">
         <EditForm Model="model" OnValidSubmit="Save">
             <DataAnnotationsValidator />
-            <div class="card">
-                <div class="card-header">@formTitle</div>
-                <div class="card-body">
-                    <div class="mb-3">
-                        <label class="form-label">Назва</label>
-                        <InputText class="form-control"
-                                   maxlength="@CourseEditDto.NameMaxLength"
-                                   @bind-Value="model.Name" />
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label">Тривалість (тижнів)</label>
-                        <InputNumber class="form-control" @bind-Value="model.DurationWeeks" />
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label">Початок навчального періоду</label>
-                        <InputDate class="form-control"
-                                   min="2000-01-01"
-                                   max="2100-12-31"
-                                   required
-                                   @bind-Value="model.AcademicPeriodStartDate" />
-                        <div class="form-text">
-                            Поле потрібне для автогенерації. Заняття до цієї дати не витрачають години плану й теми поточного періоду.
+            <fieldset class="border-0 p-0 m-0 w-100" disabled="@IsInteractionBlocked">
+                <div class="card">
+                    <div class="card-header">@formTitle</div>
+                    <div class="card-body">
+                        <div class="mb-3">
+                            <label class="form-label" for="course-name">Назва</label>
+                            <InputText id="course-name" class="form-control"
+                                       maxlength="@CourseEditDto.NameMaxLength"
+                                       @bind-Value="model.Name" />
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label" for="course-duration">Тривалість (тижнів)</label>
+                            <InputNumber id="course-duration" class="form-control" @bind-Value="model.DurationWeeks" />
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label" for="course-period-start">Початок навчального періоду</label>
+                            <InputDate id="course-period-start" class="form-control"
+                                       min="2000-01-01"
+                                       max="2100-12-31"
+                                       required
+                                       @bind-Value="model.AcademicPeriodStartDate" />
+                            <div class="form-text">
+                                Поле потрібне для автогенерації. Заняття до цієї дати не витрачають години плану й теми поточного періоду.
+                            </div>
                         </div>
                     </div>
+                    <div class="card-footer d-flex gap-2">
+                        <button class="btn btn-success" type="submit">@(saving ? "Збереження…" : "Зберегти")</button>
+                        <button class="btn btn-secondary" type="button" @onclick="Cancel">Скасувати</button>
+                    </div>
                 </div>
-                <div class="card-footer d-flex gap-2">
-                    <button class="btn btn-success" type="submit">Зберегти</button>
-                    <button class="btn btn-secondary" type="button" @onclick="Cancel">Скасувати</button>
-                </div>
-            </div>
+            </fieldset>
         </EditForm>
     </div>
 </div>
@@ -94,6 +115,10 @@
     private List<CourseEditDto> items = new();
     private CourseEditDto model = new();
     private string? error, ok;
+    private bool loading, saving, loadFailed, mutationInProgress;
+    private bool IsInteractionBlocked => loading || mutationInProgress || loadFailed;
+    private Action? pendingRefreshCompletion;
+    private string? pendingRefreshSuccessMessage;
     private string formTitle = "Новий курс";
     private string sortField = nameof(CourseEditDto.Name);
     private bool sortAsc = true;
@@ -135,23 +160,53 @@
     // Початкове завантаження курсів.
     protected override async Task OnInitializedAsync() => await Load();
     // Завантажує список курсів та ініціалізує форму.
-    private async Task Load()
+    private async Task<bool> Load(bool clearMessages = true)
     {
-        error = ok = null;
-        items = await Api.GetCourses();
-        if (!items.Any())
+        error = null;
+        if (clearMessages) ok = null;
+        loading = true;
+        loadFailed = false;
+        try
         {
-            model = new CourseEditDto(null, "", 16, null);
-            formTitle = "Новий курс";
+            items = await Api.GetCourses();
+            if (!items.Any())
+            {
+                ResetForm();
+            }
+            return true;
         }
-        StateHasChanged();
+        catch (Exception ex)
+        {
+            loadFailed = true;
+            error = $"Не вдалося завантажити курси: {ex.Message}";
+            return false;
+        }
+        finally
+        {
+            loading = false;
+        }
+    }
+    private async Task RetryLoad()
+    {
+        if (loading || mutationInProgress) return;
+        if (!await Load(clearMessages: false)) return;
+        var completion = pendingRefreshCompletion;
+        var successMessage = pendingRefreshSuccessMessage;
+        pendingRefreshCompletion = null;
+        pendingRefreshSuccessMessage = null;
+        completion?.Invoke();
+        if (!string.IsNullOrWhiteSpace(successMessage)) ok = successMessage;
+    }
+    private void ResetForm()
+    {
+        model = new CourseEditDto(null, "", 16, null);
+        formTitle = "Новий курс";
     }
     // Скидає форму створення курсу.
     private void New()
     {
         error = ok = null;
-        model = new CourseEditDto(null, "", 16, null);
-        formTitle = "Новий курс";
+        ResetForm();
     }
     // Заповнює форму для редагування курсу.
     private void Edit(CourseEditDto c)
@@ -163,45 +218,97 @@
     // Зберігає курс через API.
     private async Task Save()
     {
+        if (loading || mutationInProgress || loadFailed) return;
         error = ok = null;
+        mutationInProgress = true;
+        saving = true;
         try
         {
-            await Api.UpsertCourse(model);
-            ok = "Збережено.";
-            await Load();
-            New();
+            var id = await Api.UpsertCourse(model);
+            model = new CourseEditDto(id, model.Name, model.DurationWeeks, model.AcademicPeriodStartDate);
+            if (await Load(clearMessages: false))
+            {
+                ResetForm();
+                ok = "Збережено.";
+            }
+            else
+            {
+                var refreshError = error;
+                ok = null;
+                pendingRefreshCompletion = ResetForm;
+                pendingRefreshSuccessMessage = "Збережено.";
+                error = $"Курс збережено, але оновити список не вдалося. Повторіть завантаження; повторно зберігати курс не потрібно. Причина: {refreshError}";
+            }
         }
         catch (Exception ex) { error = ex.Message; }
+        finally
+        {
+            saving = false;
+            mutationInProgress = false;
+        }
     }
     // Скасовує редагування.
     private void Cancel() => New();
     // Видаляє курс з підтвердженням та force-режимом.
     private async Task Delete(int id)
     {
+        if (loading || mutationInProgress || loadFailed) return;
+        mutationInProgress = true;
         error = ok = null;
-        var course = items.FirstOrDefault(c => c.Id == id);
-        var caption = course?.Name ?? $"#{id}";
-        var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити курс {caption}? Дію не можна скасувати.");
-        if (!confirmed) return;
         try
         {
+            var course = items.FirstOrDefault(c => c.Id == id);
+            var caption = course?.Name ?? $"#{id}";
+            var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити курс {caption}? Дію не можна скасувати.");
+            if (!confirmed) return;
             try
             {
                 await Api.DeleteCourse(id);
-                await Load();
-                ok = "Видалено.";
+                await CompleteDeleteRefresh(id, "Курс видалено", "Видалено.");
                 return;
             }
-            catch (HttpRequestException ex) when ((int?)ex.StatusCode == 409 || ex.Message.Contains("409"))
+            catch (ApiErrorException ex) when (ex.StatusCode == HttpStatusCode.Conflict)
             {
                 var sure = await JS.InvokeAsync<bool>("confirm",
                     "Курс використовується. Видалити разом із пов’язаними групами, модулями та заняттями?");
                 if (!sure) { error = "Скасовано користувачем."; return; }
                 await Api.DeleteCourse(id, force: true);
-                await Load();
-                ok = "Курс і пов’язані дані видалено.";
+                await CompleteDeleteRefresh(
+                    id,
+                    "Курс і пов’язані дані видалено",
+                    "Курс і пов’язані дані видалено.");
             }
         }
         catch (Exception ex) { error = ex.Message; }
+        finally { mutationInProgress = false; }
+    }
+    // Завершує видалення лише після підтвердженого перечитування списку.
+    private async Task CompleteDeleteRefresh(int deletedId, string completedAction, string successMessage)
+    {
+        if (await Load())
+        {
+            ResetDeletedCourseForm(deletedId);
+            ok = successMessage;
+            return;
+        }
+
+        pendingRefreshCompletion = () => ResetDeletedCourseForm(deletedId);
+        pendingRefreshSuccessMessage = successMessage;
+        SetDeleteRefreshFailure(completedAction);
+    }
+    // Не залишає форму з ідентифікатором уже видаленого курсу.
+    private void ResetDeletedCourseForm(int deletedId)
+    {
+        if (model.Id == deletedId)
+        {
+            ResetForm();
+        }
+    }
+    // Пояснює, що видалення вже відбулося, а повторити потрібно лише завантаження списку.
+    private void SetDeleteRefreshFailure(string completedAction)
+    {
+        var refreshError = error;
+        ok = null;
+        error = $"{completedAction}, але оновити список не вдалося. Повторіть завантаження; повторно видаляти курс не потрібно. Причина: {refreshError}";
     }
 }

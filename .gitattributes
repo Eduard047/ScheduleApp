@@ -1,0 +1,2 @@
+# Вважаємо CR частиною коректного CRLF-завершення рядка, але й надалі перевіряємо зайві пробіли та табуляцію.
+* whitespace=trailing-space,space-before-tab,cr-at-eol

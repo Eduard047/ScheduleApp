@@ -134,11 +134,24 @@ public sealed class AggregatesService
                              && !excludeLoadIds.Contains(si.LessonTypeId)
                              && teacherIds.Contains(si.TeacherId!.Value)
                              && courseIds.Contains(si.Group.CourseId))
-                .Select(si => new { TeacherId = si.TeacherId!.Value, CourseId = si.Group.CourseId, si.StartTime, si.EndTime })
+                .Select(si => new CurriculumScheduleRow(
+                    si.Id,
+                    si.Group.CourseId,
+                    si.BatchKey,
+                    si.Date,
+                    si.StartTime,
+                    si.EndTime,
+                    si.GroupId,
+                    si.ModuleId,
+                    si.LessonTypeId,
+                    si.ModuleTopicId,
+                    si.TeacherId,
+                    si.RoomId,
+                    si.IsSelfStudy))
                 .ToListAsync();
             var counts = BuildCountLookup(
-                items,
-                item => (item.TeacherId, item.CourseId),
+                CurriculumScheduleAggregation.CollapseForTeacherLoad(items),
+                item => (TeacherId: item.TeacherId!.Value, item.CourseId),
                 item => CurriculumScheduleAggregation.ScheduledHours(item.StartTime, item.EndTime));
 
             foreach (var load in activeLoads)
@@ -162,11 +175,24 @@ public sealed class AggregatesService
                                  && !excludeLoadIds.Contains(si.LessonTypeId)
                                  && teacherIds.Contains(si.TeacherId!.Value)
                                  && courseIds.Contains(si.Group.CourseId))
-                    .Select(si => new { TeacherId = si.TeacherId!.Value, CourseId = si.Group.CourseId, si.StartTime, si.EndTime })
+                    .Select(si => new CurriculumScheduleRow(
+                        si.Id,
+                        si.Group.CourseId,
+                        si.BatchKey,
+                        si.Date,
+                        si.StartTime,
+                        si.EndTime,
+                        si.GroupId,
+                        si.ModuleId,
+                        si.LessonTypeId,
+                        si.ModuleTopicId,
+                        si.TeacherId,
+                        si.RoomId,
+                        si.IsSelfStudy))
                     .ToListAsync();
                 var counts = BuildCountLookup(
-                    items,
-                    item => (item.TeacherId, item.CourseId),
+                    CurriculumScheduleAggregation.CollapseForTeacherLoad(items),
+                    item => (TeacherId: item.TeacherId!.Value, item.CourseId),
                     item => CurriculumScheduleAggregation.ScheduledHours(item.StartTime, item.EndTime));
                 var loadsToUpdate = await _db.TeacherCourseLoads
                     .Where(l => l.IsActive && teacherIds.Contains(l.TeacherId) && courseIds.Contains(l.CourseId))

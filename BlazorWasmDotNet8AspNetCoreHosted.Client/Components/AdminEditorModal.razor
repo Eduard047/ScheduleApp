@@ -1,15 +1,32 @@
 @* Спільна оболонка модальних редакторів адмінських сторінок. *@
-<div class="editor-overlay" @onclick="OnClose">
-    <div class="@EditorClass" role="dialog" aria-modal="true" @onclick:stopPropagation="true">
+@inject IJSRuntime JS
+
+<div class="editor-overlay" @onclick="CloseAsync">
+    <div @ref="_dialogElement"
+         class="@EditorClass"
+         role="dialog"
+         aria-modal="true"
+         aria-busy="@Busy"
+         aria-labelledby="@_titleId"
+         aria-describedby="@(!string.IsNullOrWhiteSpace(Subtitle) ? _subtitleId : null)"
+         tabindex="-1"
+         @onkeydown="HandleKeyDown"
+         @onkeydown:stopPropagation="true"
+         @onclick:stopPropagation="true">
         <div class="editor-modal-head">
             <div>
-                <div class="editor-title">@Title</div>
+                <div id="@_titleId" class="editor-title">@Title</div>
                 @if (!string.IsNullOrWhiteSpace(Subtitle))
                 {
-                    <div class="editor-subtitle">@Subtitle</div>
+                    <div id="@_subtitleId" class="editor-subtitle">@Subtitle</div>
                 }
             </div>
-            <button type="button" class="btn btn-outline-secondary editor-close" title="Закрити" @onclick="OnClose">×</button>
+            <button type="button"
+                    class="btn btn-outline-secondary editor-close"
+                    title="Закрити"
+                    aria-label="Закрити редактор"
+                    disabled="@Busy"
+                    @onclick="CloseAsync">×</button>
         </div>
 
         @ChildContent
@@ -29,10 +46,46 @@
     [Parameter, EditorRequired]
     public EventCallback OnClose { get; set; }
 
+    [Parameter]
+    public bool Busy { get; set; }
+
     [Parameter, EditorRequired]
     public RenderFragment ChildContent { get; set; } = default!;
+
+    private readonly string _titleId = $"admin-editor-title-{Guid.NewGuid():N}";
+    private readonly string _subtitleId = $"admin-editor-subtitle-{Guid.NewGuid():N}";
+    private ElementReference _dialogElement;
+    private bool _focusInitialized;
 
     private string EditorClass => string.IsNullOrWhiteSpace(CssClass)
         ? "editor editor-modal"
         : $"editor editor-modal {CssClass}";
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_focusInitialized)
+        {
+            return;
+        }
+
+        _focusInitialized = true;
+        try
+        {
+            await JS.InvokeVoidAsync("scheduleApp.focusModal", _dialogElement);
+        }
+        catch (JSException)
+        {
+        }
+    }
+
+    private async Task HandleKeyDown(KeyboardEventArgs args)
+    {
+        if (!Busy && string.Equals(args.Key, "Escape", StringComparison.Ordinal))
+        {
+            await CloseAsync();
+        }
+    }
+
+    private Task CloseAsync()
+        => Busy ? Task.CompletedTask : OnClose.InvokeAsync();
 }

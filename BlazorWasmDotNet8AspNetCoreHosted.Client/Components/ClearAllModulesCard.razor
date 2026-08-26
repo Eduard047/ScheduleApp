@@ -11,11 +11,11 @@
     </div>
     @if (!string.IsNullOrWhiteSpace(Error))
     {
-        <div class="alert alert-danger mt-2">@Error</div>
+        <div class="alert alert-danger mt-2" role="alert">@Error</div>
     }
     @if (!string.IsNullOrWhiteSpace(Ok))
     {
-        <div class="alert alert-success mt-2">@Ok</div>
+        <div class="alert alert-success mt-2" role="status">@Ok</div>
     }
 </div>
 

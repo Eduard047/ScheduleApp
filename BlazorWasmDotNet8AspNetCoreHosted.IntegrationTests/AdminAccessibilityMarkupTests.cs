@@ -1,0 +1,118 @@
+namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
+
+public sealed class AdminAccessibilityMarkupTests
+{
+    [Fact]
+    public void Teachers_table_is_a_named_keyboard_scroll_region()
+    {
+        var markup = ReadAdminPage("AdminTeachers.razor");
+
+        Assert.Contains(
+            "<div class=\"table-responsive\" role=\"region\" aria-label=\"Список викладачів\" tabindex=\"0\">",
+            markup);
+        Assert.Contains("@if (listLoadFailed || metaLoadFailed)", markup);
+        Assert.Contains("@RetryLoadLabel", markup);
+    }
+
+    [Fact]
+    public void Schedule_log_toggles_expose_their_state_and_control_targets()
+    {
+        var markup = ReadAdminPage("AdminScheduleLogs.razor");
+
+        Assert.Contains("aria-pressed=\"@IsActionSelected(filter.Code)\"", markup);
+        Assert.Contains("aria-expanded=\"@allDetailsExpanded\"", markup);
+        Assert.Contains("aria-controls=\"schedule-log-results\"", markup);
+        Assert.Contains("id=\"schedule-log-results\"", markup);
+        Assert.Contains("aria-expanded=\"@isExpanded\"", markup);
+        Assert.Contains("aria-controls=\"@detailsId\"", markup);
+        Assert.Contains("<div id=\"@detailsId\" class=\"log-details\">", markup);
+        Assert.Contains("<div id=\"@detailsId\" hidden></div>", markup);
+        Assert.DoesNotContain("_expandedAll", markup);
+    }
+
+    [Fact]
+    public void Time_slot_loading_status_preserves_table_cell_semantics()
+    {
+        var markup = ReadAdminPage("AdminTimeSlots.razor");
+
+        Assert.Contains(
+            "<td colspan=\"6\" class=\"text-muted\"><span role=\"status\">Завантаження слотів…</span></td>",
+            markup);
+        Assert.DoesNotContain("<td colspan=\"6\" class=\"text-muted\" role=\"status\">", markup);
+    }
+
+    [Theory]
+    [InlineData("AdminBuildings.razor", 2)]
+    [InlineData("AdminRooms.razor", 1)]
+    [InlineData("AdminDepartments.razor", 1)]
+    [InlineData("AdminGroups.razor", 1)]
+    [InlineData("AdminCalendar.razor", 1)]
+    public void Failed_post_mutation_refresh_can_be_retried_inside_open_modal(
+        string fileName,
+        int expectedModalCount)
+    {
+        var markup = ReadAdminPage(fileName);
+        var modalBodies = markup
+            .Split("<AdminEditorModal", StringSplitOptions.RemoveEmptyEntries)
+            .Skip(1)
+            .Select(segment => segment[..segment.IndexOf("</AdminEditorModal>", StringComparison.Ordinal)])
+            .ToList();
+
+        Assert.Equal(expectedModalCount, modalBodies.Count);
+        foreach (var modalBody in modalBodies)
+        {
+            var recoveryIndex = modalBody.IndexOf("@if (loadFailed)", StringComparison.Ordinal);
+            var disabledFormIndex = modalBody.IndexOf(
+                "<fieldset class=\"border-0 p-0 m-0 w-100\" disabled=\"@IsInteractionBlocked\">",
+                StringComparison.Ordinal);
+
+            Assert.True(recoveryIndex >= 0, $"{fileName}: у модальному редакторі немає recovery-блоку.");
+            Assert.True(
+                disabledFormIndex > recoveryIndex,
+                $"{fileName}: recovery-кнопка має бути поза заблокованою формою.");
+            Assert.Contains("@onclick=\"RetryLoad\"", modalBody);
+            Assert.Contains("Повторити лише завантаження", modalBody);
+            Assert.Contains("Busy=\"@(loading || mutationInProgress)\"", modalBody);
+            Assert.DoesNotContain("Busy=\"@IsInteractionBlocked\"", modalBody);
+        }
+    }
+
+    [Fact]
+    public void Modules_recovery_keeps_both_modal_shells_closable()
+    {
+        var markup = ReadAdminPage("AdminModules.razor");
+        var modalBodies = markup
+            .Split("<AdminEditorModal", StringSplitOptions.RemoveEmptyEntries)
+            .Skip(1)
+            .Select(segment => segment[..segment.IndexOf("</AdminEditorModal>", StringComparison.Ordinal)])
+            .ToList();
+
+        Assert.Equal(2, modalBodies.Count);
+        foreach (var modalBody in modalBodies)
+        {
+            Assert.Contains("Busy=\"@IsModalBusy\"", modalBody);
+            Assert.DoesNotContain("Busy=\"@IsPageInteractionBlocked\"", modalBody);
+        }
+    }
+
+    // Шукає checkout від каталогу тестового процесу без локальних абсолютних шляхів.
+    private static string ReadAdminPage(string fileName)
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory);
+             directory is not null;
+             directory = directory.Parent)
+        {
+            var candidate = Path.Combine(
+                directory.FullName,
+                "BlazorWasmDotNet8AspNetCoreHosted.Client",
+                "Pages",
+                fileName);
+            if (File.Exists(candidate))
+            {
+                return File.ReadAllText(candidate);
+            }
+        }
+
+        throw new FileNotFoundException($"Не знайдено Razor-сторінку {fileName} від каталогу тестового процесу.");
+    }
+}

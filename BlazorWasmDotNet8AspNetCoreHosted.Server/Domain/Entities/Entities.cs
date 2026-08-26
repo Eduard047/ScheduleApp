@@ -320,6 +320,7 @@ public class AutoGenJobRun
 {
     public int Id { get; set; }
     public string JobId { get; set; } = default!;
+    public string ClientPartitionKey { get; set; } = "legacy";
     public string RequestHash { get; set; } = string.Empty;
     public string? OwnerInstanceId { get; set; }
     public int Attempt { get; set; }

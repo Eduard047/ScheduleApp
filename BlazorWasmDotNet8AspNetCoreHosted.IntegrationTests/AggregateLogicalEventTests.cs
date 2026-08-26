@@ -97,6 +97,68 @@ public sealed class AggregateLogicalEventTests
         Assert.Equal(3, storedPlan.ScheduledHours);
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task Teacher_load_aggregation_counts_each_teacher_once_per_explicit_and_legacy_logical_event(
+        bool withBatchKey,
+        bool scopedRecalculation)
+    {
+        await using var fixture = await AggregateTestDatabase.CreateAsync();
+        var model = await fixture.SeedAsync();
+        var batchKey = withBatchKey ? "batch-load-event" : null;
+        foreach (var topicId in new[] { model.FirstTopicId, model.SecondTopicId })
+        {
+            foreach (var teacherId in new[] { model.FirstTeacherId, model.SecondTeacherId })
+            {
+                fixture.Db.ScheduleItems.Add(CreateScheduleItem(
+                    model,
+                    topicId,
+                    teacherId,
+                    batchKey,
+                    Monday,
+                    new TimeOnly(8, 0),
+                    new TimeOnly(9, 0)));
+            }
+        }
+        fixture.Db.TeacherCourseLoads.AddRange(
+            new TeacherCourseLoad
+            {
+                TeacherId = model.FirstTeacherId,
+                CourseId = model.CourseId,
+                ScheduledHours = 99,
+                IsActive = true
+            },
+            new TeacherCourseLoad
+            {
+                TeacherId = model.SecondTeacherId,
+                CourseId = model.CourseId,
+                ScheduledHours = 99,
+                IsActive = true
+            });
+        await fixture.Db.SaveChangesAsync();
+
+        await new AggregatesService(fixture.Db).RecalcAsync(
+            Array.Empty<(int CourseId, int ModuleId)>(),
+            scopedRecalculation
+                ? new[]
+                {
+                    (model.FirstTeacherId, model.CourseId),
+                    (model.SecondTeacherId, model.CourseId)
+                }
+                : null);
+        fixture.Db.ChangeTracker.Clear();
+
+        var loads = await fixture.Db.TeacherCourseLoads
+            .AsNoTracking()
+            .OrderBy(load => load.TeacherId)
+            .Select(load => load.ScheduledHours)
+            .ToListAsync();
+        Assert.Equal(new[] { 1, 1 }, loads);
+    }
+
     [Fact]
     public async Task Topic_statistics_collapse_coteachers_per_topic_and_preserve_different_topics()
     {

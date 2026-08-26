@@ -8,7 +8,21 @@
 
 @page "/admin/schedule-logs"
 
-<h3 class="mb-3">Журнал змін розкладу</h3>
+<PageTitle>Адмін • Журнал змін розкладу</PageTitle>
+
+<h1 class="h3 mb-3">Журнал змін розкладу</h1>
+
+@if (!string.IsNullOrWhiteSpace(_error))
+{
+    <div class="alert alert-danger" role="alert">
+        @_error
+        <div class="mt-2">
+            <button type="button" class="btn btn-sm btn-outline-danger" @onclick="RetryFailedOperationAsync" disabled="@_loading">
+                @(_retryClearAfterError ? "Повторити очищення" : "Повторити завантаження")
+            </button>
+        </div>
+    </div>
+}
 
 <div class="card p-3 mb-3">
     <div class="log-toolbar">
@@ -18,39 +32,43 @@
                 <div class="log-compact-note">Журнал зберігається локально у браузері цього робочого місця.</div>
             </div>
             <div class="d-flex gap-2">
-                <button class="btn btn-outline-secondary" @onclick="ReloadAsync">Оновити</button>
-                <button class="btn btn-outline-danger" @onclick="ClearLogsAsync" disabled="@(!_entries.Any())">Очистити</button>
+                <button class="btn btn-outline-secondary" @onclick="ReloadAsync" disabled="@_loading">Оновити</button>
+                <button class="btn btn-outline-danger" @onclick="ClearLogsAsync" disabled="@(_loading || !_entries.Any())">Очистити</button>
             </div>
         </div>
         <div class="log-toolbar-row">
             <div>
-                <label class="form-label">Дата від</label>
-                <input type="date"
+                <label class="form-label" for="schedule-log-from">Дата від</label>
+                <input id="schedule-log-from" type="date"
                        class="form-control"
                        value="@FormatDate(_fromDate)"
                        @onchange="OnFromChanged" />
             </div>
             <div>
-                <label class="form-label">Дата до</label>
-                <input type="date"
+                <label class="form-label" for="schedule-log-to">Дата до</label>
+                <input id="schedule-log-to" type="date"
                        class="form-control"
                        value="@FormatDate(_toDate)"
                        @onchange="OnToChanged" />
             </div>
             <div style="min-width: 220px;">
-                <label class="form-label">Пошук</label>
-                <input class="form-control"
+                <label class="form-label" for="schedule-log-search">Пошук</label>
+                <input id="schedule-log-search" class="form-control"
                        placeholder="Курс, група, викладач, модуль, причина..."
                        @bind="_search"
                        @bind:event="oninput" />
             </div>
             <div class="d-flex align-items-end">
-                <button class="btn btn-outline-primary w-100" type="button" data-bs-toggle="collapse" data-bs-target="#logFiltersCollapse">
+                <button class="btn btn-outline-primary w-100"
+                        type="button"
+                        aria-expanded="@_advancedFiltersOpen"
+                        aria-controls="logFiltersCollapse"
+                        @onclick="ToggleAdvancedFilters">
                     Розширені фільтри
                 </button>
             </div>
         </div>
-        <div class="collapse" id="logFiltersCollapse">
+        <div class="collapse @(_advancedFiltersOpen ? "show" : null)" id="logFiltersCollapse">
             <div class="mt-3">
                 <div class="d-flex align-items-center justify-content-between">
                     <div class="fw-semibold">Типи дій</div>
@@ -59,7 +77,9 @@
                 <div class="log-actions mt-2">
                     @foreach (var filter in ActionFilters)
                     {
-                        <button class="btn btn-sm @(IsActionSelected(filter.Code) ? "btn-primary" : "btn-outline-primary")"
+                        <button type="button"
+                                class="btn btn-sm @(IsActionSelected(filter.Code) ? "btn-primary" : "btn-outline-primary")"
+                                aria-pressed="@IsActionSelected(filter.Code)"
                                 @onclick="() => ToggleAction(filter.Code)">
                             @filter.Label (@filter.Count)
                         </button>
@@ -80,33 +100,40 @@
 
 @if (_loading)
 {
-    <div>Завантаження...</div>
+    <div role="status" aria-live="polite">Завантаження...</div>
 }
-else
+else if (_error is null || _entries.Count > 0)
 {
     var filtered = FilteredEntries.ToList();
     if (filtered.Count == 0)
     {
-        <div class="alert alert-secondary">Немає записів для вибраних фільтрів.</div>
+        <div class="alert alert-secondary" role="status">Немає записів для вибраних фільтрів.</div>
     }
     else
     {
+        var allDetailsExpanded = filtered.All(entry => _expanded.Contains(entry.Id));
         <div class="d-flex flex-column flex-md-row justify-content-between align-items-start align-items-md-center gap-2 mb-2">
             <div class="small text-muted">Показано @filtered.Count із @_entries.Count записів.</div>
-            <button class="btn btn-sm btn-outline-primary" @onclick="ToggleAllDetails">
-                @(_expandedAll ? "Згорнути всі" : "Розгорнути всі")
+            <button type="button"
+                    class="btn btn-sm btn-outline-primary"
+                    aria-expanded="@allDetailsExpanded"
+                    aria-controls="schedule-log-results"
+                    @onclick="ToggleAllDetails">
+                @(allDetailsExpanded ? "Згорнути всі" : "Розгорнути всі")
             </button>
         </div>
-        @foreach (var group in GroupByDay(filtered))
-        {
-            <div class="mb-3">
-                <div class="log-day-title">@group.Key.ToString("dd.MM.yyyy", CultureInfo.InvariantCulture)
-                    <span class="text-muted small ms-2">@group.Count() записів</span>
-                </div>
-                <div class="d-flex flex-column gap-2 mt-2">
-                    @foreach (var entry in group)
-                    {
-                        var isExpanded = _expanded.Contains(entry.Id);
+        <div id="schedule-log-results">
+            @foreach (var group in GroupByDay(filtered))
+            {
+                <div class="mb-3">
+                    <div class="log-day-title">@group.Key.ToString("dd.MM.yyyy", CultureInfo.InvariantCulture)
+                        <span class="text-muted small ms-2">@group.Count() записів</span>
+                    </div>
+                    <div class="d-flex flex-column gap-2 mt-2">
+                        @foreach (var entry in group)
+                        {
+                            var isExpanded = _expanded.Contains(entry.Id);
+                            var detailsId = $"schedule-log-details-{entry.Id}";
                         <div class="card log-entry">
                             <div class="card-body">
                                 <div class="d-flex flex-column flex-md-row justify-content-between align-items-start gap-3">
@@ -121,7 +148,11 @@ else
                                     </div>
                                     <div class="text-md-end d-flex flex-column gap-2">
                                         <span class="badge @(entry.Success ? "bg-success" : "bg-danger")">@(entry.Success ? "Успіх" : "Помилка")</span>
-                                        <button class="btn btn-sm btn-outline-secondary" @onclick="() => ToggleDetails(entry.Id)">
+                                        <button type="button"
+                                                class="btn btn-sm btn-outline-secondary"
+                                                aria-expanded="@isExpanded"
+                                                aria-controls="@detailsId"
+                                                @onclick="() => ToggleDetails(entry.Id)">
                                             @(isExpanded ? "Згорнути" : "Деталі")
                                         </button>
                                     </div>
@@ -132,7 +163,7 @@ else
                                 }
                                 @if (isExpanded)
                                 {
-                                    <div class="log-details">
+                                    <div id="@detailsId" class="log-details">
                                         <div class="row g-3 small">
                                             <div class="col-12 col-lg-4">
                                                 <div class="detail-title">Діапазон</div>
@@ -267,12 +298,17 @@ else
                                         }
                                     </div>
                                 }
+                                else
+                                {
+                                    <div id="@detailsId" hidden></div>
+                                }
                             </div>
                         </div>
-                    }
+                        }
+                    </div>
                 </div>
-            </div>
-        }
+            }
+        </div>
     }
 }
 
@@ -283,22 +319,41 @@ else
     private DateOnly? _fromDate;
     private DateOnly? _toDate;
     private bool _onlyErrors;
-    private bool _loading = true;
-    private bool _expandedAll;
+    private bool _loading;
+    private bool _advancedFiltersOpen;
+    private bool _retryClearAfterError;
+    private string? _error;
     private readonly HashSet<string> _selectedActions = new();
     private readonly HashSet<string> _expanded = new();
 
     protected override async Task OnInitializedAsync()
     {
         await ReloadAsync();
-        _loading = false;
     }
 
     private async Task ReloadAsync()
     {
-        _entries.Clear();
-        _entries.AddRange(await LogService.LoadAsync());
+        if (_loading) return;
+        _loading = true;
+        _error = null;
+        _retryClearAfterError = false;
+        try
+        {
+            var loaded = await LogService.LoadAsync();
+            _entries.Clear();
+            _entries.AddRange(loaded);
+        }
+        catch (Exception ex)
+        {
+            _error = $"Не вдалося завантажити журнал: {ex.Message}";
+        }
+        finally
+        {
+            _loading = false;
+        }
     }
+
+    private void ToggleAdvancedFilters() => _advancedFiltersOpen = !_advancedFiltersOpen;
 
     private IEnumerable<AdminScheduleLogEntry> FilteredEntries
     {
@@ -372,26 +427,73 @@ else
 
     private void ToggleAllDetails()
     {
-        _expandedAll = !_expandedAll;
-        _expanded.Clear();
-        if (_expandedAll)
+        var visibleIds = FilteredEntries
+            .Select(entry => entry.Id)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        var shouldExpand = visibleIds.Any(id => !_expanded.Contains(id));
+        foreach (var id in visibleIds)
         {
-            foreach (var entry in FilteredEntries)
+            if (shouldExpand)
             {
-                _expanded.Add(entry.Id);
+                _expanded.Add(id);
+            }
+            else
+            {
+                _expanded.Remove(id);
             }
         }
     }
 
     private async Task ClearLogsAsync()
     {
+        if (_loading)
+        {
+            return;
+        }
         var confirm = await JS.InvokeAsync<bool>("confirm", "Очистити журнал змін? Дію не можна скасувати.");
         if (!confirm)
         {
             return;
         }
-        await LogService.ClearAsync();
-        _entries.Clear();
+        await ClearLogsCoreAsync();
+    }
+
+    private async Task RetryFailedOperationAsync()
+    {
+        if (_retryClearAfterError)
+        {
+            await ClearLogsCoreAsync();
+            return;
+        }
+        await ReloadAsync();
+    }
+
+    // Очищає UI лише після підтвердженого видалення даних із локального сховища.
+    private async Task ClearLogsCoreAsync()
+    {
+        if (_loading)
+        {
+            return;
+        }
+        _loading = true;
+        _error = null;
+        try
+        {
+            await LogService.ClearAsync();
+            _entries.Clear();
+            _expanded.Clear();
+            _retryClearAfterError = false;
+        }
+        catch (Exception ex)
+        {
+            _retryClearAfterError = true;
+            _error = $"Не вдалося очистити журнал: {ex.Message}";
+        }
+        finally
+        {
+            _loading = false;
+        }
     }
 
     private static string FormatDate(DateOnly? date)

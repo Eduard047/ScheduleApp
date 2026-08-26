@@ -14,6 +14,146 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 public sealed class TeacherDraftsAutogenJobServiceSecurityTests
 {
     [Fact]
+    public async Task Plan_handoff_gate_rejects_waiters_above_the_global_limit_without_queueing()
+    {
+        using var gate = new ExpensiveOperationGate();
+        var leases = new List<IDisposable>();
+        try
+        {
+            for (var index = 0; index < 8; index++)
+            {
+                leases.Add(Assert.IsAssignableFrom<IDisposable>(
+                    await gate.TryEnterAsync(
+                        ExpensiveOperationKind.AutoGenPlanHandoff,
+                        CancellationToken.None)));
+            }
+
+            Assert.Null(await gate.TryEnterAsync(
+                ExpensiveOperationKind.AutoGenPlanHandoff,
+                CancellationToken.None));
+        }
+        finally
+        {
+            foreach (var lease in leases)
+            {
+                lease.Dispose();
+            }
+        }
+    }
+
+    [Fact]
+    public async Task GetAsync_rejects_noncanonical_job_id_before_storage_access()
+    {
+        var service = new TeacherDraftsAutogenJobService(
+            new ThrowingScopeFactory(() => new InvalidOperationException("Сховище не повинно викликатися.")),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+
+        var status = await service.GetAsync("../../not-a-job");
+
+        Assert.Null(status);
+    }
+
+    [Fact]
+    public async Task GetAsync_cancels_while_waiting_for_persistence_gate()
+    {
+        var service = new TeacherDraftsAutogenJobService(
+            new ThrowingScopeFactory(() => new InvalidOperationException("Сховище не повинно викликатися.")),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+        var gate = await HoldGateAsync(service, "_persistenceGate");
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+
+        try
+        {
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                service.GetAsync(Guid.NewGuid().ToString("N"), cancellation.Token));
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    [Fact]
+    public async Task CancelAsync_rejects_noncanonical_job_id_before_storage_access()
+    {
+        var service = new TeacherDraftsAutogenJobService(
+            new ThrowingScopeFactory(() => new InvalidOperationException("Сховище не повинно викликатися.")),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+
+        var status = await service.CancelAsync("../../not-a-job");
+
+        Assert.Null(status);
+    }
+
+    [Fact]
+    public async Task CancelAsync_cancels_while_waiting_for_persistence_gate()
+    {
+        var service = new TeacherDraftsAutogenJobService(
+            new ThrowingScopeFactory(() => new InvalidOperationException("Сховище не повинно викликатися.")),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+        var gate = await HoldGateAsync(service, "_persistenceGate");
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+
+        try
+        {
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                service.CancelAsync(Guid.NewGuid().ToString("N"), cancellation.Token));
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    [Fact]
+    public async Task GetAsync_rejects_oversized_persisted_status_before_json_deserialization()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        var jobId = Guid.NewGuid().ToString("N");
+        await using (var db = new AppDbContext(options))
+        {
+            await db.Database.EnsureCreatedAsync();
+            db.AutoGenJobRuns.Add(new AutoGenJobRun
+            {
+                JobId = jobId,
+                RequestHash = new string('a', 64),
+                Version = 1,
+                Kind = (int)AutoGenJobKind.Generate,
+                State = (int)AutoGenJobState.Succeeded,
+                Title = "Перевірка обмеження",
+                CurrentStage = "Завершено",
+                CreatedAtUtc = DateTime.UtcNow,
+                CompletedAtUtc = DateTime.UtcNow,
+                RangeStartDate = new DateOnly(2026, 1, 1),
+                RangeEndDate = new DateOnly(2026, 1, 1),
+                RequestJson = "{}",
+                StatusJson = new string('1',
+                    TeacherDraftsAutogenJobService.MaxPersistedPayloadCharacters + 1),
+                UpdatedAtUtc = DateTime.UtcNow
+            });
+            await db.SaveChangesAsync();
+        }
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(options));
+        await using var provider = services.BuildServiceProvider();
+        var service = new TeacherDraftsAutogenJobService(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+
+        var exception = await Assert.ThrowsAsync<AutoGenJobPersistenceException>(() =>
+            service.GetAsync(jobId));
+
+        Assert.Contains(
+            TeacherDraftsAutogenJobService.MaxPersistedPayloadCharacters.ToString(),
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task StopAsync_cancels_and_awaits_running_job_before_returning()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
@@ -58,7 +198,7 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
         Assert.NotNull(stopTask);
         await stopTask.WaitAsync(TimeSpan.FromSeconds(5));
         executionGate.Release();
-        var status = service.Get(started.JobId);
+        var status = await service.GetAsync(started.JobId);
         Assert.NotNull(status);
         Assert.Equal(AutoGenJobState.Canceled, status.State);
         Assert.True(status.CancellationRequested);
@@ -74,6 +214,46 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
 
         Assert.Throws<AutoGenJobPersistenceException>(() => service.Start(CreateValidRequest()));
 
+        Assert.Equal(0, GetPrivateCollectionCount(service, "_jobs"));
+        Assert.Equal(0, GetPrivateCollectionCount(service, "_runningTasks"));
+    }
+
+    [Fact]
+    public void Start_rejects_null_group_room_preference_before_persistence()
+    {
+        var service = new TeacherDraftsAutogenJobService(
+            new ThrowingScopeFactory(() => new InvalidOperationException("Сховище не повинно викликатися.")),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+        var request = CreateValidRequest() with
+        {
+            GroupRoomPreferences = new List<GroupRoomPreferenceDto> { null! }
+        };
+
+        var exception = Assert.Throws<AutoGenJobValidationException>(() => service.Start(request));
+
+        Assert.Contains("порожні елементи", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, GetPrivateCollectionCount(service, "_jobs"));
+        Assert.Equal(0, GetPrivateCollectionCount(service, "_runningTasks"));
+    }
+
+    [Fact]
+    public void Start_rejects_duplicate_group_room_preferences_before_hash_or_persistence()
+    {
+        var service = new TeacherDraftsAutogenJobService(
+            new ThrowingScopeFactory(() => new InvalidOperationException("Сховище не повинно викликатися.")),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+        var request = CreateValidRequest() with
+        {
+            GroupRoomPreferences =
+            [
+                new GroupRoomPreferenceDto(1, 10, [100]),
+                new GroupRoomPreferenceDto(1, 20, [200])
+            ]
+        };
+
+        var exception = Assert.Throws<AutoGenJobValidationException>(() => service.Start(request));
+
+        Assert.Contains("лише одне налаштування", exception.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(0, GetPrivateCollectionCount(service, "_jobs"));
         Assert.Equal(0, GetPrivateCollectionCount(service, "_runningTasks"));
     }
@@ -834,6 +1014,179 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
     }
 
     [Fact]
+    public async Task Plan_read_materializes_only_the_requested_bounded_page()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Add);
+        await using (var db = new AppDbContext(fixture.Options))
+        {
+            var plan = await db.AutoGenDraftPlans
+                .Include(item => item.Mutations)
+                .SingleAsync(item => item.PlanId == fixture.PlanId);
+            var template = Assert.Single(plan.Mutations);
+            for (var ordinal = 2; ordinal <= 450; ordinal++)
+            {
+                plan.Mutations.Add(new AutoGenDraftPlanMutation
+                {
+                    Ordinal = ordinal,
+                    Operation = template.Operation,
+                    SourceDraftId = template.SourceDraftId,
+                    BeforeRevision = template.BeforeRevision,
+                    BeforeJson = template.BeforeJson,
+                    AfterJson = template.AfterJson
+                });
+            }
+            plan.AddCount = 450;
+            await db.SaveChangesAsync();
+        }
+
+        await using var readDb = new AppDbContext(fixture.Options);
+        var service = new TeacherDraftsAutogenPlanService(readDb);
+        var first = await service.GetDetailsPageAsync(fixture.PlanId, 0, 200);
+        var middle = await service.GetDetailsPageAsync(fixture.PlanId, 200, 200);
+        var last = await service.GetDetailsPageAsync(fixture.PlanId, 400, 200);
+
+        Assert.Equal(450, first.TotalChanges);
+        Assert.Equal(200, first.Changes.Count);
+        Assert.True(first.HasMoreChanges);
+        Assert.Equal(200, middle.ChangeOffset);
+        Assert.Equal(200, middle.Changes.Count);
+        Assert.Equal(50, last.Changes.Count);
+        Assert.False(last.HasMoreChanges);
+        Assert.Equal(Enumerable.Range(401, 50), last.Changes.Select(change => change.Ordinal));
+        await Assert.ThrowsAsync<AutoGenPlanValidationException>(() =>
+            service.GetDetailsPageAsync(
+                fixture.PlanId,
+                0,
+                TeacherDraftsAutogenPlanService.MaxChangePageSize + 1));
+    }
+
+    [Fact]
+    public async Task Plan_read_rejects_persisted_count_that_disagrees_with_mutations()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Add);
+        await using (var db = new AppDbContext(fixture.Options))
+        {
+            var plan = await db.AutoGenDraftPlans.SingleAsync(item => item.PlanId == fixture.PlanId);
+            plan.AddCount = 2;
+            await db.SaveChangesAsync();
+        }
+
+        await using var readDb = new AppDbContext(fixture.Options);
+        var service = new TeacherDraftsAutogenPlanService(readDb);
+
+        await Assert.ThrowsAsync<AutoGenPlanPersistenceException>(() =>
+            service.GetDetailsPageAsync(fixture.PlanId, 0, 200));
+        await Assert.ThrowsAsync<AutoGenPlanPersistenceException>(() =>
+            service.GetDetailsAsync(fixture.PlanId));
+    }
+
+    [Fact]
+    public async Task Plan_read_rejects_oversized_persisted_snapshot_before_deserialization()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Add);
+        await using (var db = new AppDbContext(fixture.Options))
+        {
+            var mutation = await db.AutoGenDraftPlanMutations.SingleAsync();
+            mutation.AfterJson = new string('1', 8_193);
+            await db.SaveChangesAsync();
+        }
+
+        await using var readDb = new AppDbContext(fixture.Options);
+        var service = new TeacherDraftsAutogenPlanService(readDb);
+
+        var error = await Assert.ThrowsAsync<AutoGenPlanPersistenceException>(() =>
+            service.GetDetailsPageAsync(fixture.PlanId, 0, 200));
+        Assert.Contains("8192", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Plan_read_rejects_oversized_job_payload_before_deserialization()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Add);
+        await using (var db = new AppDbContext(fixture.Options))
+        {
+            var run = await db.AutoGenJobRuns.SingleAsync();
+            run.RequestJson = new string('1',
+                TeacherDraftsAutogenJobService.MaxPersistedPayloadCharacters + 1);
+            await db.SaveChangesAsync();
+        }
+
+        await using var readDb = new AppDbContext(fixture.Options);
+        var service = new TeacherDraftsAutogenPlanService(readDb);
+
+        var error = await Assert.ThrowsAsync<AutoGenPlanPersistenceException>(() =>
+            service.GetDetailsPageAsync(fixture.PlanId, 0, 200));
+        Assert.Contains(
+            TeacherDraftsAutogenJobService.MaxPersistedPayloadCharacters.ToString(),
+            error.Message,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Expired_plan_cleanup_deletes_mutations_in_bounded_batches_before_the_plan()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Add);
+        await using var db = new AppDbContext(fixture.Options);
+        var plan = await db.AutoGenDraftPlans
+            .Include(item => item.Mutations)
+            .SingleAsync(item => item.PlanId == fixture.PlanId);
+        plan.ExpiresAtUtc = DateTime.UtcNow.AddMinutes(-1);
+        var template = Assert.Single(plan.Mutations);
+        for (var index = 0; index < TeacherDraftsAutogenPlanService.CleanupMutationBatchSize; index++)
+        {
+            plan.Mutations.Add(new AutoGenDraftPlanMutation
+            {
+                Ordinal = index + 2,
+                Operation = template.Operation,
+                SourceDraftId = template.SourceDraftId,
+                BeforeRevision = template.BeforeRevision,
+                BeforeJson = template.BeforeJson,
+                AfterJson = template.AfterJson
+            });
+        }
+        plan.AddCount = plan.Mutations.Count;
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        var firstDeletedPlans = await TeacherDraftsAutogenPlanService.CleanupExpiredPlansAsync(db);
+
+        Assert.Equal(0, firstDeletedPlans);
+        Assert.True(await db.AutoGenDraftPlans.AsNoTracking().AnyAsync(item => item.PlanId == fixture.PlanId));
+        Assert.Equal(1, await db.AutoGenDraftPlanMutations.AsNoTracking().CountAsync());
+
+        var secondDeletedPlans = await TeacherDraftsAutogenPlanService.CleanupExpiredPlansAsync(db);
+
+        Assert.Equal(1, secondDeletedPlans);
+        Assert.False(await db.AutoGenDraftPlans.AsNoTracking().AnyAsync(item => item.PlanId == fixture.PlanId));
+    }
+
+    [Fact]
+    public async Task Plan_read_allows_completed_persistence_handoff_before_observer_cleanup()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Add);
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(fixture.Options));
+        services.AddScoped<TeacherDraftsAutogenPlanService>();
+        await using var provider = services.BuildServiceProvider();
+        var service = new TeacherDraftsAutogenJobService(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+        var runtime = CreateRuntime(CreateValidRequest() with { ClientJobId = fixture.PlanId });
+        var stateField = runtime.GetType().GetField(
+            "_state",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(stateField);
+        stateField.SetValue(runtime, AutoGenJobState.Succeeded);
+        AddPrivateDictionaryEntry(service, "_jobs", fixture.PlanId, runtime);
+        AddPrivateDictionaryEntry(service, "_runningTasks", fixture.PlanId, Task.CompletedTask);
+
+        var plan = await service.GetPlanPageAsync(fixture.PlanId, 0, 200);
+
+        Assert.Equal(fixture.PlanId, plan.Summary.PlanId);
+        Assert.Single(plan.Changes);
+    }
+
+    [Fact]
     public async Task Plan_action_waits_for_the_same_execution_gate_as_generation()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");
@@ -948,6 +1301,24 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
         var collection = field?.GetValue(service);
         var count = collection?.GetType().GetProperty("Count", BindingFlags.Instance | BindingFlags.Public);
         return Assert.IsType<int>(count?.GetValue(collection));
+    }
+
+    private static void AddPrivateDictionaryEntry(
+        TeacherDraftsAutogenJobService service,
+        string fieldName,
+        string key,
+        object value)
+    {
+        var field = typeof(TeacherDraftsAutogenJobService).GetField(
+            fieldName,
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var dictionary = field?.GetValue(service);
+        Assert.NotNull(dictionary);
+        var tryAdd = dictionary.GetType().GetMethod(
+            "TryAdd",
+            BindingFlags.Instance | BindingFlags.Public);
+        Assert.NotNull(tryAdd);
+        Assert.True(Assert.IsType<bool>(tryAdd.Invoke(dictionary, new[] { key, value })));
     }
 
     private sealed class AutoGenPlanFixture : IAsyncDisposable

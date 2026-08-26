@@ -14,6 +14,7 @@ using Microsoft.EntityFrameworkCore;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 
+[Collection(DocxImportTestCollection.Name)]
 public sealed class ScheduleEndpointCorrectnessTests
 {
     private static readonly DateOnly Monday = new(2026, 5, 4);
@@ -994,6 +995,185 @@ public sealed class ScheduleEndpointCorrectnessTests
         Assert.Contains("кілька курсів", result.Error, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public async Task Docx_apply_reuses_existing_lesson_type_after_accidental_adjacent_word_repeat()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "КН-1", DurationWeeks = 52 };
+        var canonicalType = new LessonTypeRef
+        {
+            Code = "СОКРАТІВСЬКИЙ_СЕМІНАР",
+            Name = "Сократівський семінар",
+            IsActive = true
+        };
+        fixture.Db.AddRange(course, canonicalType);
+        await fixture.Db.SaveChangesAsync();
+        var bytes = CreateTopicTypeChangeImportDocx("Сократівський Сократівський семінар");
+        await using var stream = new MemoryStream(bytes);
+        var file = new FormFile(stream, 0, bytes.Length, "file", "КН-1.docx");
+
+        var result = await new DocxImportService().ImportAsync(
+            file,
+            fixture.Db,
+            apply: true,
+            CancellationToken.None);
+
+        Assert.Null(result.Error);
+        Assert.Contains(result.Warnings, warning =>
+            warning.Contains("повторене сусіднє слово", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(1, await fixture.Db.LessonTypes.CountAsync());
+        Assert.All(
+            await fixture.Db.ModuleTopics.AsNoTracking().ToListAsync(),
+            topic => Assert.Equal(canonicalType.Id, topic.LessonTypeId));
+    }
+
+    [Fact]
+    public async Task Docx_apply_on_empty_database_normalizes_repeat_even_when_canonical_name_comes_later()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "КН-1", DurationWeeks = 52 };
+        fixture.Db.Courses.Add(course);
+        await fixture.Db.SaveChangesAsync();
+        var bytes = CreateTopicImportDocx(
+            new[] { "1", "Сократівський Сократівський семінар", "1", "1", "0", "1.1 Перша тема" },
+            new[] { "2", "Сократівський семінар", "1", "1", "0", "1.2 Друга тема" });
+        await using var stream = new MemoryStream(bytes);
+        var file = new FormFile(stream, 0, bytes.Length, "file", "КН-1.docx");
+
+        var result = await new DocxImportService().ImportAsync(
+            file,
+            fixture.Db,
+            apply: true,
+            CancellationToken.None);
+
+        Assert.Null(result.Error);
+        Assert.Contains(result.Warnings, warning =>
+            warning.Contains("повторене сусіднє слово", StringComparison.OrdinalIgnoreCase));
+        var lessonType = Assert.Single(await fixture.Db.LessonTypes.AsNoTracking().ToListAsync());
+        Assert.Equal("Сократівський семінар", lessonType.Name);
+        Assert.Equal("СОКРАТІВСЬКИЙ_СЕМІНАР", lessonType.Code);
+        Assert.Equal(2, await fixture.Db.ModuleTopics.CountAsync());
+        Assert.All(
+            await fixture.Db.ModuleTopics.AsNoTracking().ToListAsync(),
+            topic => Assert.Equal(lessonType.Id, topic.LessonTypeId));
+    }
+
+    [Fact]
+    public async Task Docx_apply_merges_existing_repeat_without_recreating_populated_database()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "КН-1", DurationWeeks = 52 };
+        var group = new Group { Name = "КН-1", StudentsCount = 20, Course = course };
+        var module = new Module { Code = "1", Title = "Заповнений модуль", Credits = 1, Course = course };
+        var canonicalType = new LessonTypeRef
+        {
+            Code = "СОКРАТІВСЬКИЙ_СЕМІНАР",
+            Name = "Сократівський семінар",
+            IsActive = true,
+            RequiresRoom = true,
+            RequiresTeacher = true,
+            BlocksRoom = true,
+            BlocksTeacher = true,
+            CountInPlan = true,
+            CountInLoad = true
+        };
+        var duplicateType = new LessonTypeRef
+        {
+            Code = "СОКРАТІВСЬКИЙ_СОКРАТІВСЬКИЙ_СЕМІНАР",
+            Name = "Сократівський Сократівський семінар",
+            IsActive = true,
+            RequiresRoom = true,
+            RequiresTeacher = true,
+            BlocksRoom = true,
+            BlocksTeacher = true,
+            CountInPlan = true,
+            CountInLoad = true
+        };
+        var topic = new ModuleTopic
+        {
+            Module = module,
+            LessonType = duplicateType,
+            TopicCode = "1.1",
+            Order = 1,
+            TotalHours = 1,
+            AuditoriumHours = 1
+        };
+        var draft = new TeacherDraftItem
+        {
+            Date = new DateOnly(2026, 9, 7),
+            DayOfWeek = DayOfWeek.Monday,
+            StartTime = new TimeOnly(9, 0),
+            EndTime = new TimeOnly(9, 45),
+            LessonType = duplicateType,
+            Group = group,
+            Module = module,
+            ModuleTopic = topic
+        };
+        var scheduleItem = new ScheduleItem
+        {
+            Date = new DateOnly(2026, 9, 7),
+            DayOfWeek = DayOfWeek.Monday,
+            StartTime = new TimeOnly(10, 0),
+            EndTime = new TimeOnly(10, 45),
+            LessonType = duplicateType,
+            Group = group,
+            Module = module,
+            ModuleTopic = topic
+        };
+        fixture.Db.AddRange(canonicalType, draft, scheduleItem);
+        await fixture.Db.SaveChangesAsync();
+        var draftRevision = draft.Revision;
+        var scheduleRevision = scheduleItem.Revision;
+        var bytes = CreateTopicImportDocx(
+            new[] { "1", duplicateType.Name, "1", "1", "0", "1.1 Перша тема" },
+            new[] { "2", canonicalType.Name, "1", "1", "0", "1.2 Друга тема" });
+        await using var stream = new MemoryStream(bytes);
+        var file = new FormFile(stream, 0, bytes.Length, "file", "КН-1.docx");
+
+        var result = await new DocxImportService().ImportAsync(
+            file,
+            fixture.Db,
+            apply: true,
+            CancellationToken.None);
+
+        Assert.Null(result.Error);
+        fixture.Db.ChangeTracker.Clear();
+        Assert.False(await fixture.Db.LessonTypes.AnyAsync(type => type.Id == duplicateType.Id));
+        Assert.Equal(canonicalType.Id, await fixture.Db.TeacherDraftItems
+            .Where(item => item.Id == draft.Id)
+            .Select(item => item.LessonTypeId)
+            .SingleAsync());
+        Assert.NotEqual(draftRevision, await fixture.Db.TeacherDraftItems
+            .Where(item => item.Id == draft.Id)
+            .Select(item => item.Revision)
+            .SingleAsync());
+        var staleDraftDelete = await new TeacherDraftsController(
+                fixture.Db,
+                new RulesService(fixture.Db),
+                queryService: null!,
+                exportService: null!,
+                autogenService: null!,
+                autogenJobService: null!,
+                publishService: null!)
+            .Delete(draft.Id, draftRevision);
+        Assert.IsType<ConflictObjectResult>(staleDraftDelete);
+        Assert.True(await fixture.Db.TeacherDraftItems.AnyAsync(item => item.Id == draft.Id));
+        Assert.Equal(canonicalType.Id, await fixture.Db.ScheduleItems
+            .Where(item => item.Id == scheduleItem.Id)
+            .Select(item => item.LessonTypeId)
+            .SingleAsync());
+        Assert.NotEqual(scheduleRevision, await fixture.Db.ScheduleItems
+            .Where(item => item.Id == scheduleItem.Id)
+            .Select(item => item.Revision)
+            .SingleAsync());
+        var staleDelete = await CreateController(fixture.Db).Delete(scheduleItem.Id, scheduleRevision);
+        Assert.IsType<ConflictObjectResult>(staleDelete);
+        Assert.True(await fixture.Db.ScheduleItems.AnyAsync(item => item.Id == scheduleItem.Id));
+        Assert.All(
+            await fixture.Db.ModuleTopics.AsNoTracking().ToListAsync(),
+            importedTopic => Assert.Equal(canonicalType.Id, importedTopic.LessonTypeId));
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -1102,12 +1282,14 @@ public sealed class ScheduleEndpointCorrectnessTests
         await using var stream = new MemoryStream(bytes);
         var file = new FormFile(stream, 0, bytes.Length, "file", "КН-1.docx");
 
-        await Assert.ThrowsAsync<DbUpdateException>(() => new DocxImportService().ImportAsync(
+        var result = await new DocxImportService().ImportAsync(
             file,
             fixture.Db,
             apply: true,
-            CancellationToken.None));
+            CancellationToken.None);
 
+        Assert.NotNull(result.Error);
+        Assert.Contains("Імпорт скасовано", result.Error, StringComparison.OrdinalIgnoreCase);
         Assert.False(fixture.Db.ChangeTracker.HasChanges());
         Assert.Empty(await fixture.Db.Modules.ToListAsync());
         Assert.Empty(await fixture.Db.ModuleCourses.ToListAsync());

@@ -6,23 +6,33 @@
 @using System.Collections.Generic
 @using System.Text.RegularExpressions
 @using System.Text.Json
+@using BlazorWasmDotNet8AspNetCoreHosted.Client.Services
 @using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
 @using Microsoft.AspNetCore.Components.Forms
 @inject BlazorWasmDotNet8AspNetCoreHosted.Client.Services.IAdminApi Admin
 @inject IJSRuntime JS
 @inject HttpClient Http
 
-<PageTitle>Модулі</PageTitle>
+<PageTitle>Адмін • Модулі</PageTitle>
 
-<h3 class="mb-3">Модулі</h3>
+<h1 class="h3 mb-3">Модулі</h1>
 
 @if (!string.IsNullOrWhiteSpace(error))
 {
-    <div class="alert alert-danger">@error</div>
+    <div class="alert alert-danger" role="alert">@error</div>
 }
 @if (!string.IsNullOrWhiteSpace(ok))
 {
-    <div class="alert alert-success">@ok</div>
+    <div class="alert alert-success" role="status">@ok</div>
+}
+@if (_refreshRecoveryRequired)
+{
+    <div class="alert alert-warning d-flex flex-wrap align-items-center justify-content-between gap-2" role="alert">
+        <span>@_refreshRecoveryMessage</span>
+        <button type="button" class="btn btn-sm btn-outline-dark" @onclick="RetryRefreshAsync" disabled="@_refreshRecoveryInProgress">
+            @(_refreshRecoveryInProgress ? "Оновлення…" : "Повторити оновлення")
+        </button>
+    </div>
 }
 
 <div class="card p-3 mb-3">
@@ -35,31 +45,30 @@
     </div>
     <div class="row g-3 align-items-end">
         <div class="col-12 col-md-6">
-            <label class="form-label d-block">Файл .docx</label>
-            <InputFile class="d-none" id="docxFileInput" OnChange="OnImportFileChange" accept=".docx" />
-            <label for="docxFileInput" class="btn btn-outline-secondary me-2 mb-2">Оберіть файл</label>
-            <span class="text-muted small">@ImportFileCaption</span>
+            <label class="form-label" for="docxFileInput">Файл .docx</label>
+            <InputFile class="form-control" id="docxFileInput" OnChange="OnImportFileChange" accept=".docx" disabled="@IsPageInteractionBlocked" />
+            <div class="text-muted small mt-1">@ImportFileCaption</div>
         </div>
         <div class="col-12 col-md-6 d-flex flex-wrap gap-2">
             <button class="btn btn-outline-primary"
                     @onclick="() => ImportDocx(false)"
-                    disabled="@(importBusy || importFile is null)">
+                    disabled="@(IsPageInteractionBlocked || importFile is null)">
                 Попередній перегляд
             </button>
             <button class="btn btn-primary"
                     @onclick="() => ImportDocx(true)"
-                    disabled="@(importBusy || importFile is null)">
+                    disabled="@(IsPageInteractionBlocked || importFile is null)">
                 Імпортувати
             </button>
         </div>
     </div>
     @if (!string.IsNullOrWhiteSpace(importError))
     {
-        <div class="alert alert-danger mt-3">@importError</div>
+        <div class="alert alert-danger mt-3" role="alert">@importError</div>
     }
     @if (!string.IsNullOrWhiteSpace(importOk))
     {
-        <div class="alert alert-success mt-3">@importOk</div>
+        <div class="alert alert-success mt-3" role="status">@importOk</div>
     }
     @if (importResult is not null)
     {
@@ -67,15 +76,17 @@
     }
 </div>
 
-<ClearAllModulesCard Busy="@clearBusy" Error="@clearError" Ok="@clearOk" OnClear="@ClearAllModules" />
+<fieldset class="border-0 p-0 m-0 w-100" disabled="@IsPageInteractionBlocked">
+    <ClearAllModulesCard Busy="@clearBusy" Error="@clearError" Ok="@clearOk" OnClear="@ClearAllModules" />
+</fieldset>
 
 <div class="card p-3 mb-3">
     <div class="d-flex justify-content-between align-items-center mb-2 gap-2 flex-wrap">
-        <button class="btn btn-primary" @onclick="OpenCreateModule">Додати модуль</button>
+        <button class="btn btn-primary" @onclick="OpenCreateModule" disabled="@IsPageInteractionBlocked">Додати модуль</button>
         <AdminSearchBox @bind-Value="filter" Class="ms-auto" Style="max-width:320px;" Placeholder="Id / код / назва / курс / кредити" />
         <div class="text-muted small">Відібрано: @SortedAndFiltered.Count() з @items.Count</div>
     </div>
-    <div class="table-responsive">
+    <div class="table-responsive" role="region" aria-label="Список модулів" tabindex="0">
         <table class="table table-sm align-middle">
             <thead>
                 <tr>
@@ -84,7 +95,7 @@
                     <SortableHeader Field="@nameof(ModuleEditDto.Title)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Назва</SortableHeader>
                     <SortableHeader Field="@CourseField" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Курси</SortableHeader>
                     <SortableHeader Field="@nameof(ModuleEditDto.Credits)" ActiveField="@sortField" SortAscending="@sortAsc" OnSort="@ToggleSort">Обсяг кредитів</SortableHeader>
-                    <th style="width:230px;"></th>
+                    <th style="width:230px;"><span class="visually-hidden">Дії</span></th>
                 </tr>
             </thead>
             <tbody>
@@ -98,13 +109,13 @@
                         <td>@m.Credits</td>
                         <td class="text-end text-nowrap">
                             <button class="btn btn-sm btn-outline-secondary me-2" title="План модуля"
-                                    @onclick="() => OpenPlans(m)">
+                                    @onclick="() => OpenPlans(m)" disabled="@IsPageInteractionBlocked">
                                 План модуля
                             </button>
-                            <button class="btn btn-sm btn-outline-primary me-2" @onclick="() => OpenEditModule(m)">
+                            <button class="btn btn-sm btn-outline-primary me-2" @onclick="() => OpenEditModule(m)" disabled="@IsPageInteractionBlocked">
                                 Редагувати
                             </button>
-                            <button class="btn btn-sm btn-outline-danger" @onclick="() => Delete(m.Id!.Value)">
+                            <button class="btn btn-sm btn-outline-danger" @onclick="() => Delete(m.Id!.Value)" disabled="@IsPageInteractionBlocked">
                                 Видалити
                             </button>
                         </td>
@@ -117,27 +128,33 @@
 
 @if (moduleEditorOpen)
 {
-    <div class="editor-overlay" @onclick="CloseModuleEditor">
-        <div class="editor editor-modal module-editor" role="dialog" aria-modal="true" @onclick:stopPropagation="true">
-            <div class="editor-modal-head">
-                <div>
-                    <div class="editor-title">@((form.Id is null ? "Створення модуля" : $"Редагування модуля #{form.Id}"))</div>
-                    <div class="editor-subtitle">Налаштуйте курс, дозволені корпуси та аудиторії для модуля.</div>
+    <AdminEditorModal Title="@((form.Id is null ? "Створення модуля" : $"Редагування модуля #{form.Id}"))"
+                      Subtitle="Налаштуйте курс, дозволені корпуси та аудиторії для модуля."
+                      CssClass="module-editor"
+                      Busy="@IsModalBusy"
+                      OnClose="@CloseModuleEditor">
+            @if (_refreshRecoveryRequired)
+            {
+                <div class="alert alert-warning d-flex flex-wrap align-items-center justify-content-between gap-2" role="alert">
+                    <span>@_refreshRecoveryMessage</span>
+                    <button type="button" class="btn btn-sm btn-outline-dark" @onclick="RetryRefreshAsync" disabled="@_refreshRecoveryInProgress">
+                        @(_refreshRecoveryInProgress ? "Оновлення…" : "Повторити оновлення")
+                    </button>
                 </div>
-                <button type="button" class="btn btn-outline-secondary editor-close" title="Закрити" @onclick="CloseModuleEditor">×</button>
-            </div>
+            }
+            <fieldset class="border-0 p-0 m-0" disabled="@IsPageInteractionBlocked">
             <div class="module-editor-body">
                 <div class="row g-3">
                     <div class="col-12 col-md-3">
-                        <label class="form-label">Код</label>
-                        <input class="form-control" @bind="form.Code" />
+                        <label class="form-label" for="module-code">Код</label>
+                        <input id="module-code" class="form-control" @bind="form.Code" />
                     </div>
                     <div class="col-12 col-md-5">
-                        <label class="form-label">Назва</label>
-                        <input class="form-control" @bind="form.Title" />
+                        <label class="form-label" for="module-title">Назва</label>
+                        <input id="module-title" class="form-control" @bind="form.Title" />
                     </div>
                     <div class="col-12">
-                        <label class="form-label">Курс модуля</label>
+                        <div id="module-course-label" class="form-label">Курс модуля</div>
                         <div class="form-text small mb-2">
                             Один модуль належить лише одному курсу.
                         </div>
@@ -147,13 +164,14 @@
                         }
                         else
                         {
-                            <div class="course-chip-grid">
+                            <div class="course-chip-grid" role="group" aria-labelledby="module-course-label">
                                 @foreach (var c in courses.OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase))
                                 {
                                     var cid = c.Id;
                                     var selected = IsCourseSelected(cid);
                                     <button type="button"
                                             class="course-chip btn btn-sm @(selected ? "btn-primary" : "btn-outline-primary")"
+                                            aria-pressed="@selected"
                                             @onclick="() => SelectCourse(cid)">
                                         @c.Name
                                     </button>
@@ -169,10 +187,10 @@
                     </div>
                     <div class="col-12 col-lg-6">
                         <div class="d-flex justify-content-between align-items-center mb-1">
-                            <label class="form-label mb-0">Дозволені корпуси</label>
+                            <div id="module-buildings-label" class="form-label mb-0">Дозволені корпуси</div>
                             <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="SelectAllBuildings">Обрати всі</button>
                         </div>
-                        <div class="border rounded p-2" style="max-height:200px;overflow:auto;">
+                        <div class="border rounded p-2" style="max-height:200px;overflow:auto;" role="group" aria-labelledby="module-buildings-label">
                             @foreach (var b in buildings)
                             {
                                 var bid = b.Id ?? 0;
@@ -187,7 +205,7 @@
                     </div>
                     <div class="col-12 col-lg-6">
                         <div class="d-flex justify-content-between align-items-center mb-1">
-                            <label class="form-label mb-0">Дозволені аудиторії</label>
+                            <div id="module-rooms-label" class="form-label mb-0">Дозволені аудиторії</div>
                             <button type="button" class="btn btn-sm btn-outline-secondary"
                                     @onclick="SelectAllRooms"
                                     disabled="@(!rooms.Any())">Обрати всі</button>
@@ -198,7 +216,7 @@
                         }
                         else
                         {
-                            <div class="border rounded p-2" style="max-height:200px;overflow:auto;">
+                            <div class="border rounded p-2" style="max-height:200px;overflow:auto;" role="group" aria-labelledby="module-rooms-label">
                                 @foreach (var r in rooms)
                                 {
                                     var rid = r.Id ?? 0;
@@ -219,29 +237,36 @@
                 </div>
             </div>
             <div class="editor-actions">
-                <button class="btn btn-primary" @onclick="Save">Зберегти</button>
-                <button class="btn btn-outline-secondary" @onclick="CloseModuleEditor">Скасувати</button>
+                <button class="btn btn-primary" @onclick="Save" disabled="@IsPageInteractionBlocked">@(moduleSaving ? "Збереження…" : "Зберегти")</button>
+                <button class="btn btn-outline-secondary" @onclick="CloseModuleEditor" disabled="@IsPageInteractionBlocked">Скасувати</button>
             </div>
-        </div>
-    </div>
+            </fieldset>
+    </AdminEditorModal>
 }
 
-@if (plansModuleId is not null)
+@if (plansModuleId is not null && !topicEditorOpen)
 {
     <div class="plan-modal-overlay">
         <div class="plan-modal-backdrop" @onclick="ClosePlans"></div>
-        <div class="plan-modal-dialog">
+        <div @ref="_planDialogElement"
+             class="plan-modal-dialog"
+             role="dialog"
+             aria-modal="true"
+             aria-busy="@IsPageInteractionBlocked"
+             aria-labelledby="module-plan-title"
+             tabindex="-1"
+             @onkeydown="HandlePlanKeyDown">
             <div class="plan-modal-header">
                 <div>
-                    <h5 class="mb-0">
+                    <h2 id="module-plan-title" class="h5 mb-0">
                         План модуля: <span class="fw-semibold">@plansModuleTitle</span>
-                    </h5>
+                    </h2>
                     <div class="d-flex align-items-center gap-2 mt-2">
-                        <label class="form-label mb-0 small">Курс</label>
-                        <select class="form-select form-select-sm"
+                        <label class="form-label mb-0 small" for="module-plan-course">Курс</label>
+                        <select id="module-plan-course" class="form-select form-select-sm"
                                 value="@selectedPlanCourseId"
                                 @onchange="OnPlanCourseChanged"
-                                disabled="@(_plansBusy || !planCourseIds.Any())">
+                                disabled="@(IsPageInteractionBlocked || !planCourseIds.Any())">
                             @foreach (var cid in planCourseIds)
                             {
                                 <option value="@cid">@NameOfCourse(cid)</option>
@@ -250,24 +275,38 @@
                     </div>
                 </div>
                 <div class="d-flex gap-2">
-                    <button class="btn btn-sm btn-outline-secondary" @onclick="ClosePlans" disabled="@_plansBusy">Закрити</button>
-                    <button class="btn btn-sm btn-primary" @onclick="SavePlans" disabled="@(_plansBusy || selectedPlanCourseId <= 0)">@(_plansBusy ? "Зачекайте..." : "Зберегти план")</button>
+                    <button class="btn btn-sm btn-outline-secondary" @onclick="ClosePlans" disabled="@IsPageInteractionBlocked">Закрити</button>
+                    <button class="btn btn-sm btn-primary" @onclick="SavePlans" disabled="@(IsPageInteractionBlocked || selectedPlanCourseId <= 0)">@(_plansBusy ? "Зачекайте..." : "Зберегти план")</button>
                 </div>
             </div>
             <div class="plan-modal-body">
+                @if (_refreshRecoveryRequired)
+                {
+                    <div class="alert alert-warning d-flex flex-wrap align-items-center justify-content-between gap-2" role="alert">
+                        <span>@_refreshRecoveryMessage</span>
+                        <div class="d-flex flex-wrap gap-2">
+                            <button type="button" class="btn btn-sm btn-outline-dark" @onclick="RetryRefreshAsync" disabled="@_refreshRecoveryInProgress">
+                                @(_refreshRecoveryInProgress ? "Оновлення…" : "Повторити оновлення")
+                            </button>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="ClosePlansDuringRecovery" disabled="@_refreshRecoveryInProgress">
+                                Закрити план
+                            </button>
+                        </div>
+                    </div>
+                }
                 <div class="row g-3 mt-3">
                     <div class="col-12 col-md-4">
-                        <label class="form-label">Обсяг кредитів (за планом)</label>
-                        <input type="number" min="0" step="0.1" class="form-control" @bind="planCourse.Credits" disabled="@_plansBusy" />
+                        <label class="form-label" for="module-plan-credits">Обсяг кредитів (за планом)</label>
+                        <input id="module-plan-credits" type="number" min="0" step="0.1" class="form-control" @bind="planCourse.Credits" disabled="@IsPageInteractionBlocked" />
                         <div class="form-text">≈ @Math.Round(planCourse.Credits * 30M) год.</div>
                     </div>
                     <div class="col-12 col-md-4">
-                        <label class="form-label">Розкладено</label>
-                        <input type="number" class="form-control" value="@planCourse.ScheduledHours" disabled />
+                        <label class="form-label" for="module-plan-scheduled">Розкладено</label>
+                        <input id="module-plan-scheduled" type="number" class="form-control" value="@planCourse.ScheduledHours" disabled />
                     </div>
                     <div class="col-12 col-md-4 d-flex align-items-end">
                         <div class="form-check">
-                            <input class="form-check-input" type="checkbox" id="planActive" @bind="planCourse.IsActive" disabled="@_plansBusy" />
+                            <input class="form-check-input" type="checkbox" id="planActive" @bind="planCourse.IsActive" disabled="@IsPageInteractionBlocked" />
                             <label class="form-check-label" for="planActive">Активний</label>
                         </div>
                     </div>
@@ -285,11 +324,11 @@
                         <button type="button"
                                 class="btn btn-sm btn-primary"
                                 @onclick="OpenCreateTopic"
-                                disabled="@(_plansBusy || !plansModuleId.HasValue)">
+                                disabled="@(IsPageInteractionBlocked || !plansModuleId.HasValue)">
                             Додати заняття
                         </button>
                     </div>
-                    <div class="table-responsive mt-3">
+                    <div class="table-responsive mt-3" role="region" aria-label="Теми модуля" tabindex="0">
                         <table class="table table-sm align-middle module-topics-table">
                             <thead>
                                 <tr>
@@ -323,7 +362,7 @@
                                             <td>@(string.IsNullOrWhiteSpace(topic.DepartmentName) ? "—" : topic.DepartmentName)</td>
                                             <td class="text-center">
                                 <input class="form-check-input" type="checkbox" checked="@topic.IsInterAssembly"
-                                       disabled="@_plansBusy"
+                                       disabled="@IsPageInteractionBlocked"
                                        @onchange="e => ToggleTopicInterAssembly(topic, e)"
                                        aria-label="Міжзборові заходи" />
                                             </td>
@@ -331,7 +370,7 @@
                                                 <button type="button"
                                                         class="btn btn-sm topic-flag-btn @(topic.SelfStudyBySupervisor ? "btn-success" : "btn-outline-secondary")"
                                                         title="Самостійні години цієї теми ставляться у розклад"
-                                                        disabled="@_plansBusy"
+                                                        disabled="@IsPageInteractionBlocked"
                                                         @onclick="() => ToggleTopicSupervisorSelfStudy(topic)">
                                                     @(topic.SelfStudyBySupervisor ? "У розкладі" : "Не розкладати")
                                                 </button>
@@ -347,8 +386,8 @@
                                             </td>
                                             <td class="module-topics-col-actions text-end text-nowrap">
                                                 <div class="btn-group btn-group-sm me-1 mb-1 mb-sm-0">
-                                                    <button class="btn btn-outline-secondary" disabled="@_plansBusy" @onclick="() => EditTopic(topic)">Редагувати</button>
-                                                    <button class="btn btn-outline-danger" disabled="@_plansBusy" @onclick="() => DeleteTopic(topic.Id)">Видалити</button>
+                                                    <button class="btn btn-outline-secondary" disabled="@IsPageInteractionBlocked" @onclick="() => EditTopic(topic)">Редагувати</button>
+                                                    <button class="btn btn-outline-danger" disabled="@IsPageInteractionBlocked" @onclick="() => DeleteTopic(topic.Id)">Видалити</button>
                                                 </div>
                                             </td>
                                         </tr>
@@ -372,68 +411,75 @@
                         </table>
                     </div>
                 </div>
-                @if (topicEditorOpen)
-                {
-                    <div class="editor-overlay topic-editor-overlay" @onclick="CloseTopicEditor">
-                        <div class="editor editor-modal topic-editor" role="dialog" aria-modal="true" @onclick:stopPropagation="true">
-                            <div class="editor-modal-head">
-                                <div>
-                                    <div class="editor-title">@(topicForm.Id is null ? "Створення теми заняття" : $"Редагування теми #{topicForm.Id}")</div>
-                                    <div class="editor-subtitle">Вкажіть код у форматі <code>1.1.1.1</code> та заповніть параметри теми.</div>
-                                </div>
-                                <button type="button" class="btn btn-outline-secondary editor-close" title="Закрити" @onclick="CloseTopicEditor">×</button>
-                            </div>
-                            <div class="row g-3 align-items-end">
-                                <div class="col-12 col-lg-4">
-                                    <label class="form-label text-nowrap">Код заняття</label>
-                                    <input class="form-control" @bind="topicCodeInput" />
-                                </div>
-                                <div class="col-12 col-lg-4">
-                                    <label class="form-label text-nowrap">Тип заняття</label>
-                                    <select class="form-select" @bind="topicForm.LessonTypeId">
-                                        <option value="0">- Оберіть тип заняття -</option>
-                                        @foreach (var lt in lessonTypes)
-                                        {
-                                            <option value="@lt.Id">@lt.Name</option>
-                                        }
-                                    </select>
-                                </div>
-                                <div class="col-12 col-lg-4">
-                                    <label class="form-label text-nowrap">Кафедра</label>
-                                    <select class="form-select"
-                                            value="@topicForm.DepartmentId"
-                                            @onchange="e => topicForm.DepartmentId = int.TryParse(e.Value?.ToString(), out var v) && v > 0 ? v : (int?)null">
-                                        <option value="">— Не вказано —</option>
-                                        @foreach (var dep in departments.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase))
-                                        {
-                                            <option value="@dep.Id" selected="@(topicForm.DepartmentId == dep.Id)">@dep.Name</option>
-                                        }
-                                    </select>
-                                </div>
-                                <div class="col-12 col-md-4">
-                                    <label class="form-label text-nowrap">Годин аудиторних</label>
-                                    <input type="number" min="0" class="form-control" @bind="topicForm.AuditoriumHours" @bind:after="SyncTotalHours" />
-                                </div>
-                                <div class="col-12 col-md-4">
-                                    <label class="form-label text-nowrap">Годин самостійних</label>
-                                    <input type="number" min="0" class="form-control" @bind="topicForm.SelfStudyHours" @bind:after="SyncTotalHours" />
-                                </div>
-                                <div class="col-12 col-md-4">
-                                    <label class="form-label text-nowrap">Всього</label>
-                                    <input type="number" min="0" class="form-control" value="@topicForm.TotalHours" readonly />
-                                </div>
-                            </div>
-                            <div class="editor-actions">
-                                <button type="button" class="btn btn-primary" @onclick="SaveTopic" disabled="@(_plansBusy || !plansModuleId.HasValue)">Зберегти заняття</button>
-                                <button type="button" class="btn btn-outline-secondary" @onclick="ClearTopicForm" disabled="@(_plansBusy || !plansModuleId.HasValue)">Очистити поля</button>
-                                <button type="button" class="btn btn-outline-secondary" @onclick="CloseTopicEditor" disabled="@_plansBusy">Скасувати</button>
-                            </div>
-                        </div>
-                    </div>
-                }
             </div>
         </div>
     </div>
+}
+
+@if (topicEditorOpen && plansModuleId is not null)
+{
+    <AdminEditorModal Title="@(topicForm.Id is null ? "Створення теми заняття" : $"Редагування теми #{topicForm.Id}")"
+                      Subtitle="Вкажіть код у форматі 1.1.1.1 та заповніть параметри теми."
+                      CssClass="topic-editor"
+                      Busy="@IsModalBusy"
+                      OnClose="@CloseTopicEditor">
+        @if (_refreshRecoveryRequired)
+        {
+            <div class="alert alert-warning d-flex flex-wrap align-items-center justify-content-between gap-2" role="alert">
+                <span>@_refreshRecoveryMessage</span>
+                <button type="button" class="btn btn-sm btn-outline-dark" @onclick="RetryRefreshAsync" disabled="@_refreshRecoveryInProgress">
+                    @(_refreshRecoveryInProgress ? "Оновлення…" : "Повторити оновлення")
+                </button>
+            </div>
+        }
+        <fieldset class="border-0 p-0 m-0" disabled="@IsPageInteractionBlocked">
+            <div class="row g-3 align-items-end">
+                <div class="col-12 col-lg-4">
+                    <label class="form-label text-nowrap" for="module-topic-code">Код заняття</label>
+                    <input id="module-topic-code" class="form-control" @bind="topicCodeInput" />
+                </div>
+                <div class="col-12 col-lg-4">
+                    <label class="form-label text-nowrap" for="module-topic-type">Тип заняття</label>
+                    <select id="module-topic-type" class="form-select" @bind="topicForm.LessonTypeId">
+                        <option value="0">- Оберіть тип заняття -</option>
+                        @foreach (var lt in lessonTypes)
+                        {
+                            <option value="@lt.Id">@lt.Name</option>
+                        }
+                    </select>
+                </div>
+                <div class="col-12 col-lg-4">
+                    <label class="form-label text-nowrap" for="module-topic-department">Кафедра</label>
+                    <select id="module-topic-department" class="form-select"
+                            value="@topicForm.DepartmentId"
+                            @onchange="e => topicForm.DepartmentId = int.TryParse(e.Value?.ToString(), out var v) && v > 0 ? v : (int?)null">
+                        <option value="">— Не вказано —</option>
+                        @foreach (var dep in departments.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase))
+                        {
+                            <option value="@dep.Id" selected="@(topicForm.DepartmentId == dep.Id)">@dep.Name</option>
+                        }
+                    </select>
+                </div>
+                <div class="col-12 col-md-4">
+                    <label class="form-label text-nowrap" for="module-topic-auditorium">Годин аудиторних</label>
+                    <input id="module-topic-auditorium" type="number" min="0" class="form-control" @bind="topicForm.AuditoriumHours" @bind:after="SyncTotalHours" />
+                </div>
+                <div class="col-12 col-md-4">
+                    <label class="form-label text-nowrap" for="module-topic-self-study">Годин самостійних</label>
+                    <input id="module-topic-self-study" type="number" min="0" class="form-control" @bind="topicForm.SelfStudyHours" @bind:after="SyncTotalHours" />
+                </div>
+                <div class="col-12 col-md-4">
+                    <label class="form-label text-nowrap" for="module-topic-total">Всього</label>
+                    <input id="module-topic-total" type="number" min="0" class="form-control" value="@topicForm.TotalHours" readonly />
+                </div>
+            </div>
+            <div class="editor-actions">
+                <button type="button" class="btn btn-primary" @onclick="SaveTopic" disabled="@(IsPageInteractionBlocked || !plansModuleId.HasValue)">Зберегти заняття</button>
+                <button type="button" class="btn btn-outline-secondary" @onclick="ClearTopicForm" disabled="@(IsPageInteractionBlocked || !plansModuleId.HasValue)">Очистити поля</button>
+                <button type="button" class="btn btn-outline-secondary" @onclick="CloseTopicEditor" disabled="@IsPageInteractionBlocked">Скасувати</button>
+            </div>
+        </fieldset>
+    </AdminEditorModal>
 }
 
 @code {
@@ -450,6 +496,17 @@
     private List<ModuleEditDto> items = new();
     private ModuleEditDto form = NewModuleForm();
     private bool moduleEditorOpen;
+    private bool moduleSaving;
+    private bool _pageMutationInProgress;
+    private readonly LatestAsyncRequestGuard _pageLoadGuard = new();
+    private bool _pageLoadInProgress;
+    private bool _refreshRecoveryRequired;
+    private bool _refreshRecoveryInProgress;
+    private string? _refreshRecoveryMessage;
+    private string? _pendingRecoverySuccessMessage;
+    private string? _lastLoadError;
+    private Func<Task<bool>>? _refreshRecoveryAction;
+    private Action? _refreshRecoveryCompleted;
     private List<LookupDto> courses = new();
     private List<LookupDto> departments = new();
     private List<RoomEditDto> rooms = new();
@@ -464,6 +521,8 @@ private string plansModuleTitle = "";
 private string plansModuleCode = "";
     private PlanCourseVM planCourse = new();
     private bool _plansBusy;
+    private ElementReference _planDialogElement;
+    private bool _planFocusPending;
 
     private List<ModuleTopicViewDto> moduleTopics = new();
     private ModuleTopicFormVM topicForm = new();
@@ -475,6 +534,15 @@ private string plansModuleCode = "";
     private string sortField = nameof(ModuleEditDto.Title);
     private bool sortAsc = true;
     private string? filter;
+    private bool IsPageInteractionBlocked
+        => _pageMutationInProgress
+            || _pageLoadInProgress
+            || _refreshRecoveryRequired
+            || _refreshRecoveryInProgress;
+    private bool IsModalBusy
+        => _pageMutationInProgress
+            || _pageLoadInProgress
+            || _refreshRecoveryInProgress;
     private static ModuleEditDto NewModuleForm() => new()
     {
         Id = null,
@@ -486,20 +554,116 @@ private string plansModuleCode = "";
         CloneCourseIds = new(),
         Credits = 0
     };
+    // Захоплює єдиний шлюз для будь-якої мутації на сторінці.
+    private bool TryBeginPageMutation()
+    {
+        if (IsPageInteractionBlocked)
+        {
+            return false;
+        }
+
+        _pageMutationInProgress = true;
+        return true;
+    }
+    private void EndPageMutation() => _pageMutationInProgress = false;
+    // Блокує повторну мутацію, доки підтверджений запис сервера не буде перечитано.
+    private void RequireRefreshRecovery(
+        string message,
+        string successMessage,
+        Func<Task<bool>> refreshAction,
+        Action? completed = null)
+    {
+        _refreshRecoveryRequired = true;
+        _refreshRecoveryMessage = message;
+        _pendingRecoverySuccessMessage = successMessage;
+        _refreshRecoveryAction = refreshAction;
+        _refreshRecoveryCompleted = completed;
+        ok = null;
+        error = null;
+    }
+    // Повторює лише читання стану; успішну мутацію не надсилає вдруге.
+    private async Task RetryRefreshAsync()
+    {
+        if (!_refreshRecoveryRequired
+            || _pageMutationInProgress
+            || _pageLoadInProgress
+            || _refreshRecoveryInProgress)
+        {
+            return;
+        }
+
+        _refreshRecoveryInProgress = true;
+        try
+        {
+            var refreshed = _refreshRecoveryAction is not null && await _refreshRecoveryAction();
+            if (!refreshed)
+            {
+                _refreshRecoveryMessage = $"Оновити дані не вдалося: {_lastLoadError ?? "невідома помилка"}. Повторіть спробу; операцію на сервері не повторюйте.";
+                return;
+            }
+
+            var successMessage = _pendingRecoverySuccessMessage;
+            var completed = _refreshRecoveryCompleted;
+            _refreshRecoveryRequired = false;
+            _refreshRecoveryMessage = null;
+            _pendingRecoverySuccessMessage = null;
+            _refreshRecoveryAction = null;
+            _refreshRecoveryCompleted = null;
+            error = null;
+            ok = successMessage;
+            completed?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            _lastLoadError = ex.Message;
+            _refreshRecoveryMessage = $"Оновити дані не вдалося: {ex.Message}. Повторіть спробу; операцію на сервері не повторюйте.";
+        }
+        finally
+        {
+            _refreshRecoveryInProgress = false;
+        }
+    }
     private void OpenCreateModule()
     {
+        if (IsPageInteractionBlocked) return;
         form = NewModuleForm();
         moduleEditorOpen = true;
         UpdateVisibleRooms();
     }
     private void CloseModuleEditor()
     {
+        if (IsModalBusy) return;
+        CloseModuleEditorCore();
+    }
+    private void CloseModuleEditorCore()
+    {
         moduleEditorOpen = false;
         form = NewModuleForm();
         UpdateVisibleRooms();
     }
     // Завантажує дані модулів і довідників під час першого відкриття сторінки.
-    protected override async Task OnInitializedAsync() => await Load();
+    protected override async Task OnInitializedAsync()
+    {
+        if (!await Load())
+        {
+            RequireRefreshRecovery(
+                $"Не вдалося завантажити дані модулів: {_lastLoadError ?? "невідома помилка"}.",
+                "Дані модулів завантажено.",
+                () => Load(clearMessages: false));
+        }
+    }
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!_planFocusPending || plansModuleId is null || topicEditorOpen) return;
+        _planFocusPending = false;
+        try
+        {
+            await JS.InvokeVoidAsync("scheduleApp.focusModal", _planDialogElement);
+        }
+        catch (JSException)
+        {
+        }
+    }
     private int ImportedTopicsCount => importResult?.Modules?.Sum(m => m.Topics?.Count ?? 0) ?? 0;
     private string ImportFileCaption => importFile is null
         ? "Файл не обрано"
@@ -507,6 +671,7 @@ private string plansModuleCode = "";
     // Обробляє вибір файлу для імпорту DOCX.
     private async Task OnImportFileChange(InputFileChangeEventArgs e)
     {
+        if (IsPageInteractionBlocked) return;
         importFile = e.FileCount > 0 ? e.File : null;
         importResult = null;
         importError = null;
@@ -522,16 +687,33 @@ private string plansModuleCode = "";
             importOk = null;
             return;
         }
+        if (!TryBeginPageMutation()) return;
+
         try
         {
             importBusy = true;
+            ok = null;
+            error = null;
             importError = null;
             importOk = null;
             importResult = await Admin.ImportModulesFromDocx(importFile, apply);
-            importOk = apply ? "Імпорт виконано." : "Прев’ю імпорту отримано.";
             if (apply)
             {
-                await Load();
+                if (await Load(clearMessages: false))
+                {
+                    importOk = "Імпорт виконано.";
+                }
+                else
+                {
+                    RequireRefreshRecovery(
+                        $"Імпорт виконано, але оновити список не вдалося: {_lastLoadError ?? "невідома помилка"}. Повторно імпортувати файл не потрібно.",
+                        "Імпорт виконано.",
+                        () => Load(clearMessages: false));
+                }
+            }
+            else
+            {
+                importOk = "Прев’ю імпорту отримано.";
             }
         }
         catch (Exception ex)
@@ -541,6 +723,7 @@ private string plansModuleCode = "";
         finally
         {
             importBusy = false;
+            EndPageMutation();
         }
     }
     // Намагається витягнути повідомлення помилки з JSON-відповіді.
@@ -564,11 +747,11 @@ private string plansModuleCode = "";
     // Викликає повне очищення модулів після підтвердження.
     private async Task ClearAllModules()
     {
-        if (clearBusy)
-        {
-            return;
-        }
+        if (!TryBeginPageMutation()) return;
+
         clearBusy = true;
+        ok = null;
+        error = null;
         clearError = null;
         clearOk = null;
         try
@@ -581,8 +764,17 @@ private string plansModuleCode = "";
                 return;
             }
             await Admin.ClearModulesAndPlans();
-            clearOk = "Усі модулі та плани очищено.";
-            await Load();
+            if (await Load(clearMessages: false))
+            {
+                clearOk = "Усі модулі та плани очищено.";
+            }
+            else
+            {
+                RequireRefreshRecovery(
+                    $"Модулі та плани очищено, але оновити список не вдалося: {_lastLoadError ?? "невідома помилка"}. Повторно очищати дані не потрібно.",
+                    "Усі модулі та плани очищено.",
+                    () => Load(clearMessages: false));
+            }
         }
         catch (Exception ex)
         {
@@ -591,30 +783,66 @@ private string plansModuleCode = "";
         finally
         {
             clearBusy = false;
+            EndPageMutation();
         }
     }
     // Отримує список модулів, супровідні довідники та налаштовує стан форми.
-    private async Task Load()
+    private async Task<bool> Load(bool clearMessages = true)
     {
-        error = null;
-        ok = null;
+        var loadVersion = _pageLoadGuard.Begin();
+        _pageLoadInProgress = true;
+        if (clearMessages)
+        {
+            error = null;
+            ok = null;
+        }
+        _lastLoadError = null;
         try
         {
-            items = await Admin.GetModules();
+            var loadedItems = await Admin.GetModules();
             var meta = await Admin.GetMeta();
-            courses = meta.Courses ?? new();
-            lessonTypes = meta.LessonTypes ?? new();
-            departments = meta.Departments ?? new();
-            allRooms = await Admin.GetRooms() ?? new();
-            buildings = await Admin.GetBuildings();
+            var loadedCourses = meta.Courses ?? new();
+            var loadedLessonTypes = meta.LessonTypes ?? new();
+            var loadedDepartments = meta.Departments ?? new();
+            var loadedRooms = await Admin.GetRooms() ?? new();
+            var loadedBuildings = await Admin.GetBuildings();
+
+            if (!_pageLoadGuard.IsCurrent(loadVersion))
+            {
+                return true;
+            }
+
+            items = loadedItems;
+            courses = loadedCourses;
+            lessonTypes = loadedLessonTypes;
+            departments = loadedDepartments;
+            allRooms = loadedRooms;
+            buildings = loadedBuildings;
             EnsureBuildingsCoverSelectedRooms();
             UpdateVisibleRooms();
-            ok = "Дані модулів завантажено.";
+            return true;
         }
         catch (Exception ex)
         {
-            ok = null;
-            error = ex.Message;
+            if (!_pageLoadGuard.IsCurrent(loadVersion))
+            {
+                return true;
+            }
+
+            _lastLoadError = ex.Message;
+            if (clearMessages)
+            {
+                ok = null;
+                error = ex.Message;
+            }
+            return false;
+        }
+        finally
+        {
+            if (_pageLoadGuard.IsCurrent(loadVersion))
+            {
+                _pageLoadInProgress = false;
+            }
         }
     }
     // Додає або вилучає ідентифікатор зі списку залежно від прапорця.
@@ -626,6 +854,7 @@ private string plansModuleCode = "";
     // Перемикає доступність будівлі й оновлює видимі аудиторії.
     private void ToggleBuilding(int buildingId, bool on)
     {
+        if (IsPageInteractionBlocked) return;
         if (buildingId <= 0) return;
         Toggle(form.AllowedBuildingIds, buildingId, on);
         UpdateVisibleRooms();
@@ -701,6 +930,7 @@ private string plansModuleCode = "";
     // Встановлює єдиний обраний курс модуля.
     private void SelectCourse(int courseId)
     {
+        if (IsPageInteractionBlocked) return;
         if (courseId <= 0) return;
         SetSelectedCourses(new[] { courseId });
     }
@@ -729,6 +959,7 @@ private string plansModuleCode = "";
     // Заповнює форму даними модуля для редагування.
     private void OpenEditModule(ModuleEditDto m)
     {
+        if (IsPageInteractionBlocked) return;
         form = new(m.Id, m.Code, m.Title, m.CourseId, new List<int>(m.AllowedRoomIds), new List<int>(m.AllowedBuildingIds), m.Credits);
         SetSelectedCourses(ModuleCourseIds(m));
         EnsureBuildingsCoverSelectedRooms();
@@ -738,6 +969,10 @@ private string plansModuleCode = "";
     // Перевіряє введені дані та зберігає модуль через API.
     private async Task Save()
     {
+        if (!TryBeginPageMutation()) return;
+        moduleSaving = true;
+        ok = null;
+        error = null;
         try
         {
             var selectedCourses = CurrentCourseIds();
@@ -747,16 +982,45 @@ private string plansModuleCode = "";
                 return;
             }
             SetSelectedCourses(selectedCourses);
-            await Admin.UpsertModule(form);
-            await Load();
-            ok = "Модуль успішно збережено.";
-            CloseModuleEditor();
+            var payload = new ModuleEditDto(
+                form.Id,
+                form.Code,
+                form.Title,
+                form.CourseId,
+                new List<int>(form.AllowedRoomIds),
+                new List<int>(form.AllowedBuildingIds),
+                form.Credits);
+            var savedId = await Admin.UpsertModule(payload);
+            form.Id = savedId;
+            if (await Load(clearMessages: false))
+            {
+                ok = "Модуль успішно збережено.";
+                error = null;
+                CloseModuleEditorCore();
+            }
+            else
+            {
+                RequireRefreshRecovery(
+                    $"Модуль збережено, але оновити список не вдалося: {_lastLoadError ?? "невідома помилка"}. Повторно зберігати модуль не потрібно.",
+                    "Модуль успішно збережено.",
+                    () => Load(clearMessages: false),
+                    CloseModuleEditorCore);
+            }
         }
         catch (Exception ex) { error = ex.Message; }
+        finally
+        {
+            moduleSaving = false;
+            EndPageMutation();
+        }
     }
     // Видаляє модуль і перезавантажує перелік.
     private async Task Delete(int id)
     {
+        if (!TryBeginPageMutation()) return;
+
+        ok = null;
+        error = null;
         try
         {
             var module = items.FirstOrDefault(m => m.Id == id);
@@ -764,17 +1028,32 @@ private string plansModuleCode = "";
             var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити модуль {caption}? Дію не можна скасувати.");
             if (!confirmed) return;
             await Admin.DeleteModule(id);
-            await Load();
-            ok = "Модуль успішно видалено.";
+            if (await Load(clearMessages: false))
+            {
+                ok = "Модуль успішно видалено.";
+                error = null;
+            }
+            else
+            {
+                RequireRefreshRecovery(
+                    $"Модуль видалено, але оновити список не вдалося: {_lastLoadError ?? "невідома помилка"}. Повторно видаляти модуль не потрібно.",
+                    "Модуль успішно видалено.",
+                    () => Load(clearMessages: false));
+            }
         }
         catch (Exception ex) { error = ex.Message; }
+        finally { EndPageMutation(); }
     }
     // Перемикає прапорець міжзборових заходів для теми і зберігає зміни.
     private async Task ToggleTopicInterAssembly(ModuleTopicViewDto topic, ChangeEventArgs e)
     {
-        if (_plansBusy || plansModuleId is null) return;
+        if (plansModuleId is null) return;
         if (e?.Value is null) return;
+        if (!TryBeginPageMutation()) return;
+
         _plansBusy = true;
+        ok = null;
+        error = null;
         var moduleId = plansModuleId.Value;
         var newValue = e.Value is bool b && b;
         try
@@ -793,10 +1072,21 @@ private string plansModuleCode = "";
                 topic.SelfStudyBySupervisor
             );
             await Admin.UpsertModuleTopic(moduleId, payload);
-            await LoadTopics(moduleId);
-            ok = newValue
+            var successMessage = newValue
                 ? "Тему позначено як міжзборову, вона не увійде в автогенерацію."
                 : "Міжзборову позначку знято.";
+            if (await LoadTopics(moduleId))
+            {
+                ok = successMessage;
+                error = null;
+            }
+            else
+            {
+                RequireRefreshRecovery(
+                    $"Позначку теми збережено, але оновити теми не вдалося: {_lastLoadError ?? "невідома помилка"}. Повторно змінювати позначку не потрібно.",
+                    successMessage,
+                    () => LoadTopics(moduleId));
+            }
         }
         catch (Exception ex)
         {
@@ -805,13 +1095,17 @@ private string plansModuleCode = "";
         finally
         {
             _plansBusy = false;
+            EndPageMutation();
         }
     }
     // Перемикає позначку, що самостійні години веде керівник, і виключає їх з розкладу.
     private async Task ToggleTopicSupervisorSelfStudy(ModuleTopicViewDto topic)
     {
-        if (_plansBusy || plansModuleId is null) return;
+        if (plansModuleId is null || !TryBeginPageMutation()) return;
+
         _plansBusy = true;
+        ok = null;
+        error = null;
         var moduleId = plansModuleId.Value;
         var newValue = !topic.SelfStudyBySupervisor;
         try
@@ -830,10 +1124,21 @@ private string plansModuleCode = "";
                 newValue
             );
             await Admin.UpsertModuleTopic(moduleId, payload);
-            await LoadTopics(moduleId);
-            ok = newValue
+            var successMessage = newValue
                 ? "Самостійні години теми будуть розкладатися під керівником."
                 : "Самостійні години теми виключено з розкладу.";
+            if (await LoadTopics(moduleId))
+            {
+                ok = successMessage;
+                error = null;
+            }
+            else
+            {
+                RequireRefreshRecovery(
+                    $"Налаштування теми збережено, але оновити теми не вдалося: {_lastLoadError ?? "невідома помилка"}. Повторно змінювати налаштування не потрібно.",
+                    successMessage,
+                    () => LoadTopics(moduleId));
+            }
         }
         catch (Exception ex)
         {
@@ -842,17 +1147,21 @@ private string plansModuleCode = "";
         finally
         {
             _plansBusy = false;
+            EndPageMutation();
         }
     }
     // Відкриває панель планів для обраного модуля та завантажує дані.
     private async Task OpenPlans(ModuleEditDto m)
     {
-        if (_plansBusy) return;
+        if (!m.Id.HasValue || !TryBeginPageMutation()) return;
+
         _plansBusy = true;
         try
         {
-            ok = "Дані плану модуля завантажено.";
+            ok = null;
+            error = null;
             plansModuleId = m.Id;
+            _planFocusPending = true;
             plansModuleTitle = $"{m.Code} - {m.Title}";
             plansModuleCode = m.Code ?? string.Empty;
             planCourseIds = ModuleCourseIds(m);
@@ -860,8 +1169,20 @@ private string plansModuleCode = "";
             var moduleCredits = m.Credits;
             if (plansModuleId is int moduleId && selectedPlanCourseId > 0)
             {
-                await EnsurePlanModuleSeparated(moduleId, selectedPlanCourseId);
-                await LoadPlanDetails(plansModuleId ?? moduleId, selectedPlanCourseId, moduleCredits);
+                if (!await EnsurePlanModuleSeparated(moduleId, selectedPlanCourseId, moduleCredits))
+                {
+                    return;
+                }
+
+                var activeModuleId = plansModuleId ?? moduleId;
+                if (!await LoadPlanContext(activeModuleId, selectedPlanCourseId, moduleCredits))
+                {
+                    RequireRefreshRecovery(
+                        $"Не вдалося завантажити план модуля: {_lastLoadError ?? "невідома помилка"}.",
+                        "Дані плану модуля завантажено.",
+                        () => LoadPlanContext(activeModuleId, selectedPlanCourseId, moduleCredits));
+                    return;
+                }
             }
             else
             {
@@ -874,25 +1195,42 @@ private string plansModuleCode = "";
                     ScheduledHours = 0,
                     IsActive = true
                 };
+                if (plansModuleId is int id && !await LoadTopics(id))
+                {
+                    RequireRefreshRecovery(
+                        $"Не вдалося завантажити теми модуля: {_lastLoadError ?? "невідома помилка"}.",
+                        "Дані плану модуля завантажено.",
+                        () => LoadTopics(id));
+                    return;
+                }
+                ResetTopicForm(plansModuleId ?? 0);
             }
-            if (plansModuleId is int id)
-            {
-                await LoadTopics(id);
-            }
+            ok = "Дані плану модуля завантажено.";
         }
         catch (Exception ex)
         {
-            selectedPlanCourseId = 0;
-            planCourse = new();
-            error = ex.Message;
+            RequirePlanContextRecovery(
+                $"Не вдалося підготувати план модуля: {ex.Message}. Дані плану заблоковано до успішного оновлення.",
+                m.Id.Value,
+                selectedPlanCourseId > 0 ? selectedPlanCourseId : m.CourseId,
+                m.Credits);
         }
-        finally { _plansBusy = false; }
+        finally
+        {
+            _plansBusy = false;
+            EndPageMutation();
+        }
     }
     // Скидає стан панелі планів і приховує її.
     private void ClosePlans()
     {
-        if (_plansBusy) return;
+        if (IsPageInteractionBlocked) return;
+        ClosePlansCore();
+    }
+    private void ClosePlansCore()
+    {
         plansModuleId = null;
+        _planFocusPending = false;
         planCourseIds = new();
         selectedPlanCourseId = 0;
         plansModuleTitle = "";
@@ -902,11 +1240,23 @@ private string plansModuleCode = "";
         topicEditorOpen = false;
         ResetTopicForm(0);
     }
+    // Закриває план клавішею Escape, не перехоплюючи Escape вкладеного редактора теми.
+    private Task HandlePlanKeyDown(KeyboardEventArgs args)
+    {
+        if (!IsPageInteractionBlocked && !topicEditorOpen && string.Equals(args.Key, "Escape", StringComparison.Ordinal))
+        {
+            ClosePlans();
+        }
+        return Task.CompletedTask;
+    }
     // Зберігає налаштування плану годин для вибраного курсу.
     private async Task SavePlans()
     {
-        if (_plansBusy || plansModuleId is null || selectedPlanCourseId <= 0) return;
+        if (plansModuleId is null || selectedPlanCourseId <= 0 || !TryBeginPageMutation()) return;
+
         _plansBusy = true;
+        ok = null;
+        error = null;
         var moduleId = plansModuleId.Value;
         var courseId = selectedPlanCourseId;
         var credits = planCourse.Credits;
@@ -923,113 +1273,253 @@ private string plansModuleCode = "";
             {
                 return;
             }
-            planCourse.TargetHours = normalizedHours;
-            ok = "План модуля оновлено.";
-            await LoadPlanDetails(moduleId, courseId, credits);
-            var moduleRow = items.FirstOrDefault(x => x.Id == moduleId);
-            if (moduleRow is not null)
+            void ApplyCreditsToRow()
             {
-                moduleRow.Credits = credits;
+                var moduleRow = items.FirstOrDefault(x => x.Id == moduleId);
+                if (moduleRow is not null)
+                {
+                    moduleRow.Credits = credits;
+                }
+            }
+            if (await LoadPlanDetails(moduleId, courseId, credits))
+            {
+                ApplyCreditsToRow();
+                ok = "План модуля оновлено.";
+                error = null;
+            }
+            else
+            {
+                RequireRefreshRecovery(
+                    $"План модуля збережено, але оновити його не вдалося: {_lastLoadError ?? "невідома помилка"}. Повторно зберігати план не потрібно.",
+                    "План модуля оновлено.",
+                    () => LoadPlanDetails(moduleId, courseId, credits),
+                    ApplyCreditsToRow);
             }
         }
         catch (Exception ex) { error = ex.Message; }
-        finally { _plansBusy = false; }
+        finally
+        {
+            _plansBusy = false;
+            EndPageMutation();
+        }
     }
     // Завантажує деталі плану годин для модуля та курсу.
-    private async Task LoadPlanDetails(int moduleId, int courseId, decimal fallbackCredits)
+    private async Task<bool> LoadPlanDetails(int moduleId, int courseId, decimal fallbackCredits)
     {
-        if (courseId <= 0)
+        _lastLoadError = null;
+        try
         {
-            var normalizedHours = (int)Math.Round(Math.Max(0m, fallbackCredits) * 30m);
-            planCourse = new PlanCourseVM
+            PlanCourseVM loadedPlan;
+            if (courseId <= 0)
             {
-                CourseId = 0,
-                TargetHours = normalizedHours,
-                Credits = fallbackCredits,
-                ScheduledHours = 0,
-                IsActive = true
-            };
-            return;
+                var normalizedHours = (int)Math.Round(Math.Max(0m, fallbackCredits) * 30m);
+                loadedPlan = new PlanCourseVM
+                {
+                    CourseId = 0,
+                    TargetHours = normalizedHours,
+                    Credits = fallbackCredits,
+                    ScheduledHours = 0,
+                    IsActive = true
+                };
+            }
+            else
+            {
+                var dto = await Admin.GetCourseModulePlan(moduleId, courseId);
+                if (dto is null)
+                {
+                    var normalizedHours = (int)Math.Round(Math.Max(0m, fallbackCredits) * 30m);
+                    loadedPlan = new PlanCourseVM
+                    {
+                        CourseId = courseId,
+                        TargetHours = normalizedHours,
+                        Credits = fallbackCredits,
+                        ScheduledHours = 0,
+                        IsActive = true
+                    };
+                }
+                else
+                {
+                    loadedPlan = new PlanCourseVM
+                    {
+                        CourseId = courseId,
+                        TargetHours = dto.TargetHours,
+                        Credits = Math.Round(dto.TargetHours / 30m, 2),
+                        ScheduledHours = dto.ScheduledHours,
+                        IsActive = dto.IsActive
+                    };
+                }
+            }
+
+            planCourse = loadedPlan;
+            return true;
         }
-        var dto = await Admin.GetCourseModulePlan(moduleId, courseId);
-        if (dto is null)
+        catch (Exception ex)
         {
-            var normalizedHours = (int)Math.Round(Math.Max(0m, fallbackCredits) * 30m);
-            planCourse = new PlanCourseVM
-            {
-                CourseId = courseId,
-                TargetHours = normalizedHours,
-                Credits = fallbackCredits,
-                ScheduledHours = 0,
-                IsActive = true
-            };
+            _lastLoadError = ex.Message;
+            return false;
         }
-        else
+    }
+    private async Task<bool> LoadPlanContext(int moduleId, int courseId, decimal fallbackCredits)
+    {
+        if (!await LoadPlanDetails(moduleId, courseId, fallbackCredits))
         {
-            planCourse = new PlanCourseVM
-            {
-                CourseId = courseId,
-                TargetHours = dto.TargetHours,
-                Credits = Math.Round(dto.TargetHours / 30m, 2),
-                ScheduledHours = dto.ScheduledHours,
-                IsActive = dto.IsActive
-            };
+            return false;
         }
+        if (!await LoadTopics(moduleId))
+        {
+            return false;
+        }
+        ResetTopicForm(moduleId);
+        return true;
     }
     // Реагує на зміну курсу у плані та підвантажує його дані.
     private async Task OnPlanCourseChanged(ChangeEventArgs e)
     {
-        if (_plansBusy || plansModuleId is null) return;
+        if (plansModuleId is null) return;
         if (e?.Value is null) return;
         if (!int.TryParse(e.Value.ToString(), out var nextCourseId)) return;
         if (!planCourseIds.Contains(nextCourseId)) return;
         if (nextCourseId <= 0 || nextCourseId == selectedPlanCourseId) return;
+        if (!TryBeginPageMutation()) return;
+
         _plansBusy = true;
+        ok = null;
+        error = null;
         var moduleId = plansModuleId.Value;
+        var fallbackCredits = items.FirstOrDefault(x => x.Id == moduleId)?.Credits ?? planCourse.Credits;
         selectedPlanCourseId = nextCourseId;
         try
         {
-            await EnsurePlanModuleSeparated(moduleId, nextCourseId);
+            if (!await EnsurePlanModuleSeparated(moduleId, nextCourseId, fallbackCredits))
+            {
+                return;
+            }
             if (plansModuleId is not int currentModuleId || selectedPlanCourseId != nextCourseId)
             {
                 return;
             }
-            var module = items.FirstOrDefault(x => x.Id == currentModuleId);
-            var credits = module?.Credits ?? planCourse.Credits;
-            await LoadPlanDetails(currentModuleId, nextCourseId, credits);
-            await LoadTopics(currentModuleId);
+            var currentModule = items.FirstOrDefault(x => x.Id == currentModuleId);
+            var currentCredits = currentModule?.Credits ?? fallbackCredits;
+            if (!await LoadPlanContext(currentModuleId, nextCourseId, currentCredits))
+            {
+                RequireRefreshRecovery(
+                    $"Не вдалося завантажити план для вибраного курсу: {_lastLoadError ?? "невідома помилка"}.",
+                    "План для вибраного курсу завантажено.",
+                    () => LoadPlanContext(currentModuleId, nextCourseId, currentCredits));
+            }
         }
         catch (Exception ex)
         {
-            selectedPlanCourseId = 0;
-            planCourse = new();
-            error = ex.Message;
+            RequirePlanContextRecovery(
+                $"Не вдалося змінити курс плану: {ex.Message}. Дані плану заблоковано до успішного оновлення.",
+                moduleId,
+                nextCourseId,
+                fallbackCredits);
         }
         finally
         {
             _plansBusy = false;
+            EndPageMutation();
         }
     }
     // За потреби розділяє модуль між курсами та перемикає модальне вікно на курсо-специфічний запис.
-    private async Task EnsurePlanModuleSeparated(int currentModuleId, int courseId)
+    private async Task<bool> EnsurePlanModuleSeparated(int currentModuleId, int courseId, decimal fallbackCredits)
     {
-        if (courseId <= 0) return;
+        if (courseId <= 0) return true;
         var scopedModuleId = await Admin.EnsureCourseScopedModule(currentModuleId, courseId);
         if (scopedModuleId <= 0)
         {
-            return;
+            return true;
         }
         if (scopedModuleId != currentModuleId)
         {
             plansModuleId = scopedModuleId;
-            await Load();
-            var scopedModule = items.FirstOrDefault(x => x.Id == scopedModuleId);
-            if (scopedModule is not null)
+            if (!await Load(clearMessages: false))
             {
-                plansModuleTitle = $"{scopedModule.Code} - {scopedModule.Title}";
-                plansModuleCode = scopedModule.Code ?? plansModuleCode;
+                RequireRefreshRecovery(
+                    $"Модуль підготовлено для курсу, але оновити список не вдалося: {_lastLoadError ?? "невідома помилка"}. Повторно перемикати курс не потрібно.",
+                    "План для вибраного курсу завантажено.",
+                    async () =>
+                    {
+                        if (!await Load(clearMessages: false)) return false;
+                        UpdatePlanModuleCaption(scopedModuleId);
+                        return await LoadPlanContext(scopedModuleId, courseId, fallbackCredits);
+                    });
+                return false;
             }
+            UpdatePlanModuleCaption(scopedModuleId);
         }
+        return true;
+    }
+    private void UpdatePlanModuleCaption(int moduleId)
+    {
+        var scopedModule = items.FirstOrDefault(x => x.Id == moduleId);
+        if (scopedModule is null) return;
+        plansModuleTitle = $"{scopedModule.Code} - {scopedModule.Title}";
+        plansModuleCode = scopedModule.Code ?? plansModuleCode;
+    }
+    private void RequirePlanContextRecovery(
+        string message,
+        int preferredModuleId,
+        int courseId,
+        decimal fallbackCredits)
+    {
+        var moduleCode = plansModuleCode;
+        RequireRefreshRecovery(
+            message,
+            "Дані плану модуля відновлено.",
+            () => RecoverPlanContextAsync(preferredModuleId, courseId, fallbackCredits, moduleCode));
+    }
+    // Відновлює контекст плану лише читанням і не повторює невизначену мутацію розділення модуля.
+    private async Task<bool> RecoverPlanContextAsync(
+        int preferredModuleId,
+        int courseId,
+        decimal fallbackCredits,
+        string moduleCode)
+    {
+        if (!await Load(clearMessages: false))
+        {
+            return false;
+        }
+
+        var recoveredModule = items.FirstOrDefault(module =>
+                module.Id == preferredModuleId
+                && (courseId <= 0 || ModuleCourseIds(module).Contains(courseId)))
+            ?? items.FirstOrDefault(module =>
+                courseId > 0
+                && ModuleCourseIds(module).Contains(courseId)
+                && string.Equals(module.Code, moduleCode, StringComparison.OrdinalIgnoreCase));
+        if (recoveredModule?.Id is not int recoveredModuleId)
+        {
+            _lastLoadError = "Не знайдено модуль для вибраного курсу після оновлення.";
+            return false;
+        }
+
+        plansModuleId = recoveredModuleId;
+        planCourseIds = ModuleCourseIds(recoveredModule);
+        selectedPlanCourseId = courseId > 0 && planCourseIds.Contains(courseId)
+            ? courseId
+            : planCourseIds.FirstOrDefault();
+        UpdatePlanModuleCaption(recoveredModuleId);
+        return await LoadPlanContext(
+            recoveredModuleId,
+            selectedPlanCourseId,
+            recoveredModule.Credits > 0 ? recoveredModule.Credits : fallbackCredits);
+    }
+    private void ClosePlansDuringRecovery()
+    {
+        if (!_refreshRecoveryRequired
+            || _refreshRecoveryInProgress
+            || _pageMutationInProgress
+            || _pageLoadInProgress)
+        {
+            return;
+        }
+
+        _refreshRecoveryAction = () => Load(clearMessages: false);
+        _refreshRecoveryCompleted = null;
+        _pendingRecoverySuccessMessage = "Дані модулів оновлено.";
+        ClosePlansCore();
     }
     // Ініціалізує форму теми з типовими значеннями для вказаного модуля.
     private void ResetTopicForm(int moduleId)
@@ -1054,18 +1544,25 @@ private string plansModuleCode = "";
     }
     private void OpenCreateTopic()
     {
-        if (plansModuleId is null) return;
+        if (IsPageInteractionBlocked || plansModuleId is null) return;
         ResetTopicForm(plansModuleId.Value);
         topicEditorOpen = true;
     }
     private void CloseTopicEditor()
     {
+        if (IsModalBusy) return;
+        CloseTopicEditorCore();
+    }
+    private void CloseTopicEditorCore()
+    {
         topicEditorOpen = false;
         ResetTopicForm(plansModuleId ?? 0);
+        _planFocusPending = plansModuleId is not null;
     }
     // Підтримує сумарну кількість годин у відповідності до складових.
     private void SyncTotalHours()
     {
+        if (IsPageInteractionBlocked) return;
         var safeAuditorium = Math.Max(0, topicForm.AuditoriumHours ?? 0);
         var safeSelf = Math.Max(0, topicForm.SelfStudyHours ?? 0);
         topicForm.AuditoriumHours = safeAuditorium;
@@ -1075,29 +1572,30 @@ private string plansModuleCode = "";
     // Перемикає режим «веде керівник» для самостійних годин у формі.
     private void ToggleFormSupervisorFlag()
     {
+        if (IsPageInteractionBlocked) return;
         topicForm.SelfStudyBySupervisor = !topicForm.SelfStudyBySupervisor;
     }
     // Очищає форму теми та встановлює значення за замовчуванням.
     private void ClearTopicForm()
     {
+        if (IsPageInteractionBlocked) return;
         ResetTopicForm(plansModuleId ?? 0);
     }
     // Завантажує теми модуля та готує агреговану інформацію.
-    private async Task LoadTopics(int moduleId)
+    private async Task<bool> LoadTopics(int moduleId)
     {
+        _lastLoadError = null;
         try
         {
-            moduleTopics = await Admin.GetModuleTopics(moduleId);
-            moduleTopics.Sort((a, b) => CompareTopicCodes(a.TopicCode, b.TopicCode));
+            var loadedTopics = await Admin.GetModuleTopics(moduleId);
+            loadedTopics.Sort((a, b) => CompareTopicCodes(a.TopicCode, b.TopicCode));
+            moduleTopics = loadedTopics;
+            return true;
         }
         catch (Exception ex)
         {
-            error = ex.Message;
-            moduleTopics = new List<ModuleTopicViewDto>();
-        }
-        finally
-        {
-            ResetTopicForm(moduleId);
+            _lastLoadError = ex.Message;
+            return false;
         }
     }
     // Підраховує загальну кількість годин для тем у модулі.
@@ -1111,6 +1609,7 @@ private string plansModuleCode = "";
     // Заповнює форму теми даними для редагування.
     private void EditTopic(ModuleTopicViewDto topic)
     {
+        if (IsPageInteractionBlocked) return;
         topicForm = new ModuleTopicFormVM
         {
             Id = topic.Id,
@@ -1131,8 +1630,11 @@ private string plansModuleCode = "";
     // Валідує та зберігає тему модуля, оновлює список.
     private async Task SaveTopic()
     {
-        if (_plansBusy || plansModuleId is null) return;
+        if (plansModuleId is null || !TryBeginPageMutation()) return;
+
         _plansBusy = true;
+        ok = null;
+        error = null;
         try
         {
             var moduleId = plansModuleId.Value;
@@ -1176,10 +1678,22 @@ private string plansModuleCode = "";
                 selfStudyHours,
                 topicForm.IsInterAssembly,
                 topicForm.SelfStudyBySupervisor);
-            await Admin.UpsertModuleTopic(moduleId, payload);
-            ok = "Заняття збережено.";
-            await LoadTopics(moduleId);
-            topicEditorOpen = false;
+            var savedId = await Admin.UpsertModuleTopic(moduleId, payload);
+            topicForm.Id = savedId;
+            if (await LoadTopics(moduleId))
+            {
+                ok = "Заняття збережено.";
+                error = null;
+                CloseTopicEditorCore();
+            }
+            else
+            {
+                RequireRefreshRecovery(
+                    $"Заняття збережено, але оновити теми не вдалося: {_lastLoadError ?? "невідома помилка"}. Повторно зберігати заняття не потрібно.",
+                    "Заняття збережено.",
+                    () => LoadTopics(moduleId),
+                    CloseTopicEditorCore);
+            }
         }
         catch (Exception ex)
         {
@@ -1188,14 +1702,18 @@ private string plansModuleCode = "";
         finally
         {
             _plansBusy = false;
+            EndPageMutation();
         }
     }
     // Видаляє тему модуля та перезавантажує дані.
     private async Task DeleteTopic(int topicId)
     {
-        if (_plansBusy || plansModuleId is null) return;
+        if (plansModuleId is null || !TryBeginPageMutation()) return;
+
         _plansBusy = true;
         var moduleId = plansModuleId.Value;
+        ok = null;
+        error = null;
         try
         {
             var topic = moduleTopics.FirstOrDefault(t => t.Id == topicId);
@@ -1203,8 +1721,18 @@ private string plansModuleCode = "";
             var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити тему {caption}? Дію не можна скасувати.");
             if (!confirmed) return;
             await Admin.DeleteModuleTopic(moduleId, topicId);
-            ok = "Тему видалено.";
-            await LoadTopics(moduleId);
+            if (await LoadTopics(moduleId))
+            {
+                ok = "Тему видалено.";
+                error = null;
+            }
+            else
+            {
+                RequireRefreshRecovery(
+                    $"Тему видалено, але оновити список тем не вдалося: {_lastLoadError ?? "невідома помилка"}. Повторно видаляти тему не потрібно.",
+                    "Тему видалено.",
+                    () => LoadTopics(moduleId));
+            }
         }
         catch (Exception ex)
         {
@@ -1213,6 +1741,7 @@ private string plansModuleCode = "";
         finally
         {
             _plansBusy = false;
+            EndPageMutation();
         }
     }
     // Фільтрує перелік модулів за введеним рядком.
@@ -1252,6 +1781,7 @@ private string plansModuleCode = "";
     // Змінює параметри сортування для таблиці модулів.
     private void ToggleSort(string field)
     {
+        if (IsPageInteractionBlocked) return;
         if (sortField == field) sortAsc = !sortAsc;
         else
         {
@@ -1271,6 +1801,7 @@ private string plansModuleCode = "";
     // Позначає всі доступні аудиторії для модуля.
     private void SelectAllRooms()
     {
+        if (IsPageInteractionBlocked) return;
         var allIds = rooms
             .Select(r => r.Id ?? 0)
             .Where(id => id > 0)
@@ -1282,6 +1813,7 @@ private string plansModuleCode = "";
     // Дозволяє всі будівлі для модуля одним кліком.
     private void SelectAllBuildings()
     {
+        if (IsPageInteractionBlocked) return;
         var allIds = buildings
             .Select(b => b.Id ?? 0)
             .Where(id => id > 0)

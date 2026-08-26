@@ -6,17 +6,33 @@
 
 <PageTitle>Адмін • Аудиторії</PageTitle>
 
-<h3 class="mb-3">Аудиторії</h3>
+<h1 class="h3 mb-3">Аудиторії</h1>
 
 @if (!string.IsNullOrWhiteSpace(error))
 {
-    <div class="alert alert-danger">@error</div>
+    <div class="alert alert-danger" role="alert">
+        @error
+        @if (loadFailed)
+        {
+            <div class="mt-2">
+                <button type="button" class="btn btn-sm btn-outline-danger" @onclick="RetryLoad" disabled="@(loading || mutationInProgress)">
+                    Повторити завантаження
+                </button>
+            </div>
+        }
+    </div>
 }
 @if (!string.IsNullOrWhiteSpace(ok))
 {
-    <div class="alert alert-success">@ok</div>
+    <div class="alert alert-success" role="status">@ok</div>
 }
 
+@if (loading)
+{
+    <div class="text-muted mb-3" role="status" aria-live="polite">Завантаження аудиторій…</div>
+}
+
+<fieldset class="border-0 p-0 m-0 w-100" disabled="@IsInteractionBlocked">
 <div class="card p-3">
     <div class="d-flex justify-content-between align-items-center mb-2 gap-2 flex-wrap">
         <button class="btn btn-primary" @onclick="OpenCreate">Додати аудиторію</button>
@@ -52,25 +68,41 @@
         </table>
     </div>
 </div>
+</fieldset>
 
 @if (editorOpen)
 {
     <AdminEditorModal Title="@RoomEditorTitle"
                       Subtitle="Заповніть назву, місткість та виберіть корпус."
                       CssClass="room-editor"
+                      Busy="@(loading || mutationInProgress)"
                       OnClose="@CloseEditor">
+        @if (loadFailed)
+        {
+            <div class="alert alert-danger" role="alert">
+                <div class="fw-semibold">Операцію виконано, але дані не оновлено.</div>
+                <div class="small mt-1">@error</div>
+                <button type="button"
+                        class="btn btn-sm btn-outline-danger mt-2"
+                        @onclick="RetryLoad"
+                        disabled="@(loading || mutationInProgress)">
+                    @(loading ? "Завантаження…" : "Повторити лише завантаження")
+                </button>
+            </div>
+        }
+        <fieldset class="border-0 p-0 m-0 w-100" disabled="@IsInteractionBlocked">
         <div class="row g-3">
             <div class="col-12 col-md-5">
-                <label class="form-label">Назва</label>
-                <input class="form-control" @bind="form.Name" />
+                <label class="form-label" for="room-name">Назва</label>
+                <input id="room-name" class="form-control" @bind="form.Name" />
             </div>
             <div class="col-12 col-md-3">
-                <label class="form-label">Місткість</label>
-                <input type="number" min="0" class="form-control" @bind="form.Capacity" />
+                <label class="form-label" for="room-capacity">Місткість</label>
+                <input id="room-capacity" type="number" min="0" class="form-control" @bind="form.Capacity" />
             </div>
             <div class="col-12 col-md-4">
-                <label class="form-label">Корпус</label>
-                <select class="form-select" @bind="form.BuildingId">
+                <label class="form-label" for="room-building">Корпус</label>
+                <select id="room-building" class="form-select" @bind="form.BuildingId">
                     <option value="0">— Оберіть —</option>
                     @foreach (var b in buildings)
                     {
@@ -80,9 +112,10 @@
             </div>
         </div>
         <div class="editor-actions">
-            <button class="btn btn-primary" @onclick="Save">Зберегти</button>
+            <button class="btn btn-primary" @onclick="Save">@(saving ? "Збереження…" : "Зберегти")</button>
             <button class="btn btn-outline-secondary" @onclick="CloseEditor">Скасувати</button>
         </div>
+        </fieldset>
     </AdminEditorModal>
 }
 
@@ -93,6 +126,10 @@
     private RoomEditDto form = NewForm();
     private List<BuildingEditDto> buildings = new();
     private bool editorOpen;
+    private bool loading, saving, loadFailed, mutationInProgress;
+    private bool IsInteractionBlocked => loading || mutationInProgress || loadFailed;
+    private Action? pendingRefreshCompletion;
+    private string? pendingRefreshSuccessMessage;
     private const string BuildingField = "Building";
     private string sortField = nameof(RoomEditDto.Name);
     private bool sortAsc = true;
@@ -119,15 +156,39 @@
     // Початкове завантаження аудиторій і корпусів.
     protected override async Task OnInitializedAsync() => await Load();
     // Завантажує список аудиторій та корпусів.
-    private async Task Load()
+    private async Task<bool> Load(bool clearMessages = true)
     {
+        error = null;
+        if (clearMessages) ok = null;
+        loading = true;
+        loadFailed = false;
         try
         {
-            error = ok = null;
-            items = await Admin.GetRooms();
-            buildings = await Admin.GetBuildings();
+            var loadedItems = await Admin.GetRooms();
+            var loadedBuildings = await Admin.GetBuildings();
+            items = loadedItems;
+            buildings = loadedBuildings;
+            return true;
         }
-        catch (Exception ex) { error = ex.Message; }
+        catch (Exception ex)
+        {
+            loadFailed = true;
+            error = $"Не вдалося завантажити аудиторії: {ex.Message}";
+            return false;
+        }
+        finally { loading = false; }
+    }
+    // Повторює лише завантаження після вже виконаної серверної операції.
+    private async Task RetryLoad()
+    {
+        if (loading || mutationInProgress) return;
+        if (!await Load(clearMessages: false)) return;
+        var completion = pendingRefreshCompletion;
+        var successMessage = pendingRefreshSuccessMessage;
+        pendingRefreshCompletion = null;
+        pendingRefreshSuccessMessage = null;
+        completion?.Invoke();
+        if (!string.IsNullOrWhiteSpace(successMessage)) ok = successMessage;
     }
     // Повертає назву корпусу за ідентифікатором.
     private static string NameOf(IEnumerable<BuildingEditDto> list, int id)
@@ -135,29 +196,67 @@
     // Зберігає аудиторію через API.
     private async Task Save()
     {
+        if (IsInteractionBlocked) return;
+        mutationInProgress = true;
+        saving = true;
         try
         {
-            await Admin.UpsertRoom(form);
-            await Load();
-            ok = "Збережено.";
-            CloseEditor();
+            error = ok = null;
+            form.Id = await Admin.UpsertRoom(form);
+            await FinishMutationAsync(
+                "Аудиторію збережено",
+                "Збережено.",
+                "повторно зберігати аудиторію не потрібно",
+                CloseEditor);
         }
         catch (Exception ex) { error = ex.Message; }
+        finally
+        {
+            saving = false;
+            mutationInProgress = false;
+        }
     }
     // Видаляє аудиторію після підтвердження.
     private async Task Delete(int id)
     {
+        if (IsInteractionBlocked) return;
+        mutationInProgress = true;
         try
         {
+            error = ok = null;
             var room = items.FirstOrDefault(r => r.Id == id);
             var caption = room is null ? $"#{id}" : $"{room.Name} (#{id})";
             var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити аудиторію {caption}? Дію не можна скасувати.");
             if (!confirmed) return;
             await Admin.DeleteRoom(id);
-            await Load();
-            ok = "Видалено.";
+            await FinishMutationAsync(
+                "Аудиторію видалено",
+                "Видалено.",
+                "повторно видаляти аудиторію не потрібно",
+                editorOpen && form.Id == id ? CloseEditor : null);
         }
         catch (Exception ex) { error = ex.Message; }
+        finally { mutationInProgress = false; }
+    }
+    // Завершує мутацію лише після успішного оновлення локального списку.
+    private async Task FinishMutationAsync(
+        string completedAction,
+        string successMessage,
+        string repeatWarning,
+        Action? completion = null)
+    {
+        if (await Load(clearMessages: false))
+        {
+            completion?.Invoke();
+            ok = successMessage;
+            return;
+        }
+
+        var refreshError = error;
+        ok = null;
+        pendingRefreshCompletion = completion;
+        pendingRefreshSuccessMessage = successMessage;
+        error = $"{completedAction}, але оновити дані не вдалося. Повторіть завантаження; {repeatWarning}. Причина: {refreshError}";
     }
     // Фільтрує аудиторії за пошуковим рядком.
     private IEnumerable<RoomEditDto> ApplyFilter(IEnumerable<RoomEditDto> seq)

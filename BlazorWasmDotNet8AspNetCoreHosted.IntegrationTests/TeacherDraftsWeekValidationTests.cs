@@ -18,6 +18,113 @@ public sealed class TeacherDraftsWeekValidationTests
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     [Fact]
+    public async Task Validate_week_rejects_rows_above_the_aggregate_limit()
+    {
+        await using var fixture = await WeekValidationFixture.CreateAsync();
+        var rows = Enumerable.Range(0, TeacherDraftsWeekValidationService.MaxWeekDraftRowCount + 1)
+            .Select(index =>
+            {
+                var draft = fixture.CreateDraft(
+                    fixture.FirstModuleId,
+                    new TimeOnly(8, 0),
+                    new TimeOnly(9, 0));
+                draft.BatchKey = $"limit-{index}";
+                return draft;
+            })
+            .ToList();
+        fixture.Db.TeacherDraftItems.AddRange(rows);
+        await fixture.Db.SaveChangesAsync();
+
+        var exception = await Assert.ThrowsAsync<DraftValidationCapacityException>(() =>
+            new TeacherDraftsWeekValidationService(fixture.Db).ValidateAsync(Monday));
+
+        Assert.Contains(
+            TeacherDraftsWeekValidationService.MaxWeekDraftRowCount.ToString(),
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Validate_week_rejects_official_schedule_rows_above_the_aggregate_limit()
+    {
+        await using var fixture = await WeekValidationFixture.CreateAsync();
+        fixture.Db.TeacherDraftItems.Add(
+            fixture.CreateDraft(fixture.FirstModuleId, new TimeOnly(8, 0), new TimeOnly(9, 0)));
+        fixture.Db.ScheduleItems.AddRange(
+            Enumerable.Range(0, TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount + 1)
+                .Select(index => fixture.CreateScheduleItem(
+                    fixture.FirstModuleId,
+                    new TimeOnly(10, 0),
+                    new TimeOnly(11, 0),
+                    $"official-limit-{index}")));
+        await fixture.Db.SaveChangesAsync();
+
+        var exception = await Assert.ThrowsAsync<DraftValidationCapacityException>(() =>
+            new TeacherDraftsWeekValidationService(fixture.Db).ValidateAsync(Monday));
+
+        Assert.Contains(
+            TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount.ToString(),
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Validate_week_rejects_cross_period_module_sequence_context_above_the_limit()
+    {
+        await using var fixture = await WeekValidationFixture.CreateAsync();
+        AddTwoBlockSequence(fixture);
+        var course = await fixture.Db.Courses.SingleAsync(item => item.Id == fixture.CourseId);
+        course.DurationWeeks = 2;
+        fixture.Db.TeacherDraftItems.Add(
+            fixture.CreateDraft(fixture.SecondModuleId, new TimeOnly(8, 0), new TimeOnly(9, 0)));
+        fixture.Db.ScheduleItems.AddRange(
+            Enumerable.Range(0, TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount + 1)
+                .Select(index =>
+                {
+                    var item = fixture.CreateScheduleItem(
+                        fixture.FirstModuleId,
+                        new TimeOnly(10, 0),
+                        new TimeOnly(11, 0),
+                        $"sequence-limit-{index}");
+                    item.Date = Monday.AddDays(7);
+                    item.DayOfWeek = DayOfWeek.Monday;
+                    return item;
+                }));
+        await fixture.Db.SaveChangesAsync();
+
+        var exception = await Assert.ThrowsAsync<DraftValidationCapacityException>(() =>
+            new TeacherDraftsWeekValidationService(fixture.Db).ValidateAsync(Monday));
+
+        Assert.Contains(
+            TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount.ToString(),
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Validate_week_stops_pathological_overlap_reporting_at_the_safe_limit()
+    {
+        await using var fixture = await WeekValidationFixture.CreateAsync();
+        fixture.Db.TeacherDraftItems.AddRange(
+            Enumerable.Range(0, 1_002)
+                .Select(index =>
+                {
+                    var draft = fixture.CreateDraft(
+                        fixture.FirstModuleId,
+                        new TimeOnly(8, 0),
+                        new TimeOnly(9, 0));
+                    draft.BatchKey = $"overlap-limit-{index}";
+                    return draft;
+                }));
+        await fixture.Db.SaveChangesAsync();
+
+        var exception = await Assert.ThrowsAsync<DraftValidationCapacityException>(() =>
+            new TeacherDraftsWeekValidationService(fixture.Db).ValidateAsync(Monday));
+
+        Assert.Contains("1000", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Validate_week_reports_module_sequence_regression_as_error()
     {
         await using var fixture = await WeekValidationFixture.CreateAsync();
@@ -98,7 +205,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var ok = Assert.IsType<OkObjectResult>(action.Result);
         var payload = Assert.IsType<PublishWeekResults>(ok.Value);
@@ -112,7 +219,7 @@ public sealed class TeacherDraftsWeekValidationTests
     }
 
     [Fact]
-    public async Task Validate_week_reports_topic_order_regression_against_published_future_week()
+    public async Task Validate_week_allows_topic_reordering_against_published_future_week()
     {
         await using var fixture = await WeekValidationFixture.CreateAsync();
         var (firstTopic, secondTopic) = await AddOrderedTopicsAsync(fixture);
@@ -135,13 +242,13 @@ public sealed class TeacherDraftsWeekValidationTests
 
         var report = await new TeacherDraftsWeekValidationService(fixture.Db).ValidateAsync(Monday);
 
-        Assert.Contains(report.Issues, issue =>
+        Assert.DoesNotContain(report.Issues, issue =>
             issue.Code == "week-hard-rule-violation"
-            && issue.Description.Contains("має порядок", StringComparison.OrdinalIgnoreCase));
+            && issue.Description.Contains("поряд", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
-    public async Task Publish_week_rejects_topic_order_regression_against_published_future_week()
+    public async Task Publish_week_allows_topic_reordering_against_published_future_week()
     {
         await using var fixture = await WeekValidationFixture.CreateAsync();
         var (firstTopic, secondTopic) = await AddOrderedTopicsAsync(fixture);
@@ -166,17 +273,20 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var ok = Assert.IsType<OkObjectResult>(action.Result);
         var payload = Assert.IsType<PublishWeekResults>(ok.Value);
-        Assert.Equal(0, payload.Created);
-        Assert.Contains(payload.Warnings, warning =>
-            warning.Contains("має порядок", StringComparison.OrdinalIgnoreCase));
-        Assert.True(await fixture.Db.TeacherDraftItems.AnyAsync(item => item.Id == draft.Id));
-        Assert.Equal(
-            new[] { future.Id },
-            await fixture.Db.ScheduleItems.Select(item => item.Id).ToArrayAsync());
+        Assert.Equal(1, payload.Created);
+        Assert.DoesNotContain(payload.Warnings, warning =>
+            warning.Contains("поряд", StringComparison.OrdinalIgnoreCase));
+        Assert.False(await fixture.Db.TeacherDraftItems.AnyAsync(item => item.Id == draft.Id));
+        Assert.Equal(2, await fixture.Db.ScheduleItems.CountAsync());
+        Assert.True(await fixture.Db.ScheduleItems.AnyAsync(item => item.Id == future.Id));
+        Assert.True(await fixture.Db.ScheduleItems.AnyAsync(item =>
+            item.Date == Monday
+            && item.GroupId == fixture.GroupId
+            && item.ModuleTopicId == secondTopic.Id));
     }
 
     [Fact]
@@ -676,7 +786,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         Assert.Contains(report.Issues, issue =>
             issue.Code == "week-publish-package-violation"
@@ -729,7 +839,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         Assert.Contains(report.Issues, issue =>
             issue.Code == "week-publish-rule-violation"
@@ -780,7 +890,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         Assert.Contains(report.Issues, issue =>
             issue.Code == "week-publish-rule-violation"
@@ -859,6 +969,85 @@ public sealed class TeacherDraftsWeekValidationTests
 
         Assert.Equal(singleRowQueryCount, queryCounter.ReaderCommandCount);
         Assert.InRange(singleRowQueryCount, 1, 20);
+    }
+
+    [Fact]
+    public async Task Applied_scope_validation_query_count_does_not_scale_with_scope_count()
+    {
+        var queryCounter = new QueryCountingInterceptor();
+        await using var fixture = await WeekValidationFixture.CreateAsync(queryCounter);
+        var draft = fixture.CreateDraft(
+            fixture.FirstModuleId,
+            new TimeOnly(8, 0),
+            new TimeOnly(9, 0));
+        fixture.Db.TeacherDraftItems.Add(draft);
+        await fixture.Db.SaveChangesAsync();
+        await fixture.AddAppliedPlanAsync(draft);
+        queryCounter.Reset();
+        _ = await new TeacherDraftsWeekValidationService(fixture.Db).ValidateAsync(Monday);
+        var oneScopeQueryCount = queryCounter.ReaderCommandCount;
+
+        for (var offset = 1; offset <= 9; offset++)
+        {
+            var plan = await fixture.AddAppliedPlanAsync(draft);
+            plan.RangeStartDate = Monday.AddDays(-offset);
+            plan.RangeEndDate = Monday.AddDays(6);
+        }
+        await fixture.Db.SaveChangesAsync();
+        queryCounter.Reset();
+
+        _ = await new TeacherDraftsWeekValidationService(fixture.Db).ValidateAsync(Monday);
+
+        Assert.Equal(oneScopeQueryCount, queryCounter.ReaderCommandCount);
+    }
+
+    [Fact]
+    public async Task Validate_week_rejects_oversized_persisted_scope_json()
+    {
+        await using var fixture = await WeekValidationFixture.CreateAsync();
+        var draft = fixture.CreateDraft(
+            fixture.FirstModuleId,
+            new TimeOnly(8, 0),
+            new TimeOnly(9, 0));
+        fixture.Db.TeacherDraftItems.Add(draft);
+        await fixture.Db.SaveChangesAsync();
+        var plan = await fixture.AddAppliedPlanAsync(draft);
+        plan.GroupIdsJson = new string('1',
+            TeacherDraftsWeekValidationService.MaxAppliedPlanGroupIdsJsonLength + 1);
+        await fixture.Db.SaveChangesAsync();
+
+        var exception = await Assert.ThrowsAsync<DraftValidationCapacityException>(() =>
+            new TeacherDraftsWeekValidationService(fixture.Db).ValidateAsync(Monday));
+
+        Assert.Contains(
+            TeacherDraftsWeekValidationService.MaxAppliedPlanGroupIdsJsonLength.ToString(),
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Validate_week_rejects_too_many_groups_in_persisted_scope()
+    {
+        await using var fixture = await WeekValidationFixture.CreateAsync();
+        var draft = fixture.CreateDraft(
+            fixture.FirstModuleId,
+            new TimeOnly(8, 0),
+            new TimeOnly(9, 0));
+        fixture.Db.TeacherDraftItems.Add(draft);
+        await fixture.Db.SaveChangesAsync();
+        var plan = await fixture.AddAppliedPlanAsync(draft);
+        plan.GroupIdsJson = JsonSerializer.Serialize(
+            Enumerable.Range(1, TeacherDraftsWeekValidationService.MaxAppliedPlanGroupCount + 1),
+            JsonOptions);
+        await fixture.Db.SaveChangesAsync();
+
+        var exception = await Assert.ThrowsAsync<DraftValidationCapacityException>(() =>
+            new TeacherDraftsWeekValidationService(fixture.Db).ValidateAsync(Monday));
+
+        Assert.Contains(
+            TeacherDraftsWeekValidationService.MaxAppliedPlanGroupCount.ToString(),
+            exception.Message,
+            StringComparison.Ordinal);
     }
 
     [Fact]
@@ -984,7 +1173,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var ok = Assert.IsType<OkObjectResult>(result.Result);
         var payload = Assert.IsType<PublishWeekResults>(ok.Value);
@@ -1010,7 +1199,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var ok = Assert.IsType<OkObjectResult>(result.Result);
         var payload = Assert.IsType<PublishWeekResults>(ok.Value);
@@ -1146,7 +1335,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var ok = Assert.IsType<OkObjectResult>(result.Result);
         var payload = Assert.IsType<PublishWeekResults>(ok.Value);
@@ -1246,7 +1435,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var ok = Assert.IsType<OkObjectResult>(result.Result);
         var payload = Assert.IsType<PublishWeekResults>(ok.Value);
@@ -1408,7 +1597,7 @@ public sealed class TeacherDraftsWeekValidationTests
                 fixture.Db,
                 new RulesService(fixture.Db),
                 new AggregatesService(fixture.Db))
-            .PublishWeekAsync(new PublishWeekRequest(Monday, null));
+            .PublishWeekAsync(new PublishWeekRequest(Monday, null, PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         var ok = Assert.IsType<OkObjectResult>(result.Result);
         var payload = Assert.IsType<PublishWeekResults>(ok.Value);

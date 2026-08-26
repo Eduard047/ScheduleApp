@@ -1,14 +1,18 @@
 @* Заголовок таблиці з єдиною поведінкою сортування. *@
 <th class="@HeaderClass"
     style="@Style"
-    role="button"
-    title="@Title"
-    @onclick="Sort">
-    @ChildContent
-    @if (IsActive)
-    {
-        <span class="ms-1">@(SortAscending ? "▲" : "▼")</span>
-    }
+    scope="col"
+    aria-sort="@AriaSort">
+    <button type="button"
+            class="sortable-th__button"
+            title="@Title"
+            @onclick="Sort">
+        <span>@ChildContent</span>
+        @if (IsActive)
+        {
+            <span class="ms-1" aria-hidden="true">@(SortAscending ? "▲" : "▼")</span>
+        }
+    </button>
 </th>
 
 @code {
@@ -37,6 +41,10 @@
     public RenderFragment ChildContent { get; set; } = default!;
 
     private bool IsActive => string.Equals(Field, ActiveField, StringComparison.Ordinal);
+
+    private string AriaSort => IsActive
+        ? SortAscending ? "ascending" : "descending"
+        : "none";
 
     private string HeaderClass => string.IsNullOrWhiteSpace(Class)
         ? "sortable-th"

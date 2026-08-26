@@ -1,26 +1,27 @@
 @* Сторінка налаштування послідовностей модулів *@
 @page "/admin/module-sequence"
 @using System.Linq
+@using BlazorWasmDotNet8AspNetCoreHosted.Client.Services
 @using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
 @inject BlazorWasmDotNet8AspNetCoreHosted.Client.Services.IAdminApi Admin
 
 <PageTitle>Адмін · Послідовності</PageTitle>
 
-<h3 class="mb-3">Послідовності модулів</h3>
+<h1 class="h3 mb-3">Послідовності модулів</h1>
 
 @if (!string.IsNullOrWhiteSpace(error))
 {
-    <div class="alert alert-danger">@error</div>
+    <div class="alert alert-danger" role="alert">@error</div>
 }
 @if (!string.IsNullOrWhiteSpace(ok))
 {
-    <div class="alert alert-success">@ok</div>
+    <div class="alert alert-success" role="status">@ok</div>
 }
 <div class="card p-3 mb-3">
     <div class="row g-3 align-items-end">
         <div class="col-12 col-md-6 col-lg-4">
-            <label class="form-label">Курс</label>
-            <select class="form-select" value="@_selectedCourseId" @onchange="OnCourseChanged" disabled="@isLoading">
+            <label class="form-label" for="module-sequence-course">Курс</label>
+            <select id="module-sequence-course" class="form-select" value="@_selectedCourseId" @onchange="OnCourseChanged" disabled="@IsSequenceBusy">
                 <option value="0">- Оберіть курс -</option>
                 @foreach (var c in courses.OrderBy(c => c.Name))
                 {
@@ -30,12 +31,12 @@
             </select>
         </div>
         <div class="col-12 col-md-6 col-lg-4">
-            <label class="form-label">Швидкі дії</label>
+            <div class="form-label">Швидкі дії</div>
             <div class="d-flex gap-2">
-                <button class="btn btn-outline-secondary" @onclick="RefreshCurrent" disabled="@(isLoading || isCourseLoading || _selectedCourseId == 0)">
+                <button class="btn btn-outline-secondary" @onclick="RefreshCurrent" disabled="@(IsSequenceBusy || _selectedCourseId == 0)">
                     <span class="oi oi-loop-circular me-1"></span>Оновити
                 </button>
-                <button class="btn btn-primary" @onclick="SaveAsync" disabled="@(isLoading || isCourseLoading || isSaving || _selectedCourseId == 0)">
+                <button class="btn btn-primary" @onclick="SaveAsync" disabled="@(!CanSaveSequence)">
                     @if (isSaving)
                     {
                         <span class="spinner-border spinner-border-sm me-2" role="status"></span>
@@ -64,15 +65,21 @@ else if (_selectedCourseId == 0)
 else
 {
     var courseModules = CourseModules();
-    if (courseModules.Count == 0)
-    {
-        <div class="alert alert-warning">Для вибраного курсу ще немає модулів.</div>
-    }
-    else if (isCourseLoading)
+    if (isCourseLoading)
     {
         <div class="text-center text-muted py-4">
             <span class="spinner-border me-2" role="status"></span>Завантаження конфігурації...
         </div>
+    }
+    else if (!_sequenceLoadSucceeded)
+    {
+        <div class="alert alert-warning" role="alert">
+            Конфігурацію не завантажено. Виправлення вимкнено, щоб не перезаписати збережену послідовність.
+        </div>
+    }
+    else if (courseModules.Count == 0)
+    {
+        <div class="alert alert-warning">Для вибраного курсу ще немає модулів.</div>
     }
     else
     {
@@ -82,7 +89,7 @@ else
                     <div class="card-header d-flex justify-content-between align-items-center">
                         <span>Головні модулі</span>
                         <div class="btn-group btn-group-sm">
-                            <button class="btn btn-outline-secondary" @onclick="ClearMain" disabled="@(mainModules.Count == 0)">Очистити</button>
+                            <button class="btn btn-outline-secondary" @onclick="ClearMain" disabled="@(!CanEditSequence || mainModules.Count == 0)">Очистити</button>
                         </div>
                     </div>
                     <div class="card-body">
@@ -114,22 +121,23 @@ else
                                                 @if (index > 0)
                                                 {
                                                     <div class="form-check form-switch mt-1">
-                                                        <input class="form-check-input" type="checkbox"
+                                                        <input id="module-sequence-join-@index" class="form-check-input" type="checkbox"
                                                                checked="@entry.JoinPreviousGroup"
+                                                               disabled="@(!CanEditSequence)"
                                                                @onchange="@((ChangeEventArgs e) => ToggleJoinPrevious(e, index))" />
-                                                        <label class="form-check-label small">В одному блоці з попереднім</label>
+                                                        <label class="form-check-label small" for="module-sequence-join-@index">В одному блоці з попереднім</label>
                                                     </div>
                                                 }
                                             </div>
                                         </div>
                                         <div class="btn-group btn-group-sm">
-                                            <button class="btn btn-outline-secondary" title="Вгору" @onclick="@(() => MoveUp(index))" disabled="@(index == 0)">
+                                            <button class="btn btn-outline-secondary" title="Вгору" @onclick="@(() => MoveUp(index))" disabled="@(!CanEditSequence || index == 0)">
                                                 <span class="oi oi-chevron-top"></span>
                                             </button>
-                                            <button class="btn btn-outline-secondary" title="Вниз" @onclick="@(() => MoveDown(index))" disabled="@(index == mainModules.Count - 1)">
+                                            <button class="btn btn-outline-secondary" title="Вниз" @onclick="@(() => MoveDown(index))" disabled="@(!CanEditSequence || index == mainModules.Count - 1)">
                                                 <span class="oi oi-chevron-bottom"></span>
                                             </button>
-                                            <button class="btn btn-outline-danger" title="Прибрати" @onclick="@(() => RemoveFromMain(index))">
+                                            <button class="btn btn-outline-danger" title="Прибрати" @onclick="@(() => RemoveFromMain(index))" disabled="@(!CanEditSequence)">
                                                 <span class="oi oi-x"></span>
                                             </button>
                                         </div>
@@ -145,8 +153,8 @@ else
                     <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
                         <span>Доступні модулі</span>
                         <div class="btn-group btn-group-sm">
-                            <button class="btn btn-outline-secondary" @onclick="SelectAllFillers" disabled="@(courseModules.Count == 0)">Всі як низький пріоритет</button>
-                            <button class="btn btn-outline-secondary" @onclick="ClearFillers" disabled="@(fillerIds.Count == 0)">Очистити низькі пріоритети</button>
+                            <button class="btn btn-outline-secondary" @onclick="SelectAllFillers" disabled="@(!CanEditSequence || courseModules.Count == 0)">Всі як низький пріоритет</button>
+                            <button class="btn btn-outline-secondary" @onclick="ClearFillers" disabled="@(!CanEditSequence || fillerIds.Count == 0)">Очистити низькі пріоритети</button>
                         </div>
                     </div>
                     <div class="card-body p-0">
@@ -178,14 +186,15 @@ else
                                                 </div>
                                             </td>
                                             <td class="text-end">
-                                                <button class="btn btn-outline-primary btn-sm" @onclick="@(() => AddToMain(mid))" disabled="@inMain">
+                                                <button class="btn btn-outline-primary btn-sm" @onclick="@(() => AddToMain(mid))" disabled="@(!CanEditSequence || inMain)">
                                                     <span class="oi oi-plus me-1"></span>Додати
                                                 </button>
                                             </td>
                                             <td class="text-center">
                                                 <input class="form-check-input" type="checkbox"
                                                        checked="@fillerIds.Contains(mid)"
-                                                       disabled="@inMain"
+                                                       disabled="@(!CanEditSequence || inMain)"
+                                                       aria-label="Низький пріоритет для модуля @ModuleTitle(mid)"
                                                        @onchange="@((ChangeEventArgs e) => ToggleFiller(e, mid))" />
                                             </td>
                                         </tr>
@@ -209,12 +218,19 @@ else
     private Dictionary<int, ModuleEditDto> moduleLookup = new();
     private readonly List<MainModuleEntry> mainModules = new();
     private HashSet<int> fillerIds = new();
+    private readonly LatestAsyncRequestGuard _sequenceLoadGuard = new();
     private int _selectedCourseId;
     private bool isLoading;
     private bool isCourseLoading;
     private bool isSaving;
+    private bool _referenceLoadSucceeded;
+    private bool _sequenceLoadSucceeded;
     private string? ok;
     private string? error;
+    private bool IsSequenceBusy => isLoading || isCourseLoading || isSaving;
+    private bool CanEditSequence
+        => !IsSequenceBusy && _referenceLoadSucceeded && _sequenceLoadSucceeded && _selectedCourseId > 0;
+    private bool CanSaveSequence => CanEditSequence;
     // Початкове завантаження курсів, модулів і послідовності.
     protected override async Task OnInitializedAsync()
     {
@@ -222,12 +238,17 @@ else
         ok = error = null;
         try
         {
-            courses = await Admin.GetCourses();
-            modules = await Admin.GetModules();
-            moduleLookup = modules
+            var loadedCourses = await Admin.GetCourses();
+            var loadedModules = await Admin.GetModules();
+            var loadedModuleLookup = loadedModules
                 .Where(m => m.Id.HasValue)
                 .ToDictionary(m => m.Id!.Value, m => m);
-            _selectedCourseId = courses
+
+            courses = loadedCourses;
+            modules = loadedModules;
+            moduleLookup = loadedModuleLookup;
+            _referenceLoadSucceeded = true;
+            _selectedCourseId = loadedCourses
                 .Where(c => c.Id.HasValue)
                 .OrderBy(c => c.Name)
                 .Select(c => c.Id!.Value)
@@ -239,7 +260,15 @@ else
         }
         catch (Exception ex)
         {
-            error = ex.Message;
+            _referenceLoadSucceeded = false;
+            _sequenceLoadSucceeded = false;
+            courses = new();
+            modules = new();
+            moduleLookup = new();
+            _selectedCourseId = 0;
+            mainModules.Clear();
+            fillerIds.Clear();
+            error = $"Не вдалося завантажити довідники курсів і модулів: {ex.Message}";
         }
         finally
         {
@@ -249,6 +278,8 @@ else
     // Реагує на зміну курсу та перезавантажує послідовність.
     private async Task OnCourseChanged(ChangeEventArgs args)
     {
+        if (IsSequenceBusy || !_referenceLoadSucceeded) return;
+
         ok = null;
         error = null;
         if (int.TryParse(args.Value?.ToString(), out var cid))
@@ -259,27 +290,41 @@ else
         {
             _selectedCourseId = 0;
         }
+        _sequenceLoadSucceeded = false;
         mainModules.Clear();
         fillerIds.Clear();
         if (_selectedCourseId > 0)
         {
             await LoadSequence(_selectedCourseId);
         }
+        else
+        {
+            _sequenceLoadGuard.Invalidate();
+        }
     }
     // Оновлює послідовність для поточного курсу.
     private async Task RefreshCurrent()
     {
-        if (_selectedCourseId <= 0) return;
+        if (IsSequenceBusy || !_referenceLoadSucceeded || _selectedCourseId <= 0) return;
         ok = null;
         error = null;
-        mainModules.Clear();
-        fillerIds.Clear();
         await LoadSequence(_selectedCourseId);
     }
     // Завантажує збережену послідовність модулів курсу.
     private async Task LoadSequence(int courseId)
     {
+        if (!_referenceLoadSucceeded || courseId <= 0)
+        {
+            _sequenceLoadGuard.Invalidate();
+            _sequenceLoadSucceeded = false;
+            isCourseLoading = false;
+            error = "Конфігурацію не завантажено: спочатку потрібно успішно отримати курси й модулі.";
+            return;
+        }
+
+        var requestVersion = _sequenceLoadGuard.Begin();
         isCourseLoading = true;
+        _sequenceLoadSucceeded = false;
         try
         {
             var cfg = await Admin.GetModuleSequence(courseId);
@@ -287,7 +332,8 @@ else
                 .Where(m => m.Id.HasValue && ModuleBelongsToCourse(m, courseId))
                 .Select(m => m.Id!.Value)
                 .ToHashSet();
-            var ordered = new List<MainModuleEntry>();
+            var loadedMainModules = new List<MainModuleEntry>();
+            var loadedFillerIds = new HashSet<int>();
             var seen = new HashSet<int>();
             int? previousGroup = null;
             if (cfg is not null)
@@ -298,31 +344,42 @@ else
                     if (allowed.Contains(mid) && seen.Add(mid))
                     {
                         var joinPrevious = previousGroup.HasValue && item.GroupOrder == previousGroup.Value;
-                        ordered.Add(new MainModuleEntry(mid, joinPrevious));
+                        loadedMainModules.Add(new MainModuleEntry(mid, joinPrevious));
                         previousGroup = item.GroupOrder;
                     }
                 }
-                fillerIds = cfg.FillerModuleIds
+                loadedFillerIds = cfg.FillerModuleIds
                     .Where(allowed.Contains)
                     .ToHashSet();
             }
-            else
+
+            loadedFillerIds.ExceptWith(loadedMainModules.Select(entry => entry.ModuleId));
+            if (!_sequenceLoadGuard.IsCurrent(requestVersion) || _selectedCourseId != courseId)
             {
-                fillerIds.Clear();
+                return;
             }
-            fillerIds.ExceptWith(ordered.Select(entry => entry.ModuleId));
+
             mainModules.Clear();
-            mainModules.AddRange(ordered);
+            mainModules.AddRange(loadedMainModules);
+            fillerIds = loadedFillerIds;
             EnsureFirstMainGroup();
+            _sequenceLoadSucceeded = true;
+            error = null;
         }
         catch (Exception ex)
         {
-            error = ex.Message;
+            if (_sequenceLoadGuard.IsCurrent(requestVersion) && _selectedCourseId == courseId)
+            {
+                _sequenceLoadSucceeded = false;
+                error = $"Не вдалося завантажити конфігурацію: {ex.Message}";
+            }
         }
         finally
         {
-            isCourseLoading = false;
-            StateHasChanged();
+            if (_sequenceLoadGuard.IsCurrent(requestVersion) && _selectedCourseId == courseId)
+            {
+                isCourseLoading = false;
+            }
         }
     }
     // Повертає модулі, що належать до курсу.
@@ -358,6 +415,7 @@ else
     // Додає модуль до основної послідовності.
     private void AddToMain(int moduleId)
     {
+        if (!CanEditSequence) return;
         if (!moduleLookup.ContainsKey(moduleId)) return;
         if (mainModules.Any(entry => entry.ModuleId == moduleId)) return;
         ok = null;
@@ -368,6 +426,7 @@ else
     // Підіймає модуль у послідовності.
     private void MoveUp(int index)
     {
+        if (!CanEditSequence) return;
         if (index <= 0 || index >= mainModules.Count) return;
         ok = null;
         (mainModules[index - 1], mainModules[index]) = (mainModules[index], mainModules[index - 1]);
@@ -376,6 +435,7 @@ else
     // Опускає модуль у послідовності.
     private void MoveDown(int index)
     {
+        if (!CanEditSequence) return;
         if (index < 0 || index >= mainModules.Count - 1) return;
         ok = null;
         (mainModules[index], mainModules[index + 1]) = (mainModules[index + 1], mainModules[index]);
@@ -384,6 +444,7 @@ else
     // Видаляє модуль з основної послідовності.
     private void RemoveFromMain(int index)
     {
+        if (!CanEditSequence) return;
         if (index < 0 || index >= mainModules.Count) return;
         ok = null;
         mainModules.RemoveAt(index);
@@ -391,6 +452,7 @@ else
     }
     private void ToggleJoinPrevious(ChangeEventArgs args, int index)
     {
+        if (!CanEditSequence) return;
         if (index <= 0 || index >= mainModules.Count) return;
         ok = null;
         var flag = args.Value is bool b && b;
@@ -405,12 +467,15 @@ else
         }
     }
     private List<int> BuildGroupOrders()
+        => BuildGroupOrders(mainModules);
+
+    private static List<int> BuildGroupOrders(IReadOnlyList<MainModuleEntry> entries)
     {
-        var orders = new List<int>(mainModules.Count);
+        var orders = new List<int>(entries.Count);
         int groupOrder = 0;
-        for (var i = 0; i < mainModules.Count; i++)
+        for (var i = 0; i < entries.Count; i++)
         {
-            if (i == 0 || !mainModules[i].JoinPreviousGroup)
+            if (i == 0 || !entries[i].JoinPreviousGroup)
             {
                 groupOrder++;
             }
@@ -421,6 +486,7 @@ else
     // Перемикає модуль у списку низького пріоритету.
     private void ToggleFiller(ChangeEventArgs args, int moduleId)
     {
+        if (!CanEditSequence) return;
         if (mainModules.Any(entry => entry.ModuleId == moduleId)) return;
         ok = null;
         var flag = args.Value is bool b && b;
@@ -436,6 +502,7 @@ else
     // Позначає всі модулі як низький пріоритет.
     private void SelectAllFillers()
     {
+        if (!CanEditSequence) return;
         ok = null;
         fillerIds = CourseModules()
             .Select(m => m.Id!.Value)
@@ -445,12 +512,14 @@ else
     // Очищає список низьких пріоритетів.
     private void ClearFillers()
     {
+        if (!CanEditSequence) return;
         ok = null;
         fillerIds.Clear();
     }
     // Очищає основну послідовність.
     private void ClearMain()
     {
+        if (!CanEditSequence) return;
         ok = null;
         mainModules.Clear();
     }
@@ -488,24 +557,33 @@ else
     // Зберігає послідовність модулів для курсу.
     private async Task SaveAsync()
     {
-        if (_selectedCourseId <= 0) return;
+        if (!CanSaveSequence) return;
+
+        var courseId = _selectedCourseId;
+        var mainSnapshot = mainModules
+            .Select(entry => new MainModuleEntry(entry.ModuleId, entry.JoinPreviousGroup))
+            .ToList();
+        var fillerSnapshot = fillerIds.ToList();
         isSaving = true;
         ok = null;
         error = null;
         try
         {
-            var groupOrders = BuildGroupOrders();
-            var mainItems = mainModules
+            var groupOrders = BuildGroupOrders(mainSnapshot);
+            var mainItems = mainSnapshot
                 .Select((entry, index) => new ModuleSequenceSaveItemDto(entry.ModuleId, groupOrders[index]))
                 .ToList();
             var payload = new ModuleSequenceSaveRequestDto(
-                _selectedCourseId,
+                courseId,
                 mainItems,
-                fillerIds
-                    .Where(id => moduleLookup.TryGetValue(id, out var module) && ModuleBelongsToCourse(module, _selectedCourseId))
+                fillerSnapshot
+                    .Where(id => moduleLookup.TryGetValue(id, out var module) && ModuleBelongsToCourse(module, courseId))
                     .ToList());
             await Admin.SaveModuleSequence(payload);
-            ok = "Збережено.";
+            if (_selectedCourseId == courseId && _sequenceLoadSucceeded)
+            {
+                ok = "Збережено.";
+            }
         }
         catch (Exception ex)
         {
