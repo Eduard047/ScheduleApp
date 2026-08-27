@@ -55,7 +55,8 @@ public sealed class ClientHttpContractTests
               "detail": "Дані змінилися після завантаження.",
               "errors": { "Name": ["Назва вже використовується."] },
               "warnings": ["Оновіть список."],
-              "traceId": "trace-42"
+              "traceId": "trace-42",
+              "code": "Stale"
             }
             """;
         using var client = CreateClient(new HttpResponseMessage(HttpStatusCode.Conflict)
@@ -71,6 +72,7 @@ public sealed class ClientHttpContractTests
         Assert.Equal(new[] { "Назва вже використовується." }, exception.Errors);
         Assert.Equal(new[] { "Оновіть список." }, exception.Warnings);
         Assert.Equal("trace-42", exception.TraceId);
+        Assert.Equal("Stale", exception.Code);
     }
 
     [Fact]
@@ -259,7 +261,7 @@ public sealed class ClientHttpContractTests
     }
 }
 
-public sealed class AdminTimeSlotsReliabilityTests
+public sealed class AdminTimeSlotSequenceEditorTests
 {
     private const string ComponentTypeName =
         "BlazorWasmDotNet8AspNetCoreHosted.Client.Pages.AdminTimeSlots";
@@ -267,311 +269,684 @@ public sealed class AdminTimeSlotsReliabilityTests
         BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
 
     [Fact]
-    public async Task Preferred_limit_success_enables_editor_with_server_value()
+    public async Task Context_load_uses_single_editor_request_and_hydrates_complete_state()
     {
-        var component = CreateComponent(new SequenceResponseHandler(
-            () => JsonResponse(HttpStatusCode.OK, """
-                { "id": 1, "courseId": null, "maxSlotOrder": 4 }
-                """)));
-
-        await InvokeAsync(component, "LoadPreferredFirstSlotLimit", null, 0);
-
-        Assert.True(GetField<bool>(component, "_hasLoadedPreferredFirstLimit"));
-        Assert.False(GetField<bool>(component, "_preferredFirstLimitLoading"));
-        Assert.Null(GetField<string?>(component, "_preferredFirstLimitLoadError"));
-        Assert.Equal(4, GetField<int>(component, "_preferredFirstMaxSlotOrder"));
-        Assert.Equal(4, GetField<int>(component, "_loadedPreferredFirstMaxSlotOrder"));
-        Assert.True(GetProperty<bool>(component, "CanEditPreferredFirstLimit"));
-        Assert.False(GetProperty<bool>(component, "CanSavePreferredFirstLimit"));
-    }
-
-    [Fact]
-    public async Task Preferred_limit_failure_stays_unavailable_until_retry_succeeds()
-    {
-        var component = CreateComponent(new SequenceResponseHandler(
-            () => JsonResponse(HttpStatusCode.ServiceUnavailable, """
-                { "detail": "Ліміт тимчасово недоступний." }
-                """, "application/problem+json"),
-            () => JsonResponse(HttpStatusCode.OK, """
-                { "id": 1, "courseId": null, "maxSlotOrder": 6 }
-                """)));
-
-        await InvokeAsync(component, "LoadPreferredFirstSlotLimit", null, 0);
-
-        Assert.False(GetField<bool>(component, "_hasLoadedPreferredFirstLimit"));
-        Assert.False(GetField<bool>(component, "_preferredFirstLimitLoading"));
-        Assert.False(GetProperty<bool>(component, "CanEditPreferredFirstLimit"));
-        Assert.False(GetProperty<bool>(component, "CanSavePreferredFirstLimit"));
-        Assert.Contains(
-            "Ліміт тимчасово недоступний",
-            GetField<string>(component, "_preferredFirstLimitLoadError"),
-            StringComparison.Ordinal);
-
-        await InvokeAsync(component, "RetryPreferredFirstSlotLimitAsync");
-
-        Assert.True(GetField<bool>(component, "_hasLoadedPreferredFirstLimit"));
-        Assert.Null(GetField<string?>(component, "_preferredFirstLimitLoadError"));
-        Assert.Equal(6, GetField<int>(component, "_preferredFirstMaxSlotOrder"));
-        Assert.True(GetProperty<bool>(component, "CanEditPreferredFirstLimit"));
-    }
-
-    [Fact]
-    public async Task Preferred_limit_retry_preserves_dirty_draft_against_refreshed_snapshot()
-    {
-        var component = CreateComponent(new SequenceResponseHandler(
-            () => JsonResponse(HttpStatusCode.OK, """
-                { "id": 1, "courseId": null, "maxSlotOrder": 4 }
-                """),
-            () => JsonResponse(HttpStatusCode.ServiceUnavailable, """
-                { "detail": "Повторне завантаження не вдалося." }
-                """, "application/problem+json"),
-            () => JsonResponse(HttpStatusCode.OK, """
-                { "id": 1, "courseId": null, "maxSlotOrder": 5 }
-                """)));
-        await InvokeAsync(component, "LoadPreferredFirstSlotLimit", null, 0);
-        SetField(component, "_preferredFirstMaxSlotOrder", 7);
-
-        await InvokeAsync(component, "LoadPreferredFirstSlotLimit", null, 0);
-
-        Assert.True(GetProperty<bool>(component, "HasUnsavedPreferredFirstLimit"));
-        Assert.False(GetProperty<bool>(component, "CanSavePreferredFirstLimit"));
-
-        await InvokeAsync(component, "RetryPreferredFirstSlotLimitAsync");
-
-        Assert.Equal(7, GetField<int>(component, "_preferredFirstMaxSlotOrder"));
-        Assert.Equal(5, GetField<int>(component, "_loadedPreferredFirstMaxSlotOrder"));
-        Assert.True(GetProperty<bool>(component, "HasUnsavedPreferredFirstLimit"));
-        Assert.True(GetProperty<bool>(component, "CanSavePreferredFirstLimit"));
-    }
-
-    [Fact]
-    public async Task Copy_preview_failure_is_not_reported_as_empty_and_retry_recovers()
-    {
-        var component = CreateComponent(new SequenceResponseHandler(
-            () => JsonResponse(HttpStatusCode.BadGateway, """
-                { "detail": "Шаблон тимчасово недоступний." }
-                """, "application/problem+json"),
-            () => JsonResponse(HttpStatusCode.OK, """
-                {
-                  "course": [],
-                  "global": [
-                    {
-                      "id": 1,
-                      "courseId": null,
-                      "dayOfWeek": null,
-                      "sortOrder": 1,
-                      "start": "09:00",
-                      "end": "09:45",
-                      "isActive": true,
-                      "isLunch": false
-                    }
-                  ]
-                }
-                """)));
-        SetField(component, "_slotsLoadSucceeded", true);
-
-        await InvokeAsync(component, "LoadCopyPreviewAsync");
-
-        Assert.False(GetField<bool>(component, "_copyPreviewLoading"));
-        Assert.False(GetProperty<bool>(component, "CanCopyToEditor"));
-        Assert.Empty(GetField<List<TimeSlotDto>>(component, "_copyPreviewRows"));
-        Assert.Contains(
-            "Шаблон тимчасово недоступний",
-            GetField<string>(component, "_copyPreviewError"),
-            StringComparison.Ordinal);
-        Assert.Contains(
-            "недоступний",
-            Invoke<string>(component, "GetCopyHint"),
-            StringComparison.Ordinal);
-        Assert.DoesNotContain(
-            "немає слотів",
-            Invoke<string>(component, "GetCopyHint"),
-            StringComparison.Ordinal);
-
-        await InvokeAsync(component, "LoadCopyPreviewAsync");
-
-        Assert.False(GetField<bool>(component, "_copyPreviewLoading"));
-        Assert.Null(GetField<string?>(component, "_copyPreviewError"));
-        Assert.Single(GetField<List<TimeSlotDto>>(component, "_copyPreviewRows"));
-        Assert.True(GetProperty<bool>(component, "CanCopyToEditor"));
-    }
-
-    [Fact]
-    public async Task Preferred_limit_delayed_save_does_not_mark_new_course_draft_as_saved()
-    {
-        var handler = new DelayedMutationHandler();
-        var component = CreateComponent(handler);
-        SetField(component, "_hasLoadedPreferredFirstLimit", true);
-        SetField<int?>(component, "_preferredFirstLimitCourseId", null);
-        SetField(component, "_preferredFirstMaxSlotOrder", 7);
-        SetField(component, "_loadedPreferredFirstMaxSlotOrder", 4);
-
-        var saveTask = InvokeTask(component, "SavePreferredFirstSlotLimit");
-        await handler.MutationStarted.WaitAsync(TimeSpan.FromSeconds(5));
-
-        Assert.True(GetProperty<bool>(component, "AreContextControlsDisabled"));
-        SetEnumField(component, "_scope", "Course");
-        SetField<int?>(component, "_courseId", 2);
-        SetField(component, "_contextLoadVersion", 1);
-        SetField<int?>(component, "_preferredFirstLimitCourseId", 2);
-        SetField(component, "_preferredFirstMaxSlotOrder", 9);
-        SetField(component, "_loadedPreferredFirstMaxSlotOrder", 8);
-
-        handler.CompleteMutation(new HttpResponseMessage(HttpStatusCode.NoContent));
-        await saveTask;
-
-        Assert.False(GetField<bool>(component, "_savingPreferredFirstLimit"));
-        Assert.Equal(9, GetField<int>(component, "_preferredFirstMaxSlotOrder"));
-        Assert.Equal(8, GetField<int>(component, "_loadedPreferredFirstMaxSlotOrder"));
-        Assert.True(GetProperty<bool>(component, "HasUnsavedPreferredFirstLimit"));
-        Assert.Null(GetField<string?>(component, "_ok"));
-    }
-
-    [Fact]
-    public async Task Slot_delayed_save_does_not_reload_new_day_context()
-    {
-        var handler = new DelayedMutationHandler();
-        var component = CreateComponent(handler);
-        SetField(component, "_slotsLoadSucceeded", true);
-        SetField(component, "_rows", Rows(1));
-        SetField(component, "_loadedRowsSnapshot", new List<TimeSlotDto>());
-
-        var saveTask = InvokeTask(component, "Save");
-        await handler.MutationStarted.WaitAsync(TimeSpan.FromSeconds(5));
-
-        Assert.True(GetProperty<bool>(component, "AreContextControlsDisabled"));
-        SetField<int?>(component, "_dayOfWeek", 2);
-        SetField(component, "_contextLoadVersion", 1);
-        SetField(component, "_rows", Rows(9));
-        SetField(component, "_loadedRowsSnapshot", Rows(8));
-
-        handler.CompleteMutation(new HttpResponseMessage(HttpStatusCode.NoContent));
-        await saveTask;
-
-        Assert.False(GetField<bool>(component, "_savingSlots"));
-        Assert.Equal(9, Assert.Single(GetField<List<TimeSlotDto>>(component, "_rows")).SortOrder);
-        Assert.Equal(8, Assert.Single(GetField<List<TimeSlotDto>>(component, "_loadedRowsSnapshot")).SortOrder);
-        Assert.Null(GetField<string?>(component, "_ok"));
-        Assert.Equal(1, handler.RequestCount);
-    }
-
-    [Fact]
-    public async Task Template_delayed_save_does_not_reload_new_day_context()
-    {
-        var handler = new DelayedMutationHandler(returnEmptyTemplateForGet: true);
-        var component = CreateComponent(handler);
-        SetField(component, "_slotsLoadSucceeded", true);
-        SetField(component, "_rows", Rows(1));
-
-        var saveTask = InvokeTask(component, "SaveEditorAsTemplateAsync");
-        await handler.MutationStarted.WaitAsync(TimeSpan.FromSeconds(5));
-
-        Assert.True(GetProperty<bool>(component, "AreContextControlsDisabled"));
-        SetField<int?>(component, "_dayOfWeek", 2);
-        SetField(component, "_contextLoadVersion", 1);
-        SetField(component, "_rows", Rows(9));
-
-        handler.CompleteMutation(new HttpResponseMessage(HttpStatusCode.NoContent));
-        await saveTask;
-
-        Assert.False(GetField<bool>(component, "_savingTemplate"));
-        Assert.Equal(9, Assert.Single(GetField<List<TimeSlotDto>>(component, "_rows")).SortOrder);
-        Assert.Null(GetField<string?>(component, "_ok"));
-        Assert.Equal(2, handler.RequestCount);
-    }
-
-    [Fact]
-    public async Task Slot_load_failure_blocks_direct_mutations_until_retry_succeeds()
-    {
-        var handler = new SlotsLoadRetryHandler();
+        var handler = new SequenceHandler(EditorContextResponse("09:00", preferredLimit: 4));
         var component = CreateComponent(handler);
 
         await InvokeAsync(component, "InitializeAsync");
 
-        Assert.True(GetField<bool>(component, "_metaLoadSucceeded"));
-        Assert.False(GetField<bool>(component, "_initialLoadFailed"));
-        Assert.False(GetField<bool>(component, "_slotsLoading"));
-        Assert.False(GetField<bool>(component, "_slotsLoadSucceeded"));
-        Assert.False(GetProperty<bool>(component, "CanMutateSlotEditor"));
-        Assert.False(GetProperty<bool>(component, "AreContextControlsDisabled"));
-        Assert.Contains("Не вдалося завантажити слоти", GetField<string>(component, "_error"));
-        Assert.Contains("Редактор недоступний", Invoke<string>(component, "GetEditorStateHint"));
-        Assert.DoesNotContain("Слотів у редакторі: 0", Invoke<string>(component, "GetEditorStateHint"));
-
-        InvokeVoid(component, "AddRow");
-        Assert.Empty(GetField<List<TimeSlotDto>>(component, "_rows"));
-        SetField(component, "_rows", Rows(7));
-        SetField(component, "_loadedRowsSnapshot", new List<TimeSlotDto>());
-
-        await InvokeAsync(component, "Save");
-
-        Assert.Equal(0, handler.PostCount);
-        Assert.Null(GetField<string?>(component, "_ok"));
-
-        await InvokeAsync(component, "RetrySlotsLoadAsync");
-
-        Assert.False(GetField<bool>(component, "_slotsLoading"));
+        var request = Assert.Single(handler.Requests);
+        Assert.Equal(HttpMethod.Get, request.Method);
+        Assert.EndsWith("/api/admin/config/slots/editor-context", request.RequestUri!.AbsolutePath, StringComparison.Ordinal);
+        Assert.Contains("targetMode=AllCourses", request.RequestUri.Query, StringComparison.Ordinal);
         Assert.True(GetField<bool>(component, "_slotsLoadSucceeded"));
-        Assert.True(GetProperty<bool>(component, "CanMutateSlotEditor"));
-        Assert.False(GetProperty<bool>(component, "AreContextControlsDisabled"));
-        Assert.Equal(2, Assert.Single(GetField<List<TimeSlotDto>>(component, "_rows")).SortOrder);
-
-        InvokeVoid(component, "AddRow");
-        Assert.Equal(2, GetField<List<TimeSlotDto>>(component, "_rows").Count);
+        Assert.Equal("09:00", Assert.Single(GetField<List<TimeSlotDto>>(component, "_rows")).Start);
+        Assert.Equal(4, GetField<int>(component, "_preferredFirstMaxSlotOrder"));
+        Assert.Equal("revision-1", GetField<string>(component, "_currentRevision"));
+        Assert.Equal(TimeSlotLunchMutationMode.Unchanged, GetField<TimeSlotLunchMutationMode>(component, "_lunchMutation"));
     }
 
     [Fact]
-    public async Task Metadata_failure_keeps_context_controls_and_editor_disabled()
+    public async Task Incomplete_course_context_clears_pending_lunch_intent_without_an_api_request()
     {
-        var component = CreateComponent(new MetadataFailureHandler());
+        var handler = new SequenceHandler();
+        var component = CreateComponent(handler);
+        SetField(component, "_targetMode", TimeSlotEditorTargetMode.Course);
+        SetField<int?>(component, "_courseId", null);
+        SetField(component, "_lunchMutation", TimeSlotLunchMutationMode.Remove);
 
-        await InvokeAsync(component, "InitializeAsync");
+        await InvokeAsync(component, "LoadRaw");
 
-        Assert.False(GetField<bool>(component, "_metaLoadSucceeded"));
-        Assert.True(GetField<bool>(component, "_initialLoadFailed"));
-        Assert.False(GetField<bool>(component, "_slotsLoadSucceeded"));
-        Assert.True(GetProperty<bool>(component, "AreContextControlsDisabled"));
-        Assert.False(GetProperty<bool>(component, "CanMutateSlotEditor"));
-        Assert.Contains("Не вдалося завантажити довідник курсів", GetField<string>(component, "_error"));
-        InvokeVoid(component, "AddRow");
-        Assert.Empty(GetField<List<TimeSlotDto>>(component, "_rows"));
+        Assert.Empty(handler.Requests);
+        Assert.Equal(TimeSlotLunchMutationMode.Unchanged, GetField<TimeSlotLunchMutationMode>(component, "_lunchMutation"));
+        Assert.False(GetProperty<bool>(component, "HasUnsavedSlotChanges"));
+        Assert.Equal(string.Empty, GetField<string>(component, "_currentRevision"));
     }
 
     [Fact]
-    public async Task Stale_context_load_cannot_unlock_editor_while_new_context_is_loading()
+    public void Quick_builder_creates_a_numbered_non_overlapping_sequence()
     {
-        var handler = new DelayedContextLoadHandler();
+        var component = CreateReadyComponent();
+        SetField(component, "_builderStart", "08:30");
+        SetField(component, "_builderCount", 3);
+        SetField(component, "_builderDurationMinutes", 45);
+        SetField(component, "_builderBreakMinutes", 10);
+
+        InvokeVoid(component, "BuildSequence");
+
+        var rows = GetField<List<TimeSlotDto>>(component, "_rows");
+        Assert.Collection(
+            rows,
+            row => AssertRow(row, 1, "08:30", "09:15"),
+            row => AssertRow(row, 2, "09:25", "10:10"),
+            row => AssertRow(row, 3, "10:20", "11:05"));
+        Assert.True(GetProperty<bool>(component, "HasUnsavedSlotChanges"));
+        Assert.Null(Invoke<string?>(component, "Validate"));
+    }
+
+    [Theory]
+    [InlineData("10:25:00", "10:25")]
+    [InlineData(" 09:00 ", "09:00")]
+    public void Browser_time_values_are_normalized_to_the_editor_minute_format(
+        string browserValue,
+        string expected)
+    {
+        var componentType = typeof(TimeSlotsApi).Assembly.GetType(ComponentTypeName, throwOnError: true)!;
+        var method = componentType.GetMethod(
+            "NormalizeTimeInputValue",
+            BindingFlags.Static | BindingFlags.NonPublic)!;
+
+        Assert.Equal(expected, method.Invoke(null, [browserValue]));
+    }
+
+    [Fact]
+    public void Insert_after_shifts_following_periods_and_preserves_valid_breaks()
+    {
+        var component = CreateReadyComponent();
+        SetField(component, "_rows", new List<TimeSlotDto>
+        {
+            Row(1, "09:00", "09:45"),
+            Row(2, "09:55", "10:40")
+        });
+
+        InvokeVoid(component, "InsertAfter", 0);
+
+        var rows = GetField<List<TimeSlotDto>>(component, "_rows");
+        Assert.Collection(
+            rows,
+            row => AssertRow(row, 1, "09:00", "09:45"),
+            row => AssertRow(row, 2, "09:55", "10:40"),
+            row => AssertRow(row, 3, "10:50", "11:35"));
+        Assert.Null(Invoke<string?>(component, "Validate"));
+    }
+
+    [Fact]
+    public void Add_after_late_period_rejects_midnight_wrap_instead_of_appending_morning_time()
+    {
+        var component = CreateReadyComponent();
+        SetField(component, "_rows", new List<TimeSlotDto> { Row(1, "23:30", "23:50") });
+
+        InvokeVoid(component, "AddRow");
+
+        var row = Assert.Single(GetField<List<TimeSlotDto>>(component, "_rows"));
+        Assert.Equal("23:30", row.Start);
+        Assert.Contains("за межі поточного дня", GetField<string>(component, "_error"), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Move_buttons_derive_sort_order_from_visual_position()
+    {
+        var component = CreateReadyComponent();
+        var first = Row(40, "09:00", "09:45");
+        first.Id = 1;
+        var second = Row(10, "09:55", "10:55");
+        second.Id = 2;
+        second.IsLunch = true;
+        SetField(component, "_rows", new List<TimeSlotDto>
+        {
+            first,
+            second
+        });
+
+        InvokeVoid(component, "MoveRow", 1, -1);
+
+        var rows = GetField<List<TimeSlotDto>>(component, "_rows");
+        Assert.Equal(new[] { 2, 1 }, rows.Select(row => row.Id));
+        Assert.Equal(new[] { "09:00", "10:10" }, rows.Select(row => row.Start));
+        Assert.Equal(new[] { "10:00", "10:55" }, rows.Select(row => row.End));
+        Assert.Equal(new[] { 1, 2 }, rows.Select(row => row.SortOrder));
+        Assert.Equal(TimeSlotLunchMutationMode.Set, GetField<TimeSlotLunchMutationMode>(component, "_lunchMutation"));
+        Assert.Null(Invoke<string?>(component, "Validate"));
+    }
+
+    [Fact]
+    public void Explicit_lunch_assignment_and_removal_change_only_lunch_intent_until_row_state_changes()
+    {
+        var component = CreateReadyComponent();
+        SetField(component, "_rows", new List<TimeSlotDto> { Row(1, "12:00", "12:45") });
+        SetField(component, "_loadedRowsSnapshot", new List<TimeSlotDto> { Row(1, "12:00", "12:45") });
+
+        InvokeVoid(component, "ToggleLunch", 0, new Microsoft.AspNetCore.Components.ChangeEventArgs { Value = true });
+
+        Assert.Equal(TimeSlotLunchMutationMode.Set, GetField<TimeSlotLunchMutationMode>(component, "_lunchMutation"));
+        Assert.False(GetProperty<bool>(component, "HasUnsavedSequenceChanges"));
+        Assert.True(GetProperty<bool>(component, "HasUnsavedLunchChanges"));
+        Assert.True(GetProperty<bool>(component, "CanPreviewChanges"));
+
+        InvokeVoid(component, "ToggleLunch", 0, new Microsoft.AspNetCore.Components.ChangeEventArgs { Value = false });
+
+        Assert.Equal(TimeSlotLunchMutationMode.Remove, GetField<TimeSlotLunchMutationMode>(component, "_lunchMutation"));
+        Assert.False(GetProperty<bool>(component, "HasUnsavedSequenceChanges"));
+    }
+
+    [Fact]
+    public void Empty_sequence_requires_explicit_clear_intent()
+    {
+        var component = CreateReadyComponent();
+        SetField(component, "_rows", new List<TimeSlotDto>());
+        SetField(component, "_loadedRowsSnapshot", new List<TimeSlotDto> { Row(1, "09:00", "09:45") });
+
+        Assert.False(GetProperty<bool>(component, "CanPreviewChanges"));
+        Assert.Contains("підтвердьте явний намір", Invoke<string>(component, "Validate"), StringComparison.Ordinal);
+
+        SetField(component, "_clearRequested", true);
+
+        Assert.True(GetProperty<bool>(component, "CanPreviewChanges"));
+        Assert.Null(Invoke<string?>(component, "Validate"));
+        var request = Invoke<TimeSlotSequenceApplyRequestDto>(component, "BuildRequest", (object?)null);
+        Assert.True(request.ApplySlots);
+        Assert.True(request.Clear);
+        Assert.Empty(request.Slots);
+        Assert.Equal(TimeSlotLunchMutationMode.Unchanged, request.LunchMutation);
+        Assert.Null(request.LunchSlot);
+    }
+
+    [Fact]
+    public void Reset_to_shared_request_never_combines_reset_with_slot_replacement()
+    {
+        var component = CreateReadyComponent();
+        SetField(component, "_targetMode", TimeSlotEditorTargetMode.Course);
+        SetField<int?>(component, "_courseId", 4);
+        SetField(component, "_rows", new List<TimeSlotDto> { Row(1, "09:00", "09:45") });
+        SetField(component, "_resetCourseToGlobal", true);
+
+        var request = Invoke<TimeSlotSequenceApplyRequestDto>(component, "BuildRequest", (object?)null);
+
+        Assert.True(request.ResetCourseToGlobal);
+        Assert.False(request.ApplySlots);
+        Assert.True(GetProperty<bool>(component, "CanPreviewChanges"));
+        Assert.False(request.Clear);
+        Assert.Empty(request.Slots);
+        Assert.Equal(4, request.CourseId);
+        Assert.Equal(TimeSlotLunchMutationMode.Unchanged, request.LunchMutation);
+        Assert.Null(request.LunchSlot);
+    }
+
+    [Fact]
+    public void Lunch_only_set_sends_selected_interval_without_replacing_slots()
+    {
+        var component = CreateReadyComponent();
+        var draft = Row(1, "12:00", "12:45");
+        draft.IsLunch = true;
+        SetField(component, "_rows", new List<TimeSlotDto> { draft });
+        SetField(component, "_loadedRowsSnapshot", new List<TimeSlotDto> { Row(1, "12:00", "12:45") });
+        SetField(component, "_lunchMutation", TimeSlotLunchMutationMode.Set);
+
+        var request = Invoke<TimeSlotSequenceApplyRequestDto>(component, "BuildRequest", (object?)null);
+
+        Assert.False(GetProperty<bool>(component, "HasUnsavedSequenceChanges"));
+        Assert.True(GetProperty<bool>(component, "HasUnsavedLunchChanges"));
+        Assert.False(request.ApplySlots);
+        Assert.True(GetProperty<bool>(component, "CanPreviewChanges"));
+        Assert.Empty(request.Slots);
+        Assert.False(request.Clear);
+        Assert.Null(request.DayOfWeek);
+        Assert.Equal(TimeSlotLunchMutationMode.Set, request.LunchMutation);
+        Assert.NotNull(request.LunchSlot);
+        Assert.Equal("12:00", request.LunchSlot.Start);
+        Assert.Equal("12:45", request.LunchSlot.End);
+        Assert.True(request.LunchSlot.IsLunch);
+    }
+
+    [Fact]
+    public void Lunch_only_remove_sends_no_slots_or_lunch_interval()
+    {
+        var component = CreateReadyComponent();
+        SetField(component, "_rows", new List<TimeSlotDto> { Row(1, "12:00", "12:45") });
+        SetField(component, "_loadedRowsSnapshot", new List<TimeSlotDto> { Row(1, "12:00", "12:45") });
+        SetField(component, "_lunchMutation", TimeSlotLunchMutationMode.Remove);
+
+        var request = Invoke<TimeSlotSequenceApplyRequestDto>(component, "BuildRequest", (object?)null);
+
+        Assert.False(request.ApplySlots);
+        Assert.True(GetProperty<bool>(component, "CanPreviewChanges"));
+        Assert.Empty(request.Slots);
+        Assert.False(request.Clear);
+        Assert.Equal(TimeSlotLunchMutationMode.Remove, request.LunchMutation);
+        Assert.Null(request.LunchSlot);
+    }
+
+    [Fact]
+    public void Course_lunch_removal_targets_only_its_override_and_cancel_restores_the_marker()
+    {
+        var component = CreateReadyComponent();
+        SetField(component, "_targetMode", TimeSlotEditorTargetMode.Course);
+        SetField<int?>(component, "_courseId", 4);
+        SetField(component, "_context", new TimeSlotEditorContextDto
+        {
+            TargetMode = TimeSlotEditorTargetMode.Course,
+            CourseId = 4,
+            ExplicitLunch = new LunchConfigEditDto(7, 4, "12:00", "12:45"),
+            EffectiveLunch = new LunchConfigEditDto(7, 4, "12:00", "12:45"),
+            CurrentRevision = "revision-1"
+        });
+        var row = Row(1, "12:00", "12:45");
+        row.IsLunch = true;
+        SetField(component, "_rows", new List<TimeSlotDto> { row });
+        var snapshot = Row(1, "12:00", "12:45");
+        snapshot.IsLunch = true;
+        SetField(component, "_loadedRowsSnapshot", new List<TimeSlotDto> { snapshot });
+
+        InvokeVoid(component, "RequestLunchRemoval");
+        var request = Invoke<TimeSlotSequenceApplyRequestDto>(component, "BuildRequest", (object?)null);
+
+        Assert.Equal(4, request.CourseId);
+        Assert.False(request.ApplySlots);
+        Assert.Empty(request.Slots);
+        Assert.Equal(TimeSlotLunchMutationMode.Remove, request.LunchMutation);
+        Assert.Null(request.LunchSlot);
+        Assert.DoesNotContain(GetField<List<TimeSlotDto>>(component, "_rows"), slot => slot.IsLunch);
+
+        InvokeVoid(component, "CancelLunchRemoval");
+
+        Assert.Equal(TimeSlotLunchMutationMode.Unchanged, GetField<TimeSlotLunchMutationMode>(component, "_lunchMutation"));
+        Assert.True(Assert.Single(GetField<List<TimeSlotDto>>(component, "_rows")).IsLunch);
+    }
+
+    [Fact]
+    public void Inherited_lunch_cannot_be_unchecked_but_selecting_another_row_creates_an_explicit_set()
+    {
+        var component = CreateInheritedLunchComponent();
+
+        InvokeVoid(component, "ToggleLunch", 0, new Microsoft.AspNetCore.Components.ChangeEventArgs { Value = false });
+
+        Assert.True(GetField<List<TimeSlotDto>>(component, "_rows")[0].IsLunch);
+        Assert.Equal(TimeSlotLunchMutationMode.Unchanged, GetField<TimeSlotLunchMutationMode>(component, "_lunchMutation"));
+        Assert.Contains("успадкована зі спільного графіка", GetField<string>(component, "_ok"), StringComparison.Ordinal);
+
+        InvokeVoid(component, "ToggleLunch", 1, new Microsoft.AspNetCore.Components.ChangeEventArgs { Value = true });
+        var request = Invoke<TimeSlotSequenceApplyRequestDto>(component, "BuildRequest", (object?)null);
+
+        var rows = GetField<List<TimeSlotDto>>(component, "_rows");
+        Assert.False(rows[0].IsLunch);
+        Assert.True(rows[1].IsLunch);
+        Assert.Equal(TimeSlotLunchMutationMode.Set, GetField<TimeSlotLunchMutationMode>(component, "_lunchMutation"));
+        Assert.False(request.ApplySlots);
+        Assert.Equal("13:00", Assert.IsType<TimeSlotDto>(request.LunchSlot).Start);
+    }
+
+    [Fact]
+    public void Disabling_inherited_lunch_row_changes_slots_without_removing_shared_lunch()
+    {
+        var component = CreateInheritedLunchComponent();
+
+        InvokeVoid(component, "ToggleActive", 0, new Microsoft.AspNetCore.Components.ChangeEventArgs { Value = false });
+        var request = Invoke<TimeSlotSequenceApplyRequestDto>(component, "BuildRequest", (object?)null);
+
+        var row = GetField<List<TimeSlotDto>>(component, "_rows")[0];
+        Assert.False(row.IsActive);
+        Assert.False(row.IsLunch);
+        Assert.Equal(TimeSlotLunchMutationMode.Unchanged, GetField<TimeSlotLunchMutationMode>(component, "_lunchMutation"));
+        Assert.True(request.ApplySlots);
+        Assert.Equal(TimeSlotLunchMutationMode.Unchanged, request.LunchMutation);
+        Assert.Null(request.LunchSlot);
+        Assert.Contains("Спільна обідня перерва не змінюється", GetField<string>(component, "_ok"), StringComparison.Ordinal);
+
+        InvokeVoid(component, "ToggleActive", 0, new Microsoft.AspNetCore.Components.ChangeEventArgs { Value = true });
+
+        Assert.True(GetField<List<TimeSlotDto>>(component, "_rows")[0].IsLunch);
+        Assert.False(GetProperty<bool>(component, "HasUnsavedSequenceChanges"));
+    }
+
+    [Fact]
+    public void Unchanged_lunch_without_sequence_edits_sends_an_empty_non_applying_payload()
+    {
+        var component = CreateReadyComponent();
+        SetField(component, "_rows", new List<TimeSlotDto> { Row(1, "09:00", "09:45") });
+        SetField(component, "_loadedRowsSnapshot", new List<TimeSlotDto> { Row(1, "09:00", "09:45") });
+
+        var request = Invoke<TimeSlotSequenceApplyRequestDto>(component, "BuildRequest", (object?)null);
+
+        Assert.False(request.ApplySlots);
+        Assert.False(GetProperty<bool>(component, "CanPreviewChanges"));
+        Assert.Empty(request.Slots);
+        Assert.False(request.Clear);
+        Assert.Equal(TimeSlotLunchMutationMode.Unchanged, request.LunchMutation);
+        Assert.Null(request.LunchSlot);
+    }
+
+    [Fact]
+    public void Slot_and_lunch_change_replaces_slots_and_carries_lunch_marker_in_sequence()
+    {
+        var component = CreateReadyComponent();
+        var draft = Row(1, "12:00", "12:50");
+        draft.IsLunch = true;
+        SetField(component, "_rows", new List<TimeSlotDto> { draft });
+        SetField(component, "_loadedRowsSnapshot", new List<TimeSlotDto> { Row(1, "12:00", "12:45") });
+        SetField(component, "_lunchMutation", TimeSlotLunchMutationMode.Set);
+
+        var request = Invoke<TimeSlotSequenceApplyRequestDto>(component, "BuildRequest", (object?)null);
+
+        Assert.True(request.ApplySlots);
+        Assert.True(Assert.Single(request.Slots).IsLunch);
+        Assert.Equal(TimeSlotLunchMutationMode.Set, request.LunchMutation);
+        Assert.Null(request.LunchSlot);
+    }
+
+    [Fact]
+    public void Explicit_course_configuration_applies_slots_even_when_times_match_inherited_graph()
+    {
+        var component = CreateReadyComponent();
+        SetField(component, "_targetMode", TimeSlotEditorTargetMode.Course);
+        SetField<int?>(component, "_courseId", 4);
+        SetField(component, "_rows", new List<TimeSlotDto> { Row(1, "09:00", "09:45") });
+        SetField(component, "_loadedRowsSnapshot", new List<TimeSlotDto> { Row(1, "09:00", "09:45") });
+        SetField(component, "_explicitOverrideRequested", true);
+
+        var request = Invoke<TimeSlotSequenceApplyRequestDto>(component, "BuildRequest", (object?)null);
+
+        Assert.True(request.ApplySlots);
+        Assert.Single(request.Slots);
+        Assert.False(request.Clear);
+        Assert.Equal(TimeSlotLunchMutationMode.Unchanged, request.LunchMutation);
+        Assert.Null(request.LunchSlot);
+    }
+
+    [Fact]
+    public void Day_override_removal_is_an_explicit_clear_without_slot_or_lunch_edits()
+    {
+        var component = CreateReadyComponent();
+        SetField(component, "_targetMode", TimeSlotEditorTargetMode.Course);
+        SetField<int?>(component, "_courseId", 4);
+        SetField<int?>(component, "_dayOfWeek", 2);
+        SetField(component, "_rows", new List<TimeSlotDto> { Row(1, "09:00", "09:45") });
+        SetField(component, "_loadedRowsSnapshot", new List<TimeSlotDto> { Row(1, "09:00", "09:45") });
+        SetField(component, "_context", new TimeSlotEditorContextDto
+        {
+            TargetMode = TimeSlotEditorTargetMode.Course,
+            CourseId = 4,
+            DayOfWeek = 2,
+            HasDayOverride = true,
+            CurrentRevision = "revision-1"
+        });
+
+        InvokeVoid(component, "RequestDayOverrideRemoval");
+        var request = Invoke<TimeSlotSequenceApplyRequestDto>(component, "BuildRequest", (object?)null);
+
+        Assert.True(request.ApplySlots);
+        Assert.True(request.Clear);
+        Assert.Empty(request.Slots);
+        Assert.False(request.ResetCourseToGlobal);
+        Assert.Equal(TimeSlotLunchMutationMode.Unchanged, request.LunchMutation);
+        Assert.Null(request.LunchSlot);
+    }
+
+    [Fact]
+    public void Day_override_removal_is_unavailable_when_the_day_uses_its_base_graph()
+    {
+        var component = CreateReadyComponent();
+        SetField<int?>(component, "_dayOfWeek", 2);
+        SetField(component, "_context", new TimeSlotEditorContextDto
+        {
+            TargetMode = TimeSlotEditorTargetMode.AllCourses,
+            DayOfWeek = 2,
+            HasDayOverride = false,
+            CurrentRevision = "revision-1"
+        });
+
+        Assert.False(GetProperty<bool>(component, "CanRequestDayOverrideRemoval"));
+
+        InvokeVoid(component, "RequestDayOverrideRemoval");
+
+        Assert.False(GetField<bool>(component, "_removeDayOverrideRequested"));
+    }
+
+    [Fact]
+    public void Quick_builder_preserves_unmatched_existing_lunch_as_unchanged()
+    {
+        var component = CreateReadyComponent();
+        SetField(component, "_context", new TimeSlotEditorContextDto
+        {
+            TargetMode = TimeSlotEditorTargetMode.AllCourses,
+            EffectiveLunch = new LunchConfigEditDto(null, null, "12:00", "12:45"),
+            CurrentRevision = "revision-1"
+        });
+        var previous = Row(1, "12:00", "12:45");
+        previous.IsLunch = true;
+        SetField(component, "_rows", new List<TimeSlotDto> { previous });
+        SetField(component, "_loadedRowsSnapshot", new List<TimeSlotDto> { Row(1, "12:00", "12:45") });
+        SetField(component, "_builderStart", "08:30");
+        SetField(component, "_builderCount", 2);
+        SetField(component, "_builderDurationMinutes", 45);
+        SetField(component, "_builderBreakMinutes", 10);
+
+        InvokeVoid(component, "BuildSequence");
+        var request = Invoke<TimeSlotSequenceApplyRequestDto>(component, "BuildRequest", (object?)null);
+
+        Assert.Equal(TimeSlotLunchMutationMode.Unchanged, GetField<TimeSlotLunchMutationMode>(component, "_lunchMutation"));
+        Assert.DoesNotContain(GetField<List<TimeSlotDto>>(component, "_rows"), row => row.IsLunch);
+        Assert.Contains("залишиться без змін", GetField<string>(component, "_ok"), StringComparison.Ordinal);
+        Assert.True(request.ApplySlots);
+        Assert.Equal(TimeSlotLunchMutationMode.Unchanged, request.LunchMutation);
+        Assert.Null(request.LunchSlot);
+    }
+
+    [Fact]
+    public void Revert_restores_loaded_rows_and_resets_lunch_mutation()
+    {
+        var component = CreateReadyComponent();
+        SetField(component, "_rows", new List<TimeSlotDto> { Row(1, "10:00", "10:45") });
+        SetField(component, "_loadedRowsSnapshot", new List<TimeSlotDto> { Row(1, "09:00", "09:45") });
+        SetField(component, "_lunchMutation", TimeSlotLunchMutationMode.Remove);
+
+        InvokeVoid(component, "RevertChanges");
+
+        Assert.Equal("09:00", Assert.Single(GetField<List<TimeSlotDto>>(component, "_rows")).Start);
+        Assert.Equal(TimeSlotLunchMutationMode.Unchanged, GetField<TimeSlotLunchMutationMode>(component, "_lunchMutation"));
+        Assert.False(GetProperty<bool>(component, "HasUnsavedSlotChanges"));
+    }
+
+    [Fact]
+    public async Task Preview_posts_one_scoped_request_without_group_fan_out()
+    {
+        var handler = new SequenceHandler(JsonResponse(HttpStatusCode.OK, """
+            {
+              "targetMode": "AllCourses",
+              "affectedCourseCount": 5,
+              "courseOverridesToReplace": 2,
+              "materializedCourseCount": 1,
+              "scheduleConflictCount": 0,
+              "draftConflictCount": 0,
+              "noChanges": false,
+              "currentRevision": "revision-1",
+              "previewToken": "preview-1"
+            }
+            """));
+        var component = CreateReadyComponent(handler);
+        SetField(component, "_rows", new List<TimeSlotDto> { Row(7, "09:00", "09:45") });
+
+        await InvokeAsync(component, "PreviewAsync");
+
+        var request = Assert.Single(handler.Requests);
+        Assert.Equal(HttpMethod.Post, request.Method);
+        Assert.EndsWith("/api/admin/config/slots/editor/preview", request.RequestUri!.AbsolutePath, StringComparison.Ordinal);
+        var payload = await request.Content!.ReadAsStringAsync();
+        Assert.Contains("\"targetMode\":\"AllCourses\"", payload, StringComparison.Ordinal);
+        Assert.Contains("\"currentRevision\":\"revision-1\"", payload, StringComparison.Ordinal);
+        Assert.Contains("\"applySlots\":true", payload, StringComparison.Ordinal);
+        Assert.Contains("\"sortOrder\":1", payload, StringComparison.Ordinal);
+        Assert.DoesNotContain("groupId", payload, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("preview-1", GetField<TimeSlotSequencePreviewDto>(component, "_preview").PreviewToken);
+        Assert.True(GetProperty<bool>(component, "CanApplyPreview"));
+    }
+
+    [Fact]
+    public async Task Machine_readable_stale_response_preserves_draft_and_requests_reload()
+    {
+        var handler = new SequenceHandler(JsonResponse(
+            HttpStatusCode.Conflict,
+            """{ "detail": "Конфігурація застаріла.", "code": "Stale" }""",
+            "application/problem+json"));
+        var component = CreateReadyComponent(handler);
+        SetField(component, "_rows", new List<TimeSlotDto> { Row(1, "10:00", "10:45") });
+
+        await InvokeAsync(component, "PreviewAsync");
+
+        Assert.Equal("10:00", Assert.Single(GetField<List<TimeSlotDto>>(component, "_rows")).Start);
+        Assert.True(GetField<bool>(component, "_staleData"));
+        Assert.Contains("Ваші правки збережено", GetField<string>(component, "_error"), StringComparison.Ordinal);
+        Assert.Null(GetField<TimeSlotSequencePreviewDto?>(component, "_preview"));
+    }
+
+    [Fact]
+    public async Task Ordinary_conflict_preserves_draft_and_shows_server_detail_without_marking_stale()
+    {
+        var handler = new SequenceHandler(JsonResponse(
+            HttpStatusCode.Conflict,
+            """{ "detail": "Час перетинається з уже запланованим заняттям." }""",
+            "application/problem+json"));
+        var component = CreateReadyComponent(handler);
+        SetField(component, "_rows", new List<TimeSlotDto> { Row(1, "10:00", "10:45") });
+
+        await InvokeAsync(component, "PreviewAsync");
+
+        Assert.Equal("10:00", Assert.Single(GetField<List<TimeSlotDto>>(component, "_rows")).Start);
+        Assert.False(GetField<bool>(component, "_staleData"));
+        Assert.Equal("Час перетинається з уже запланованим заняттям.", GetField<string>(component, "_error"));
+        Assert.Null(GetField<TimeSlotSequencePreviewDto?>(component, "_preview"));
+    }
+
+    [Fact]
+    public async Task Apply_posts_preview_token_then_refreshes_the_saved_context()
+    {
+        var handler = new SequenceHandler(
+            JsonResponse(HttpStatusCode.OK, """
+                {
+                  "noChanges": false,
+                  "affectedCourseCount": 5,
+                  "previousRevision": "revision-1",
+                  "currentRevision": "revision-2"
+                }
+                """),
+            EditorContextResponse("10:00"));
+        var component = CreateReadyComponent(handler);
+        SetField(component, "_rows", new List<TimeSlotDto> { Row(1, "09:00", "09:50") });
+        SetField(component, "_preview", new TimeSlotSequencePreviewDto
+        {
+            TargetMode = TimeSlotEditorTargetMode.AllCourses,
+            AffectedCourseCount = 5,
+            CurrentRevision = "revision-1",
+            PreviewToken = "preview-1"
+        });
+
+        await InvokeAsync(component, "ApplyPreviewAsync");
+
+        Assert.Equal(2, handler.Requests.Count);
+        var apply = handler.Requests[0];
+        Assert.EndsWith("/api/admin/config/slots/editor/apply", apply.RequestUri!.AbsolutePath, StringComparison.Ordinal);
+        var payload = await apply.Content!.ReadAsStringAsync();
+        Assert.Contains("\"previewToken\":\"preview-1\"", payload, StringComparison.Ordinal);
+        Assert.Contains("\"currentRevision\":\"revision-1\"", payload, StringComparison.Ordinal);
+        Assert.Contains("\"applySlots\":true", payload, StringComparison.Ordinal);
+        Assert.Equal(HttpMethod.Get, handler.Requests[1].Method);
+        Assert.Equal("10:00", Assert.Single(GetField<List<TimeSlotDto>>(component, "_rows")).Start);
+        Assert.Contains("Оновлено курсів: 5", GetField<string>(component, "_ok"), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Delayed_apply_cannot_reload_or_mark_a_new_day_draft_as_saved()
+    {
+        var handler = new DelayedMutationHandler();
+        var component = CreateReadyComponent(handler);
+        SetField(component, "_rows", new List<TimeSlotDto> { Row(1, "09:00", "09:50") });
+        SetField(component, "_preview", new TimeSlotSequencePreviewDto
+        {
+            TargetMode = TimeSlotEditorTargetMode.AllCourses,
+            AffectedCourseCount = 5,
+            CurrentRevision = "revision-1",
+            PreviewToken = "preview-1"
+        });
+
+        var applyTask = InvokeTask(component, "ApplyPreviewAsync");
+        await handler.Started.WaitAsync(TimeSpan.FromSeconds(5));
+        SetField<int?>(component, "_dayOfWeek", 2);
+        SetField(component, "_contextLoadVersion", 1);
+        SetField(component, "_rows", new List<TimeSlotDto> { Row(1, "12:00", "12:45") });
+        handler.Complete(JsonResponse(HttpStatusCode.OK, """
+            {
+              "noChanges": false,
+              "affectedCourseCount": 5,
+              "previousRevision": "revision-1",
+              "currentRevision": "revision-2"
+            }
+            """));
+
+        await applyTask;
+
+        Assert.Single(handler.Requests);
+        Assert.Equal("12:00", Assert.Single(GetField<List<TimeSlotDto>>(component, "_rows")).Start);
+        Assert.Null(GetField<string?>(component, "_ok"));
+        Assert.False(GetField<bool>(component, "_applying"));
+    }
+
+    [Fact]
+    public async Task Stale_context_response_cannot_replace_new_day_or_unlock_its_load()
+    {
+        var handler = new DelayedContextHandler();
         var component = CreateComponent(handler);
 
         var firstLoad = InvokeTask(component, "LoadRaw");
-        await handler.FirstRawStarted.WaitAsync(TimeSpan.FromSeconds(5));
-
-        Assert.True(GetField<bool>(component, "_slotsLoading"));
-        Assert.False(GetField<bool>(component, "_slotsLoadSucceeded"));
-        Assert.True(GetProperty<bool>(component, "AreContextControlsDisabled"));
-        Assert.False(GetProperty<bool>(component, "CanMutateSlotEditor"));
-        InvokeVoid(component, "AddRow");
-        Assert.Empty(GetField<List<TimeSlotDto>>(component, "_rows"));
-
+        await handler.FirstStarted.WaitAsync(TimeSpan.FromSeconds(5));
         SetField<int?>(component, "_dayOfWeek", 2);
         var secondLoad = InvokeTask(component, "LoadRaw");
-        await handler.SecondRawStarted.WaitAsync(TimeSpan.FromSeconds(5));
+        await handler.SecondStarted.WaitAsync(TimeSpan.FromSeconds(5));
 
-        handler.CompleteFirstRaw(RawSlotsResponse(1));
+        handler.CompleteFirst(EditorContextResponse("09:00"));
         await firstLoad;
 
         Assert.True(GetField<bool>(component, "_slotsLoading"));
         Assert.False(GetField<bool>(component, "_slotsLoadSucceeded"));
-        Assert.True(GetProperty<bool>(component, "AreContextControlsDisabled"));
 
-        handler.CompleteSecondRaw(RawSlotsResponse(2));
+        handler.CompleteSecond(EditorContextResponse("10:00", dayOfWeek: 2));
         await secondLoad;
 
         Assert.False(GetField<bool>(component, "_slotsLoading"));
         Assert.True(GetField<bool>(component, "_slotsLoadSucceeded"));
-        Assert.True(GetProperty<bool>(component, "CanMutateSlotEditor"));
-        Assert.False(GetProperty<bool>(component, "AreContextControlsDisabled"));
-        Assert.Equal(2, Assert.Single(GetField<List<TimeSlotDto>>(component, "_rows")).SortOrder);
+        Assert.Equal("10:00", Assert.Single(GetField<List<TimeSlotDto>>(component, "_rows")).Start);
+    }
+
+    private static object CreateReadyComponent(HttpMessageHandler? handler = null)
+    {
+        var component = CreateComponent(handler ?? new SequenceHandler());
+        SetField(component, "_metaLoadSucceeded", true);
+        SetField(component, "_slotsLoadSucceeded", true);
+        SetField(component, "_currentRevision", "revision-1");
+        SetField(component, "_rows", new List<TimeSlotDto>());
+        SetField(component, "_loadedRowsSnapshot", new List<TimeSlotDto>());
+        SetField(component, "_context", new TimeSlotEditorContextDto
+        {
+            TargetMode = TimeSlotEditorTargetMode.AllCourses,
+            CurrentRevision = "revision-1"
+        });
+        return component;
+    }
+
+    private static object CreateInheritedLunchComponent()
+    {
+        var component = CreateReadyComponent();
+        SetField(component, "_targetMode", TimeSlotEditorTargetMode.Course);
+        SetField<int?>(component, "_courseId", 4);
+        SetField(component, "_context", new TimeSlotEditorContextDto
+        {
+            TargetMode = TimeSlotEditorTargetMode.Course,
+            CourseId = 4,
+            ExplicitLunch = null,
+            EffectiveLunch = new LunchConfigEditDto(7, null, "12:00", "12:45"),
+            CurrentRevision = "revision-1"
+        });
+        var inherited = Row(1, "12:00", "12:45");
+        inherited.IsLunch = true;
+        var alternative = Row(2, "13:00", "13:45");
+        SetField(component, "_rows", new List<TimeSlotDto> { inherited, alternative });
+        var inheritedSnapshot = Row(1, "12:00", "12:45");
+        inheritedSnapshot.IsLunch = true;
+        SetField(component, "_loadedRowsSnapshot", new List<TimeSlotDto>
+        {
+            inheritedSnapshot,
+            Row(2, "13:00", "13:45")
+        });
+        return component;
     }
 
     private static object CreateComponent(HttpMessageHandler handler)
@@ -580,22 +955,21 @@ public sealed class AdminTimeSlotsReliabilityTests
         var component = Activator.CreateInstance(componentType)!;
         var client = new HttpClient(handler) { BaseAddress = new Uri("https://schedule.test/") };
         componentType.GetProperty("Api", InstanceMembers)!.SetValue(component, new TimeSlotsApi(client));
-        componentType.GetProperty("AdminApi", InstanceMembers)!.SetValue(component, new AdminApi(client));
         SetField(component, "_metaLoadSucceeded", true);
         return component;
     }
 
     private static async Task InvokeAsync(object component, string methodName, params object?[] arguments)
-    {
-        await InvokeTask(component, methodName, arguments);
-    }
+        => await InvokeTask(component, methodName, arguments);
 
     private static Task InvokeTask(object component, string methodName, params object?[] arguments)
-        => Assert.IsAssignableFrom<Task>(
-            component.GetType().GetMethod(methodName, InstanceMembers)!.Invoke(component, arguments));
+        => Assert.IsAssignableFrom<Task>(component.GetType().GetMethod(methodName, InstanceMembers)!.Invoke(component, arguments));
 
-    private static T Invoke<T>(object component, string methodName)
-        => Assert.IsType<T>(component.GetType().GetMethod(methodName, InstanceMembers)!.Invoke(component, null));
+    private static T Invoke<T>(object component, string methodName, params object?[] arguments)
+    {
+        var result = component.GetType().GetMethod(methodName, InstanceMembers)!.Invoke(component, arguments);
+        return result is null ? default! : Assert.IsType<T>(result);
+    }
 
     private static void InvokeVoid(object component, string methodName, params object?[] arguments)
         => component.GetType().GetMethod(methodName, InstanceMembers)!.Invoke(component, arguments);
@@ -606,212 +980,113 @@ public sealed class AdminTimeSlotsReliabilityTests
     private static void SetField<T>(object component, string fieldName, T value)
         => component.GetType().GetField(fieldName, InstanceMembers)!.SetValue(component, value);
 
-    private static void SetEnumField(object component, string fieldName, string value)
-    {
-        var field = component.GetType().GetField(fieldName, InstanceMembers)!;
-        field.SetValue(component, Enum.Parse(field.FieldType, value));
-    }
-
     private static T GetProperty<T>(object component, string propertyName)
         => (T)component.GetType().GetProperty(propertyName, InstanceMembers)!.GetValue(component)!;
+
+    private static TimeSlotDto Row(int order, string start, string end)
+        => new()
+        {
+            SortOrder = order,
+            Start = start,
+            End = end,
+            IsActive = true
+        };
+
+    private static void AssertRow(TimeSlotDto row, int order, string start, string end)
+    {
+        Assert.Equal(order, row.SortOrder);
+        Assert.Equal(start, row.Start);
+        Assert.Equal(end, row.End);
+        Assert.True(row.IsActive);
+    }
+
+    private static HttpResponseMessage EditorContextResponse(
+        string start,
+        int? dayOfWeek = null,
+        int preferredLimit = 0)
+        => JsonResponse(HttpStatusCode.OK, $$"""
+            {
+              "targetMode": "AllCourses",
+              "courseId": null,
+              "dayOfWeek": {{(dayOfWeek is null ? "null" : dayOfWeek.Value)}},
+              "courses": [{ "id": 1, "name": "Курс 1" }],
+              "explicitSlots": [{
+                "id": 1,
+                "courseId": null,
+                "dayOfWeek": {{(dayOfWeek is null ? "null" : dayOfWeek.Value)}},
+                "sortOrder": 1,
+                "start": "{{start}}",
+                "end": "{{TimeOnly.Parse(start).AddMinutes(45):HH:mm}}",
+                "isActive": true,
+                "isLunch": false
+              }],
+              "globalSlots": [],
+              "effectiveSlots": [],
+              "isInherited": false,
+              "preferredFirstMaxSlotOrder": {{preferredLimit}},
+              "courseOverrideCount": 0,
+              "currentRevision": "revision-1"
+            }
+            """);
 
     private static HttpResponseMessage JsonResponse(
         HttpStatusCode statusCode,
         string payload,
         string mediaType = "application/json")
-        => new(statusCode)
-        {
-            Content = new StringContent(payload, Encoding.UTF8, mediaType)
-        };
+        => new(statusCode) { Content = new StringContent(payload, Encoding.UTF8, mediaType) };
 
-    private static HttpResponseMessage RawSlotsResponse(int sortOrder)
-        => JsonResponse(HttpStatusCode.OK, $$"""
-            {
-              "course": [],
-              "global": [
-                {
-                  "id": {{sortOrder}},
-                  "courseId": null,
-                  "dayOfWeek": null,
-                  "sortOrder": {{sortOrder}},
-                  "start": "09:00",
-                  "end": "09:45",
-                  "isActive": true,
-                  "isLunch": false
-                }
-              ]
-            }
-            """);
-
-    private static List<TimeSlotDto> Rows(int sortOrder)
-        =>
-        [
-            new TimeSlotDto
-            {
-                Id = sortOrder,
-                CourseId = null,
-                DayOfWeek = null,
-                SortOrder = sortOrder,
-                Start = "09:00",
-                End = "09:45",
-                IsActive = true,
-                IsLunch = false
-            }
-        ];
-
-    private sealed class SequenceResponseHandler(params Func<HttpResponseMessage>[] responses) : HttpMessageHandler
+    private sealed class SequenceHandler(params HttpResponseMessage[] responses) : HttpMessageHandler
     {
-        private readonly Queue<Func<HttpResponseMessage>> _responses = new(responses);
+        private readonly Queue<HttpResponseMessage> _responses = new(responses);
+        public List<HttpRequestMessage> Requests { get; } = [];
 
-        protected override Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request,
-            CancellationToken cancellationToken)
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
+            Requests.Add(request);
             Assert.NotEmpty(_responses);
-            return Task.FromResult(_responses.Dequeue()());
+            return Task.FromResult(_responses.Dequeue());
         }
     }
 
-    private sealed class DelayedMutationHandler(bool returnEmptyTemplateForGet = false) : HttpMessageHandler
+    private sealed class DelayedContextHandler : HttpMessageHandler
     {
-        private readonly TaskCompletionSource<HttpRequestMessage> _mutationStarted =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
-        private readonly TaskCompletionSource<HttpResponseMessage> _mutationResponse =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<bool> _firstStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<bool> _secondStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<HttpResponseMessage> _firstResponse = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<HttpResponseMessage> _secondResponse = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _requestCount;
 
-        public Task<HttpRequestMessage> MutationStarted => _mutationStarted.Task;
-        public int RequestCount { get; private set; }
+        public Task FirstStarted => _firstStarted.Task;
+        public Task SecondStarted => _secondStarted.Task;
+        public void CompleteFirst(HttpResponseMessage response) => _firstResponse.TrySetResult(response);
+        public void CompleteSecond(HttpResponseMessage response) => _secondResponse.TrySetResult(response);
 
-        public void CompleteMutation(HttpResponseMessage response)
-            => _mutationResponse.TrySetResult(response);
-
-        protected override async Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request,
-            CancellationToken cancellationToken)
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            RequestCount++;
-            if (returnEmptyTemplateForGet && request.Method == HttpMethod.Get)
+            var requestNumber = Interlocked.Increment(ref _requestCount);
+            if (requestNumber == 1)
             {
-                return JsonResponse(HttpStatusCode.OK, """
-                    { "course": [], "global": [] }
-                    """);
+                _firstStarted.TrySetResult(true);
+                return _firstResponse.Task.WaitAsync(cancellationToken);
             }
-
-            _mutationStarted.TrySetResult(request);
-            return await _mutationResponse.Task.WaitAsync(cancellationToken);
+            _secondStarted.TrySetResult(true);
+            return _secondResponse.Task.WaitAsync(cancellationToken);
         }
     }
 
-    private sealed class SlotsLoadRetryHandler : HttpMessageHandler
+    private sealed class DelayedMutationHandler : HttpMessageHandler
     {
-        private int _rawGetCount;
+        private readonly TaskCompletionSource<bool> _started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<HttpResponseMessage> _response = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task Started => _started.Task;
+        public List<HttpRequestMessage> Requests { get; } = [];
+        public void Complete(HttpResponseMessage response) => _response.TrySetResult(response);
 
-        public int PostCount { get; private set; }
-
-        protected override Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request,
-            CancellationToken cancellationToken)
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            var path = request.RequestUri!.AbsolutePath;
-            if (request.Method != HttpMethod.Get)
-            {
-                PostCount++;
-                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
-            }
-            if (path.EndsWith("/api/meta", StringComparison.Ordinal))
-            {
-                return Task.FromResult(JsonResponse(HttpStatusCode.OK, """
-                    {
-                      "courses": [], "groups": [], "teachers": [], "rooms": [],
-                      "buildings": [], "lessonTypes": [], "lunches": []
-                    }
-                    """));
-            }
-            if (path.EndsWith("/slots/raw", StringComparison.Ordinal))
-            {
-                var requestNumber = Interlocked.Increment(ref _rawGetCount);
-                return Task.FromResult(requestNumber == 1
-                    ? JsonResponse(HttpStatusCode.ServiceUnavailable, """
-                        { "detail": "Слоти тимчасово недоступні." }
-                        """, "application/problem+json")
-                    : RawSlotsResponse(2));
-            }
-            if (path.EndsWith("/config/lunch", StringComparison.Ordinal))
-            {
-                return Task.FromResult(JsonResponse(HttpStatusCode.OK, "[]"));
-            }
-            if (path.EndsWith("/preferred-first-slot-limit", StringComparison.Ordinal))
-            {
-                return Task.FromResult(JsonResponse(HttpStatusCode.OK, """
-                    { "id": 1, "courseId": null, "maxSlotOrder": 4 }
-                    """));
-            }
-            throw new InvalidOperationException($"Неочікуваний запит: {request.Method} {path}");
-        }
-    }
-
-    private sealed class MetadataFailureHandler : HttpMessageHandler
-    {
-        protected override Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request,
-            CancellationToken cancellationToken)
-            => Task.FromResult(JsonResponse(HttpStatusCode.ServiceUnavailable, """
-                { "detail": "Довідник тимчасово недоступний." }
-                """, "application/problem+json"));
-    }
-
-    private sealed class DelayedContextLoadHandler : HttpMessageHandler
-    {
-        private readonly TaskCompletionSource<bool> _firstRawStarted =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
-        private readonly TaskCompletionSource<bool> _secondRawStarted =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
-        private readonly TaskCompletionSource<HttpResponseMessage> _firstRawResponse =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
-        private readonly TaskCompletionSource<HttpResponseMessage> _secondRawResponse =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
-        private int _rawGetCount;
-
-        public Task FirstRawStarted => _firstRawStarted.Task;
-        public Task SecondRawStarted => _secondRawStarted.Task;
-
-        public void CompleteFirstRaw(HttpResponseMessage response)
-            => _firstRawResponse.TrySetResult(response);
-
-        public void CompleteSecondRaw(HttpResponseMessage response)
-            => _secondRawResponse.TrySetResult(response);
-
-        protected override async Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request,
-            CancellationToken cancellationToken)
-        {
-            var path = request.RequestUri!.AbsolutePath;
-            if (path.EndsWith("/slots/raw", StringComparison.Ordinal))
-            {
-                var requestNumber = Interlocked.Increment(ref _rawGetCount);
-                if (requestNumber == 1)
-                {
-                    _firstRawStarted.TrySetResult(true);
-                    return await _firstRawResponse.Task.WaitAsync(cancellationToken);
-                }
-                if (requestNumber == 2)
-                {
-                    _secondRawStarted.TrySetResult(true);
-                    return await _secondRawResponse.Task.WaitAsync(cancellationToken);
-                }
-                return RawSlotsResponse(3);
-            }
-            if (path.EndsWith("/config/lunch", StringComparison.Ordinal))
-            {
-                return JsonResponse(HttpStatusCode.OK, "[]");
-            }
-            if (path.EndsWith("/preferred-first-slot-limit", StringComparison.Ordinal))
-            {
-                return JsonResponse(HttpStatusCode.OK, """
-                    { "id": 1, "courseId": null, "maxSlotOrder": 4 }
-                    """);
-            }
-            throw new InvalidOperationException($"Неочікуваний запит: {request.Method} {path}");
+            Requests.Add(request);
+            _started.TrySetResult(true);
+            return _response.Task.WaitAsync(cancellationToken);
         }
     }
 }

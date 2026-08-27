@@ -18,6 +18,7 @@ public sealed class ApiErrorException : Exception
         IReadOnlyList<string>? errors = null,
         IReadOnlyList<string>? warnings = null,
         string? traceId = null,
+        string? code = null,
         Exception? innerException = null)
         : base(string.IsNullOrWhiteSpace(message) ? $"{(int)statusCode} {statusCode}" : message, innerException)
     {
@@ -25,11 +26,13 @@ public sealed class ApiErrorException : Exception
         Errors = errors ?? Array.Empty<string>();
         Warnings = warnings ?? Array.Empty<string>();
         TraceId = traceId;
+        Code = code;
     }
     public HttpStatusCode StatusCode { get; }
     public IReadOnlyList<string> Errors { get; }
     public IReadOnlyList<string> Warnings { get; }
     public string? TraceId { get; }
+    public string? Code { get; }
 }
 
 public static class HttpResponseMessageExtensions
@@ -67,20 +70,21 @@ public static class HttpResponseMessageExtensions
             {
             }
         }
-        var (message, errors, warnings, traceId) = ParseErrorPayload(payload);
+        var (message, errors, warnings, traceId, code) = ParseErrorPayload(payload);
         throw new ApiErrorException(
             response.StatusCode,
             message ?? BuildFallbackMessage(response.StatusCode, response.ReasonPhrase),
             errors,
             warnings,
-            traceId);
+            traceId,
+            code);
     }
     // Розбирає JSON-помилку в узгоджений формат повідомлення.
-    private static (string? Message, IReadOnlyList<string>? Errors, IReadOnlyList<string>? Warnings, string? TraceId) ParseErrorPayload(string? payload)
+    private static (string? Message, IReadOnlyList<string>? Errors, IReadOnlyList<string>? Warnings, string? TraceId, string? Code) ParseErrorPayload(string? payload)
     {
         if (string.IsNullOrWhiteSpace(payload))
         {
-            return (null, null, null, null);
+            return (null, null, null, null, null);
         }
         try
         {
@@ -92,11 +96,12 @@ public static class HttpResponseMessageExtensions
             var errors = TryGetProperty(root, "errors", out var errorsElement) ? ExtractStrings(errorsElement) : null;
             var warnings = TryGetProperty(root, "warnings", out var warningsElement) ? ExtractStrings(warningsElement) : null;
             var traceId = TryGetString(root, "traceId");
-            return (message ?? payload, errors, warnings, traceId);
+            var code = TryGetString(root, "code");
+            return (message ?? payload, errors, warnings, traceId, code);
         }
         catch (JsonException)
         {
-            return (payload, null, null, null);
+            return (payload, null, null, null, null);
         }
     }
     // Безпечно читає рядкове поле з JSON.

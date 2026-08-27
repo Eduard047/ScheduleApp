@@ -8,6 +8,45 @@ public class TimeSlotsApi
 {
     private readonly HttpClient _http;
     public TimeSlotsApi(HttpClient http) => _http = http;
+
+    // Завантажує весь стан графіка одним запитом, щоб редактор не складав його з кількох відповідей.
+    public async Task<TimeSlotEditorContextDto> GetEditorContextAsync(
+        TimeSlotEditorTargetMode targetMode,
+        int? courseId = null,
+        int? dayOfWeek = null)
+    {
+        var query = new List<string> { $"targetMode={targetMode}" };
+        if (courseId is not null) query.Add($"courseId={courseId}");
+        if (dayOfWeek is not null) query.Add($"dayOfWeek={dayOfWeek}");
+        var url = $"api/admin/config/slots/editor-context?{string.Join("&", query)}";
+        return await _http.GetFromJsonWithDetailsAsync<TimeSlotEditorContextDto>(url)
+               ?? new TimeSlotEditorContextDto
+               {
+                   TargetMode = targetMode,
+                   CourseId = courseId,
+                   DayOfWeek = dayOfWeek
+               };
+    }
+
+    // Перевіряє майбутню зміну без запису та повертає точний вплив на розклад.
+    public async Task<TimeSlotSequencePreviewDto> PreviewEditorAsync(
+        TimeSlotSequenceApplyRequestDto payload)
+    {
+        using var response = await _http.PostAsJsonAsync("api/admin/config/slots/editor/preview", payload);
+        await response.EnsureSuccessWithDetailsAsync();
+        return await response.Content.ReadFromJsonAsync<TimeSlotSequencePreviewDto>()
+               ?? throw new InvalidOperationException("Сервер не повернув результат перевірки графіка.");
+    }
+
+    // Застосовує саме той варіант, який користувач щойно перевірив.
+    public async Task<TimeSlotSequenceApplyResultDto> ApplyEditorAsync(
+        TimeSlotSequenceApplyRequestDto payload)
+    {
+        using var response = await _http.PostAsJsonAsync("api/admin/config/slots/editor/apply", payload);
+        await response.EnsureSuccessWithDetailsAsync();
+        return await response.Content.ReadFromJsonAsync<TimeSlotSequenceApplyResultDto>()
+               ?? throw new InvalidOperationException("Сервер не повернув результат застосування графіка.");
+    }
     // Відповідь ефективних слотів.
     private sealed record EffectiveSlotsResponse(int? courseId, bool usingCourseSpecific, List<TimeSlotDto> slots);
     // Відповідь сирих слотів.

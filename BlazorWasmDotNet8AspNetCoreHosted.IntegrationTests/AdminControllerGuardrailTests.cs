@@ -1,6 +1,7 @@
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Admin;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TimeSlotEditor;
 using System.Data;
 using System.Data.Common;
 using System.Text.Json;
@@ -2565,6 +2566,1089 @@ public sealed class AdminControllerGuardrailTests
         Assert.False(await fixture.Db.CalendarExceptions.AnyAsync(item => item.Id == courseException.Id));
         Assert.True(await fixture.Db.CalendarExceptions.AnyAsync(item => item.Id == groupException.Id));
     }
+
+    [Fact]
+    public void Time_slot_sequence_rules_validate_inactive_rows_and_derive_order_from_position()
+    {
+        var invalid = TimeSlotSequenceRules.Validate(
+            [
+                EditorSlot("09:00", "10:00", isActive: false, sortOrder: 99),
+                EditorSlot("09:30", "10:30", isActive: false, sortOrder: 5)
+            ],
+            dayOfWeek: null);
+
+        Assert.False(invalid.IsValid);
+        Assert.Contains(invalid.Errors, error => error.Contains("перетинаються", StringComparison.Ordinal));
+        Assert.Equal([1, 2], invalid.Slots.Select(slot => slot.SortOrder).ToArray());
+    }
+
+    [Fact]
+    public void Time_slot_sequence_rules_reject_null_rows_without_throwing()
+    {
+        var result = TimeSlotSequenceRules.Validate([null!], dayOfWeek: null);
+
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Errors, error => error.Contains("не може бути порожнім", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Time_slot_editor_request_defaults_and_lunch_mode_use_explicit_json_contract()
+    {
+        var request = new TimeSlotSequenceApplyRequestDto();
+
+        Assert.True(request.ApplySlots);
+        Assert.Equal(TimeSlotLunchMutationMode.Unchanged, request.LunchMutation);
+        Assert.Equal(
+            "\"Remove\"",
+            JsonSerializer.Serialize(TimeSlotLunchMutationMode.Remove));
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_course_day_materializes_global_week_before_override()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс без власного графіка", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        fixture.Db.TimeSlots.AddRange(
+            EntitySlot(null, null, "09:00", "10:00"),
+            EntitySlot(null, DayOfWeek.Tuesday, "11:00", "12:00"));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            (int)DayOfWeek.Monday));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            (int)DayOfWeek.Monday,
+            context.CurrentRevision,
+            [EditorSlot("10:00", "11:00")]);
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+        Assert.Equal(1, preview.MaterializedCourseCount);
+        request.PreviewToken = preview.PreviewToken;
+
+        var applied = AssertSuccess(await service.ApplyAsync(request));
+
+        Assert.False(applied.NoChanges);
+        fixture.Db.ChangeTracker.Clear();
+        var courseSlots = await fixture.Db.TimeSlots
+            .AsNoTracking()
+            .Where(slot => slot.CourseId == course.Id)
+            .ToListAsync();
+        Assert.Equal(3, courseSlots.Count);
+        Assert.Equal(new TimeOnly(10, 0), Assert.Single(courseSlots, slot => slot.DayOfWeek == DayOfWeek.Monday).Start);
+        Assert.Equal(new TimeOnly(11, 0), Assert.Single(courseSlots, slot => slot.DayOfWeek == DayOfWeek.Tuesday).Start);
+        Assert.Equal(new TimeOnly(9, 0), Assert.Single(courseSlots, slot => slot.DayOfWeek == null).Start);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_all_courses_preserves_existing_tuesday_override_when_applying_monday()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var overridden = new Course { Name = "Курс із вівторком", DurationWeeks = 12 };
+        var inherited = new Course { Name = "Курс зі спільним графіком", DurationWeeks = 12 };
+        fixture.Db.Courses.AddRange(overridden, inherited);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.TimeSlots.AddRange(
+            EntitySlot(null, null, "09:00", "10:00"),
+            EntitySlot(null, DayOfWeek.Tuesday, "11:00", "12:00"),
+            EntitySlot(overridden.Id, DayOfWeek.Tuesday, "13:00", "14:00"));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            (int)DayOfWeek.Monday));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            (int)DayOfWeek.Monday,
+            context.CurrentRevision,
+            [EditorSlot("10:00", "11:00")]);
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+        Assert.Equal(2, preview.AffectedCourseCount);
+        Assert.Equal(0, preview.CourseOverridesToReplace);
+        Assert.Equal(0, preview.MaterializedCourseCount);
+        request.PreviewToken = preview.PreviewToken;
+
+        AssertSuccess(await service.ApplyAsync(request));
+
+        fixture.Db.ChangeTracker.Clear();
+        var stored = await fixture.Db.TimeSlots.AsNoTracking().ToListAsync();
+        Assert.Equal(5, stored.Count);
+        var overriddenMonday = TimeSlotsResolver.ResolveForDay(
+            stored,
+            overridden.Id,
+            DayOfWeek.Monday,
+            activeOnly: false);
+        var overriddenTuesday = TimeSlotsResolver.ResolveForDay(
+            stored,
+            overridden.Id,
+            DayOfWeek.Tuesday,
+            activeOnly: false);
+        var inheritedMonday = TimeSlotsResolver.ResolveForDay(
+            stored,
+            inherited.Id,
+            DayOfWeek.Monday,
+            activeOnly: false);
+        var inheritedTuesday = TimeSlotsResolver.ResolveForDay(
+            stored,
+            inherited.Id,
+            DayOfWeek.Tuesday,
+            activeOnly: false);
+        Assert.Equal(new TimeOnly(10, 0), Assert.Single(overriddenMonday.Slots).Start);
+        Assert.Equal(new TimeOnly(13, 0), Assert.Single(overriddenTuesday.Slots).Start);
+        Assert.Equal(new TimeOnly(10, 0), Assert.Single(inheritedMonday.Slots).Start);
+        Assert.Equal(new TimeOnly(11, 0), Assert.Single(inheritedTuesday.Slots).Start);
+        Assert.DoesNotContain(stored, slot => slot.CourseId == inherited.Id);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_clear_missing_course_override_is_noop_without_materialization()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс-спадкоємець", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        fixture.Db.TimeSlots.Add(EntitySlot(null, null, "09:00", "10:00"));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            (int)DayOfWeek.Monday));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            (int)DayOfWeek.Monday,
+            context.CurrentRevision,
+            []);
+        request.Clear = true;
+
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+        Assert.True(preview.NoChanges);
+        Assert.Equal(0, preview.MaterializedCourseCount);
+        request.PreviewToken = preview.PreviewToken;
+        var applied = AssertSuccess(await service.ApplyAsync(request));
+
+        Assert.True(applied.NoChanges);
+        Assert.False(await fixture.Db.TimeSlots.AnyAsync(slot => slot.CourseId == course.Id));
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_rejects_day_scoped_reset_to_global()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс скидання", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        await fixture.Db.SaveChangesAsync();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            (int)DayOfWeek.Monday));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            (int)DayOfWeek.Monday,
+            context.CurrentRevision,
+            []);
+        request.ResetCourseToGlobal = true;
+        request.ApplySlots = false;
+
+        var outcome = await service.PreviewAsync(request);
+
+        Assert.False(outcome.IsSuccess);
+        Assert.Equal(TimeSlotEditorFailureKind.Validation, outcome.Failure!.Kind);
+        Assert.Contains("Усі дні", outcome.Failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_rejects_true_stale_preview_when_current_plan_would_change_state()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс конкурентності", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        fixture.Db.TimeSlots.Add(EntitySlot(null, null, "09:00", "10:00"));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            null));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            null,
+            context.CurrentRevision,
+            [EditorSlot("09:00", "10:00")]);
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+        request.PreviewToken = preview.PreviewToken;
+        await fixture.Db.TimeSlots
+            .Where(slot => slot.CourseId == null && slot.DayOfWeek == null)
+            .ExecuteDeleteAsync();
+        fixture.Db.TimeSlots.Add(EntitySlot(null, null, "11:00", "12:00"));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+
+        var outcome = await service.ApplyAsync(request);
+
+        Assert.False(outcome.IsSuccess);
+        Assert.Equal(TimeSlotEditorFailureKind.Stale, outcome.Failure!.Kind);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_revision_detects_second_precision_changes()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс секундної точності", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        fixture.Db.TimeSlots.Add(new TimeSlot
+        {
+            CourseId = null,
+            DayOfWeek = null,
+            Start = new TimeOnly(9, 0, 30),
+            End = new TimeOnly(10, 0, 30),
+            SortOrder = 1,
+            IsActive = true
+        });
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            null));
+        var normalizationRequest = EditorRequest(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            null,
+            context.CurrentRevision,
+            [EditorSlot("09:00", "10:00")]);
+        var normalizationPreview = AssertSuccess(await service.PreviewAsync(normalizationRequest));
+        Assert.False(normalizationPreview.NoChanges);
+
+        var staleRequest = EditorRequest(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            null,
+            context.CurrentRevision,
+            [EditorSlot("11:00", "12:00")]);
+        var stalePreview = AssertSuccess(await service.PreviewAsync(staleRequest));
+        staleRequest.PreviewToken = stalePreview.PreviewToken;
+        var stored = await fixture.Db.TimeSlots.SingleAsync();
+        stored.Start = new TimeOnly(9, 0, 45);
+        stored.End = new TimeOnly(10, 0, 45);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+
+        var outcome = await service.ApplyAsync(staleRequest);
+
+        Assert.False(outcome.IsSuccess);
+        Assert.Equal(TimeSlotEditorFailureKind.Stale, outcome.Failure!.Kind);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_preferred_first_change_does_not_stale_slot_revision()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс незалежного ліміту", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        fixture.Db.TimeSlots.Add(EntitySlot(null, null, "09:00", "10:00"));
+        fixture.Db.PreferredFirstSlotLimitConfigs.Add(new PreferredFirstSlotLimitConfig
+        {
+            CourseId = null,
+            MaxSlotOrder = 3
+        });
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null,
+            context.CurrentRevision,
+            [EditorSlot("10:00", "11:00")]);
+        var preferred = await fixture.Db.PreferredFirstSlotLimitConfigs.SingleAsync();
+        preferred.MaxSlotOrder = 4;
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+
+        var preview = await service.PreviewAsync(request);
+
+        Assert.True(preview.IsSuccess, preview.Failure?.Message);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_all_courses_replaces_course_lunch_overrides_with_one_global_lunch()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var firstCourse = new Course { Name = "Курс із власним обідом", DurationWeeks = 12 };
+        var secondCourse = new Course { Name = "Курс зі спільним обідом", DurationWeeks = 12 };
+        fixture.Db.Courses.AddRange(firstCourse, secondCourse);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.TimeSlots.AddRange(
+            EntitySlot(null, null, "09:00", "10:00", sortOrder: 1),
+            EntitySlot(null, null, "11:00", "12:00", sortOrder: 2));
+        fixture.Db.LunchConfigs.AddRange(
+            new LunchConfig
+            {
+                CourseId = null,
+                Start = new TimeOnly(11, 0),
+                End = new TimeOnly(12, 0)
+            },
+            new LunchConfig
+            {
+                CourseId = firstCourse.Id,
+                Start = new TimeOnly(10, 0),
+                End = new TimeOnly(11, 0)
+            });
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            null));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            null,
+            context.CurrentRevision,
+            [
+                EditorSlot("09:00", "10:00", sortOrder: 1),
+                EditorSlot("12:00", "13:00", isLunch: true, sortOrder: 2)
+            ]);
+        request.LunchMutation = TimeSlotLunchMutationMode.Set;
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+        Assert.Equal(0, preview.MaterializedCourseCount);
+        request.PreviewToken = preview.PreviewToken;
+
+        AssertSuccess(await service.ApplyAsync(request));
+
+        fixture.Db.ChangeTracker.Clear();
+        var lunch = Assert.Single(await fixture.Db.LunchConfigs.AsNoTracking().ToListAsync());
+        Assert.Null(lunch.CourseId);
+        Assert.Equal(new TimeOnly(12, 0), lunch.Start);
+        Assert.Equal(new TimeOnly(13, 0), lunch.End);
+        var storedSlots = await fixture.Db.TimeSlots.AsNoTracking().ToListAsync();
+        var storedLunches = await fixture.Db.LunchConfigs.AsNoTracking().ToListAsync();
+        var resolved = TimeSlotsResolver.ResolveForDay(
+            storedSlots,
+            firstCourse.Id,
+            DayOfWeek.Monday,
+            storedLunches,
+            activeOnly: false);
+        Assert.Equal(new TimeOnly(9, 0), Assert.Single(resolved.Slots).Start);
+        Assert.DoesNotContain(storedSlots, slot => slot.CourseId == firstCourse.Id);
+        Assert.DoesNotContain(storedSlots, slot => slot.CourseId == secondCourse.Id);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_course_slots_preserve_unmatched_explicit_lunch_when_unchanged()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс зі збереженим обідом", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.TimeSlots.Add(EntitySlot(null, null, "09:00", "10:00"));
+        fixture.Db.LunchConfigs.Add(new LunchConfig
+        {
+            CourseId = course.Id,
+            Start = new TimeOnly(14, 0),
+            End = new TimeOnly(15, 0)
+        });
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null,
+            context.CurrentRevision,
+            [EditorSlot("10:00", "11:00")]);
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+        request.PreviewToken = preview.PreviewToken;
+
+        AssertSuccess(await service.ApplyAsync(request));
+
+        fixture.Db.ChangeTracker.Clear();
+        var lunch = Assert.Single(await fixture.Db.LunchConfigs.AsNoTracking().ToListAsync());
+        Assert.Equal(course.Id, lunch.CourseId);
+        Assert.Equal(new TimeOnly(14, 0), lunch.Start);
+        Assert.Equal(new TimeOnly(15, 0), lunch.End);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_course_lunch_remove_does_not_materialize_slots()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс видалення обіду", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.TimeSlots.Add(EntitySlot(null, null, "09:00", "10:00"));
+        fixture.Db.LunchConfigs.AddRange(
+            new LunchConfig
+            {
+                CourseId = null,
+                Start = new TimeOnly(12, 0),
+                End = new TimeOnly(13, 0)
+            },
+            new LunchConfig
+            {
+                CourseId = course.Id,
+                Start = new TimeOnly(13, 0),
+                End = new TimeOnly(14, 0)
+            });
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null,
+            context.CurrentRevision,
+            []);
+        request.ApplySlots = false;
+        request.LunchMutation = TimeSlotLunchMutationMode.Remove;
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+        request.PreviewToken = preview.PreviewToken;
+
+        AssertSuccess(await service.ApplyAsync(request));
+
+        fixture.Db.ChangeTracker.Clear();
+        var lunch = Assert.Single(await fixture.Db.LunchConfigs.AsNoTracking().ToListAsync());
+        Assert.Null(lunch.CourseId);
+        Assert.False(await fixture.Db.TimeSlots.AnyAsync(slot => slot.CourseId == course.Id));
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_course_lunch_set_only_does_not_materialize_slots()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс окремого обіду", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        fixture.Db.TimeSlots.Add(EntitySlot(null, null, "09:00", "10:00"));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null,
+            context.CurrentRevision,
+            []);
+        request.ApplySlots = false;
+        request.LunchMutation = TimeSlotLunchMutationMode.Set;
+        request.LunchSlot = EditorSlot("12:00", "13:00", isLunch: true);
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+        request.PreviewToken = preview.PreviewToken;
+
+        AssertSuccess(await service.ApplyAsync(request));
+
+        fixture.Db.ChangeTracker.Clear();
+        var lunch = Assert.Single(await fixture.Db.LunchConfigs.AsNoTracking().ToListAsync());
+        Assert.Equal(course.Id, lunch.CourseId);
+        Assert.Equal(new TimeOnly(12, 0), lunch.Start);
+        Assert.False(await fixture.Db.TimeSlots.AnyAsync(slot => slot.CourseId == course.Id));
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_all_courses_unchanged_lunch_preserves_global_and_course_rows()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс незмінного обіду", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.TimeSlots.Add(EntitySlot(null, null, "09:00", "10:00"));
+        fixture.Db.LunchConfigs.AddRange(
+            new LunchConfig
+            {
+                CourseId = null,
+                Start = new TimeOnly(12, 0),
+                End = new TimeOnly(13, 0)
+            },
+            new LunchConfig
+            {
+                CourseId = course.Id,
+                Start = new TimeOnly(13, 0),
+                End = new TimeOnly(14, 0)
+            });
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            null));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            null,
+            context.CurrentRevision,
+            [EditorSlot("10:00", "11:00")]);
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+        request.PreviewToken = preview.PreviewToken;
+
+        AssertSuccess(await service.ApplyAsync(request));
+
+        fixture.Db.ChangeTracker.Clear();
+        var lunches = await fixture.Db.LunchConfigs.AsNoTracking().OrderBy(row => row.CourseId).ToListAsync();
+        Assert.Equal(2, lunches.Count);
+        Assert.Contains(lunches, row => row.CourseId == null && row.Start == new TimeOnly(12, 0));
+        Assert.Contains(lunches, row => row.CourseId == course.Id && row.Start == new TimeOnly(13, 0));
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_all_courses_lunch_remove_deletes_every_lunch_without_slot_materialization()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс спільного видалення обіду", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.TimeSlots.Add(EntitySlot(null, null, "09:00", "10:00"));
+        fixture.Db.LunchConfigs.AddRange(
+            new LunchConfig
+            {
+                CourseId = null,
+                Start = new TimeOnly(12, 0),
+                End = new TimeOnly(13, 0)
+            },
+            new LunchConfig
+            {
+                CourseId = course.Id,
+                Start = new TimeOnly(13, 0),
+                End = new TimeOnly(14, 0)
+            });
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            null));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            null,
+            context.CurrentRevision,
+            []);
+        request.ApplySlots = false;
+        request.LunchMutation = TimeSlotLunchMutationMode.Remove;
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+        request.PreviewToken = preview.PreviewToken;
+
+        AssertSuccess(await service.ApplyAsync(request));
+
+        fixture.Db.ChangeTracker.Clear();
+        Assert.Empty(await fixture.Db.LunchConfigs.AsNoTracking().ToListAsync());
+        Assert.False(await fixture.Db.TimeSlots.AnyAsync(slot => slot.CourseId == course.Id));
+        Assert.Equal(new TimeOnly(9, 0), await fixture.Db.TimeSlots.Select(slot => slot.Start).SingleAsync());
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_lunch_set_collapses_duplicate_global_rows_to_one()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        fixture.Db.LunchConfigs.AddRange(
+            new LunchConfig
+            {
+                CourseId = null,
+                Start = new TimeOnly(11, 0),
+                End = new TimeOnly(12, 0)
+            },
+            new LunchConfig
+            {
+                CourseId = null,
+                Start = new TimeOnly(13, 0),
+                End = new TimeOnly(14, 0)
+            });
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            null));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            null,
+            context.CurrentRevision,
+            []);
+        request.ApplySlots = false;
+        request.LunchMutation = TimeSlotLunchMutationMode.Set;
+        request.LunchSlot = EditorSlot("12:00", "13:00", isLunch: true);
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+        request.PreviewToken = preview.PreviewToken;
+
+        AssertSuccess(await service.ApplyAsync(request));
+
+        fixture.Db.ChangeTracker.Clear();
+        var lunch = Assert.Single(await fixture.Db.LunchConfigs.AsNoTracking().ToListAsync());
+        Assert.Null(lunch.CourseId);
+        Assert.Equal(new TimeOnly(12, 0), lunch.Start);
+        Assert.Equal(new TimeOnly(13, 0), lunch.End);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_day_clear_removes_only_exact_override()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс очищення понеділка", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.TimeSlots.AddRange(
+            EntitySlot(course.Id, null, "09:00", "10:00"),
+            EntitySlot(course.Id, DayOfWeek.Monday, "10:00", "11:00"),
+            EntitySlot(course.Id, DayOfWeek.Tuesday, "11:00", "12:00"));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            (int)DayOfWeek.Monday));
+        Assert.True(context.HasDayOverride);
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            (int)DayOfWeek.Monday,
+            context.CurrentRevision,
+            []);
+        request.Clear = true;
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+        request.PreviewToken = preview.PreviewToken;
+
+        AssertSuccess(await service.ApplyAsync(request));
+
+        fixture.Db.ChangeTracker.Clear();
+        var stored = await fixture.Db.TimeSlots.AsNoTracking().ToListAsync();
+        Assert.DoesNotContain(stored, slot => slot.CourseId == course.Id && slot.DayOfWeek == DayOfWeek.Monday);
+        Assert.Contains(stored, slot => slot.CourseId == course.Id && slot.DayOfWeek == null);
+        Assert.Contains(stored, slot => slot.CourseId == course.Id && slot.DayOfWeek == DayOfWeek.Tuesday);
+        var monday = TimeSlotsResolver.ResolveForDay(stored, course.Id, DayOfWeek.Monday, activeOnly: false);
+        Assert.Equal(new TimeOnly(9, 0), Assert.Single(monday.Slots).Start);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_all_courses_day_clear_removes_only_exact_global_and_course_overrides()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс очищення спільного понеділка", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.TimeSlots.AddRange(
+            EntitySlot(null, null, "09:00", "10:00"),
+            EntitySlot(null, DayOfWeek.Monday, "10:00", "11:00"),
+            EntitySlot(null, DayOfWeek.Tuesday, "11:00", "12:00"),
+            EntitySlot(course.Id, null, "12:00", "13:00"),
+            EntitySlot(course.Id, DayOfWeek.Monday, "13:00", "14:00"),
+            EntitySlot(course.Id, DayOfWeek.Tuesday, "14:00", "15:00"));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            (int)DayOfWeek.Monday));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            (int)DayOfWeek.Monday,
+            context.CurrentRevision,
+            []);
+        request.Clear = true;
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+        Assert.Equal(1, preview.CourseOverridesToReplace);
+        request.PreviewToken = preview.PreviewToken;
+
+        AssertSuccess(await service.ApplyAsync(request));
+
+        fixture.Db.ChangeTracker.Clear();
+        var stored = await fixture.Db.TimeSlots.AsNoTracking().ToListAsync();
+        Assert.DoesNotContain(stored, slot => slot.DayOfWeek == DayOfWeek.Monday);
+        Assert.Contains(stored, slot => slot.CourseId == null && slot.DayOfWeek == null);
+        Assert.Contains(stored, slot => slot.CourseId == null && slot.DayOfWeek == DayOfWeek.Tuesday);
+        Assert.Contains(stored, slot => slot.CourseId == course.Id && slot.DayOfWeek == null);
+        Assert.Contains(stored, slot => slot.CourseId == course.Id && slot.DayOfWeek == DayOfWeek.Tuesday);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_all_courses_day_skips_redundant_course_override()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс без зайвого понеділка", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.TimeSlots.AddRange(
+            EntitySlot(null, null, "09:00", "10:00"),
+            EntitySlot(course.Id, null, "10:00", "11:00"),
+            EntitySlot(course.Id, DayOfWeek.Tuesday, "12:00", "13:00"));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            (int)DayOfWeek.Monday));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            (int)DayOfWeek.Monday,
+            context.CurrentRevision,
+            [EditorSlot("10:00", "11:00")]);
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+        request.PreviewToken = preview.PreviewToken;
+
+        AssertSuccess(await service.ApplyAsync(request));
+
+        fixture.Db.ChangeTracker.Clear();
+        Assert.False(await fixture.Db.TimeSlots.AnyAsync(slot =>
+            slot.CourseId == course.Id && slot.DayOfWeek == DayOfWeek.Monday));
+        Assert.True(await fixture.Db.TimeSlots.AnyAsync(slot =>
+            slot.CourseId == course.Id && slot.DayOfWeek == DayOfWeek.Tuesday && slot.Start == new TimeOnly(12, 0)));
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_context_reports_day_overrides_and_resolved_global_fallback()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс контексту дня", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.TimeSlots.AddRange(
+            EntitySlot(null, null, "09:00", "10:00"),
+            EntitySlot(course.Id, null, "10:00", "11:00"),
+            EntitySlot(course.Id, DayOfWeek.Tuesday, "11:00", "12:00"));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+
+        var courseMonday = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            (int)DayOfWeek.Monday));
+        var courseTuesday = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            (int)DayOfWeek.Tuesday));
+        var allMonday = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            (int)DayOfWeek.Monday));
+        var allTuesday = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            (int)DayOfWeek.Tuesday));
+
+        Assert.False(courseMonday.HasDayOverride);
+        Assert.Empty(courseMonday.ExplicitSlots);
+        Assert.Equal(new TimeOnly(10, 0), TimeOnly.Parse(Assert.Single(courseMonday.EffectiveSlots).Start));
+        Assert.Equal(new TimeOnly(9, 0), TimeOnly.Parse(Assert.Single(courseMonday.GlobalSlots).Start));
+        Assert.True(courseTuesday.HasDayOverride);
+        Assert.False(allMonday.HasDayOverride);
+        Assert.Empty(allMonday.ExplicitSlots);
+        Assert.Equal(new TimeOnly(9, 0), TimeOnly.Parse(Assert.Single(allMonday.GlobalSlots).Start));
+        Assert.True(allTuesday.HasDayOverride);
+        Assert.Empty(allTuesday.ExplicitSlots);
+        Assert.Equal(new TimeOnly(9, 0), TimeOnly.Parse(Assert.Single(allTuesday.GlobalSlots).Start));
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_rejects_nonempty_slots_when_apply_slots_is_false()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс суворого наміру", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        await fixture.Db.SaveChangesAsync();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null,
+            context.CurrentRevision,
+            [EditorSlot("12:00", "13:00", isLunch: true)]);
+        request.ApplySlots = false;
+        request.LunchMutation = TimeSlotLunchMutationMode.Set;
+
+        var outcome = await service.PreviewAsync(request);
+
+        Assert.False(outcome.IsSuccess);
+        Assert.Equal(TimeSlotEditorFailureKind.Validation, outcome.Failure!.Kind);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_rejects_separate_lunch_slot_when_slots_are_applied()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс обходу обіднього слота", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        await fixture.Db.SaveChangesAsync();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null,
+            context.CurrentRevision,
+            [EditorSlot("09:00", "10:00")]);
+        request.LunchMutation = TimeSlotLunchMutationMode.Set;
+        request.LunchSlot = EditorSlot("12:00", "13:00", isLunch: true);
+
+        var outcome = await service.PreviewAsync(request);
+
+        Assert.False(outcome.IsSuccess);
+        Assert.Equal(TimeSlotEditorFailureKind.Validation, outcome.Failure!.Kind);
+        Assert.Contains("без застосування слотів", outcome.Failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_rejects_lunch_mutation_for_day_scope()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс денного обіду", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        await fixture.Db.SaveChangesAsync();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            (int)DayOfWeek.Monday));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            (int)DayOfWeek.Monday,
+            context.CurrentRevision,
+            [EditorSlot("09:00", "10:00")]);
+        request.LunchMutation = TimeSlotLunchMutationMode.Set;
+        request.LunchSlot = EditorSlot("12:00", "13:00", isLunch: true);
+
+        var outcome = await service.PreviewAsync(request);
+
+        Assert.False(outcome.IsSuccess);
+        Assert.Equal(TimeSlotEditorFailureKind.Validation, outcome.Failure!.Kind);
+        Assert.Contains("Усі дні", outcome.Failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_rejects_request_without_any_mutation_intent()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс порожнього запиту", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        await fixture.Db.SaveChangesAsync();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null,
+            context.CurrentRevision,
+            []);
+        request.ApplySlots = false;
+
+        var outcome = await service.PreviewAsync(request);
+
+        Assert.False(outcome.IsSuccess);
+        Assert.Equal(TimeSlotEditorFailureKind.Validation, outcome.Failure!.Kind);
+        Assert.Contains("не містить змін", outcome.Failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_repeated_literal_apply_with_same_revision_and_token_is_noop()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс повтору", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        fixture.Db.TimeSlots.Add(EntitySlot(null, null, "09:00", "10:00"));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+
+        var firstContext = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            null));
+        var firstRequest = EditorRequest(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            null,
+            firstContext.CurrentRevision,
+            [EditorSlot("10:00", "11:00")]);
+        var firstPreview = AssertSuccess(await service.PreviewAsync(firstRequest));
+        firstRequest.PreviewToken = firstPreview.PreviewToken;
+        Assert.False(AssertSuccess(await service.ApplyAsync(firstRequest)).NoChanges);
+
+        fixture.Db.ChangeTracker.Clear();
+        var secondApply = AssertSuccess(await service.ApplyAsync(firstRequest));
+
+        Assert.True(secondApply.NoChanges);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_literal_replay_rejects_intervening_course_override()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс втручання між повторами", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.TimeSlots.AddRange(
+            EntitySlot(null, null, "09:00", "10:00"),
+            EntitySlot(course.Id, null, "10:00", "11:00"));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            (int)DayOfWeek.Monday));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            (int)DayOfWeek.Monday,
+            context.CurrentRevision,
+            [EditorSlot("10:00", "11:00")]);
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+        request.PreviewToken = preview.PreviewToken;
+        AssertSuccess(await service.ApplyAsync(request));
+        fixture.Db.ChangeTracker.Clear();
+        fixture.Db.TimeSlots.Add(EntitySlot(course.Id, DayOfWeek.Tuesday, "12:00", "13:00"));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+
+        var replay = await service.ApplyAsync(request);
+
+        Assert.False(replay.IsSuccess);
+        Assert.Equal(TimeSlotEditorFailureKind.Stale, replay.Failure!.Kind);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_all_courses_conflict_prevents_every_course_write()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedRoomModelAsync(20, 20, 40);
+        var secondCourse = new Course { Name = "Другий курс", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(secondCourse);
+        fixture.Db.TimeSlots.Add(EntitySlot(null, null, "09:00", "10:00"));
+        fixture.Db.ScheduleItems.Add(CreateScheduleItem(
+            model,
+            model.FirstGroup.Id,
+            new DateOnly(2026, 9, 7)));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            null));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.AllCourses,
+            null,
+            null,
+            context.CurrentRevision,
+            [EditorSlot("10:00", "11:00")]);
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+        Assert.Equal(1, preview.ScheduleConflictCount);
+        Assert.Single(preview.ConflictSamples);
+        Assert.False(preview.CanApply);
+        request.PreviewToken = preview.PreviewToken;
+
+        var action = await new AdminConfigController(fixture.Db).ApplyTimeSlotSequence(
+            request,
+            CancellationToken.None);
+
+        var conflict = Assert.IsType<ConflictObjectResult>(action);
+        Assert.Contains("\"code\":\"conflict\"", JsonSerializer.Serialize(conflict.Value), StringComparison.Ordinal);
+        fixture.Db.ChangeTracker.Clear();
+        Assert.Single(await fixture.Db.TimeSlots.AsNoTracking().ToListAsync());
+        Assert.False(await fixture.Db.TimeSlots.AnyAsync(slot => slot.CourseId != null));
+        Assert.Equal(new TimeOnly(9, 0), await fixture.Db.TimeSlots.Select(slot => slot.Start).SingleAsync());
+    }
+
+    private static T AssertSuccess<T>(TimeSlotEditorOutcome<T> outcome)
+    {
+        Assert.True(outcome.IsSuccess, outcome.Failure?.Message);
+        return Assert.IsType<T>(outcome.Value);
+    }
+
+    private static TimeSlotSequenceApplyRequestDto EditorRequest(
+        TimeSlotEditorTargetMode targetMode,
+        int? courseId,
+        int? dayOfWeek,
+        string revision,
+        List<TimeSlotDto> slots)
+        => new()
+        {
+            TargetMode = targetMode,
+            CourseId = courseId,
+            DayOfWeek = dayOfWeek,
+            CurrentRevision = revision,
+            Slots = slots
+        };
+
+    private static TimeSlotDto EditorSlot(
+        string start,
+        string end,
+        bool isActive = true,
+        bool isLunch = false,
+        int sortOrder = 1)
+        => new()
+        {
+            Start = start,
+            End = end,
+            IsActive = isActive,
+            IsLunch = isLunch,
+            SortOrder = sortOrder
+        };
+
+    private static TimeSlot EntitySlot(
+        int? courseId,
+        DayOfWeek? day,
+        string start,
+        string end,
+        int sortOrder = 1)
+        => new()
+        {
+            CourseId = courseId,
+            DayOfWeek = day,
+            Start = TimeOnly.Parse(start),
+            End = TimeOnly.Parse(end),
+            SortOrder = sortOrder,
+            IsActive = true
+        };
 
     private static LessonTypeRef CreateCompatibleLessonType(
         LessonTypeRef target,

@@ -3,6 +3,7 @@ using Microsoft.EntityFrameworkCore;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TimeSlotEditor;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using System.Data;
@@ -575,6 +576,66 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
         }).ToList();
         return Ok(new { courseId, dayOfWeek = (int)day.Value, usingCourseSpecific = resolvedDay.UsingCourseSpecific, usingDaySpecific = resolvedDay.UsingDaySpecific, slots = daySlots });
     }
+    [HttpGet("slots/editor-context")]
+    // Повертає компактний контекст для візуального редактора графіка пар.
+    public async Task<IActionResult> GetTimeSlotEditorContext(
+        [FromQuery] TimeSlotEditorTargetMode targetMode,
+        [FromQuery] int? courseId,
+        [FromQuery] int? dayOfWeek,
+        CancellationToken cancellationToken)
+    {
+        var outcome = await new TimeSlotEditorService(db).GetContextAsync(
+            targetMode,
+            courseId,
+            dayOfWeek,
+            cancellationToken);
+        return outcome.IsSuccess
+            ? Ok(outcome.Value)
+            : MapTimeSlotEditorFailure(outcome.Failure!);
+    }
+
+    [HttpPost("slots/editor/preview")]
+    // Перевіряє графік і показує точний вплив без зміни даних.
+    public async Task<IActionResult> PreviewTimeSlotSequence(
+        [FromBody] TimeSlotSequenceApplyRequestDto request,
+        CancellationToken cancellationToken)
+    {
+        var outcome = await new TimeSlotEditorService(db).PreviewAsync(request, cancellationToken);
+        return outcome.IsSuccess
+            ? Ok(outcome.Value)
+            : MapTimeSlotEditorFailure(outcome.Failure!);
+    }
+
+    [HttpPost("slots/editor/apply")]
+    // Атомарно застосовує лише попередньо перевірений графік.
+    public async Task<IActionResult> ApplyTimeSlotSequence(
+        [FromBody] TimeSlotSequenceApplyRequestDto request,
+        CancellationToken cancellationToken)
+    {
+        var outcome = await new TimeSlotEditorService(db).ApplyAsync(request, cancellationToken);
+        return outcome.IsSuccess
+            ? Ok(outcome.Value)
+            : MapTimeSlotEditorFailure(outcome.Failure!);
+    }
+
+    private IActionResult MapTimeSlotEditorFailure(TimeSlotEditorFailure failure)
+    {
+        var body = new
+        {
+            code = failure.Kind.ToString().ToLowerInvariant(),
+            message = failure.Message,
+            currentRevision = failure.CurrentRevision
+        };
+        return failure.Kind switch
+        {
+            TimeSlotEditorFailureKind.Validation => BadRequest(body),
+            TimeSlotEditorFailureKind.NotFound => NotFound(body),
+            TimeSlotEditorFailureKind.Stale => Conflict(body),
+            TimeSlotEditorFailureKind.Conflict => Conflict(body),
+            _ => BadRequest(body)
+        };
+    }
+
     [HttpGet("slots/raw")]
     // Повертає сирі тайм-слоти (глобальні та курсні).
     public async Task<IActionResult> GetRawSlots([FromQuery] int? courseId, [FromQuery] int? dayOfWeek)

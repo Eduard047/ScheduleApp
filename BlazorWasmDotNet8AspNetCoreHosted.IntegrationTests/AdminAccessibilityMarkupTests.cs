@@ -31,14 +31,33 @@ public sealed class AdminAccessibilityMarkupTests
     }
 
     [Fact]
-    public void Time_slot_loading_status_preserves_table_cell_semantics()
+    public void Time_slot_editor_exposes_visual_sequence_and_keyboard_actions()
     {
         var markup = ReadAdminPage("AdminTimeSlots.razor");
 
-        Assert.Contains(
-            "<td colspan=\"6\" class=\"text-muted\"><span role=\"status\">Завантаження слотів…</span></td>",
-            markup);
-        Assert.DoesNotContain("<td colspan=\"6\" class=\"text-muted\" role=\"status\">", markup);
+        Assert.Contains("role=\"group\" aria-label=\"Область застосування графіка\"", markup);
+        Assert.Contains("aria-pressed=\"@(_targetMode == TimeSlotEditorTargetMode.Course)\"", markup);
+        Assert.Contains("aria-pressed=\"@(_targetMode == TimeSlotEditorTargetMode.AllCourses)\"", markup);
+        Assert.DoesNotContain("role=\"radio\"", markup);
+        Assert.DoesNotContain("aria-checked", markup);
+        Assert.Contains("<ol class=\"day-timeline\" aria-label=\"Послідовність пар\">", markup);
+        Assert.Contains("aria-label=\"Перемістити пару @(rowIndex + 1) вище\"", markup);
+        Assert.Contains("aria-label=\"Перемістити пару @(rowIndex + 1) нижче\"", markup);
+        Assert.Contains("aria-label=\"Вставити нову пару після пари @(rowIndex + 1)\"", markup);
+        Assert.Contains("aria-label=\"Видалити пару @(rowIndex + 1)\"", markup);
+        Assert.Contains("aria-live=\"polite\" aria-atomic=\"true\"", markup);
+        Assert.Contains("<NavigationLock ConfirmExternalNavigation=\"@HasUnsavedChanges\"", markup);
+        Assert.Contains("Прибрати спільну перерву", markup);
+        Assert.Contains("Прибрати власну перерву й успадковувати спільну", markup);
+        Assert.Contains("Прибрати виняток і повернути основний графік", markup);
+        Assert.Contains("вимкніть «Використовувати в розкладі»", markup);
+        Assert.Contains("disabled=\"@(!CanEditSequence || !row.IsActive || inheritedLunch)\"", markup);
+        Assert.Contains("Успадковано; оберіть іншу активну пару, щоб змінити.", markup);
+        Assert.Contains("Перевірити зміни", markup);
+        Assert.Contains("Застосувати графік", markup);
+        Assert.DoesNotContain("Перевірити й застосувати", markup);
+        Assert.DoesNotContain("<table", markup, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Груп", markup, StringComparison.OrdinalIgnoreCase);
     }
 
     [Theory]
