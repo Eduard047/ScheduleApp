@@ -63,9 +63,14 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         // Створює або оновлює викладача.
         public async Task<int> UpsertTeacher(TeacherEditDto dto)
             => await PostForId("api/admin/teachers/upsert", dto);
-        // Видаляє викладача.
-        public async Task DeleteTeacher(int id)
-            => await EnsureAndDispose(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/teachers/{id}")));
+        // Видаляє викладача з опційним force.
+        public async Task DeleteTeacher(int id, bool force = false)
+        {
+            var url = force
+                ? ApiClientHelpers.WithConfirm($"api/admin/teachers/{id}?force=true")
+                : ApiClientHelpers.WithConfirm($"api/admin/teachers/{id}");
+            await EnsureAndDispose(await _http.DeleteAsync(url));
+        }
         // Довідник навчальних груп.
         public async Task<List<GroupEditDto>> GetGroups()
             => await _http.GetFromJsonWithDetailsAsync<List<GroupEditDto>>("api/admin/groups") ?? new();
@@ -86,9 +91,14 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         // Створює або оновлює модуль.
         public async Task<int> UpsertModule(ModuleEditDto dto)
             => await PostForId("api/admin/modules/upsert", dto);
-        // Видаляє модуль.
-        public async Task DeleteModule(int id)
-            => await EnsureAndDispose(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/modules/{id}")));
+        // Видаляє модуль з опційним force.
+        public async Task DeleteModule(int id, bool force = false)
+        {
+            var url = force
+                ? ApiClientHelpers.WithConfirm($"api/admin/modules/{id}?force=true")
+                : ApiClientHelpers.WithConfirm($"api/admin/modules/{id}");
+            await EnsureAndDispose(await _http.DeleteAsync(url));
+        }
         // Перетворює модуль на окремий екземпляр для конкретного курсу.
         public async Task<int> EnsureCourseScopedModule(int moduleId, int courseId)
         {
@@ -111,9 +121,14 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         // Створює або оновлює аудиторію.
         public async Task<int> UpsertRoom(RoomEditDto dto)
             => await PostForId("api/admin/rooms/upsert", dto);
-        // Видаляє аудиторію.
-        public async Task DeleteRoom(int id)
-            => await EnsureAndDispose(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/rooms/{id}")));
+        // Видаляє аудиторію з опційним force.
+        public async Task DeleteRoom(int id, bool force = false)
+        {
+            var url = force
+                ? ApiClientHelpers.WithConfirm($"api/admin/rooms/{id}?force=true")
+                : ApiClientHelpers.WithConfirm($"api/admin/rooms/{id}");
+            await EnsureAndDispose(await _http.DeleteAsync(url));
+        }
         // Читає узгоджений знімок корпусів і переходів одним запитом без кешування.
         public async Task<BuildingCatalogDto> GetBuildingCatalog()
             => await _http.GetFromJsonWithDetailsAsync<BuildingCatalogDto>("api/admin/buildings") ?? new(new(), new());

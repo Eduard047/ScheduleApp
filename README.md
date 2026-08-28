@@ -66,6 +66,7 @@ ScheduleApp — система формування, перевірки та п�
 
 - [operations-guide.md](operations-guide.md) - Покроковий посібник з операційного запуску проекту.
 - [database-setup.md](database-setup.md) - Інструкція з налаштування бази даних та підключення.
+- [docs/autogeneration.md](docs/autogeneration.md) - Детальний контракт Plan → Preview → Apply, інваріанти та безпечні тестові сценарії автогенерації.
 
 ## Автогенерація
 

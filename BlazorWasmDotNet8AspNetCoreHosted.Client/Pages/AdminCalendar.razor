@@ -62,6 +62,18 @@
                 </tr>
             </thead>
             <tbody>
+                @if (!loading && !loadFailed && !SortedAndFiltered.Any())
+                {
+                    <tr>
+                        <td colspan="7" class="text-muted text-center py-3">
+                            <span class="admin-table-empty-state" role="status">
+                                @(items.Count == 0
+                                    ? "Поки що немає календарних винятків."
+                                    : "За вашим пошуком календарних винятків не знайдено.")
+                            </span>
+                        </td>
+                    </tr>
+                }
                 @foreach (var x in SortedAndFiltered)
                 {
                     <tr>

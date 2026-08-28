@@ -1,6 +1,7 @@
 ﻿@* Сторінка адміністрування модулів *@
 @page "/admin/modules"
 @using System.Net.Http.Json
+@using System.Net
 @using System.Globalization
 @using System.Linq
 @using System.Collections.Generic
@@ -99,6 +100,18 @@
                 </tr>
             </thead>
             <tbody>
+                @if (!_pageLoadInProgress && !_refreshRecoveryRequired && !SortedAndFiltered.Any())
+                {
+                    <tr>
+                        <td colspan="6" class="text-muted text-center py-3">
+                            <span class="admin-table-empty-state" role="status">
+                                @(items.Count == 0
+                                    ? "Поки що немає модулів."
+                                    : "За вашим пошуком модулів не знайдено.")
+                            </span>
+                        </td>
+                    </tr>
+                }
                 @foreach (var m in SortedAndFiltered)
                 {
                     <tr>
@@ -1038,17 +1051,41 @@ private string plansModuleCode = "";
             var caption = module is null ? $"#{id}" : $"{module.Code} — {module.Title}";
             var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити модуль {caption}? Дію не можна скасувати.");
             if (!confirmed) return;
-            await Admin.DeleteModule(id);
+            var forceDelete = false;
+            try
+            {
+                await Admin.DeleteModule(id);
+            }
+            catch (ApiErrorException ex) when (
+                ex.StatusCode == HttpStatusCode.Conflict
+                && !ex.Message.Contains("чернет", StringComparison.OrdinalIgnoreCase))
+            {
+                var forceConfirmed = await JS.InvokeAsync<bool>(
+                    "confirm",
+                    "Модуль використовується. Примусово видалити модуль разом із пов’язаними опублікованими заняттями та планами? Чернетки не будуть видалені, і за їх наявності сервер відхилить операцію.");
+                if (!forceConfirmed)
+                {
+                    error = "Дію скасовано користувачем.";
+                    return;
+                }
+
+                await Admin.DeleteModule(id, force: true);
+                forceDelete = true;
+            }
+
+            var successMessage = forceDelete
+                ? "Модуль і пов’язані опубліковані заняття та плани видалено."
+                : "Модуль успішно видалено.";
             if (await Load(clearMessages: false))
             {
-                ok = "Модуль успішно видалено.";
+                ok = successMessage;
                 error = null;
             }
             else
             {
                 RequireRefreshRecovery(
                     $"Модуль видалено, але оновити список не вдалося: {_lastLoadError ?? "невідома помилка"}. Повторно видаляти модуль не потрібно.",
-                    "Модуль успішно видалено.",
+                    successMessage,
                     () => Load(clearMessages: false));
             }
         }

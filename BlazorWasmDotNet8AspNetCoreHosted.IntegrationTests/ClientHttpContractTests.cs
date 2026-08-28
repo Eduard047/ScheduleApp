@@ -245,6 +245,9 @@ public sealed class ClientHttpContractTests
     [Theory]
     [InlineData("course")]
     [InlineData("group")]
+    [InlineData("room")]
+    [InlineData("teacher")]
+    [InlineData("module")]
     [InlineData("lesson-type")]
     public async Task Admin_delete_preserves_conflict_status_for_ui_confirmation(string entity)
     {
@@ -258,6 +261,9 @@ public sealed class ClientHttpContractTests
         {
             "course" => api.DeleteCourse(7),
             "group" => api.DeleteGroup(7),
+            "room" => api.DeleteRoom(7),
+            "teacher" => api.DeleteTeacher(7),
+            "module" => api.DeleteModule(7),
             _ => api.DeleteLessonType(7)
         });
 
@@ -268,23 +274,65 @@ public sealed class ClientHttpContractTests
     [Theory]
     [InlineData("course")]
     [InlineData("group")]
+    [InlineData("room")]
+    [InlineData("teacher")]
+    [InlineData("module")]
     public async Task Admin_force_delete_sends_force_query(string entity)
     {
         var handler = new StaticResponseHandler(new HttpResponseMessage(HttpStatusCode.NoContent));
         using var client = new HttpClient(handler) { BaseAddress = new Uri("https://schedule.test/") };
         var api = new AdminApi(client);
 
-        if (entity == "course")
+        switch (entity)
         {
-            await api.DeleteCourse(7, force: true);
-        }
-        else
-        {
-            await api.DeleteGroup(7, force: true);
+            case "course":
+                await api.DeleteCourse(7, force: true);
+                break;
+            case "group":
+                await api.DeleteGroup(7, force: true);
+                break;
+            case "room":
+                await api.DeleteRoom(7, force: true);
+                break;
+            case "teacher":
+                await api.DeleteTeacher(7, force: true);
+                break;
+            case "module":
+                await api.DeleteModule(7, force: true);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(entity));
         }
 
         var requestUri = Assert.IsType<Uri>(handler.LastRequestUri);
         Assert.Contains("force=true", requestUri.Query, StringComparison.Ordinal);
+        Assert.Contains("confirm=true", requestUri.Query, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Teacher_drafts_client_exposes_only_job_based_autogeneration()
+    {
+        var legacyMethods = new[]
+        {
+            "AutogenWeek",
+            "AutogenPreflightWeek",
+            "AutogenMonth",
+            "AutogenCourse"
+        };
+
+        foreach (var methodName in legacyMethods)
+        {
+            Assert.DoesNotContain(
+                typeof(ITeacherDraftsApi).GetMethods(),
+                method => method.Name == methodName);
+            Assert.DoesNotContain(
+                typeof(TeacherDraftsApi).GetMethods(),
+                method => method.Name == methodName);
+        }
+
+        Assert.Contains(
+            typeof(ITeacherDraftsApi).GetMethods(),
+            method => method.Name == nameof(ITeacherDraftsApi.StartAutogenJob));
     }
 
     private static HttpClient CreateClient(HttpResponseMessage response)

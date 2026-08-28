@@ -46,14 +46,6 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
         return await res.Content.ReadAsByteArrayAsync();
     }
 
-    // Запускає автогенерацію чернеток на тиждень.
-    public async Task<AutoGenResult> AutogenWeek(AutoGenRequest req)
-    {
-        using var res = await http.PostAsJsonAsync("api/teacher-drafts/autogen/week", req);
-        await res.EnsureSuccessWithDetailsAsync();
-        return (await res.Content.ReadFromJsonAsync<AutoGenResult>())!;
-    }
-
     public async Task<AutoGenJobStartResult> StartAutogenJob(
         AutoGenJobRequest req,
         CancellationToken cancellationToken = default)
@@ -232,16 +224,6 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
         };
     }
 
-    // Виконує попередню перевірку ресурсів без запису чернеток.
-    public async Task<AutoGenResult> AutogenPreflightWeek(AutoGenRequest req)
-    {
-        using var res = await http.PostAsJsonAsync(
-            "api/teacher-drafts/autogen/week",
-            req with { PreflightOnly = true });
-        await res.EnsureSuccessWithDetailsAsync();
-        return (await res.Content.ReadFromJsonAsync<AutoGenResult>())!;
-    }
-
     // Очищає чернетки тижня.
     public async Task<int> ClearWeek(ClearWeekRequest req)
     {
@@ -299,22 +281,6 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
         await res.EnsureSuccessWithDetailsAsync();
         return await res.Content.ReadFromJsonAsync<TeacherDraftBatchMutationResult>()
                ?? throw new InvalidOperationException("Сервер не повернув результат атомарної зміни чернеток.");
-    }
-
-    // Запускає автогенерацію для місяця.
-    public async Task<AutoGenResult> AutogenMonth(AutogenMonthRequest req)
-    {
-        using var res = await http.PostAsJsonAsync("api/teacher-drafts/autogen/month", req);
-        await res.EnsureSuccessWithDetailsAsync();
-        return (await res.Content.ReadFromJsonAsync<AutoGenResult>())!;
-    }
-
-    // Запускає автогенерацію для діапазону тижнів курсу.
-    public async Task<AutoGenResult> AutogenCourse(AutogenCourseRequest req)
-    {
-        using var res = await http.PostAsJsonAsync("api/teacher-drafts/autogen/course", req);
-        await res.EnsureSuccessWithDetailsAsync();
-        return (await res.Content.ReadFromJsonAsync<AutoGenResult>())!;
     }
 
     // Публікує чернетки тижня у розклад.

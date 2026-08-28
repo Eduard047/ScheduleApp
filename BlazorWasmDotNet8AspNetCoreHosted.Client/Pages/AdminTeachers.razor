@@ -4,6 +4,7 @@
 @using BlazorWasmDotNet8AspNetCoreHosted.Client.Services
 @using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
 @inject HttpClient Http
+@inject IAdminApi Admin
 @inject IJSRuntime JS
 
 <PageTitle>Адмін • Викладачі</PageTitle>
@@ -552,15 +553,34 @@ else
         ok = null;
         try
         {
-            using var resp = await Http.DeleteAsync($"api/admin/teachers/{id}?confirm=true");
-            await resp.EnsureSuccessWithDetailsAsync();
+            var forceDelete = false;
+            try
+            {
+                await Admin.DeleteTeacher(id);
+            }
+            catch (ApiErrorException ex) when (ex.StatusCode == HttpStatusCode.Conflict)
+            {
+                var forceConfirmed = await JS.InvokeAsync<bool>(
+                    "confirm",
+                    "Викладач використовується у розкладі або чернетках. Примусово відв’язати його від занять, де викладач не є обов’язковим, і видалити? Для обов’язкових занять сервер відхилить операцію.");
+                if (!forceConfirmed)
+                {
+                    error = "Дію скасовано користувачем.";
+                    return;
+                }
+
+                await Admin.DeleteTeacher(id, force: true);
+                forceDelete = true;
+            }
             list.RemoveAll(teacher => teacher.Id == id);
             if (await RefreshAfterCompletedMutationAsync(
                     DeleteRefreshErrorPrefix,
                     "Список викладачів оновлено; видалення вже було виконано.",
                     closeEditorAfterRetry: false))
             {
-                ok = "Видалено.";
+                ok = forceDelete
+                    ? "Викладача видалено; необов’язкові прив’язки очищено."
+                    : "Видалено.";
             }
         }
         catch (Exception ex)

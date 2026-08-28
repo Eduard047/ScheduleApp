@@ -19,10 +19,6 @@ public interface ITeacherDraftsApi
     Task<TeacherDraftBatchDeleteResult> DeleteBatch(TeacherDraftBatchDeleteRequest req);
     // Атомарно створює, оновлює та видаляє чернетки в межах однієї операції.
     Task<TeacherDraftBatchMutationResult> MutateBatch(TeacherDraftBatchMutationRequest req);
-    // Автогенерація на тиждень.
-    Task<AutoGenResult> AutogenWeek(AutoGenRequest req);
-    // Попередня перевірка ресурсів автогенерації без створення чернеток.
-    Task<AutoGenResult> AutogenPreflightWeek(AutoGenRequest req);
     Task<AutoGenJobStartResult> StartAutogenJob(
         AutoGenJobRequest req,
         CancellationToken cancellationToken = default);
@@ -46,10 +42,6 @@ public interface ITeacherDraftsApi
         CancellationToken cancellationToken = default);
     // Очищає чернетки тижня.
     Task<int> ClearWeek(ClearWeekRequest req);
-    // Автогенерація на місяць.
-    Task<AutoGenResult> AutogenMonth(AutogenMonthRequest req);
-    // Автогенерація для курсу за діапазон.
-    Task<AutoGenResult> AutogenCourse(AutogenCourseRequest req);
     // Публікація чернеток тижня.
     Task<PublishWeekResultDto> PublishWeek(PublishWeekRequest req);
 }

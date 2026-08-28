@@ -20,7 +20,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         Task<List<TeacherViewDto>> GetTeachers();
         Task<TeacherEditDto?> GetTeacher(int id);
         Task<int> UpsertTeacher(TeacherEditDto dto);
-        Task DeleteTeacher(int id);
+        Task DeleteTeacher(int id, bool force = false);
         // Групи.
         Task<List<GroupEditDto>> GetGroups();
         Task<int> UpsertGroup(GroupEditDto dto);
@@ -28,7 +28,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         // Модулі та теми.
         Task<List<ModuleEditDto>> GetModules();
         Task<int> UpsertModule(ModuleEditDto dto);
-        Task DeleteModule(int id);
+        Task DeleteModule(int id, bool force = false);
         Task<int> EnsureCourseScopedModule(int moduleId, int courseId);
         Task<List<ModuleTopicViewDto>> GetModuleTopics(int moduleId);
         Task<int> UpsertModuleTopic(int moduleId, ModuleTopicDto dto);
@@ -36,7 +36,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         // Аудиторії.
         Task<List<RoomEditDto>> GetRooms();
         Task<int> UpsertRoom(RoomEditDto dto);
-        Task DeleteRoom(int id);
+        Task DeleteRoom(int id, bool force = false);
         // Корпуси та переходи.
         Task<BuildingCatalogDto> GetBuildingCatalog();
         Task<List<BuildingEditDto>> GetBuildings();

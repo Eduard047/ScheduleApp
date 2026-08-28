@@ -88,6 +88,21 @@ public sealed class AdminTeacherReliabilityTests
     }
 
     [Fact]
+    public async Task Dependency_conflict_requires_second_confirmation_before_force_delete()
+    {
+        var js = new ConfirmJsRuntime();
+        var handler = new TeacherForceDeleteHandler();
+        var component = CreateComponent(handler, js);
+        GetTeachers(component).Add(new TeacherViewDto { Id = 7, FullName = "Тестовий викладач" });
+
+        await InvokeAsync(component, "Delete", 7);
+
+        Assert.Equal(new[] { false, true }, handler.DeleteForces);
+        Assert.Equal(2, js.ConfirmCalls);
+        Assert.Contains("необов’язкові прив’язки очищено", GetField<string>(component, "ok"));
+    }
+
+    [Fact]
     public async Task Failed_metadata_load_blocks_editing_and_can_be_retried_without_reloading_valid_list()
     {
         var handler = new TeacherInitialLoadHandler();
@@ -119,8 +134,9 @@ public sealed class AdminTeacherReliabilityTests
     {
         var componentType = typeof(AdminApi).Assembly.GetType(ComponentTypeName, throwOnError: true)!;
         var component = Activator.CreateInstance(componentType)!;
-        componentType.GetProperty("Http", InstanceMembers)!
-            .SetValue(component, new HttpClient(handler) { BaseAddress = new Uri("https://schedule.test/") });
+        var http = new HttpClient(handler) { BaseAddress = new Uri("https://schedule.test/") };
+        componentType.GetProperty("Http", InstanceMembers)!.SetValue(component, http);
+        componentType.GetProperty("Admin", InstanceMembers)!.SetValue(component, new AdminApi(http));
         componentType.GetProperty("JS", InstanceMembers)!.SetValue(component, js);
         SetField(component, "loading", false);
         return component;
@@ -246,6 +262,35 @@ public sealed class AdminTeacherReliabilityTests
                 && path.EndsWith("/api/admin/teachers", StringComparison.Ordinal))
             {
                 ListReadCount++;
+                return Task.FromResult(JsonResponse(HttpStatusCode.OK, "[]"));
+            }
+            throw new InvalidOperationException($"Неочікуваний запит: {request.Method} {request.RequestUri}");
+        }
+    }
+
+    private sealed class TeacherForceDeleteHandler : HttpMessageHandler
+    {
+        public List<bool> DeleteForces { get; } = new();
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            var path = request.RequestUri!.AbsolutePath;
+            if (request.Method == HttpMethod.Delete
+                && path.EndsWith("/api/admin/teachers/7", StringComparison.Ordinal))
+            {
+                var force = request.RequestUri.Query.Contains("force=true", StringComparison.Ordinal);
+                DeleteForces.Add(force);
+                return Task.FromResult(force
+                    ? new HttpResponseMessage(HttpStatusCode.NoContent)
+                    : JsonResponse(
+                        HttpStatusCode.Conflict,
+                        """{ "message": "Викладач використовується." }"""));
+            }
+            if (request.Method == HttpMethod.Get
+                && path.EndsWith("/api/admin/teachers", StringComparison.Ordinal))
+            {
                 return Task.FromResult(JsonResponse(HttpStatusCode.OK, "[]"));
             }
             throw new InvalidOperationException($"Неочікуваний запит: {request.Method} {request.RequestUri}");

@@ -61,9 +61,11 @@
     <Compile Include="LogicalEventRotationPlannerTests.cs" />
     <Compile Include="ProductionGuardrailTests.cs" />
     <Compile Include="ProductionPipelineSecurityTests.cs" />
+    <Compile Include="ReadinessAndAutogenTransportContractTests.cs" />
     <Compile Include="PublishGuardrailTests.cs" />
     <Compile Include="ScheduleEndpointCorrectnessTests.cs" />
     <Compile Include="ScheduleOverviewLayoutPlannerTests.cs" />
+    <Compile Include="ScheduleUiContractTests.cs" />
     <Compile Include="SpaFallbackRoutingTests.cs" />
     <Compile Include="SwaggerEndpointTests.cs" />
     <Compile Include="TeacherDraftBatchAtomicityTests.cs" />

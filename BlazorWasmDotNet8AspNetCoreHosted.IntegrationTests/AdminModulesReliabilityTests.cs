@@ -315,6 +315,60 @@ public sealed class AdminModulesReliabilityTests
     }
 
     [Fact]
+    public async Task Module_dependency_conflict_requires_second_confirmation_before_force_delete()
+    {
+        var api = DispatchProxy.Create<IAdminApi, RecordingAdminApiProxy>();
+        var proxy = (RecordingAdminApiProxy)(object)api;
+        proxy.Handler = (method, args) => method.Name switch
+        {
+            nameof(IAdminApi.DeleteModule) when !(bool)args![1]! =>
+                Task.FromException(new ApiErrorException(
+                    HttpStatusCode.Conflict,
+                    "Модуль використовується.")),
+            nameof(IAdminApi.DeleteModule) => Task.CompletedTask,
+            nameof(IAdminApi.GetModules) => Task.FromResult(new List<ModuleEditDto>()),
+            nameof(IAdminApi.GetMeta) => Task.FromResult(EmptyMeta()),
+            nameof(IAdminApi.GetRooms) => Task.FromResult(new List<RoomEditDto>()),
+            nameof(IAdminApi.GetBuildings) => Task.FromResult(new List<BuildingEditDto>()),
+            _ => throw new NotSupportedException(method.Name)
+        };
+        var js = new RecordingJsRuntime();
+        var component = CreateModulesComponent(api, js);
+        GetField<List<ModuleEditDto>>(component, "items").Add(Module(7, 1));
+
+        await InvokeAsync(component, "Delete", 7);
+
+        Assert.Equal(new[] { false, true }, proxy.DeleteForces);
+        Assert.Equal(2, js.InvocationCount);
+        Assert.Contains("опубліковані заняття та плани видалено", GetField<string>(component, "ok"));
+    }
+
+    [Fact]
+    public async Task Module_draft_conflict_does_not_offer_unsupported_force_delete()
+    {
+        var api = DispatchProxy.Create<IAdminApi, RecordingAdminApiProxy>();
+        var proxy = (RecordingAdminApiProxy)(object)api;
+        proxy.Handler = (method, args) => method.Name switch
+        {
+            nameof(IAdminApi.DeleteModule) when !(bool)args![1]! =>
+                Task.FromException(new ApiErrorException(
+                    HttpStatusCode.Conflict,
+                    "Модуль використовується у чернетках.")),
+            nameof(IAdminApi.DeleteModule) => Task.CompletedTask,
+            _ => throw new NotSupportedException(method.Name)
+        };
+        var js = new RecordingJsRuntime();
+        var component = CreateModulesComponent(api, js);
+        GetField<List<ModuleEditDto>>(component, "items").Add(Module(7, 1));
+
+        await InvokeAsync(component, "Delete", 7);
+
+        Assert.Equal(new[] { false }, proxy.DeleteForces);
+        Assert.Equal(1, js.InvocationCount);
+        Assert.Contains("чернетках", GetField<string>(component, "error"));
+    }
+
+    [Fact]
     public async Task Completed_module_save_with_failed_refresh_can_close_editor_and_retry_only_reads()
     {
         var api = DispatchProxy.Create<IAdminApi, RecordingAdminApiProxy>();
@@ -626,6 +680,7 @@ public sealed class AdminModulesReliabilityTests
         public int SaveSequenceCalls { get; private set; }
         public int UpsertModuleCalls { get; private set; }
         public int DeleteModuleCalls { get; private set; }
+        public List<bool> DeleteForces { get; } = new();
         public int ClearModulesCalls { get; private set; }
         public int ImportCalls { get; private set; }
         public int EnsureScopedModuleCalls { get; private set; }
@@ -649,6 +704,7 @@ public sealed class AdminModulesReliabilityTests
                     break;
                 case nameof(IAdminApi.DeleteModule):
                     DeleteModuleCalls++;
+                    DeleteForces.Add((bool)args![1]!);
                     break;
                 case nameof(IAdminApi.ClearModulesAndPlans):
                     ClearModulesCalls++;

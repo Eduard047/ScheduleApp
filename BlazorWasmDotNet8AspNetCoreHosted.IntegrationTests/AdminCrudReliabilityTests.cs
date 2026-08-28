@@ -126,6 +126,51 @@ public sealed class AdminCrudReliabilityTests
     }
 
     [Fact]
+    public async Task Room_dependency_conflict_requires_second_confirmation_before_force_delete()
+    {
+        var api = DispatchProxy.Create<IAdminApi, RecordingAdminApiProxy>();
+        var proxy = (RecordingAdminApiProxy)(object)api;
+        proxy.Handler = (method, args) => method.Name switch
+        {
+            nameof(IAdminApi.DeleteRoom) when !(bool)args![1]! =>
+                Task.FromException(new ApiErrorException(
+                    HttpStatusCode.Conflict,
+                    "Аудиторія використовується.")),
+            nameof(IAdminApi.DeleteRoom) => Task.CompletedTask,
+            nameof(IAdminApi.GetRooms) => Task.FromResult(new List<RoomEditDto>()),
+            nameof(IAdminApi.GetBuildings) => Task.FromResult(new List<BuildingEditDto>()),
+            _ => throw new NotSupportedException(method.Name)
+        };
+        var js = new ConfirmJsRuntime();
+        var component = CreateComponent("AdminRooms");
+        SetInjectedProperty(component, "Admin", api);
+        SetInjectedProperty(component, "JS", js);
+        GetField<List<RoomEditDto>>(component, "items").Add(
+            new RoomEditDto(7, "Аудиторія 7", 20, 1));
+
+        await InvokeTask(component, "Delete", 7);
+
+        Assert.Equal(new[] { false, true }, proxy.DeleteForces);
+        Assert.Equal(2, js.ConfirmCalls);
+        Assert.Contains("необов’язкові прив’язки очищено", GetField<string>(component, "ok"));
+    }
+
+    [Theory]
+    [InlineData("AdminRooms.razor", "Поки що немає аудиторій.", "За вашим пошуком аудиторій не знайдено.")]
+    [InlineData("AdminModules.razor", "Поки що немає модулів.", "За вашим пошуком модулів не знайдено.")]
+    public void Reference_tables_distinguish_empty_data_from_empty_filter_results(
+        string fileName,
+        string emptyMessage,
+        string noResultsMessage)
+    {
+        var markup = ReadAdminPage(fileName);
+
+        Assert.Contains("class=\"admin-table-empty-state\" role=\"status\"", markup, StringComparison.Ordinal);
+        Assert.Contains(emptyMessage, markup, StringComparison.Ordinal);
+        Assert.Contains(noResultsMessage, markup, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Modal_recovery_retry_finishes_completed_save_without_repeating_mutation()
     {
         var buildingLoadCalls = 0;
@@ -350,6 +395,26 @@ public sealed class AdminCrudReliabilityTests
     private static object CreateComponent(string componentName)
         => Activator.CreateInstance(GetComponentType(componentName))!;
 
+    private static string ReadAdminPage(string fileName)
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory);
+             directory is not null;
+             directory = directory.Parent)
+        {
+            var candidate = Path.Combine(
+                directory.FullName,
+                "BlazorWasmDotNet8AspNetCoreHosted.Client",
+                "Pages",
+                fileName);
+            if (File.Exists(candidate))
+            {
+                return File.ReadAllText(candidate);
+            }
+        }
+
+        throw new FileNotFoundException($"Не знайдено Razor-сторінку {fileName} від каталогу тестового процесу.");
+    }
+
     private static Type GetComponentType(string componentName)
         => typeof(AdminApi).Assembly.GetType(
             ComponentNamespace + componentName,
@@ -375,6 +440,7 @@ public sealed class AdminCrudReliabilityTests
     {
         public Func<MethodInfo, object?[]?, object?> Handler { get; set; } = null!;
         public int MutationCalls { get; private set; }
+        public List<bool> DeleteForces { get; } = new();
 
         protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
         {
@@ -384,20 +450,31 @@ public sealed class AdminCrudReliabilityTests
             {
                 MutationCalls++;
             }
+            if (method.Name is nameof(IAdminApi.DeleteRoom)
+                or nameof(IAdminApi.DeleteTeacher)
+                or nameof(IAdminApi.DeleteModule))
+            {
+                DeleteForces.Add((bool)args![1]!);
+            }
             return Handler(method, args);
         }
     }
 
     private sealed class ConfirmJsRuntime : IJSRuntime
     {
+        public int ConfirmCalls { get; private set; }
+
         public ValueTask<TValue> InvokeAsync<TValue>(string identifier, object?[]? args)
-            => ValueTask.FromResult((TValue)(object)true);
+            => InvokeAsync<TValue>(identifier, CancellationToken.None, args);
 
         public ValueTask<TValue> InvokeAsync<TValue>(
             string identifier,
             CancellationToken cancellationToken,
             object?[]? args)
-            => ValueTask.FromResult((TValue)(object)true);
+        {
+            ConfirmCalls++;
+            return ValueTask.FromResult((TValue)(object)true);
+        }
     }
 
     private sealed class DepartmentSaveThenFailHandler : HttpMessageHandler

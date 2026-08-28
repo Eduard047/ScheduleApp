@@ -16,7 +16,7 @@
     [Parameter, SupplyParameterFromQuery(Name = "courseId")]
     public int? QueryCourseId { get; set; }
 
-    private const string AppVersion = "1.8.2"; // Оновлюйте перед релізом
+    private const string AppVersion = "1.8.3"; // Оновлюйте перед релізом
     private MetaResponseDto? _meta;
     private int? _courseId;
     private int? _groupId;
@@ -29,6 +29,7 @@
     private int _slotLoadVersion;
     private DateOnly? _loadedWeekStart;
     private int? _loadedCourseId;
+    private bool _hasScheduleItemsInContext;
     private bool _scheduleLoading;
     private string? _scheduleError;
     private bool _scheduleLoadFailed;
@@ -71,7 +72,7 @@
         }
     }
     private bool HasAdditionalFilters => _groupId is not null || _teacherId is not null || _roomId is not null;
-    private bool HasScheduleItemsInContext => _items.Any(ItemMatchesCourse);
+    private bool HasScheduleItemsInContext => _hasScheduleItemsInContext;
     private IEnumerable<LookupDto> GroupsForSelectedCourse => (_meta?.Groups ?? new List<LookupDto>())
         .Where(group => _courseId is null || group.CourseId == _courseId)
         .OrderBy(group => group.Name, StringComparer.CurrentCultureIgnoreCase);
@@ -97,13 +98,17 @@
         }
     }
     // Перезавантажує розклад і тайм-слоти.
-    private async Task Reload()
+    private Task Reload() => ReloadAsync(reloadSlots: true);
+    private async Task ReloadAsync(bool reloadSlots)
     {
         _scheduleLoading = true;
         _scheduleError = null;
         _scheduleLoadFailed = false;
         var requestedWeekStart = _weekStart;
         var requestedCourseId = _courseId;
+        var requestedGroupId = _groupId;
+        var requestedTeacherId = _teacherId;
+        var requestedRoomId = _roomId;
         var contextChanged = _loadedWeekStart != requestedWeekStart || _loadedCourseId != requestedCourseId;
         if (contextChanged)
         {
@@ -111,11 +116,19 @@
         }
         var itemsTask = LoadScheduleItemsAsync();
         var reloadVersion = _scheduleLoadVersion;
-        var slotsTask = ReloadSlotsAsync(rebuildView: false);
+        var slotsTask = reloadSlots
+            ? ReloadSlotsAsync(rebuildView: false)
+            : Task.CompletedTask;
         try
         {
             await Task.WhenAll(itemsTask, slotsTask);
-            if (reloadVersion != _scheduleLoadVersion)
+            if (!IsCurrentScheduleRequest(
+                    reloadVersion,
+                    requestedWeekStart,
+                    requestedCourseId,
+                    requestedGroupId,
+                    requestedTeacherId,
+                    requestedRoomId))
             {
                 return;
             }
@@ -129,7 +142,13 @@
         }
         catch (ApiErrorException ex)
         {
-            if (reloadVersion == _scheduleLoadVersion)
+            if (IsCurrentScheduleRequest(
+                    reloadVersion,
+                    requestedWeekStart,
+                    requestedCourseId,
+                    requestedGroupId,
+                    requestedTeacherId,
+                    requestedRoomId))
             {
                 ClearLoadedScheduleView();
                 _scheduleLoadFailed = true;
@@ -138,7 +157,13 @@
         }
         catch (Exception ex)
         {
-            if (reloadVersion == _scheduleLoadVersion)
+            if (IsCurrentScheduleRequest(
+                    reloadVersion,
+                    requestedWeekStart,
+                    requestedCourseId,
+                    requestedGroupId,
+                    requestedTeacherId,
+                    requestedRoomId))
             {
                 ClearLoadedScheduleView();
                 _scheduleLoadFailed = true;
@@ -153,6 +178,20 @@
             }
         }
     }
+    // Перевіряє, що відповідь належить останньому запиту та поточному набору фільтрів.
+    private bool IsCurrentScheduleRequest(
+        int loadVersion,
+        DateOnly weekStart,
+        int? courseId,
+        int? groupId,
+        int? teacherId,
+        int? roomId)
+        => loadVersion == _scheduleLoadVersion
+           && weekStart == _weekStart
+           && courseId == _courseId
+           && groupId == _groupId
+           && teacherId == _teacherId
+           && roomId == _roomId;
     // Прибирає попередній розклад, якщо користувач уже перейшов до іншого тижня або курсу.
     private void ClearLoadedScheduleView()
     {
@@ -161,6 +200,7 @@
         _rows = new List<SlotRow>();
         _visibleItems = new List<ScheduleItemDto>();
         _scheduleCells = new Dictionary<(int DayNumber, string Start, string End), List<ScheduleCell>>();
+        _hasScheduleItemsInContext = false;
         _loadedWeekStart = null;
         _loadedCourseId = null;
     }
@@ -191,12 +231,39 @@
     {
         var loadVersion = ++_scheduleLoadVersion;
         var requestedWeekStart = _weekStart;
-        var items = await ScheduleApi.GetWeek(requestedWeekStart);
-        if (loadVersion != _scheduleLoadVersion || requestedWeekStart != _weekStart)
+        var requestedCourseId = _courseId;
+        var requestedGroupId = _groupId;
+        var requestedTeacherId = _teacherId;
+        var requestedRoomId = _roomId;
+        var hasAdditionalFilters = requestedGroupId is not null
+            || requestedTeacherId is not null
+            || requestedRoomId is not null;
+
+        var filteredItemsTask = ScheduleApi.GetWeek(
+            requestedWeekStart,
+            requestedCourseId,
+            requestedGroupId,
+            requestedTeacherId,
+            requestedRoomId);
+        // Базовий запит без додаткових фільтрів відрізняє порожній тиждень від відсутності збігів.
+        var contextItemsTask = hasAdditionalFilters
+            ? ScheduleApi.GetWeek(requestedWeekStart, requestedCourseId)
+            : filteredItemsTask;
+
+        await Task.WhenAll(filteredItemsTask, contextItemsTask);
+        var items = await filteredItemsTask;
+        var contextItems = await contextItemsTask;
+        if (loadVersion != _scheduleLoadVersion
+            || requestedWeekStart != _weekStart
+            || requestedCourseId != _courseId
+            || requestedGroupId != _groupId
+            || requestedTeacherId != _teacherId
+            || requestedRoomId != _roomId)
         {
             return;
         }
         _items = items;
+        _hasScheduleItemsInContext = contextItems.Count > 0 || items.Count > 0;
     }
     // Завантажує ефективну часову сітку вибраного курсу або об'єднання всіх курсів для огляду.
     private async Task ReloadSlotsAsync(bool rebuildView = true)
@@ -318,9 +385,11 @@
                         item.LessonTypeCss ?? CssByCode(item.LessonTypeCode));
                 }).ToList());
     }
-    private void OnFilterChanged()
+    private async Task OnFilterChangedAsync()
     {
         RebuildScheduleCells();
+        var reloadSlots = _scheduleLoadFailed;
+        await ReloadAsync(reloadSlots);
     }
     // Змінює курс, очищає несумісну групу та зберігає контекст у посиланні.
     private void OnCourseFilterChanged(ChangeEventArgs args)
@@ -340,27 +409,7 @@
     private async Task OnGroupFilterChangedAsync()
     {
         RebuildScheduleCells();
-        if (_scheduleLoadFailed)
-        {
-            await Reload();
-            return;
-        }
-
-        try
-        {
-            _scheduleError = null;
-            await ReloadSlotsAsync();
-        }
-        catch (ApiErrorException ex)
-        {
-            _scheduleLoadFailed = true;
-            _scheduleError = ex.Errors.FirstOrDefault() ?? ex.Message;
-        }
-        catch (Exception ex)
-        {
-            _scheduleLoadFailed = true;
-            _scheduleError = ex.Message;
-        }
+        await ReloadAsync(reloadSlots: true);
     }
 
     private async Task RetryLoadAsync()
@@ -603,7 +652,7 @@
         </label>
         <label class="filter-field filter-field--wide">
             <span>Викладач</span>
-            <select class="select" @bind="_teacherId" @bind:after="OnFilterChanged">
+            <select class="select" @bind="_teacherId" @bind:after="OnFilterChangedAsync">
                 <option value="">Усі викладачі</option>
                 @if (_meta is not null)
                 {
@@ -616,7 +665,7 @@
         </label>
         <label class="filter-field">
             <span>Аудиторія</span>
-            <select class="select" @bind="_roomId" @bind:after="OnFilterChanged">
+            <select class="select" @bind="_roomId" @bind:after="OnFilterChangedAsync">
                 <option value="">Усі аудиторії</option>
                 @if (_meta is not null)
                 {
