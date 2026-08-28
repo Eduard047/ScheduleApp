@@ -598,9 +598,11 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
     // Перевіряє графік і показує точний вплив без зміни даних.
     public async Task<IActionResult> PreviewTimeSlotSequence(
         [FromBody] TimeSlotSequenceApplyRequestDto request,
+        [FromServices] ExpensiveOperationGate operationGate,
         CancellationToken cancellationToken)
     {
-        var outcome = await new TimeSlotEditorService(db).PreviewAsync(request, cancellationToken);
+        var outcome = await new TimeSlotEditorService(db, operationGate)
+            .PreviewAsync(request, cancellationToken);
         return outcome.IsSuccess
             ? Ok(outcome.Value)
             : MapTimeSlotEditorFailure(outcome.Failure!);
@@ -610,9 +612,11 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
     // Атомарно застосовує лише попередньо перевірений графік.
     public async Task<IActionResult> ApplyTimeSlotSequence(
         [FromBody] TimeSlotSequenceApplyRequestDto request,
+        [FromServices] ExpensiveOperationGate operationGate,
         CancellationToken cancellationToken)
     {
-        var outcome = await new TimeSlotEditorService(db).ApplyAsync(request, cancellationToken);
+        var outcome = await new TimeSlotEditorService(db, operationGate)
+            .ApplyAsync(request, cancellationToken);
         return outcome.IsSuccess
             ? Ok(outcome.Value)
             : MapTimeSlotEditorFailure(outcome.Failure!);
@@ -632,6 +636,9 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
             TimeSlotEditorFailureKind.NotFound => NotFound(body),
             TimeSlotEditorFailureKind.Stale => Conflict(body),
             TimeSlotEditorFailureKind.Conflict => Conflict(body),
+            TimeSlotEditorFailureKind.Busy => StatusCode(StatusCodes.Status429TooManyRequests, body),
+            TimeSlotEditorFailureKind.Timeout => StatusCode(StatusCodes.Status503ServiceUnavailable, body),
+            TimeSlotEditorFailureKind.Capacity => UnprocessableEntity(body),
             _ => BadRequest(body)
         };
     }
@@ -690,206 +697,23 @@ public class AdminConfigController(AppDbContext db) : ControllerBase
         return Ok(new { course, global });
     }
     [HttpPost("slots/upsert-bulk")]
-    // Зберігає набір тайм-слотів одним запитом.
-    public async Task<IActionResult> UpsertSlots([FromBody] BulkTimeSlotsSaveDto body)
-    {
-        var courseId = body?.CourseId;
-        var dayRaw = body?.DayOfWeek;
-        if (!TryParseDayOfWeek(dayRaw, out var day))
-        {
-            return BadRequest(new { message = "Некоректний день тижня." });
-        }
-        var rows = body?.Slots ?? new();
-        if (rows.Count > 100)
-            return BadRequest(new { message = "Для одного дня можна зберегти не більше 100 часових слотів." });
-        if (courseId is int cid && await db.Courses.FindAsync(cid) is null)
-            return BadRequest(new { message = "Курс не знайдено." });
-        var invalidTimeIndex = rows.FindIndex(row =>
-            !TryParseTime(row.Start, out _) || !TryParseTime(row.End, out _));
-        if (invalidTimeIndex >= 0)
-        {
-            return BadRequest(new
-            {
-                message = $"Слот #{invalidTimeIndex + 1}: час потрібно вказати у форматі HH:mm."
-            });
-        }
-        var norm = rows.Select((r, i) => new
-        {
-            Start = TimeOnly.ParseExact(r.Start, "HH:mm", CultureInfo.InvariantCulture),
-            End = TimeOnly.ParseExact(r.End, "HH:mm", CultureInfo.InvariantCulture),
-            IsActive = r.IsActive,
-            IsLunch = r.IsLunch,
-            Sort = r.SortOrder <= 0 ? i + 1 : r.SortOrder
-        })
-        .OrderBy(x => x.Sort).ThenBy(x => x.Start).ToList();
-        var lunchCount = norm.Count(x => x.IsLunch);
-        if (lunchCount > 1)
-        {
-            return BadRequest(new { message = "Може бути лише один слот, позначений як обід." });
-        }
-        if (day is not null && lunchCount > 0)
-        {
-            return BadRequest(new { message = "Обідня перерва є спільною для всіх днів. Налаштуйте її у шаблоні «Усі дні»." });
-        }
-        for (int i = 0; i < norm.Count; i++)
-        {
-            var s = norm[i].Start;
-            var e = norm[i].End;
-            if (e <= s) return BadRequest(new { message = $"Слот #{i + 1}: час завершення має бути пізніше за час початку." });
-            if (i > 0)
-            {
-                var prev = norm[i - 1];
-                if (s < prev.End) return BadRequest(new { message = $"Слоти #{i} і #{i + 1} перетинаються." });
-            }
-        }
-        var lunchSlot = norm.FirstOrDefault(x => x.IsLunch);
-        if (lunchSlot is not null && !lunchSlot.IsActive)
-        {
-            return BadRequest(new { message = "Слот обіду має бути активним." });
-        }
-        var replacementSlots = norm.Select(x => new TimeSlot
-        {
-            CourseId = courseId,
-            DayOfWeek = day,
-            Start = x.Start,
-            End = x.End,
-            SortOrder = x.Sort,
-            IsActive = x.IsActive
-        }).ToList();
-        await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
-        var managesLunch = day is null;
-        var replacementLunch = !managesLunch || lunchSlot is null
-            ? null
-            : new LunchConfig
-            {
-                CourseId = courseId,
-                Start = lunchSlot.Start,
-                End = lunchSlot.End
-            };
-        var impact = await FindSlotMutationImpactAsync(
-            courseId,
-            day,
-            replacementSlots,
-            replaceSlots: true,
-            replaceLunch: managesLunch,
-            lunchScopeToReplace: courseId,
-            replacementLunch: replacementLunch);
-        if (impact.Count > 0)
-        {
-            return Conflict(new { message = impact.ToMessage() });
-        }
-        await db.TimeSlots.Where(s => s.CourseId == courseId && s.DayOfWeek == day).ExecuteDeleteAsync();
-        int sort = 1;
-        foreach (var x in norm)
-        {
-            db.TimeSlots.Add(new TimeSlot
-            {
-                CourseId = courseId,
-                DayOfWeek = day,
-                Start = x.Start,
-                End = x.End,
-                SortOrder = sort++,
-                IsActive = x.IsActive
-            });
-        }
-        if (managesLunch && lunchSlot is not null)
-        {
-            var lunchRow = await db.LunchConfigs.FirstOrDefaultAsync(l => l.CourseId == courseId);
-            if (lunchRow is null)
-            {
-                db.LunchConfigs.Add(new LunchConfig
-                {
-                    CourseId = courseId,
-                    Start = lunchSlot.Start,
-                    End = lunchSlot.End
-                });
-            }
-            else
-            {
-                lunchRow.Start = lunchSlot.Start;
-                lunchRow.End = lunchSlot.End;
-            }
-        }
-        else if (managesLunch)
-        {
-            await db.LunchConfigs.Where(l => l.CourseId == courseId).ExecuteDeleteAsync();
-        }
-        await db.SaveChangesAsync();
-        await tx.CommitAsync();
-        return Ok();
-    }
+    // Застарілий маршрут вимкнено: він не підтримує обов'язкові preview і revision.
+    public Task<IActionResult> UpsertSlots([FromBody] BulkTimeSlotsSaveDto body)
+        => Task.FromResult<IActionResult>(LegacySlotMutationEndpointDisabled());
     [HttpDelete("slots/clear")]
-    [RequireDeletionConfirmation("слоти розкладу", TargetArgumentName = nameof(courseId))]
-    // Очищає тайм-слоти для курсу або глобальні.
-    public async Task<IActionResult> ClearSlots([FromQuery] int? courseId, [FromQuery] int? dayOfWeek)
-    {
-        if (!TryParseDayOfWeek(dayOfWeek, out var day))
-        {
-            return BadRequest(new { message = "Некоректний день тижня." });
-        }
-        if (courseId is int cid && await db.Courses.FindAsync(cid) is null)
-            return BadRequest(new { message = "Курс не знайдено." });
-        await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
-        var exists = await db.TimeSlots.AnyAsync(slot => slot.CourseId == courseId && slot.DayOfWeek == day);
-        if (!exists) return NotFound();
-        var impact = await FindSlotMutationImpactAsync(courseId, day, Array.Empty<TimeSlot>());
-        if (impact.Count > 0)
-        {
-            return Conflict(new { message = impact.ToMessage() });
-        }
-        var rows = await db.TimeSlots.Where(s => s.CourseId == courseId && s.DayOfWeek == day).ExecuteDeleteAsync();
-        if (rows == 0) return NotFound();
-        await tx.CommitAsync();
-        return NoContent();
-    }
+    // Застарілий маршрут очищення вимкнено до перевірки параметрів і доступу до БД.
+    public Task<IActionResult> ClearSlots([FromQuery] int? courseId, [FromQuery] int? dayOfWeek)
+        => Task.FromResult<IActionResult>(LegacySlotMutationEndpointDisabled());
     [HttpPost("slots/clone-from-global")]
-    // Копіює глобальні слоти в налаштування курсу.
-    public async Task<IActionResult> CloneFromGlobal([FromBody] CloneRequest r)
-    {
-        if (r.CourseId <= 0)
-            return BadRequest(new { message = "Ідентифікатор курсу має бути додатним числом." });
-        if (!TryParseDayOfWeek(r.DayOfWeek, out var day))
-        {
-            return BadRequest(new { message = "Некоректний день тижня." });
-        }
-        await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
-        var course = await db.Courses.FindAsync(r.CourseId);
-        if (course is null) return BadRequest(new { message = "Курс не знайдено." });
-        var global = await db.TimeSlots.AsNoTracking()
-            .Where(s => s.CourseId == null && s.DayOfWeek == day)
-            .OrderBy(s => s.SortOrder).ThenBy(s => s.Start)
-            .ToListAsync();
-        var replacementSlots = global.Select(slot => new TimeSlot
-        {
-            CourseId = r.CourseId,
-            DayOfWeek = day,
-            Start = slot.Start,
-            End = slot.End,
-            SortOrder = slot.SortOrder,
-            IsActive = slot.IsActive
-        }).ToList();
-        var impact = await FindSlotMutationImpactAsync(r.CourseId, day, replacementSlots);
-        if (impact.Count > 0)
-        {
-            return Conflict(new { message = impact.ToMessage() });
-        }
-        await db.TimeSlots.Where(s => s.CourseId == r.CourseId && s.DayOfWeek == day).ExecuteDeleteAsync();
-        foreach (var s in global)
-        {
-            db.TimeSlots.Add(new TimeSlot
-            {
-                CourseId = r.CourseId,
-                DayOfWeek = day,
-                Start = s.Start,
-                End = s.End,
-                SortOrder = s.SortOrder,
-                IsActive = s.IsActive
-            });
-        }
-        await db.SaveChangesAsync();
-        await tx.CommitAsync();
-        return Ok();
-    }
+    // Застарілий маршрут клонування вимкнено; редактор сам матеріалізує захищений план.
+    public Task<IActionResult> CloneFromGlobal([FromBody] CloneRequest r)
+        => Task.FromResult<IActionResult>(LegacySlotMutationEndpointDisabled());
+
+    private ObjectResult LegacySlotMutationEndpointDisabled()
+        => Problem(
+            statusCode: StatusCodes.Status410Gone,
+            title: "Застарілий маршрут зміни часових слотів вимкнено",
+            detail: "Використовуйте захищені маршрути slots/editor/preview і slots/editor/apply з актуальною версією графіка.");
 
     private sealed record SlotPlacement(
         string Source,

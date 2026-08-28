@@ -14,6 +14,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers;
 // Контролер адміністратора для керування викладачами
 public class AdminTeachersController(AppDbContext db) : ControllerBase
 {
+    internal const int MaxTeacherCatalogCount = 10_000;
+    internal const int MaxTeacherRelatedRowCount = 250_000;
 
     // Форматує час для DTO.
     private static string T(TimeOnly t) => t.ToString("HH:mm");
@@ -28,6 +30,7 @@ public class AdminTeachersController(AppDbContext db) : ControllerBase
     // Перетворює викладача у DTO для списку.
     private static TeacherViewDto ToViewDto(
         Teacher t,
+        List<int> moduleIds,
         List<TeacherCourseLoad> loads,
         List<TeacherWorkingHour> wh,
         List<int> supervisorModuleIds) =>
@@ -38,7 +41,7 @@ public class AdminTeachersController(AppDbContext db) : ControllerBase
             ScientificDegree = t.ScientificDegree,
             AcademicTitle = t.AcademicTitle,
             DepartmentId = t.DepartmentId,
-            ModuleIds = t.TeacherModules.Select(tm => tm.ModuleId).ToList(),
+            ModuleIds = moduleIds,
             SupervisorModuleIds = supervisorModuleIds,
             Loads = loads
                 .Select(l => new TeacherLoadDto(l.CourseId, l.IsActive, l.ScheduledHours))
@@ -67,34 +70,102 @@ public class AdminTeachersController(AppDbContext db) : ControllerBase
         );
     [HttpGet]
     // Повертає список викладачів із пов'язаними даними.
-    public async Task<ActionResult<List<TeacherViewDto>>> GetAll()
+    public async Task<ActionResult<List<TeacherViewDto>>> GetAll(
+        CancellationToken cancellationToken = default)
     {
         var teachers = await db.Teachers
             .AsNoTracking()
-            .Include(t => t.TeacherModules)
-            .ToListAsync();
+            .OrderBy(t => t.Id)
+            .Take(MaxTeacherCatalogCount + 1)
+            .ToListAsync(cancellationToken);
+        if (teachers.Count > MaxTeacherCatalogCount)
+        {
+            return UnprocessableEntity(new
+            {
+                message = $"Каталог викладачів перевищує безпечний ліміт {MaxTeacherCatalogCount} записів."
+            });
+        }
         var ids = teachers.Select(t => t.Id).ToList();
+        var teacherModuleRows = await db.TeacherModules
+            .AsNoTracking()
+            .Where(link => ids.Contains(link.TeacherId))
+            .OrderBy(link => link.TeacherId)
+            .ThenBy(link => link.ModuleId)
+            .Take(MaxTeacherRelatedRowCount + 1)
+            .Select(link => new { link.TeacherId, link.ModuleId })
+            .ToListAsync(cancellationToken);
+        if (teacherModuleRows.Count > MaxTeacherRelatedRowCount)
+        {
+            return UnprocessableEntity(new
+            {
+                message = $"Каталог зв'язків викладачів із модулями перевищує безпечний ліміт {MaxTeacherRelatedRowCount} записів."
+            });
+        }
         var loads = await db.TeacherCourseLoads
             .AsNoTracking()
             .Where(l => ids.Contains(l.TeacherId))
-            .ToListAsync();
+            .OrderBy(l => l.Id)
+            .Take(MaxTeacherRelatedRowCount + 1)
+            .ToListAsync(cancellationToken);
+        if (loads.Count > MaxTeacherRelatedRowCount)
+        {
+            return UnprocessableEntity(new
+            {
+                message = $"Каталог навантажень викладачів перевищує безпечний ліміт {MaxTeacherRelatedRowCount} записів."
+            });
+        }
         var wh = await db.TeacherWorkingHours
             .AsNoTracking()
             .Where(w => ids.Contains(w.TeacherId))
-            .ToListAsync();
+            .OrderBy(w => w.Id)
+            .Take(MaxTeacherRelatedRowCount + 1)
+            .ToListAsync(cancellationToken);
+        if (wh.Count > MaxTeacherRelatedRowCount)
+        {
+            return UnprocessableEntity(new
+            {
+                message = $"Каталог робочих інтервалів перевищує безпечний ліміт {MaxTeacherRelatedRowCount} записів."
+            });
+        }
         var supervisorRows = await db.ModuleSupervisors
             .AsNoTracking()
             .Where(ms => ids.Contains(ms.TeacherId))
+            .OrderBy(ms => ms.TeacherId)
+            .ThenBy(ms => ms.ModuleId)
+            .Take(MaxTeacherRelatedRowCount + 1)
             .Select(ms => new { ms.TeacherId, ms.ModuleId })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
+        if (supervisorRows.Count > MaxTeacherRelatedRowCount)
+        {
+            return UnprocessableEntity(new
+            {
+                message = $"Каталог керівників модулів перевищує безпечний ліміт {MaxTeacherRelatedRowCount} записів."
+            });
+        }
+        var loadsByTeacher = loads
+            .GroupBy(load => load.TeacherId)
+            .ToDictionary(group => group.Key, group => group.ToList());
+        var modulesByTeacher = teacherModuleRows
+            .GroupBy(link => link.TeacherId)
+            .ToDictionary(group => group.Key, group => group.Select(link => link.ModuleId).ToList());
+        var workingHoursByTeacher = wh
+            .GroupBy(interval => interval.TeacherId)
+            .ToDictionary(group => group.Key, group => group.ToList());
         var supervisorLinks = supervisorRows
             .GroupBy(row => row.TeacherId)
             .ToDictionary(group => group.Key, group => group.Select(row => row.ModuleId).ToList());
         var result = teachers
             .Select(t => ToViewDto(
                 t,
-                loads.Where(l => l.TeacherId == t.Id).ToList(),
-                wh.Where(w => w.TeacherId == t.Id).ToList(),
+                modulesByTeacher.TryGetValue(t.Id, out var teacherModules)
+                    ? teacherModules
+                    : new List<int>(),
+                loadsByTeacher.TryGetValue(t.Id, out var teacherLoads)
+                    ? teacherLoads
+                    : new List<TeacherCourseLoad>(),
+                workingHoursByTeacher.TryGetValue(t.Id, out var teacherHours)
+                    ? teacherHours
+                    : new List<TeacherWorkingHour>(),
                 supervisorLinks.TryGetValue(t.Id, out var sup) ? sup : new List<int>()))
             .ToList();
         return Ok(result);
@@ -130,10 +201,12 @@ public class AdminTeachersController(AppDbContext db) : ControllerBase
             return BadRequest(new { message = "ПІБ є обовʼязковим" });
         if (fullName.Length > 256)
             return BadRequest(new { message = "ПІБ не може перевищувати 256 символів." });
-        var moduleIds = (dto.ModuleIds ?? new List<int>()).Distinct().ToList();
-        var supervisorModuleIds = (dto.SupervisorModuleIds ?? new List<int>()).Distinct().ToList();
-        if (moduleIds.Count > 500 || supervisorModuleIds.Count > 500)
+        var requestedModuleIds = dto.ModuleIds ?? new List<int>();
+        var requestedSupervisorModuleIds = dto.SupervisorModuleIds ?? new List<int>();
+        if (requestedModuleIds.Count > 500 || requestedSupervisorModuleIds.Count > 500)
             return BadRequest(new { message = "Для одного викладача можна вибрати не більше 500 модулів у кожному переліку." });
+        var moduleIds = requestedModuleIds.Distinct().ToList();
+        var supervisorModuleIds = requestedSupervisorModuleIds.Distinct().ToList();
         if (moduleIds.Any(moduleId => moduleId <= 0) || supervisorModuleIds.Any(moduleId => moduleId <= 0))
             return BadRequest(new { message = "Ідентифікатори модулів мають бути додатними числами." });
         var allModuleIds = moduleIds.Concat(supervisorModuleIds).Distinct().ToList();

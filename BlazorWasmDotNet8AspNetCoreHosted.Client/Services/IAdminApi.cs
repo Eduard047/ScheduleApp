@@ -38,6 +38,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         Task<int> UpsertRoom(RoomEditDto dto);
         Task DeleteRoom(int id);
         // Корпуси та переходи.
+        Task<BuildingCatalogDto> GetBuildingCatalog();
         Task<List<BuildingEditDto>> GetBuildings();
         Task<List<BuildingTravelEditDto>> GetBuildingTravels();
         Task<int> UpsertBuilding(BuildingEditDto dto);
@@ -66,4 +67,9 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         Task<DocxImportResultDto> ImportModulesFromDocx(IBrowserFile file, bool apply, CancellationToken ct = default);
         Task ClearModulesAndPlans();
     }
+
+    // Узгоджений знімок корпусів і маршрутів, отриманий одним HTTP-запитом.
+    public sealed record BuildingCatalogDto(
+        List<BuildingEditDto> Buildings,
+        List<BuildingTravelEditDto> Travels);
 }

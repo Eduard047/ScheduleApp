@@ -1,5 +1,6 @@
 using System.Data;
 using System.Globalization;
+using System.Linq.Expressions;
 using System.Security.Cryptography;
 using System.Text;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
@@ -14,7 +15,10 @@ public enum TimeSlotEditorFailureKind
     Validation,
     NotFound,
     Stale,
-    Conflict
+    Conflict,
+    Busy,
+    Timeout,
+    Capacity
 }
 
 public sealed record TimeSlotEditorFailure(
@@ -36,9 +40,31 @@ public sealed record TimeSlotEditorOutcome<T>(T? Value, TimeSlotEditorFailure? F
 }
 
 // Готує контекст, попередній перегляд і атомарне застосування графіка пар.
-public sealed class TimeSlotEditorService(AppDbContext db)
+public sealed class TimeSlotEditorService
 {
     private const int ConflictSampleLimit = 10;
+    private const int ExactRangePredicateBatchSize = 384;
+    private const int MaxImpactCount = 50_000;
+    private static readonly TimeSpan DefaultOperationDeadline = TimeSpan.FromSeconds(20);
+    private readonly AppDbContext db;
+    private readonly ExpensiveOperationGate? operationGate;
+    private readonly TimeSpan operationDeadline;
+
+    public TimeSlotEditorService(
+        AppDbContext db,
+        ExpensiveOperationGate? operationGate = null,
+        TimeSpan? operationDeadline = null)
+    {
+        this.db = db;
+        this.operationGate = operationGate;
+        this.operationDeadline = operationDeadline ?? DefaultOperationDeadline;
+        if (this.operationDeadline <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(operationDeadline),
+                "Граничний час редактора має бути додатним.");
+        }
+    }
 
     public async Task<TimeSlotEditorOutcome<TimeSlotEditorContextDto>> GetContextAsync(
         TimeSlotEditorTargetMode targetMode,
@@ -130,9 +156,17 @@ public sealed class TimeSlotEditorService(AppDbContext db)
         });
     }
 
-    public async Task<TimeSlotEditorOutcome<TimeSlotSequencePreviewDto>> PreviewAsync(
+    public Task<TimeSlotEditorOutcome<TimeSlotSequencePreviewDto>> PreviewAsync(
         TimeSlotSequenceApplyRequestDto request,
         CancellationToken cancellationToken = default)
+        => ExecuteBoundedAsync(
+            token => PreviewCoreAsync(request, token),
+            clearTrackedChangesOnCancellation: false,
+            cancellationToken);
+
+    private async Task<TimeSlotEditorOutcome<TimeSlotSequencePreviewDto>> PreviewCoreAsync(
+        TimeSlotSequenceApplyRequestDto request,
+        CancellationToken cancellationToken)
     {
         var snapshot = await LoadSnapshotAsync(cancellationToken);
         var prepared = PrepareRequest(request, snapshot);
@@ -154,13 +188,16 @@ public sealed class TimeSlotEditorService(AppDbContext db)
         }
 
         var plan = BuildMutationPlan(snapshot, prepared.Request!);
-        var impact = await FindImpactAsync(
-            request,
-            snapshot.Slots,
-            snapshot.Lunches,
-            plan.AfterSlots,
-            plan.AfterLunches,
-            cancellationToken);
+        var impact = plan.NoChanges
+            ? MutationImpact.Empty
+            : await FindImpactAsync(
+                request,
+                snapshot.Courses.Select(course => course.Id).ToList(),
+                snapshot.Slots,
+                snapshot.Lunches,
+                plan.AfterSlots,
+                plan.AfterLunches,
+                cancellationToken);
         var expectedRevision = ComputePlannedRevision(snapshot, plan, request);
         var token = ComputePreviewToken(revision, expectedRevision, prepared.Request!);
 
@@ -168,9 +205,17 @@ public sealed class TimeSlotEditorService(AppDbContext db)
             BuildPreview(request, revision, token, plan, impact));
     }
 
-    public async Task<TimeSlotEditorOutcome<TimeSlotSequenceApplyResultDto>> ApplyAsync(
+    public Task<TimeSlotEditorOutcome<TimeSlotSequenceApplyResultDto>> ApplyAsync(
         TimeSlotSequenceApplyRequestDto request,
         CancellationToken cancellationToken = default)
+        => ExecuteBoundedAsync(
+            token => ApplyCoreAsync(request, token),
+            clearTrackedChangesOnCancellation: true,
+            cancellationToken);
+
+    private async Task<TimeSlotEditorOutcome<TimeSlotSequenceApplyResultDto>> ApplyCoreAsync(
+        TimeSlotSequenceApplyRequestDto request,
+        CancellationToken cancellationToken)
     {
         await using var transaction = await db.Database.BeginTransactionAsync(
             IsolationLevel.Serializable,
@@ -243,6 +288,7 @@ public sealed class TimeSlotEditorService(AppDbContext db)
 
             var impact = await FindImpactAsync(
                 request,
+                snapshot.Courses.Select(course => course.Id).ToList(),
                 snapshot.Slots,
                 snapshot.Lunches,
                 plan.AfterSlots,
@@ -274,6 +320,66 @@ public sealed class TimeSlotEditorService(AppDbContext db)
         {
             await transaction.RollbackAsync(CancellationToken.None);
             throw;
+        }
+    }
+
+    private async Task<TimeSlotEditorOutcome<T>> ExecuteBoundedAsync<T>(
+        Func<CancellationToken, Task<TimeSlotEditorOutcome<T>>> operation,
+        bool clearTrackedChangesOnCancellation,
+        CancellationToken cancellationToken)
+    {
+        IDisposable? lease = null;
+        if (operationGate is not null)
+        {
+            lease = await operationGate.TryEnterAsync(
+                ExpensiveOperationKind.TimeSlotEditorMutation,
+                cancellationToken);
+            if (lease is null)
+            {
+                return TimeSlotEditorOutcome<T>.Fail(
+                    TimeSlotEditorFailureKind.Busy,
+                    "Інша перевірка або зміна графіка вже виконується. Дочекайтеся її завершення та повторіть дію.");
+            }
+        }
+
+        using (lease)
+        using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+        {
+            deadline.CancelAfter(operationDeadline);
+            try
+            {
+                return await operation(deadline.Token);
+            }
+            catch (TimeSlotEditorCapacityException ex)
+            {
+                if (clearTrackedChangesOnCancellation)
+                {
+                    db.ChangeTracker.Clear();
+                }
+                return TimeSlotEditorOutcome<T>.Fail(
+                    TimeSlotEditorFailureKind.Capacity,
+                    ex.Message);
+            }
+            catch (OperationCanceledException) when (
+                !cancellationToken.IsCancellationRequested
+                && deadline.IsCancellationRequested)
+            {
+                if (clearTrackedChangesOnCancellation)
+                {
+                    db.ChangeTracker.Clear();
+                }
+                return TimeSlotEditorOutcome<T>.Fail(
+                    TimeSlotEditorFailureKind.Timeout,
+                    "Перевірка графіка перевищила безпечний час виконання. Зменште область змін або повторіть пізніше.");
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                if (clearTrackedChangesOnCancellation)
+                {
+                    db.ChangeTracker.Clear();
+                }
+                throw;
+            }
         }
     }
 
@@ -652,12 +758,25 @@ public sealed class TimeSlotEditorService(AppDbContext db)
 
     private async Task<MutationImpact> FindImpactAsync(
         TimeSlotSequenceApplyRequestDto request,
+        IReadOnlyCollection<int> courseIds,
         IReadOnlyCollection<TimeSlot> beforeSlots,
         IReadOnlyCollection<LunchConfig> beforeLunches,
         IReadOnlyCollection<TimeSlot> afterSlots,
         IReadOnlyCollection<LunchConfig> afterLunches,
         CancellationToken cancellationToken)
     {
+        var invalidatedRanges = FindInvalidatedRanges(
+            request,
+            courseIds,
+            beforeSlots,
+            beforeLunches,
+            afterSlots,
+            afterLunches);
+        if (invalidatedRanges.Count == 0)
+        {
+            return MutationImpact.Empty;
+        }
+
         var scheduleQuery = db.ScheduleItems.AsNoTracking().AsQueryable();
         var draftQuery = db.TeacherDraftItems.AsNoTracking().AsQueryable();
         if (request.TargetMode == TimeSlotEditorTargetMode.Course && request.CourseId is int courseId)
@@ -672,32 +791,71 @@ public sealed class TimeSlotEditorService(AppDbContext db)
             draftQuery = draftQuery.Where(item => item.DayOfWeek == day);
         }
 
-        var scheduleRows = await scheduleQuery
-            .Select(item => new Placement(
-                "Розклад",
-                false,
-                item.Id,
-                item.Date,
-                item.StartTime,
-                item.EndTime,
-                item.Group.CourseId,
-                item.Group.Name))
-            .ToListAsync(cancellationToken);
-        var draftRows = await draftQuery
-            .Select(item => new Placement(
-                "Чернетка",
-                true,
-                item.Id,
-                item.Date,
-                item.StartTime,
-                item.EndTime,
-                item.Group.CourseId,
-                item.Group.Name))
-            .ToListAsync(cancellationToken);
-        var affected = scheduleRows
-            .Concat(draftRows)
-            .Where(placement => PlacementFits(placement, beforeSlots, beforeLunches)
-                                && !PlacementFits(placement, afterSlots, afterLunches))
+        var orderedInvalidatedRanges = invalidatedRanges
+            .OrderBy(range => range.Start)
+            .ThenBy(range => range.End)
+            .ToArray();
+        var affected = new List<Placement>();
+        foreach (var rangeBatch in orderedInvalidatedRanges.Chunk(ExactRangePredicateBatchSize))
+        {
+            var exactRangePredicate = BuildExactRangePredicate<ScheduleItem>(
+                rangeBatch,
+                nameof(ScheduleItem.StartTime),
+                nameof(ScheduleItem.EndTime));
+            var rows = scheduleQuery
+                .Where(exactRangePredicate)
+                .Select(item => new Placement(
+                    "Розклад",
+                    false,
+                    item.Id,
+                    item.Date,
+                    item.StartTime,
+                    item.EndTime,
+                    item.Group.CourseId,
+                    item.Group.Name))
+                .AsAsyncEnumerable();
+            await foreach (var placement in rows.WithCancellation(cancellationToken))
+            {
+                AddAffectedPlacement(
+                    affected,
+                    placement,
+                    beforeSlots,
+                    beforeLunches,
+                    afterSlots,
+                    afterLunches);
+            }
+        }
+        foreach (var rangeBatch in orderedInvalidatedRanges.Chunk(ExactRangePredicateBatchSize))
+        {
+            var exactRangePredicate = BuildExactRangePredicate<TeacherDraftItem>(
+                rangeBatch,
+                nameof(TeacherDraftItem.StartTime),
+                nameof(TeacherDraftItem.EndTime));
+            var rows = draftQuery
+                .Where(exactRangePredicate)
+                .Select(item => new Placement(
+                    "Чернетка",
+                    true,
+                    item.Id,
+                    item.Date,
+                    item.StartTime,
+                    item.EndTime,
+                    item.Group.CourseId,
+                    item.Group.Name))
+                .AsAsyncEnumerable();
+            await foreach (var placement in rows.WithCancellation(cancellationToken))
+            {
+                AddAffectedPlacement(
+                    affected,
+                    placement,
+                    beforeSlots,
+                    beforeLunches,
+                    afterSlots,
+                    afterLunches);
+            }
+        }
+
+        affected = affected
             .OrderBy(placement => placement.IsDraft)
             .ThenBy(placement => placement.Date)
             .ThenBy(placement => placement.Id)
@@ -716,6 +874,132 @@ public sealed class TimeSlotEditorService(AppDbContext db)
                 End = placement.End.ToString("HH:mm", CultureInfo.InvariantCulture)
             }).ToList());
     }
+
+    private static Expression<Func<TEntity, bool>> BuildExactRangePredicate<TEntity>(
+        IReadOnlyList<SlotRange> ranges,
+        string startPropertyName,
+        string endPropertyName)
+    {
+        if (ranges.Count == 0)
+        {
+            throw new ArgumentException("Потрібна хоча б одна часова пара.", nameof(ranges));
+        }
+
+        var item = Expression.Parameter(typeof(TEntity), "item");
+        var startProperty = Expression.Property(item, startPropertyName);
+        var endProperty = Expression.Property(item, endPropertyName);
+        var clauses = ranges
+            .Select(range => (Expression)Expression.AndAlso(
+                Expression.Equal(startProperty, Expression.Constant(range.Start)),
+                Expression.Equal(endProperty, Expression.Constant(range.End))))
+            .ToArray();
+        return Expression.Lambda<Func<TEntity, bool>>(
+            CombineWithBalancedOr(clauses, 0, clauses.Length),
+            item);
+    }
+
+    private static Expression CombineWithBalancedOr(
+        IReadOnlyList<Expression> clauses,
+        int offset,
+        int count)
+    {
+        if (count == 1)
+        {
+            return clauses[offset];
+        }
+        var leftCount = count / 2;
+        return Expression.OrElse(
+            CombineWithBalancedOr(clauses, offset, leftCount),
+            CombineWithBalancedOr(clauses, offset + leftCount, count - leftCount));
+    }
+
+    private static void AddAffectedPlacement(
+        List<Placement> affected,
+        Placement placement,
+        IReadOnlyCollection<TimeSlot> beforeSlots,
+        IReadOnlyCollection<LunchConfig> beforeLunches,
+        IReadOnlyCollection<TimeSlot> afterSlots,
+        IReadOnlyCollection<LunchConfig> afterLunches)
+    {
+        if (!PlacementFits(placement, beforeSlots, beforeLunches)
+            || PlacementFits(placement, afterSlots, afterLunches))
+        {
+            return;
+        }
+        affected.Add(placement);
+        if (affected.Count > MaxImpactCount)
+        {
+            throw CreateImpactCapacityException();
+        }
+    }
+
+    private static HashSet<SlotRange> FindInvalidatedRanges(
+        TimeSlotSequenceApplyRequestDto request,
+        IReadOnlyCollection<int> courseIds,
+        IReadOnlyCollection<TimeSlot> beforeSlots,
+        IReadOnlyCollection<LunchConfig> beforeLunches,
+        IReadOnlyCollection<TimeSlot> afterSlots,
+        IReadOnlyCollection<LunchConfig> afterLunches)
+    {
+        IEnumerable<int> relevantCourseIds = request.TargetMode == TimeSlotEditorTargetMode.Course
+            ? [request.CourseId!.Value]
+            : courseIds;
+        IEnumerable<DayOfWeek> relevantDays =
+            !request.ResetCourseToGlobal && request.DayOfWeek is int rawDay
+                ? [(DayOfWeek)rawDay]
+                : Enum.GetValues<DayOfWeek>();
+        var invalidated = new HashSet<SlotRange>();
+        foreach (var courseId in relevantCourseIds)
+        {
+            foreach (var day in relevantDays)
+            {
+                var beforeRanges = BuildAllowedRanges(
+                    TimeSlotsResolver.ResolveForDay(
+                            beforeSlots,
+                            courseId,
+                            day,
+                            beforeLunches)
+                        .Slots);
+                var afterRanges = BuildAllowedRanges(
+                    TimeSlotsResolver.ResolveForDay(
+                            afterSlots,
+                            courseId,
+                            day,
+                            afterLunches)
+                        .Slots);
+                beforeRanges.ExceptWith(afterRanges);
+                invalidated.UnionWith(beforeRanges);
+            }
+        }
+        return invalidated;
+    }
+
+    private static HashSet<SlotRange> BuildAllowedRanges(IEnumerable<TimeSlot> slots)
+    {
+        var ordered = slots
+            .OrderBy(slot => slot.Start)
+            .ThenBy(slot => slot.End)
+            .ToList();
+        var ranges = new HashSet<SlotRange>();
+        for (var startIndex = 0; startIndex < ordered.Count; startIndex++)
+        {
+            for (var endIndex = startIndex; endIndex < ordered.Count; endIndex++)
+            {
+                if (endIndex > startIndex
+                    && ordered[endIndex - 1].End != ordered[endIndex].Start)
+                {
+                    break;
+                }
+                ranges.Add(new SlotRange(ordered[startIndex].Start, ordered[endIndex].End));
+            }
+        }
+        return ranges;
+    }
+
+    private static TimeSlotEditorCapacityException CreateImpactCapacityException()
+        => new(
+            $"Зміна графіка робить недійсними понад {MaxImpactCount} наявних занять. "
+            + "Зменште область зміни та повторіть перевірку.");
 
     private async Task ExecutePlanAsync(MutationPlan plan, CancellationToken cancellationToken)
     {
@@ -1217,11 +1501,17 @@ public sealed class TimeSlotEditorService(AppDbContext db)
         int CourseId,
         string GroupName);
 
+    private sealed record SlotRange(TimeOnly Start, TimeOnly End);
+
+    private sealed class TimeSlotEditorCapacityException(string message) : Exception(message);
+
     private sealed record MutationImpact(
         int ScheduleCount,
         int DraftCount,
         List<TimeSlotConflictSampleDto> Samples)
     {
+        public static MutationImpact Empty { get; } = new(0, 0, []);
+
         public int TotalCount => ScheduleCount + DraftCount;
     }
 }

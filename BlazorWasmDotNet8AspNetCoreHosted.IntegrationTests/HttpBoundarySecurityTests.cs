@@ -8,6 +8,7 @@ using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 
@@ -101,7 +102,7 @@ public sealed class HttpBoundarySecurityTests
     }
 
     [Fact]
-    public async Task Safe_api_request_is_not_blocked_by_fetch_metadata()
+    public async Task Safe_api_request_rejects_cross_site_fetch_metadata()
     {
         await using var host = await SecurityTestHost.StartAsync("schedule.example.test");
 
@@ -110,7 +111,26 @@ public sealed class HttpBoundarySecurityTests
             "schedule.example.test",
             request => request.Headers.TryAddWithoutValidation("Sec-Fetch-Site", "cross-site"));
 
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Safe_api_request_allows_same_origin_browser_and_headerless_clients()
+    {
+        await using var host = await SecurityTestHost.StartAsync("schedule.example.test");
+
+        using var browserResponse = await host.SendAsync(
+            HttpMethod.Get,
+            "schedule.example.test",
+            request =>
+            {
+                request.Headers.TryAddWithoutValidation("Origin", "http://schedule.example.test");
+                request.Headers.TryAddWithoutValidation("Sec-Fetch-Site", "same-origin");
+            });
+        using var apiClientResponse = await host.SendAsync(HttpMethod.Get, "schedule.example.test");
+
+        Assert.Equal(HttpStatusCode.OK, browserResponse.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, apiClientResponse.StatusCode);
     }
 
     [Fact]
@@ -120,8 +140,28 @@ public sealed class HttpBoundarySecurityTests
 
         using var response = await host.SendAsync(HttpMethod.Get, "schedule.example.test");
 
-        Assert.Equal("frame-ancestors 'none'", response.Headers.GetValues("Content-Security-Policy").Single());
+        Assert.Equal(SecurityResponseHeadersMiddleware.ContentSecurityPolicy, response.Headers.GetValues("Content-Security-Policy").Single());
         Assert.Equal("DENY", response.Headers.GetValues("X-Frame-Options").Single());
+        Assert.Equal("nosniff", response.Headers.GetValues("X-Content-Type-Options").Single());
+        Assert.Equal("strict-origin-when-cross-origin", response.Headers.GetValues("Referrer-Policy").Single());
+        Assert.Equal("camera=(), geolocation=(), microphone=()", response.Headers.GetValues("Permissions-Policy").Single());
+    }
+
+    [Fact]
+    public async Task Development_swagger_allows_only_the_inline_bootstrap_required_by_swagger_ui()
+    {
+        await using var host = await SecurityTestHost.StartAsync(
+            "schedule.example.test",
+            environmentName: Environments.Development);
+
+        using var response = await host.SendAsync(
+            HttpMethod.Get,
+            "schedule.example.test",
+            path: "/swagger/index.html");
+
+        Assert.Equal(
+            SecurityResponseHeadersMiddleware.SwaggerContentSecurityPolicy,
+            response.Headers.GetValues("Content-Security-Policy").Single());
     }
 
     [Fact]
@@ -178,11 +218,12 @@ public sealed class HttpBoundarySecurityTests
 
         public static async Task<SecurityTestHost> StartAsync(
             string allowedHostsSetting,
-            IEnumerable<IPAddress>? trustedProxies = null)
+            IEnumerable<IPAddress>? trustedProxies = null,
+            string environmentName = "Testing")
         {
             var builder = WebApplication.CreateBuilder(new WebApplicationOptions
             {
-                EnvironmentName = "Testing"
+                EnvironmentName = environmentName
             });
             builder.WebHost.ConfigureKestrel(options => options.Listen(IPAddress.Loopback, 0));
             var allowedHosts = AllowedHostPolicy.Parse(allowedHostsSetting);
@@ -219,9 +260,10 @@ public sealed class HttpBoundarySecurityTests
         public async Task<HttpResponseMessage> SendAsync(
             HttpMethod method,
             string host,
-            Action<HttpRequestMessage>? configure = null)
+            Action<HttpRequestMessage>? configure = null,
+            string path = "/api/security-boundary")
         {
-            using var request = new HttpRequestMessage(method, "/api/security-boundary");
+            using var request = new HttpRequestMessage(method, path);
             request.Headers.Host = host;
             configure?.Invoke(request);
             return await Client.SendAsync(request);

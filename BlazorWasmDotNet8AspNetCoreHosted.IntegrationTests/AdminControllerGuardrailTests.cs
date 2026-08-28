@@ -8,6 +8,7 @@ using System.Text.Json;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
@@ -178,6 +179,25 @@ public sealed class AdminControllerGuardrailTests
             .Where(module => module.Id == model.Module.Id)
             .Select(module => module.Credits)
             .SingleAsync());
+    }
+
+    [Fact]
+    public async Task Module_plan_upsert_rejects_multiple_rows_in_single_plan_contract()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedRoomModelAsync(20, 20, 40);
+
+        var result = await new AdminPlansController(fixture.Db).Upsert(
+            model.Module.Id,
+            new List<SaveCourseModulePlanDto>
+            {
+                new(30, true),
+                new(60, false)
+            },
+            model.Course.Id);
+
+        Assert.IsType<BadRequestObjectResult>(result);
+        Assert.Empty(await fixture.Db.ModulePlans.AsNoTracking().ToListAsync());
     }
 
     [Fact]
@@ -485,6 +505,27 @@ public sealed class AdminControllerGuardrailTests
 
         Assert.IsType<ConflictObjectResult>(result.Result);
         Assert.False(await fixture.Db.TeacherWorkingHours.AnyAsync(row => row.TeacherId == model.Teacher.Id));
+    }
+
+    [Fact]
+    public async Task Teacher_list_preserves_module_links_with_bounded_separate_loading()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedTeacherModelAsync();
+        fixture.Db.TeacherModules.Add(new TeacherModule
+        {
+            TeacherId = model.Teacher.Id,
+            ModuleId = model.Module.Id
+        });
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+
+        var result = await new AdminTeachersController(fixture.Db).GetAll();
+
+        var ok = Assert.IsType<OkObjectResult>(result.Result);
+        var teachers = Assert.IsType<List<TeacherViewDto>>(ok.Value);
+        var teacher = Assert.Single(teachers);
+        Assert.Equal([model.Module.Id], teacher.ModuleIds);
     }
 
     [Fact]
@@ -2604,6 +2645,30 @@ public sealed class AdminControllerGuardrailTests
     }
 
     [Fact]
+    public async Task Legacy_time_slot_mutation_routes_are_disabled_before_database_mutation()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        fixture.Db.TimeSlots.Add(EntitySlot(null, null, "09:00", "10:00"));
+        await fixture.Db.SaveChangesAsync();
+        var controller = new AdminConfigController(fixture.Db);
+
+        var upsert = await controller.UpsertSlots(new AdminConfigController.BulkTimeSlotsSaveDto(
+            null,
+            null,
+            [EditorSlot("10:00", "11:00")]));
+        var clear = await controller.ClearSlots(null, null);
+        var clone = await controller.CloneFromGlobal(new AdminConfigController.CloneRequest(999, null));
+
+        Assert.Equal(StatusCodes.Status410Gone, Assert.IsType<ObjectResult>(upsert).StatusCode);
+        Assert.Equal(StatusCodes.Status410Gone, Assert.IsType<ObjectResult>(clear).StatusCode);
+        Assert.Equal(StatusCodes.Status410Gone, Assert.IsType<ObjectResult>(clone).StatusCode);
+        fixture.Db.ChangeTracker.Clear();
+        var persisted = await fixture.Db.TimeSlots.AsNoTracking().SingleAsync();
+        Assert.Equal(new TimeOnly(9, 0), persisted.Start);
+        Assert.Equal(new TimeOnly(10, 0), persisted.End);
+    }
+
+    [Fact]
     public async Task Time_slot_editor_course_day_materializes_global_week_before_override()
     {
         await using var fixture = await TestDatabase.CreateAsync();
@@ -3586,8 +3651,10 @@ public sealed class AdminControllerGuardrailTests
         Assert.False(preview.CanApply);
         request.PreviewToken = preview.PreviewToken;
 
+        using var operationGate = new ExpensiveOperationGate();
         var action = await new AdminConfigController(fixture.Db).ApplyTimeSlotSequence(
             request,
+            operationGate,
             CancellationToken.None);
 
         var conflict = Assert.IsType<ConflictObjectResult>(action);
@@ -3596,6 +3663,238 @@ public sealed class AdminControllerGuardrailTests
         Assert.Single(await fixture.Db.TimeSlots.AsNoTracking().ToListAsync());
         Assert.False(await fixture.Db.TimeSlots.AnyAsync(slot => slot.CourseId != null));
         Assert.Equal(new TimeOnly(9, 0), await fixture.Db.TimeSlots.Select(slot => slot.Start).SingleAsync());
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_preview_filters_large_unrelated_placement_corpus_before_materialization()
+    {
+        var capture = new PlacementQueryCaptureInterceptor();
+        await using var fixture = await TestDatabase.CreateAsync(interceptor: capture);
+        var model = await fixture.SeedRoomModelAsync(20, 20, 40);
+        fixture.Db.TimeSlots.Add(EntitySlot(model.Course.Id, null, "09:00", "10:00"));
+        fixture.Db.ScheduleItems.Add(CreateScheduleItem(
+            model,
+            model.FirstGroup.Id,
+            new DateOnly(2026, 9, 7)));
+        fixture.Db.ScheduleItems.AddRange(Enumerable.Range(0, 5_000).Select(index => new ScheduleItem
+        {
+            Date = new DateOnly(2026, 9, 7).AddDays(index / 500 * 7),
+            DayOfWeek = DayOfWeek.Monday,
+            StartTime = new TimeOnly(15, 0),
+            EndTime = new TimeOnly(16, 0),
+            GroupId = model.FirstGroup.Id,
+            ModuleId = model.Module.Id,
+            LessonTypeId = model.LessonType.Id,
+            RoomId = model.Room.Id
+        }));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            model.Course.Id,
+            (int)DayOfWeek.Monday));
+        capture.Commands.Clear();
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.Course,
+            model.Course.Id,
+            (int)DayOfWeek.Monday,
+            context.CurrentRevision,
+            [EditorSlot("10:00", "11:00")]);
+
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+
+        Assert.Equal(1, preview.ScheduleConflictCount);
+        Assert.Equal(0, preview.DraftConflictCount);
+        Assert.Contains(capture.Commands, command =>
+            command.Contains("ScheduleItems", StringComparison.Ordinal)
+            && command.Contains("\"s\".\"StartTime\" =", StringComparison.Ordinal)
+            && command.Contains("\"s\".\"EndTime\" =", StringComparison.Ordinal)
+            && !command.Contains("\"s\".\"StartTime\" >=", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_sparse_invalidated_ranges_do_not_count_middle_time_rows_toward_capacity()
+    {
+        var capture = new PlacementQueryCaptureInterceptor();
+        await using var fixture = await TestDatabase.CreateAsync(interceptor: capture);
+        var model = await fixture.SeedRoomModelAsync(20, 20, 40);
+        fixture.Db.TimeSlots.AddRange(
+            EntitySlot(model.Course.Id, null, "09:00", "10:00", sortOrder: 1),
+            EntitySlot(model.Course.Id, null, "17:00", "18:00", sortOrder: 2));
+        var firstConflict = CreateScheduleItem(
+            model,
+            model.FirstGroup.Id,
+            new DateOnly(2026, 9, 7));
+        var secondConflict = CreateScheduleItem(
+            model,
+            model.FirstGroup.Id,
+            new DateOnly(2026, 9, 7));
+        secondConflict.StartTime = new TimeOnly(17, 0);
+        secondConflict.EndTime = new TimeOnly(18, 0);
+        var middleTemplate = CreateScheduleItem(
+            model,
+            model.FirstGroup.Id,
+            new DateOnly(2026, 9, 7));
+        middleTemplate.StartTime = new TimeOnly(13, 0);
+        middleTemplate.EndTime = new TimeOnly(14, 0);
+        fixture.Db.ScheduleItems.AddRange(firstConflict, secondConflict, middleTemplate);
+        await fixture.Db.SaveChangesAsync();
+        await fixture.Db.Database.ExecuteSqlInterpolatedAsync($"""
+            WITH RECURSIVE "seq"("value") AS (
+                SELECT 1
+                UNION ALL
+                SELECT "value" + 1 FROM "seq" WHERE "value" < 224
+            )
+            INSERT INTO "ScheduleItems" (
+                "BatchKey", "Date", "DayOfWeek", "EndTime", "GroupId", "IsLocked",
+                "IsSelfStudy", "LessonTypeId", "ModuleId", "ModuleTopicId", "Revision",
+                "RoomId", "StartTime", "TeacherId")
+            SELECT
+                "template"."BatchKey", "template"."Date", "template"."DayOfWeek",
+                "template"."EndTime", "template"."GroupId", "template"."IsLocked",
+                "template"."IsSelfStudy", "template"."LessonTypeId", "template"."ModuleId",
+                "template"."ModuleTopicId", "template"."Revision", "template"."RoomId",
+                "template"."StartTime", "template"."TeacherId"
+            FROM "ScheduleItems" AS "template"
+            CROSS JOIN "seq" AS "left_seq"
+            CROSS JOIN "seq" AS "right_seq"
+            WHERE "template"."Id" = {middleTemplate.Id}
+            LIMIT 50000;
+            """);
+        fixture.Db.ChangeTracker.Clear();
+
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            model.Course.Id,
+            (int)DayOfWeek.Monday));
+        capture.Commands.Clear();
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.Course,
+            model.Course.Id,
+            (int)DayOfWeek.Monday,
+            context.CurrentRevision,
+            [EditorSlot("10:00", "11:00"), EditorSlot("18:00", "19:00")]);
+
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+
+        Assert.Equal(2, preview.ScheduleConflictCount);
+        Assert.Equal(0, preview.DraftConflictCount);
+        Assert.Equal(50_003, await fixture.Db.ScheduleItems.CountAsync());
+        Assert.Contains(capture.Commands, command =>
+            command.Contains("ScheduleItems", StringComparison.Ordinal)
+            && command.Contains("\"s\".\"StartTime\" =", StringComparison.Ordinal)
+            && command.Contains(" OR ", StringComparison.Ordinal)
+            && !command.Contains("\"s\".\"StartTime\" >=", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_apply_deadline_rolls_back_without_changing_configuration()
+    {
+        var blocker = new BlockingPlacementQueryInterceptor();
+        await using var fixture = await TestDatabase.CreateAsync(interceptor: blocker);
+        var model = await fixture.SeedRoomModelAsync(20, 20, 40);
+        fixture.Db.TimeSlots.Add(EntitySlot(model.Course.Id, null, "09:00", "10:00"));
+        fixture.Db.ScheduleItems.Add(CreateScheduleItem(
+            model,
+            model.FirstGroup.Id,
+            new DateOnly(2026, 9, 7)));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            model.Course.Id,
+            (int)DayOfWeek.Monday));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.Course,
+            model.Course.Id,
+            (int)DayOfWeek.Monday,
+            context.CurrentRevision,
+            [EditorSlot("10:00", "11:00")]);
+        var preview = AssertSuccess(await service.PreviewAsync(request));
+        request.PreviewToken = preview.PreviewToken;
+        blocker.BlockPlacementQueries = true;
+        var boundedService = new TimeSlotEditorService(
+            fixture.Db,
+            operationDeadline: TimeSpan.FromMilliseconds(50));
+
+        var outcome = await boundedService.ApplyAsync(request);
+
+        Assert.False(outcome.IsSuccess);
+        Assert.Equal(TimeSlotEditorFailureKind.Timeout, outcome.Failure!.Kind);
+        fixture.Db.ChangeTracker.Clear();
+        var stored = Assert.Single(await fixture.Db.TimeSlots.AsNoTracking().ToListAsync());
+        Assert.Equal(new TimeOnly(9, 0), stored.Start);
+        Assert.Equal(new TimeOnly(10, 0), stored.End);
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_preview_propagates_caller_cancellation()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс скасування", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        fixture.Db.TimeSlots.Add(EntitySlot(null, null, "09:00", "10:00"));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var service = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await service.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null,
+            context.CurrentRevision,
+            [EditorSlot("10:00", "11:00")]);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            service.PreviewAsync(request, cancellation.Token));
+    }
+
+    [Fact]
+    public async Task Time_slot_editor_gate_fails_fast_when_another_mutation_is_running()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var course = new Course { Name = "Курс конкурентної перевірки", DurationWeeks = 12 };
+        fixture.Db.Courses.Add(course);
+        fixture.Db.TimeSlots.Add(EntitySlot(null, null, "09:00", "10:00"));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var contextService = new TimeSlotEditorService(fixture.Db);
+        var context = AssertSuccess(await contextService.GetContextAsync(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null));
+        var request = EditorRequest(
+            TimeSlotEditorTargetMode.Course,
+            course.Id,
+            null,
+            context.CurrentRevision,
+            [EditorSlot("10:00", "11:00")]);
+        using var gate = new ExpensiveOperationGate();
+        using var heldLease = await gate.TryEnterAsync(
+            ExpensiveOperationKind.TimeSlotEditorMutation,
+            CancellationToken.None);
+        Assert.NotNull(heldLease);
+        var service = new TimeSlotEditorService(fixture.Db, gate);
+
+        var outcome = await service.PreviewAsync(request);
+        var action = await new AdminConfigController(fixture.Db).PreviewTimeSlotSequence(
+            request,
+            gate,
+            CancellationToken.None);
+
+        Assert.False(outcome.IsSuccess);
+        Assert.Equal(TimeSlotEditorFailureKind.Busy, outcome.Failure!.Kind);
+        var busy = Assert.IsType<ObjectResult>(action);
+        Assert.Equal(429, busy.StatusCode);
     }
 
     private static T AssertSuccess<T>(TimeSlotEditorOutcome<T> outcome)
@@ -3806,6 +4105,45 @@ public sealed class AdminControllerGuardrailTests
                 ObservedIsolationLevel = command.Transaction.IsolationLevel;
             }
             return base.ReaderExecutingAsync(command, eventData, result, cancellationToken);
+        }
+    }
+
+    private sealed class PlacementQueryCaptureInterceptor : DbCommandInterceptor
+    {
+        public List<string> Commands { get; } = [];
+
+        public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (command.CommandText.Contains("ScheduleItems", StringComparison.Ordinal)
+                || command.CommandText.Contains("TeacherDraftItems", StringComparison.Ordinal))
+            {
+                Commands.Add(command.CommandText);
+            }
+            return base.ReaderExecutingAsync(command, eventData, result, cancellationToken);
+        }
+    }
+
+    private sealed class BlockingPlacementQueryInterceptor : DbCommandInterceptor
+    {
+        public bool BlockPlacementQueries { get; set; }
+
+        public override async ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (BlockPlacementQueries
+                && (command.CommandText.Contains("ScheduleItems", StringComparison.Ordinal)
+                    || command.CommandText.Contains("TeacherDraftItems", StringComparison.Ordinal)))
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            return await base.ReaderExecutingAsync(command, eventData, result, cancellationToken);
         }
     }
 

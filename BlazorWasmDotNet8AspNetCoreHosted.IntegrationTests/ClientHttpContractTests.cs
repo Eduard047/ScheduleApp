@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using BlazorWasmDotNet8AspNetCoreHosted.Client.Services;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
+using Microsoft.AspNetCore.Components.Forms;
 using Microsoft.JSInterop;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
@@ -44,6 +45,141 @@ public sealed class ClientHttpContractTests
         Assert.Equal(1, plan.TotalChanges);
         Assert.Single(plan.Changes);
         Assert.Equal(1, handler.RequestCount);
+    }
+
+    [Fact]
+    public async Task Buildings_catalog_client_reads_buildings_and_travels_with_one_request()
+    {
+        var handler = new StaticResponseHandler(new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = JsonContent.Create(new
+            {
+                buildings = new[] { new BuildingEditDto(7, "Головний", "вул. Тестова, 1") },
+                travels = new[] { new BuildingTravelEditDto(7, 9, 12) }
+            })
+        });
+        using var client = new HttpClient(handler) { BaseAddress = new Uri("https://schedule.test/") };
+
+        var catalog = await new AdminApi(client).GetBuildingCatalog();
+
+        Assert.Equal("Головний", Assert.Single(catalog.Buildings).Name);
+        Assert.Equal(12, Assert.Single(catalog.Travels).Minutes);
+        Assert.Equal("/api/admin/buildings", handler.LastRequestUri?.AbsolutePath);
+        Assert.Equal(1, handler.RequestCount);
+    }
+
+    [Fact]
+    public async Task Autogen_job_poll_propagates_cancellation_to_http_request()
+    {
+        var handler = new CancellationAwareHandler();
+        using var client = new HttpClient(handler) { BaseAddress = new Uri("https://schedule.test/") };
+        using var cancellation = new CancellationTokenSource();
+
+        var request = new TeacherDraftsApi(client).GetAutogenJob("job-1", cancellation.Token);
+        await handler.RequestStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => request);
+        Assert.True(handler.CancellationObserved);
+    }
+
+    [Fact]
+    public async Task Autogen_plan_paging_propagates_cancellation_to_followup_request()
+    {
+        var handler = new BlockingSecondAutogenPlanPageHandler();
+        using var client = new HttpClient(handler) { BaseAddress = new Uri("https://schedule.test/") };
+        using var cancellation = new CancellationTokenSource();
+
+        var request = new TeacherDraftsApi(client).GetAutogenPlan("plan-1", cancellation.Token);
+        await handler.SecondPageStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => request);
+        Assert.True(handler.CancellationObserved);
+    }
+
+    [Fact]
+    public async Task Teacher_drafts_client_disposes_completed_http_response()
+    {
+        var content = new TrackingStringContent(
+            JsonSerializer.Serialize(CreateJobStatus()),
+            Encoding.UTF8,
+            "application/json");
+        var handler = new StaticResponseHandler(new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = content
+        });
+        using var client = new HttpClient(handler) { BaseAddress = new Uri("https://schedule.test/") };
+
+        var status = await new TeacherDraftsApi(client).GetAutogenJob("job-1");
+
+        Assert.Equal("job-1", status.JobId);
+        Assert.True(content.IsDisposed);
+    }
+
+    [Fact]
+    public async Task Mutation_clients_dispose_completed_http_responses()
+    {
+        var scheduleContent = new TrackingStringContent("{}", Encoding.UTF8, "application/json");
+        using (var scheduleClient = new HttpClient(new StaticResponseHandler(
+                   new HttpResponseMessage(HttpStatusCode.NoContent) { Content = scheduleContent }))
+               {
+                   BaseAddress = new Uri("https://schedule.test/")
+               })
+        {
+            await new ScheduleApi(scheduleClient).Delete(1, Guid.NewGuid());
+        }
+
+        var slotContent = new TrackingStringContent("{}", Encoding.UTF8, "application/json");
+        using (var slotClient = new HttpClient(new StaticResponseHandler(
+                   new HttpResponseMessage(HttpStatusCode.NoContent) { Content = slotContent }))
+               {
+                   BaseAddress = new Uri("https://schedule.test/")
+               })
+        {
+            await new TimeSlotsApi(slotClient).SavePreferredFirstSlotLimitAsync(null, 1);
+        }
+
+        var adminContent = new TrackingStringContent("{}", Encoding.UTF8, "application/json");
+        using (var adminClient = new HttpClient(new StaticResponseHandler(
+                   new HttpResponseMessage(HttpStatusCode.NoContent) { Content = adminContent }))
+               {
+                   BaseAddress = new Uri("https://schedule.test/")
+               })
+        {
+            await new AdminApi(adminClient).DeleteBuilding(1);
+        }
+
+        Assert.True(scheduleContent.IsDisposed);
+        Assert.True(slotContent.IsDisposed);
+        Assert.True(adminContent.IsDisposed);
+    }
+
+    [Fact]
+    public async Task Docx_import_disposes_upload_stream_and_http_response()
+    {
+        var file = new TrackingBrowserFile();
+        var content = new TrackingStringContent(
+            JsonSerializer.Serialize(new DocxImportResultDto(
+                "Курс",
+                1,
+                true,
+                new(),
+                new(),
+                null)),
+            Encoding.UTF8,
+            "application/json");
+        var handler = new StaticResponseHandler(new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = content
+        });
+        using var client = new HttpClient(handler) { BaseAddress = new Uri("https://schedule.test/") };
+
+        var result = await new AdminApi(client).ImportModulesFromDocx(file, apply: false);
+
+        Assert.Equal("Курс", result.CourseName);
+        Assert.True(Assert.IsType<TrackingStream>(file.OpenedStream).IsDisposed);
+        Assert.True(content.IsDisposed);
     }
 
     [Fact]
@@ -159,16 +295,115 @@ public sealed class ClientHttpContractTests
 
     private sealed record TestPayload(int Value);
 
+    private static AutoGenJobStatus CreateJobStatus()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var day = DateOnly.FromDateTime(now.UtcDateTime);
+        return new AutoGenJobStatus(
+            JobId: "job-1",
+            State: AutoGenJobState.Succeeded,
+            Kind: AutoGenJobKind.Generate,
+            Title: "Автогенерація",
+            CurrentStage: "Завершено",
+            CreatedAt: now,
+            StartedAt: now,
+            CompletedAt: now,
+            RangeStartDate: day,
+            RangeEndDate: day,
+            TotalWeeks: 1,
+            CompletedWeeks: 1,
+            CurrentWeekNumber: 1,
+            CurrentWeekStartDate: day,
+            CurrentRangeStartDate: day,
+            CurrentRangeEndDate: day,
+            Created: 0,
+            Skipped: 0,
+            WarningCount: 0,
+            GapCount: 0,
+            DeficitCount: 0,
+            Percent: 100,
+            CancellationRequested: false);
+    }
+
     private sealed class StaticResponseHandler(HttpResponseMessage response) : HttpMessageHandler
     {
         public Uri? LastRequestUri { get; private set; }
+        public int RequestCount { get; private set; }
 
         protected override Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request,
             CancellationToken cancellationToken)
         {
             LastRequestUri = request.RequestUri;
+            RequestCount++;
             return Task.FromResult(response);
+        }
+    }
+
+    private sealed class CancellationAwareHandler : HttpMessageHandler
+    {
+        public TaskCompletionSource<bool> RequestStarted { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool CancellationObserved { get; private set; }
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            RequestStarted.TrySetResult(true);
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                CancellationObserved = true;
+                throw;
+            }
+
+            throw new InvalidOperationException("Запит мав бути скасований.");
+        }
+    }
+
+    private sealed class TrackingStringContent(
+        string content,
+        Encoding encoding,
+        string mediaType) : StringContent(content, encoding, mediaType)
+    {
+        public bool IsDisposed { get; private set; }
+
+        protected override void Dispose(bool disposing)
+        {
+            IsDisposed |= disposing;
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed class TrackingBrowserFile : IBrowserFile
+    {
+        public string Name => "modules.docx";
+        public DateTimeOffset LastModified => DateTimeOffset.UtcNow;
+        public long Size => 8;
+        public string ContentType => "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        public Stream? OpenedStream { get; private set; }
+
+        public Stream OpenReadStream(
+            long maxAllowedSize = 512_000,
+            CancellationToken cancellationToken = default)
+        {
+            OpenedStream = new TrackingStream(new byte[8]);
+            return OpenedStream;
+        }
+    }
+
+    private sealed class TrackingStream(byte[] buffer) : MemoryStream(buffer, writable: false)
+    {
+        public bool IsDisposed { get; private set; }
+
+        protected override void Dispose(bool disposing)
+        {
+            IsDisposed |= disposing;
+            base.Dispose(disposing);
         }
     }
 
@@ -217,6 +452,67 @@ public sealed class ClientHttpContractTests
             {
                 Content = JsonContent.Create(details)
             });
+        }
+    }
+
+    private sealed class BlockingSecondAutogenPlanPageHandler : HttpMessageHandler
+    {
+        public TaskCompletionSource<bool> SecondPageStarted { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool CancellationObserved { get; private set; }
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            var isSecondPage = request.RequestUri?.Query.Contains(
+                "changeOffset=200",
+                StringComparison.Ordinal) == true;
+            if (isSecondPage)
+            {
+                SecondPageStarted.TrySetResult(true);
+                try
+                {
+                    await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    CancellationObserved = true;
+                    throw;
+                }
+
+                throw new InvalidOperationException("Другий запит мав бути скасований.");
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            var details = new AutoGenPlanDetailsDto(
+                new AutoGenPlanSummaryDto(
+                    "plan-1",
+                    AutoGenPlanState.Ready,
+                    1,
+                    now,
+                    now.AddHours(1),
+                    null,
+                    null,
+                    201,
+                    0,
+                    0,
+                    true,
+                    false),
+                Enumerable.Range(1, 200)
+                    .Select(ordinal => new AutoGenPlanChangeDto(
+                        ordinal,
+                        AutoGenPlanOperation.Add,
+                        null,
+                        null))
+                    .ToList(),
+                new AutoGenResult(201, 0, new List<string>()),
+                0,
+                201);
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = JsonContent.Create(details)
+            };
         }
     }
 

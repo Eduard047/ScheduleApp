@@ -201,6 +201,173 @@ public sealed class ScheduleEndpointCorrectnessTests
             item => Assert.Equal(packageKey, item.BatchKey));
     }
 
+    [Theory]
+    [InlineData("partial")]
+    [InlineData("extra")]
+    [InlineData("mismatched")]
+    public async Task Upsert_rescheduled_rejects_incomplete_or_mismatched_existing_package(string packageShape)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedLogicalEventAsync();
+        var rescheduledType = new LessonTypeRef
+        {
+            Code = "RESCHEDULED",
+            Name = "Перенесено",
+            RequiresRoom = false,
+            RequiresTeacher = false,
+            BlocksRoom = false,
+            BlocksTeacher = false,
+            CountInPlan = false,
+            CountInLoad = false
+        };
+        fixture.Db.LessonTypes.Add(rescheduledType);
+        await fixture.Db.SaveChangesAsync();
+        var sourceRows = await fixture.Db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => item.BatchKey == model.BatchKey)
+            .OrderBy(item => item.Id)
+            .ToListAsync();
+        Assert.Equal(2, sourceRows.Count);
+        var packageKey = $"rescheduled:{sourceRows.Min(item => item.Id)}:{model.OriginalLessonTypeId}";
+        var replacementDate = Monday.AddDays(7);
+        var plantedRows = sourceRows.Select(item => new TeacherDraftItem
+        {
+            Date = replacementDate,
+            DayOfWeek = replacementDate.DayOfWeek,
+            StartTime = item.StartTime,
+            EndTime = item.EndTime,
+            GroupId = item.GroupId,
+            ModuleId = item.ModuleId,
+            ModuleTopicId = item.ModuleTopicId,
+            TeacherId = item.TeacherId,
+            RoomId = item.RoomId,
+            LessonTypeId = item.LessonTypeId,
+            BatchKey = packageKey,
+            Status = DraftStatus.Draft,
+            IsLocked = true,
+            IsSelfStudy = item.IsSelfStudy
+        }).ToList();
+        switch (packageShape)
+        {
+            case "partial":
+                plantedRows.RemoveAt(1);
+                break;
+            case "extra":
+                plantedRows.Add(new TeacherDraftItem
+                {
+                    Date = plantedRows[0].Date,
+                    DayOfWeek = plantedRows[0].DayOfWeek,
+                    StartTime = plantedRows[0].StartTime,
+                    EndTime = plantedRows[0].EndTime,
+                    GroupId = plantedRows[0].GroupId,
+                    ModuleId = plantedRows[0].ModuleId,
+                    ModuleTopicId = plantedRows[0].ModuleTopicId,
+                    TeacherId = plantedRows[0].TeacherId,
+                    RoomId = plantedRows[0].RoomId,
+                    LessonTypeId = plantedRows[0].LessonTypeId,
+                    BatchKey = packageKey,
+                    Status = DraftStatus.Draft,
+                    IsLocked = true,
+                    IsSelfStudy = plantedRows[0].IsSelfStudy
+                });
+                break;
+            case "mismatched":
+                plantedRows[1].ModuleTopicId = plantedRows[0].ModuleTopicId;
+                plantedRows[1].TeacherId = plantedRows[0].TeacherId;
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(packageShape));
+        }
+        fixture.Db.TeacherDraftItems.AddRange(plantedRows);
+        await fixture.Db.SaveChangesAsync();
+        var originalRevision = await GetScheduleItemRevisionAsync(fixture.Db, model.FirstItemId);
+
+        var result = await CreateController(fixture.Db).Upsert(new UpsertScheduleItemRequest(
+            Id: model.FirstItemId,
+            Date: Monday,
+            TimeStart: "08:00",
+            TimeEnd: "09:00",
+            GroupId: model.GroupId,
+            ModuleId: model.ModuleId,
+            TeacherId: model.FirstTeacherId,
+            RoomId: null,
+            LessonTypeId: rescheduledType.Id,
+            IsLocked: false,
+            OverrideNonWorkingDay: false,
+            ExpectedRevision: originalRevision));
+
+        Assert.IsType<ConflictObjectResult>(result.Result);
+        fixture.Db.ChangeTracker.Clear();
+        var persistedSourceRows = await fixture.Db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => item.BatchKey == model.BatchKey)
+            .ToListAsync();
+        Assert.Equal(2, persistedSourceRows.Count);
+        Assert.All(persistedSourceRows, item => Assert.Equal(model.OriginalLessonTypeId, item.LessonTypeId));
+        Assert.Equal(plantedRows.Count, await fixture.Db.TeacherDraftItems.CountAsync());
+    }
+
+    [Fact]
+    public async Task Upsert_rescheduled_rejects_room_required_logical_event_with_mixed_rooms()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedLogicalEventAsync();
+        var originalType = await fixture.Db.LessonTypes
+            .SingleAsync(item => item.Id == model.OriginalLessonTypeId);
+        originalType.RequiresRoom = true;
+        originalType.BlocksRoom = true;
+        var rescheduledType = new LessonTypeRef
+        {
+            Code = "RESCHEDULED",
+            Name = "Перенесено",
+            RequiresRoom = false,
+            RequiresTeacher = false,
+            BlocksRoom = false,
+            BlocksTeacher = false,
+            CountInPlan = false,
+            CountInLoad = false
+        };
+        var building = new Building { Name = "Корпус для перенесення" };
+        var firstRoom = new Room { Name = "Аудиторія 1", Capacity = 40, Building = building };
+        var secondRoom = new Room { Name = "Аудиторія 2", Capacity = 40, Building = building };
+        fixture.Db.AddRange(rescheduledType, building, firstRoom, secondRoom);
+        await fixture.Db.SaveChangesAsync();
+        var sourceRows = await fixture.Db.ScheduleItems
+            .Where(item => item.BatchKey == model.BatchKey)
+            .OrderBy(item => item.Id)
+            .ToListAsync();
+        sourceRows[0].RoomId = firstRoom.Id;
+        sourceRows[1].RoomId = secondRoom.Id;
+        await fixture.Db.SaveChangesAsync();
+        var originalRevision = await GetScheduleItemRevisionAsync(fixture.Db, model.FirstItemId);
+
+        var result = await CreateController(fixture.Db).Upsert(new UpsertScheduleItemRequest(
+            Id: model.FirstItemId,
+            Date: Monday,
+            TimeStart: "08:00",
+            TimeEnd: "09:00",
+            GroupId: model.GroupId,
+            ModuleId: model.ModuleId,
+            TeacherId: model.FirstTeacherId,
+            RoomId: firstRoom.Id,
+            LessonTypeId: rescheduledType.Id,
+            IsLocked: false,
+            OverrideNonWorkingDay: false,
+            ExpectedRevision: originalRevision));
+
+        Assert.IsType<ConflictObjectResult>(result.Result);
+        fixture.Db.ChangeTracker.Clear();
+        var persistedSourceRows = await fixture.Db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => item.BatchKey == model.BatchKey)
+            .OrderBy(item => item.Id)
+            .ToListAsync();
+        Assert.Equal(2, persistedSourceRows.Count);
+        Assert.All(persistedSourceRows, item => Assert.Equal(model.OriginalLessonTypeId, item.LessonTypeId));
+        Assert.Equal(new int?[] { firstRoom.Id, secondRoom.Id }, persistedSourceRows.Select(item => item.RoomId));
+        Assert.False(await fixture.Db.TeacherDraftItems.AnyAsync());
+    }
+
     [Fact]
     public async Task Upsert_rescheduled_rolls_back_when_no_replacement_slot_is_available()
     {

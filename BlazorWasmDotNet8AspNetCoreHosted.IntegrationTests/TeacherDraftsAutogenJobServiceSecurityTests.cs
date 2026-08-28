@@ -745,6 +745,103 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
     }
 
     [Fact]
+    public async Task Input_fingerprint_accepts_section_limit_and_rejects_limit_plus_one()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Add);
+        var request = CreatePlanFingerprintRequest();
+        await using var db = new AppDbContext(fixture.Options);
+        await InsertLessonTypesAsync(
+            db,
+            TeacherDraftsAutogenInputFingerprint.MaxRowsPerFingerprintSection - 1,
+            idOffset: 1_000);
+        var service = new TeacherDraftsAutogenPlanService(db);
+
+        var exactLimitFingerprint = await service.CaptureInputFingerprintAsync(request);
+
+        Assert.Equal(64, exactLimitFingerprint.Length);
+        db.LessonTypes.Add(new LessonTypeRef
+        {
+            Code = "CAPACITY-OVERFLOW",
+            Name = "Тип заняття понад ліміт",
+            IsActive = true
+        });
+        await db.SaveChangesAsync();
+
+        var error = await Assert.ThrowsAsync<AutoGenPlanCapacityException>(() =>
+            service.CaptureInputFingerprintAsync(request));
+        Assert.Contains(
+            TeacherDraftsAutogenInputFingerprint.MaxRowsPerFingerprintSection.ToString(),
+            error.Message,
+            StringComparison.Ordinal);
+        Assert.IsAssignableFrom<AutoGenPlanConflictException>(error);
+    }
+
+    [Fact]
+    public async Task Plan_scope_accepts_limit_and_apply_rejects_limit_plus_one_without_changes()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Add);
+        var request = CreatePlanFingerprintRequest();
+        await using var db = new AppDbContext(fixture.Options);
+        await InsertDraftRowsAsync(
+            db,
+            TeacherDraftsAutogenPlanService.MaxScopeRowCount,
+            idOffset: 1_000);
+        var service = new TeacherDraftsAutogenPlanService(db);
+
+        var exactLimitScope = await service.CaptureScopeAsync(request, CancellationToken.None);
+
+        Assert.Equal(TeacherDraftsAutogenPlanService.MaxScopeRowCount, exactLimitScope.Count);
+        await InsertDraftRowsAsync(db, count: 1, idOffset: 100_000);
+        var captureError = await Assert.ThrowsAsync<AutoGenPlanCapacityException>(() =>
+            service.CaptureScopeAsync(request, CancellationToken.None));
+        Assert.Contains(
+            TeacherDraftsAutogenPlanService.MaxScopeRowCount.ToString(),
+            captureError.Message,
+            StringComparison.Ordinal);
+
+        var plan = await db.AutoGenDraftPlans.SingleAsync(item => item.PlanId == fixture.PlanId);
+        plan.InputFingerprint = await service.CaptureInputFingerprintAsync(request);
+        plan.BeforeScopeRevision = LogicalRevisionToken.Combine(await db.TeacherDraftItems
+            .AsNoTracking()
+            .OrderBy(item => item.Id)
+            .Select(item => new KeyValuePair<int, Guid>(item.Id, item.Revision))
+            .ToListAsync());
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        var applyError = await Assert.ThrowsAsync<AutoGenPlanCapacityException>(() =>
+            service.ApplyAsync(fixture.PlanId, new AutoGenPlanActionRequest(1)));
+        Assert.Contains(
+            TeacherDraftsAutogenPlanService.MaxScopeRowCount.ToString(),
+            applyError.Message,
+            StringComparison.Ordinal);
+        Assert.Equal(
+            TeacherDraftsAutogenPlanService.MaxScopeRowCount + 1,
+            await db.TeacherDraftItems.AsNoTracking().CountAsync());
+        Assert.Equal(
+            (int)AutoGenPlanState.Ready,
+            await db.AutoGenDraftPlans.AsNoTracking()
+                .Where(item => item.PlanId == fixture.PlanId)
+                .Select(item => item.State)
+                .SingleAsync());
+    }
+
+    [Fact]
+    public async Task Fingerprint_and_plan_scope_honor_pre_canceled_tokens()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Add);
+        await using var db = new AppDbContext(fixture.Options);
+        var service = new TeacherDraftsAutogenPlanService(db);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            service.CaptureInputFingerprintAsync(CreatePlanFingerprintRequest(), cancellation.Token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            service.CaptureScopeAsync(CreatePlanFingerprintRequest(), cancellation.Token));
+    }
+
+    [Fact]
     public async Task Input_fingerprint_ignores_configuration_of_an_unrelated_course()
     {
         await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Add);
@@ -1222,6 +1319,122 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
 
         await Assert.ThrowsAsync<AutoGenPlanNotFoundException>(() => applyTask);
     }
+
+    private static Task<int> InsertLessonTypesAsync(
+        AppDbContext db,
+        int count,
+        int idOffset)
+        => db.Database.ExecuteSqlInterpolatedAsync($"""
+            WITH digits(value) AS (
+                VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)
+            ),
+            numbers(value) AS (
+                SELECT ones.value
+                     + tens.value * 10
+                     + hundreds.value * 100
+                     + thousands.value * 1000
+                     + ten_thousands.value * 10000
+                FROM digits AS ones
+                CROSS JOIN digits AS tens
+                CROSS JOIN digits AS hundreds
+                CROSS JOIN digits AS thousands
+                CROSS JOIN digits AS ten_thousands
+            )
+            INSERT INTO LessonTypes (
+                Id,
+                Code,
+                Name,
+                IsActive,
+                RequiresRoom,
+                RequiresTeacher,
+                BlocksRoom,
+                BlocksTeacher,
+                CountInPlan,
+                CountInLoad,
+                PreferredFirstInWeek,
+                CssKey)
+            SELECT value + {idOffset},
+                   'CAP-' || (value + {idOffset}),
+                   'Тип заняття для перевірки межі',
+                   1,
+                   0,
+                   0,
+                   0,
+                   0,
+                   1,
+                   1,
+                   0,
+                   NULL
+            FROM numbers
+            WHERE value < {count};
+            """);
+
+    private static Task<int> InsertDraftRowsAsync(
+        AppDbContext db,
+        int count,
+        int idOffset)
+        => db.Database.ExecuteSqlInterpolatedAsync($"""
+            WITH digits(value) AS (
+                VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)
+            ),
+            numbers(value) AS (
+                SELECT ones.value
+                     + tens.value * 10
+                     + hundreds.value * 100
+                     + thousands.value * 1000
+                     + ten_thousands.value * 10000
+                FROM digits AS ones
+                CROSS JOIN digits AS tens
+                CROSS JOIN digits AS hundreds
+                CROSS JOIN digits AS thousands
+                CROSS JOIN digits AS ten_thousands
+            )
+            INSERT INTO TeacherDraftItems (
+                Id,
+                Revision,
+                Date,
+                DayOfWeek,
+                StartTime,
+                EndTime,
+                LessonTypeId,
+                GroupId,
+                ModuleId,
+                ModuleTopicId,
+                TeacherId,
+                RoomId,
+                Status,
+                PublishedItemId,
+                BatchKey,
+                ValidationWarnings,
+                CreatedAt,
+                UpdatedAt,
+                IsLocked,
+                IsSelfStudy,
+                GenerationJobId)
+            SELECT value + {idOffset},
+                   printf('00000000-0000-0000-0000-%012d', value + {idOffset}),
+                   '2026-07-06',
+                   1,
+                   '09:00:00',
+                   '10:00:00',
+                   1,
+                   1,
+                   1,
+                   NULL,
+                   NULL,
+                   NULL,
+                   0,
+                   NULL,
+                   NULL,
+                   NULL,
+                   '2026-07-06 09:00:00',
+                   '2026-07-06 09:00:00',
+                   0,
+                   0,
+                   NULL
+            FROM numbers
+            WHERE value < {count};
+            """);
 
     private static AutoGenJobRequest CreateValidRequest()
         => new(

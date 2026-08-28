@@ -92,11 +92,10 @@ public sealed class AdminCrudReliabilityTests
         proxy.Handler = (method, _) => method.Name switch
         {
             nameof(IAdminApi.DeleteBuilding) => Task.CompletedTask,
-            nameof(IAdminApi.GetBuildings) => ++buildingLoadCalls == 1
-                ? Task.FromException<List<BuildingEditDto>>(
+            nameof(IAdminApi.GetBuildingCatalog) => ++buildingLoadCalls == 1
+                ? Task.FromException<BuildingCatalogDto>(
                     new HttpRequestException("мережа недоступна"))
-                : Task.FromResult(new List<BuildingEditDto>()),
-            nameof(IAdminApi.GetBuildingTravels) => Task.FromResult(new List<BuildingTravelEditDto>()),
+                : Task.FromResult(new BuildingCatalogDto(new(), new())),
             _ => throw new NotSupportedException(method.Name)
         };
         var component = CreateComponent("AdminBuildings");
@@ -135,14 +134,12 @@ public sealed class AdminCrudReliabilityTests
         proxy.Handler = (method, _) => method.Name switch
         {
             nameof(IAdminApi.UpsertBuilding) => Task.FromResult(41),
-            nameof(IAdminApi.GetBuildings) => ++buildingLoadCalls == 1
-                ? Task.FromException<List<BuildingEditDto>>(
+            nameof(IAdminApi.GetBuildingCatalog) => ++buildingLoadCalls == 1
+                ? Task.FromException<BuildingCatalogDto>(
                     new HttpRequestException("мережа недоступна"))
-                : Task.FromResult(new List<BuildingEditDto>
-                {
-                    new(41, "Новий корпус", "Адреса")
-                }),
-            nameof(IAdminApi.GetBuildingTravels) => Task.FromResult(new List<BuildingTravelEditDto>()),
+                : Task.FromResult(new BuildingCatalogDto(
+                    new() { new(41, "Новий корпус", "Адреса") },
+                    new())),
             _ => throw new NotSupportedException(method.Name)
         };
         var component = CreateComponent("AdminBuildings");
@@ -176,8 +173,7 @@ public sealed class AdminCrudReliabilityTests
         proxy.Handler = (method, _) => method.Name switch
         {
             nameof(IAdminApi.UpsertBuilding) => StartAndWait(mutationStarted, releaseMutation),
-            nameof(IAdminApi.GetBuildings) => Task.FromResult(new List<BuildingEditDto>()),
-            nameof(IAdminApi.GetBuildingTravels) => Task.FromResult(new List<BuildingTravelEditDto>()),
+            nameof(IAdminApi.GetBuildingCatalog) => Task.FromResult(new BuildingCatalogDto(new(), new())),
             nameof(IAdminApi.DeleteBuildingTravel) => Task.CompletedTask,
             _ => throw new NotSupportedException(method.Name)
         };
@@ -275,7 +271,7 @@ public sealed class AdminCrudReliabilityTests
         => (componentName, method.Name) switch
         {
             ("AdminBuildings", nameof(IAdminApi.UpsertBuilding)) => Task.FromResult(41),
-            ("AdminBuildings", nameof(IAdminApi.GetBuildings)) => Failed<List<BuildingEditDto>>(),
+            ("AdminBuildings", nameof(IAdminApi.GetBuildingCatalog)) => Failed<BuildingCatalogDto>(),
             ("AdminRooms", nameof(IAdminApi.UpsertRoom)) => Task.FromResult(42),
             ("AdminRooms", nameof(IAdminApi.GetRooms)) => Failed<List<RoomEditDto>>(),
             ("AdminGroups", nameof(IAdminApi.UpsertGroup)) => Task.FromResult(43),

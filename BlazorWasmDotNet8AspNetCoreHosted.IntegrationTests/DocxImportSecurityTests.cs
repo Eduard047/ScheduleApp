@@ -2,8 +2,10 @@ using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
+using System.Buffers.Binary;
 using System.Data.Common;
 using System.Globalization;
+using System.IO.Compression;
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Wordprocessing;
@@ -191,6 +193,50 @@ public sealed class DocxImportSecurityTests
         var module = Assert.Single(result.Modules);
         Assert.Equal("1", module.Code);
         Assert.Equal("Тестовий модуль", module.Title);
+    }
+
+    [Fact]
+    public async Task Import_rejects_zip_with_excessive_entry_count_before_opening_opc_package()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var bytes = CreateZipWithEmptyEntries(2_049);
+
+        var result = await ImportAsync(fixture, bytes, apply: false);
+
+        Assert.NotNull(result.Error);
+        Assert.Contains("ZIP-вміст", result.Error, StringComparison.Ordinal);
+        Assert.Empty(result.Modules);
+    }
+
+    [Fact]
+    public async Task Import_rejects_zip_with_excessive_declared_entry_size_before_opening_opc_package()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var bytes = CreateZipWithDeclaredUncompressedSizes(16 * 1024 * 1024 + 1);
+
+        var result = await ImportAsync(fixture, bytes, apply: false);
+
+        Assert.NotNull(result.Error);
+        Assert.Contains("ZIP-вміст", result.Error, StringComparison.Ordinal);
+        Assert.Empty(result.Modules);
+    }
+
+    [Fact]
+    public async Task Import_rejects_zip_with_excessive_aggregate_declared_size_before_opening_opc_package()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var bytes = CreateZipWithDeclaredUncompressedSizes(
+            14 * 1024 * 1024,
+            14 * 1024 * 1024,
+            14 * 1024 * 1024,
+            14 * 1024 * 1024,
+            14 * 1024 * 1024);
+
+        var result = await ImportAsync(fixture, bytes, apply: false);
+
+        Assert.NotNull(result.Error);
+        Assert.Contains("ZIP-вміст", result.Error, StringComparison.Ordinal);
+        Assert.Empty(result.Modules);
     }
 
     [Fact]
@@ -1004,6 +1050,40 @@ public sealed class DocxImportSecurityTests
 
     private static byte[] CreateModuleDocx(string moduleTitle)
         => CreateModuleDocx(new[] { ("1", moduleTitle) });
+
+    private static byte[] CreateZipWithEmptyEntries(int entryCount)
+    {
+        using var stream = new MemoryStream();
+        using (var archive = new ZipArchive(stream, ZipArchiveMode.Create, leaveOpen: true))
+        {
+            for (var index = 0; index < entryCount; index++)
+            {
+                archive.CreateEntry($"entry-{index:D4}.xml");
+            }
+        }
+        return stream.ToArray();
+    }
+
+    private static byte[] CreateZipWithDeclaredUncompressedSizes(params int[] declaredSizes)
+    {
+        var bytes = CreateZipWithEmptyEntries(declaredSizes.Length);
+        var patchedEntries = 0;
+        for (var offset = 0; offset <= bytes.Length - 46 && patchedEntries < declaredSizes.Length; offset++)
+        {
+            if (BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(offset, sizeof(uint))) != 0x02014b50)
+            {
+                continue;
+            }
+
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                bytes.AsSpan(offset + 24, sizeof(uint)),
+                checked((uint)declaredSizes[patchedEntries]));
+            patchedEntries++;
+        }
+
+        Assert.Equal(declaredSizes.Length, patchedEntries);
+        return bytes;
+    }
 
     private static byte[] CreateModuleDocx(string moduleCode, string moduleTitle, string credits)
         => CreateModuleDocx(new[] { (moduleCode, moduleTitle, credits) });

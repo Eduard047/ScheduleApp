@@ -1,15 +1,36 @@
 @* Основний макет застосунку *@
 @inherits LayoutComponentBase
 @inject NavigationManager NavigationManager
+@inject IJSRuntime JS
 
 <div class="layout-root">
+    <a class="skip-link"
+       href="@SkipLinkHref"
+       @onclick="FocusMainContentAsync"
+       @onclick:preventDefault="true">
+        Перейти до основного вмісту
+    </a>
     <TopNav />
-    <main class="@MainClass">
+    <main id="main-content" class="@MainClass" tabindex="-1">
         @Body
     </main>
 </div>
 
 @code {
+    private async Task FocusMainContentAsync()
+        => await JS.InvokeVoidAsync("scheduleApp.focusMainContent");
+
+    private string SkipLinkHref
+    {
+        get
+        {
+            var currentUri = NavigationManager.Uri;
+            var fragmentIndex = currentUri.IndexOf('#');
+            var uriWithoutFragment = fragmentIndex >= 0 ? currentUri[..fragmentIndex] : currentUri;
+            return $"{uriWithoutFragment}#main-content";
+        }
+    }
+
     private string MainClass => IsWorkArea
         ? "container-fluid layout-main layout-main--work-area"
         : "container-fluid layout-main";

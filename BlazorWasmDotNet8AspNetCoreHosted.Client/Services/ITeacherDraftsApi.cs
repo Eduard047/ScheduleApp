@@ -23,13 +23,27 @@ public interface ITeacherDraftsApi
     Task<AutoGenResult> AutogenWeek(AutoGenRequest req);
     // Попередня перевірка ресурсів автогенерації без створення чернеток.
     Task<AutoGenResult> AutogenPreflightWeek(AutoGenRequest req);
-    Task<AutoGenJobStartResult> StartAutogenJob(AutoGenJobRequest req);
-    Task<AutoGenJobStatus> GetAutogenJob(string jobId);
-    Task<AutoGenJobStatus> CancelAutogenJob(string jobId);
-    Task<AutoGenPlanDetailsDto> GetAutogenPlan(string jobId);
-    Task<AutoGenPlanDetailsDto> ApplyAutogenPlan(string jobId, AutoGenPlanActionRequest request);
-    Task<AutoGenPlanDetailsDto> RollbackAutogenPlan(string jobId, AutoGenPlanActionRequest request);
-    Task<AutoGenPlanDetailsDto?> GetLatestRollbackableAutogenPlan(int? courseId);
+    Task<AutoGenJobStartResult> StartAutogenJob(
+        AutoGenJobRequest req,
+        CancellationToken cancellationToken = default);
+    Task<AutoGenJobStatus> GetAutogenJob(string jobId, CancellationToken cancellationToken = default);
+    Task<AutoGenJobStatus> CancelAutogenJob(
+        string jobId,
+        CancellationToken cancellationToken = default);
+    Task<AutoGenPlanDetailsDto> GetAutogenPlan(
+        string jobId,
+        CancellationToken cancellationToken = default);
+    Task<AutoGenPlanDetailsDto> ApplyAutogenPlan(
+        string jobId,
+        AutoGenPlanActionRequest request,
+        CancellationToken cancellationToken = default);
+    Task<AutoGenPlanDetailsDto> RollbackAutogenPlan(
+        string jobId,
+        AutoGenPlanActionRequest request,
+        CancellationToken cancellationToken = default);
+    Task<AutoGenPlanDetailsDto?> GetLatestRollbackableAutogenPlan(
+        int? courseId,
+        CancellationToken cancellationToken = default);
     // Очищає чернетки тижня.
     Task<int> ClearWeek(ClearWeekRequest req);
     // Автогенерація на місяць.

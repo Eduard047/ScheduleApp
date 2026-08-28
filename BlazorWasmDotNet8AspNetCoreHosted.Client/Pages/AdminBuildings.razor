@@ -199,11 +199,6 @@ else
 }
 
 @code {
-    private sealed class BuildingsVm
-    {
-        public List<BuildingEditDto> buildings { get; set; } = new();
-        public List<BuildingTravelEditDto> travels { get; set; } = new();
-    }
     private bool loading, saving, loadFailed, mutationInProgress;
     private bool IsInteractionBlocked => loading || mutationInProgress || loadFailed;
     private Action? pendingRefreshCompletion;
@@ -281,10 +276,9 @@ else
         loadFailed = false;
         try
         {
-            var loadedBuildings = await Admin.GetBuildings();
-            var loadedTravels = await Admin.GetBuildingTravels();
-            buildings = loadedBuildings;
-            travels = loadedTravels;
+            var catalog = await Admin.GetBuildingCatalog();
+            buildings = catalog.Buildings;
+            travels = catalog.Travels;
             return true;
         }
         catch (Exception ex)

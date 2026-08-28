@@ -2029,7 +2029,7 @@ else
         await InvokeAsync(StateHasChanged);
         try
         {
-            var status = await Drafts.CancelAutogenJob(jobId);
+            var status = await Drafts.CancelAutogenJob(jobId, _componentLifetimeCts.Token);
             if (!string.Equals(_currentAutoGenJobId, jobId, StringComparison.Ordinal))
             {
                 return;
@@ -2039,6 +2039,9 @@ else
                 ApplyAutoGenJobStatus(status);
             }
             await InvokeAsync(StateHasChanged);
+        }
+        catch (OperationCanceledException) when (_componentLifetimeCts.IsCancellationRequested)
+        {
         }
         catch (Exception ex)
         {
@@ -3061,7 +3064,7 @@ else
         }
         try
         {
-            var activeStatus = await Drafts.GetAutogenJob(activeJobId);
+            var activeStatus = await Drafts.GetAutogenJob(activeJobId, _componentLifetimeCts.Token);
             if (!IsAutoGenJobTerminal(activeStatus.State))
             {
                 throw new InvalidOperationException(
@@ -3102,7 +3105,11 @@ else
             AutoGenJobStatus status;
             try
             {
-                status = await Drafts.GetAutogenJob(jobId);
+                status = await Drafts.GetAutogenJob(jobId, _componentLifetimeCts.Token);
+            }
+            catch (OperationCanceledException) when (_componentLifetimeCts.IsCancellationRequested)
+            {
+                return;
             }
             catch (ApiErrorException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
             {
@@ -3200,10 +3207,16 @@ else
         {
             try
             {
-                var planDetails = await Drafts.GetAutogenPlan(restoredPlan.PlanId);
+                var planDetails = await Drafts.GetAutogenPlan(
+                    restoredPlan.PlanId,
+                    _componentLifetimeCts.Token);
                 restoredPlan = planDetails.Summary;
                 restoredPlanChanges = planDetails.Changes;
                 persistenceCourseId ??= ResolveCourseIdFromPlanChanges(planDetails.Changes);
+            }
+            catch (OperationCanceledException) when (_componentLifetimeCts.IsCancellationRequested)
+            {
+                return false;
             }
             catch (ApiErrorException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Conflict)
             {
@@ -3358,9 +3371,15 @@ else
         {
             try
             {
-                var refreshedPlan = await Drafts.GetAutogenPlan(plan.PlanId);
+                var refreshedPlan = await Drafts.GetAutogenPlan(
+                    plan.PlanId,
+                    _componentLifetimeCts.Token);
                 plan = refreshedPlan.Summary;
                 planChanges = refreshedPlan.Changes;
+            }
+            catch (OperationCanceledException) when (_componentLifetimeCts.IsCancellationRequested)
+            {
+                return;
             }
             catch (ApiErrorException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Conflict)
             {
@@ -3395,7 +3414,9 @@ else
         var courseId = _selectedCourseId;
         try
         {
-            var details = await Drafts.GetLatestRollbackableAutogenPlan(courseId);
+            var details = await Drafts.GetLatestRollbackableAutogenPlan(
+                courseId,
+                _componentLifetimeCts.Token);
             if (!_rollbackablePlanLoadGuard.IsCurrent(requestVersion)
                 || courseId != _selectedCourseId)
             {
@@ -3404,6 +3425,9 @@ else
             _latestRollbackableAutoGenPlan = details?.Summary.CanRollback == true
                 ? details.Summary
                 : null;
+        }
+        catch (OperationCanceledException) when (_componentLifetimeCts.IsCancellationRequested)
+        {
         }
         catch (ApiErrorException)
         {
@@ -3870,14 +3894,18 @@ else
         AutoGenJobStatus status;
         try
         {
-            var started = await Drafts.StartAutogenJob(request);
+            var started = await Drafts.StartAutogenJob(request, _componentLifetimeCts.Token);
             status = started.Status;
+        }
+        catch (OperationCanceledException) when (_componentLifetimeCts.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception startException) when (startException is HttpRequestException or TaskCanceledException)
         {
             try
             {
-                status = await Drafts.GetAutogenJob(clientJobId);
+                status = await Drafts.GetAutogenJob(clientJobId, _componentLifetimeCts.Token);
             }
             catch (ApiErrorException lookupException) when (lookupException.StatusCode == HttpStatusCode.NotFound)
             {
@@ -3921,7 +3949,9 @@ else
             return (previewResult, rangeStartDate, rangeEndDate, weekCount, previewStatus, previewStatus.Plan, Array.Empty<AutoGenPlanChangeDto>());
         }
 
-        var plan = await Drafts.GetAutogenPlan(previewStatus.JobId);
+        var plan = await Drafts.GetAutogenPlan(
+            previewStatus.JobId,
+            _componentLifetimeCts.Token);
         return (
             plan.Result,
             rangeStartDate,
@@ -3941,7 +3971,7 @@ else
             await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
             try
             {
-                status = await Drafts.GetAutogenJob(status.JobId);
+                status = await Drafts.GetAutogenJob(status.JobId, cancellationToken);
                 cancellationToken.ThrowIfCancellationRequested();
                 consecutivePollFailures = 0;
             }
@@ -4069,9 +4099,6 @@ else
                 plan,
                 planChanges);
         }
-        catch (OperationCanceledException) when (_componentLifetimeCts.IsCancellationRequested)
-        {
-        }
         catch (ApiErrorException ex)
         {
             await HandleApiError(ex);
@@ -4110,7 +4137,8 @@ else
             await StartAutoGenProgressAsync("Застосовуємо готовий план", AutoGenProgressKind.Generate);
             var applied = await Drafts.ApplyAutogenPlan(
                 plan.PlanId,
-                new AutoGenPlanActionRequest(plan.Version));
+                new AutoGenPlanActionRequest(plan.Version),
+                _componentLifetimeCts.Token);
             var report = _latestAutoGenReport is null
                 ? null
                 : _latestAutoGenReport with
@@ -4162,6 +4190,9 @@ else
                     jobError: null);
             }
         }
+        catch (OperationCanceledException) when (_componentLifetimeCts.IsCancellationRequested)
+        {
+        }
         catch (ApiErrorException ex) when (ex.StatusCode == HttpStatusCode.Conflict)
         {
             if (string.Equals(_latestAutoGenPlan?.PlanId, plan.PlanId, StringComparison.Ordinal))
@@ -4208,7 +4239,8 @@ else
             await StartAutoGenProgressAsync("Відкочуємо застосований план", AutoGenProgressKind.Generate);
             var rolledBack = await Drafts.RollbackAutogenPlan(
                 plan.PlanId,
-                new AutoGenPlanActionRequest(plan.Version));
+                new AutoGenPlanActionRequest(plan.Version),
+                _componentLifetimeCts.Token);
             var summary = $"План автогенерації відкочено: прибрано доданих {rolledBack.Summary.AddCount}, відновлено видалених {rolledBack.Summary.DeleteCount}, повернуто змінених {rolledBack.Summary.UpdateCount}.";
             await SetOkMessageAsync(
                 summary,
@@ -4221,6 +4253,9 @@ else
                 planChanges: rolledBack.Changes);
             await UpdateAutoGenProgressMessageAsync("Оновлюємо таблицю після відкоту...");
             await LoadWeek();
+        }
+        catch (OperationCanceledException) when (_componentLifetimeCts.IsCancellationRequested)
+        {
         }
         catch (ApiErrorException ex)
         {
@@ -5414,6 +5449,7 @@ else
     {
         _componentLifetimeCts.Cancel();
         StopAutoGenProgress();
-        _componentLifetimeCts.Dispose();
+        // Не звільняємо джерело тут: незавершене async-продовження може прочитати Token після await.
+        // Джерело буде зібране разом із компонентом після завершення цих продовжень.
     }
 }

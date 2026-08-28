@@ -1004,14 +1004,30 @@ public sealed class TeacherDraftsAutogenService
                     fromBuildingId,
                     toRoomId,
                     toBuildingId);
-            // Список модулів для формування допустимих аудиторій/будівель.
-            var moduleIdsAll = await _db.Modules.Select(m => m.Id).ToListAsync(cancellationToken);
+            // Завантажуємо конфігурацію лише для модулів вибраних курсів.
+            var activePlans = await _db.ModulePlans
+                .AsNoTracking()
+                .Where(p => courseIds.Contains(p.CourseId) && p.IsActive)
+                .ToListAsync(cancellationToken);
+            var moduleIdsForPlans = activePlans
+                .Select(p => p.ModuleId)
+                .Distinct()
+                .ToList();
+            if (hasModuleHourOverrides)
+            {
+                moduleIdsForPlans = moduleIdsForPlans
+                    .Concat(moduleHoursByModuleId.Keys)
+                    .Distinct()
+                    .ToList();
+            }
+
+            // Список дозволених аудиторій/будівель для модулів поточної генерації.
             var allowedRoomsByModule = await _db.ModuleRooms
-                .Where(mr => moduleIdsAll.Contains(mr.ModuleId))
+                .Where(mr => moduleIdsForPlans.Contains(mr.ModuleId))
                 .GroupBy(mr => mr.ModuleId)
                 .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.RoomId).ToHashSet(), cancellationToken);
             var allowedBuildingsByModule = await _db.ModuleBuildings
-                .Where(mb => moduleIdsAll.Contains(mb.ModuleId))
+                .Where(mb => moduleIdsForPlans.Contains(mb.ModuleId))
                 .GroupBy(mb => mb.ModuleId)
                 .ToDictionaryAsync(g => g.Key, g => g.Select(x => x.BuildingId).ToHashSet(), cancellationToken);
             // Історичне вікно для перевірки повторів.
@@ -1621,8 +1637,14 @@ public sealed class TeacherDraftsAutogenService
             bool UsedLastWeek(int gid, int mid) =>
                 lastWeekModulesByGroup.TryGetValue(gid, out var mods) && mods.Contains(mid);
             // Базові зв'язки модуль -> викладачі / керівники самостійної роботи.
-            var teachersForModule = await _db.TeacherModules.AsNoTracking().ToListAsync(cancellationToken);
-            var supervisorsForModule = await _db.ModuleSupervisors.AsNoTracking().ToListAsync(cancellationToken);
+            var teachersForModule = await _db.TeacherModules
+                .AsNoTracking()
+                .Where(x => moduleIdsForPlans.Contains(x.ModuleId))
+                .ToListAsync(cancellationToken);
+            var supervisorsForModule = await _db.ModuleSupervisors
+                .AsNoTracking()
+                .Where(x => moduleIdsForPlans.Contains(x.ModuleId))
+                .ToListAsync(cancellationToken);
             if (requestedTeacherId is int teacherFilterId)
             {
                 teachersForModule = teachersForModule
@@ -1632,9 +1654,15 @@ public sealed class TeacherDraftsAutogenService
                     .Where(x => x.TeacherId == teacherFilterId)
                     .ToList();
             }
+            var candidateTeacherIds = teachersForModule
+                .Select(x => x.TeacherId)
+                .Concat(supervisorsForModule.Select(x => x.TeacherId))
+                .Distinct()
+                .ToList();
             // Метадані викладачів (для підписів і перевірок кафедр).
             var teachersMeta = await _db.Teachers
                 .AsNoTracking()
+                .Where(t => candidateTeacherIds.Contains(t.Id))
                 .Select(t => new
                 {
                     t.Id,
@@ -1676,7 +1704,9 @@ public sealed class TeacherDraftsAutogenService
                     : allCandidates;
             }
             // Робочі години викладачів (обмеження часу).
-            var teacherWorkingHours = await _db.TeacherWorkingHours.AsNoTracking()
+            var teacherWorkingHours = await _db.TeacherWorkingHours
+                .AsNoTracking()
+                .Where(w => candidateTeacherIds.Contains(w.TeacherId))
                 .Select(w => new { w.TeacherId, w.DayOfWeek, w.Start, w.End })
                 .ToListAsync(cancellationToken);
             // Групуємо робочі години по викладачах та днях тижня.
@@ -1700,8 +1730,6 @@ public sealed class TeacherDraftsAutogenService
                     return false;
                 return windows.Any(w => w.Start <= start && end <= w.End);
             }
-            // Активні плани модулів по курсах.
-            var activePlans = await _db.ModulePlans.Where(p => courseIds.Contains(p.CourseId) && p.IsActive).ToListAsync(cancellationToken);
             // Перераховуємо лише логічні заняття з типами, які входять у навантаження.
             void RebuildTeacherLoadMap()
             {
@@ -1748,15 +1776,6 @@ public sealed class TeacherDraftsAutogenService
                     return count;
                 }
                 return 0;
-            }
-            // Список модулів, які потрібно врахувати для планів та тем.
-            var moduleIdsForPlans = activePlans.Select(p => p.ModuleId).Distinct().ToList();
-            if (hasModuleHourOverrides)
-            {
-                moduleIdsForPlans = moduleIdsForPlans
-                    .Concat(moduleHoursByModuleId.Keys)
-                    .Distinct()
-                    .ToList();
             }
             // Назви модулів для повідомлень та логіки вибору.
             var moduleTitles = await _db.Modules.AsNoTracking()

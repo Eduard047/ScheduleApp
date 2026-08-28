@@ -17,6 +17,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers;
 // Контролер для управління основним розкладом
 public class ScheduleController : ControllerBase
 {
+    private const int MaxWeekScheduleCandidateCount = 50_000;
     private readonly AppDbContext _db;
     private readonly RulesService _rules;
     private readonly AggregatesService _aggregates;
@@ -51,6 +52,23 @@ public class ScheduleController : ControllerBase
         int? TeacherId,
         int? RoomId,
         bool IsSelfStudy);
+    private sealed record ExistingRescheduledPackageRow(
+        DateOnly Date,
+        DayOfWeek DayOfWeek,
+        TimeOnly StartTime,
+        TimeOnly EndTime,
+        int GroupId,
+        int ModuleId,
+        int LessonTypeId,
+        int? ModuleTopicId,
+        int? TeacherId,
+        int? RoomId,
+        bool IsSelfStudy);
+    private sealed record RescheduledPackageRowSignature(
+        int? ModuleTopicId,
+        int? TeacherId,
+        int? RoomId,
+        bool IsSelfStudy);
     private sealed record ScheduleRevisionRow(
         int Id,
         Guid Revision,
@@ -73,7 +91,8 @@ public class ScheduleController : ControllerBase
         [FromQuery] int? courseId,
         [FromQuery] int? groupId,
         [FromQuery] int? teacherId,
-        [FromQuery] int? roomId)
+        [FromQuery] int? roomId,
+        CancellationToken cancellationToken = default)
     {
         if (!DateHelpers.IsSupportedScheduleDate(weekStart))
         {
@@ -84,9 +103,20 @@ public class ScheduleController : ControllerBase
             .AsNoTracking()
             .Where(x => x.Date >= weekStart && x.Date < weekEnd)
             .AsQueryable();
+        // Курс і група є спільними для всіх технічних рядків логічного заняття,
+        // тому ці фільтри безпечно застосовувати до матеріалізації та revision map.
+        if (courseId is int requestedCourseId)
+        {
+            q = q.Where(x => x.Group.CourseId == requestedCourseId);
+        }
+        if (groupId is int requestedGroupId)
+        {
+            q = q.Where(x => x.GroupId == requestedGroupId);
+        }
         var items = await q
             .OrderBy(x => x.Date)
             .ThenBy(x => x.StartTime)
+            .Take(MaxWeekScheduleCandidateCount + 1)
             .Select(x => new
             {
                 x.Id,
@@ -115,7 +145,14 @@ public class ScheduleController : ControllerBase
                 LessonTypeCss = x.LessonType.CssKey,
                 x.IsLocked
             })
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
+        if (items.Count > MaxWeekScheduleCandidateCount)
+        {
+            return UnprocessableEntity(new
+            {
+                message = $"Розклад тижня містить понад {MaxWeekScheduleCandidateCount} технічних рядків. Звузьте вибір курсу або групи."
+            });
+        }
         var revisionsByItemId = BuildLogicalRevisionMap(items.Select(item => new ScheduleRevisionRow(
             item.Id,
             item.Revision,
@@ -287,6 +324,25 @@ public class ScheduleController : ControllerBase
             .AsNoTracking()
             .FirstOrDefaultAsync(item => item.Id == previousLessonTypeId);
         var previousRequiresRoom = previousLessonType?.RequiresRoom ?? true;
+        var createsRescheduledReplacement = string.Equals(
+                                                lessonType.Code,
+                                                "RESCHEDULED",
+                                                StringComparison.OrdinalIgnoreCase)
+                                            && previousLessonTypeId != request.LessonTypeId;
+        if (createsRescheduledReplacement
+            && previousRequiresRoom
+            && logicalEventRows
+                .Select(item => item.RoomId)
+                .Distinct()
+                .Skip(1)
+                .Any())
+        {
+            await tx.RollbackAsync();
+            return Conflict(new
+            {
+                message = "Логічне заняття має різні аудиторії в окремих рядках. Виправте дані перед перенесенням."
+            });
+        }
         var rescheduleSnapshot = new RescheduleEventSnapshot(
             source.Date,
             source.StartTime,
@@ -365,8 +421,7 @@ public class ScheduleController : ControllerBase
             });
         }
 
-        var isRescheduled = string.Equals(lessonType.Code, "RESCHEDULED", StringComparison.OrdinalIgnoreCase);
-        if (isRescheduled && previousLessonTypeId != request.LessonTypeId)
+        if (createsRescheduledReplacement)
         {
             var replacementCreated = await TryCreateRescheduledCopiesAsync(
                 rescheduleSnapshot,
@@ -582,12 +637,14 @@ public class ScheduleController : ControllerBase
         }
 
         var batchKey = $"rescheduled:{snapshot.Rows.Min(row => row.SourceId)}:{snapshot.LessonTypeId}";
-        var packageAlreadyExists = await _db.TeacherDraftItems
-            .AnyAsync(item => item.BatchKey == batchKey)
-            || await _db.ScheduleItems.AnyAsync(item => item.BatchKey == batchKey);
-        if (packageAlreadyExists)
+        var existingPackage = await ValidateExistingRescheduledPackageAsync(
+            snapshot,
+            requiresRoom,
+            nextWeekStart,
+            batchKey);
+        if (existingPackage.Exists)
         {
-            return true;
+            return existingPackage.IsComplete;
         }
 
         const int daySearchHorizon = 7;
@@ -681,6 +738,106 @@ public class ScheduleController : ControllerBase
         }
 
         return false;
+    }
+
+    // Повторне перенесення приймає лише повний раніше створений пакет,
+    // а не довільний рядок із передбачуваним ключем.
+    private async Task<(bool Exists, bool IsComplete)> ValidateExistingRescheduledPackageAsync(
+        RescheduleEventSnapshot snapshot,
+        bool requiresRoom,
+        DateOnly nextWeekStart,
+        string batchKey)
+    {
+        var rowLimit = snapshot.Rows.Count + 1;
+        var draftRows = await _db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => item.BatchKey == batchKey)
+            .OrderBy(item => item.Id)
+            .Take(rowLimit)
+            .Select(item => new ExistingRescheduledPackageRow(
+                item.Date,
+                item.DayOfWeek,
+                item.StartTime,
+                item.EndTime,
+                item.GroupId,
+                item.ModuleId,
+                item.LessonTypeId,
+                item.ModuleTopicId,
+                item.TeacherId,
+                item.RoomId,
+                item.IsSelfStudy))
+            .ToListAsync();
+        var scheduleRows = await _db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => item.BatchKey == batchKey)
+            .OrderBy(item => item.Id)
+            .Take(rowLimit)
+            .Select(item => new ExistingRescheduledPackageRow(
+                item.Date,
+                item.DayOfWeek,
+                item.StartTime,
+                item.EndTime,
+                item.GroupId,
+                item.ModuleId,
+                item.LessonTypeId,
+                item.ModuleTopicId,
+                item.TeacherId,
+                item.RoomId,
+                item.IsSelfStudy))
+            .ToListAsync();
+        if (draftRows.Count == 0 && scheduleRows.Count == 0)
+        {
+            return (false, false);
+        }
+        if (draftRows.Count > 0 && scheduleRows.Count > 0)
+        {
+            return (true, false);
+        }
+
+        var rows = draftRows.Count > 0 ? draftRows : scheduleRows;
+        if (rows.Count != snapshot.Rows.Count)
+        {
+            return (true, false);
+        }
+
+        var first = rows[0];
+        var replacementEnd = nextWeekStart.AddDays(7);
+        if (first.Date < nextWeekStart
+            || first.Date >= replacementEnd
+            || first.EndTime <= first.StartTime
+            || rows.Any(row =>
+                row.Date != first.Date
+                || row.DayOfWeek != first.Date.DayOfWeek
+                || row.StartTime != first.StartTime
+                || row.EndTime != first.EndTime
+                || row.GroupId != snapshot.GroupId
+                || row.ModuleId != snapshot.ModuleId
+                || row.LessonTypeId != snapshot.LessonTypeId))
+        {
+            return (true, false);
+        }
+
+        var expectedCounts = snapshot.Rows
+            .Select(row => new RescheduledPackageRowSignature(
+                row.ModuleTopicId,
+                row.TeacherId,
+                requiresRoom ? row.RoomId : null,
+                row.IsSelfStudy))
+            .GroupBy(signature => signature)
+            .ToDictionary(group => group.Key, group => group.Count());
+        var actualCounts = rows
+            .Select(row => new RescheduledPackageRowSignature(
+                row.ModuleTopicId,
+                row.TeacherId,
+                row.RoomId,
+                row.IsSelfStudy))
+            .GroupBy(signature => signature)
+            .ToDictionary(group => group.Key, group => group.Count());
+        var isComplete = expectedCounts.Count == actualCounts.Count
+                         && expectedCounts.All(entry =>
+                             actualCounts.TryGetValue(entry.Key, out var count)
+                             && count == entry.Value);
+        return (true, isComplete);
     }
     [HttpDelete("{id:int}")]
     [RequireDeletionConfirmation("запис розкладу")]

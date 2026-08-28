@@ -9,6 +9,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 
 internal static class TeacherDraftsAutogenInputFingerprint
 {
+    internal const int MaxRowsPerFingerprintSection = 50_000;
+    internal const int MaxTotalFingerprintRows = 200_000;
     private static readonly byte[] ChunkSeparator = [0];
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
@@ -18,6 +20,7 @@ internal static class TeacherDraftsAutogenInputFingerprint
         CancellationToken cancellationToken)
     {
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var rowBudget = new FingerprintRowBudget();
         var courseId = request.CourseId;
         var selectedGroupIds = (request.GroupIds ?? [])
             .Where(id => id > 0)
@@ -62,7 +65,7 @@ internal static class TeacherDraftsAutogenInputFingerprint
             }
         });
 
-        Append(hash, "lesson-types", await db.LessonTypes.AsNoTracking()
+        Append(hash, "lesson-types", await LoadBoundedAsync(db.LessonTypes.AsNoTracking()
             .OrderBy(item => item.Id)
             .Select(item => new
             {
@@ -77,10 +80,9 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.CountInPlan,
                 item.CountInLoad,
                 item.PreferredFirstInWeek
-            })
-            .ToListAsync(cancellationToken));
+            }), rowBudget, cancellationToken));
 
-        var courses = await db.Courses.AsNoTracking()
+        var courses = await LoadBoundedAsync(db.Courses.AsNoTracking()
             .Where(item => item.Id == courseId)
             .OrderBy(item => item.Id)
             .Select(item => new
@@ -89,15 +91,14 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.Name,
                 item.DurationWeeks,
                 item.AcademicPeriodStartDate
-            })
-            .ToListAsync(cancellationToken);
+            }), rowBudget, cancellationToken);
         Append(hash, "course", courses);
         var academicPeriodStartDate = courses.SingleOrDefault()?.AcademicPeriodStartDate;
         var academicPeriodEndDateExclusive = academicPeriodStartDate is DateOnly academicStartDate
             ? academicStartDate.AddDays(courses[0].DurationWeeks * 7)
             : (DateOnly?)null;
 
-        Append(hash, "course-groups", await db.Groups.AsNoTracking()
+        Append(hash, "course-groups", await LoadBoundedAsync(db.Groups.AsNoTracking()
             .Where(item => item.CourseId == courseId)
             .OrderBy(item => item.Id)
             .Select(item => new
@@ -106,10 +107,9 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.Name,
                 item.StudentsCount,
                 item.CourseId
-            })
-            .ToListAsync(cancellationToken));
+            }), rowBudget, cancellationToken));
 
-        var activeModulePlans = await db.ModulePlans.AsNoTracking()
+        var activeModulePlans = await LoadBoundedAsync(db.ModulePlans.AsNoTracking()
             .Where(item => item.CourseId == courseId && item.IsActive)
             .OrderBy(item => item.Id)
             .Select(item => new
@@ -120,8 +120,7 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.TargetHours,
                 item.ScheduledHours,
                 item.IsActive
-            })
-            .ToListAsync(cancellationToken);
+            }), rowBudget, cancellationToken);
         Append(hash, "active-module-plans", activeModulePlans);
 
         var relevantModuleIds = activeModulePlans
@@ -130,7 +129,7 @@ internal static class TeacherDraftsAutogenInputFingerprint
             .Distinct()
             .OrderBy(id => id)
             .ToList();
-        Append(hash, "modules", await db.Modules.AsNoTracking()
+        Append(hash, "modules", await LoadBoundedAsync(db.Modules.AsNoTracking()
             .Where(item => relevantModuleIds.Contains(item.Id))
             .OrderBy(item => item.Id)
             .Select(item => new
@@ -140,10 +139,9 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.Title,
                 item.Credits,
                 item.CourseId
-            })
-            .ToListAsync(cancellationToken));
+            }), rowBudget, cancellationToken));
 
-        Append(hash, "module-course-links", await db.ModuleCourses.AsNoTracking()
+        Append(hash, "module-course-links", await LoadBoundedAsync(db.ModuleCourses.AsNoTracking()
             .Where(item => item.CourseId == courseId && relevantModuleIds.Contains(item.ModuleId))
             .OrderBy(item => item.ModuleId)
             .ThenBy(item => item.CourseId)
@@ -151,10 +149,9 @@ internal static class TeacherDraftsAutogenInputFingerprint
             {
                 item.ModuleId,
                 item.CourseId
-            })
-            .ToListAsync(cancellationToken));
+            }), rowBudget, cancellationToken));
 
-        var teacherModuleLinks = await db.TeacherModules.AsNoTracking()
+        var teacherModuleLinks = await LoadBoundedAsync(db.TeacherModules.AsNoTracking()
             .Where(item => relevantModuleIds.Contains(item.ModuleId))
             .OrderBy(item => item.ModuleId)
             .ThenBy(item => item.TeacherId)
@@ -162,11 +159,10 @@ internal static class TeacherDraftsAutogenInputFingerprint
             {
                 item.TeacherId,
                 item.ModuleId
-            })
-            .ToListAsync(cancellationToken);
+            }), rowBudget, cancellationToken);
         Append(hash, "teacher-modules", teacherModuleLinks);
 
-        var supervisorLinks = await db.ModuleSupervisors.AsNoTracking()
+        var supervisorLinks = await LoadBoundedAsync(db.ModuleSupervisors.AsNoTracking()
             .Where(item => relevantModuleIds.Contains(item.ModuleId))
             .OrderBy(item => item.ModuleId)
             .ThenBy(item => item.TeacherId)
@@ -174,8 +170,7 @@ internal static class TeacherDraftsAutogenInputFingerprint
             {
                 item.TeacherId,
                 item.ModuleId
-            })
-            .ToListAsync(cancellationToken);
+            }), rowBudget, cancellationToken);
         Append(hash, "module-supervisors", supervisorLinks);
 
         var relevantTeacherIds = teacherModuleLinks
@@ -184,7 +179,7 @@ internal static class TeacherDraftsAutogenInputFingerprint
             .Distinct()
             .OrderBy(id => id)
             .ToList();
-        var teachers = await db.Teachers.AsNoTracking()
+        var teachers = await LoadBoundedAsync(db.Teachers.AsNoTracking()
             .Where(item => relevantTeacherIds.Contains(item.Id))
             .OrderBy(item => item.Id)
             .Select(item => new
@@ -192,11 +187,10 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.Id,
                 item.FullName,
                 item.DepartmentId
-            })
-            .ToListAsync(cancellationToken);
+            }), rowBudget, cancellationToken);
         Append(hash, "teachers", teachers);
 
-        Append(hash, "teacher-working-hours", await db.TeacherWorkingHours.AsNoTracking()
+        Append(hash, "teacher-working-hours", await LoadBoundedAsync(db.TeacherWorkingHours.AsNoTracking()
             .Where(item => relevantTeacherIds.Contains(item.TeacherId))
             .OrderBy(item => item.TeacherId)
             .ThenBy(item => item.DayOfWeek)
@@ -210,10 +204,9 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.DayOfWeek,
                 item.Start,
                 item.End
-            })
-            .ToListAsync(cancellationToken));
+            }), rowBudget, cancellationToken));
 
-        var moduleTopics = await db.ModuleTopics.AsNoTracking()
+        var moduleTopics = await LoadBoundedAsync(db.ModuleTopics.AsNoTracking()
             .Where(item => relevantModuleIds.Contains(item.ModuleId))
             .OrderBy(item => item.ModuleId)
             .ThenBy(item => item.Order)
@@ -231,8 +224,7 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.SelfStudyHours,
                 item.IsInterAssembly,
                 item.SelfStudyBySupervisor
-            })
-            .ToListAsync(cancellationToken);
+            }), rowBudget, cancellationToken);
         Append(hash, "module-topics", moduleTopics);
 
         var relevantDepartmentIds = teachers
@@ -244,17 +236,16 @@ internal static class TeacherDraftsAutogenInputFingerprint
             .Distinct()
             .OrderBy(id => id)
             .ToList();
-        Append(hash, "departments", await db.Departments.AsNoTracking()
+        Append(hash, "departments", await LoadBoundedAsync(db.Departments.AsNoTracking()
             .Where(item => relevantDepartmentIds.Contains(item.Id))
             .OrderBy(item => item.Id)
             .Select(item => new
             {
                 item.Id,
                 item.Name
-            })
-            .ToListAsync(cancellationToken));
+            }), rowBudget, cancellationToken));
 
-        var rooms = await db.Rooms.AsNoTracking()
+        var rooms = await LoadBoundedAsync(db.Rooms.AsNoTracking()
             .OrderBy(item => item.Id)
             .Select(item => new
             {
@@ -262,13 +253,12 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.Name,
                 item.Capacity,
                 item.BuildingId
-            })
-            .ToListAsync(cancellationToken);
+            }), rowBudget, cancellationToken);
         Append(hash, "rooms", rooms);
         var relevantRoomIds = rooms.Select(item => item.Id).ToList();
         var relevantBuildingIds = rooms.Select(item => item.BuildingId).Distinct().ToList();
 
-        Append(hash, "building-travels", await db.BuildingTravels.AsNoTracking()
+        Append(hash, "building-travels", await LoadBoundedAsync(db.BuildingTravels.AsNoTracking()
             .Where(item => relevantBuildingIds.Contains(item.FromBuildingId)
                            && relevantBuildingIds.Contains(item.ToBuildingId))
             .OrderBy(item => item.FromBuildingId)
@@ -280,10 +270,9 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.FromBuildingId,
                 item.ToBuildingId,
                 item.Minutes
-            })
-            .ToListAsync(cancellationToken));
+            }), rowBudget, cancellationToken));
 
-        Append(hash, "module-rooms", await db.ModuleRooms.AsNoTracking()
+        Append(hash, "module-rooms", await LoadBoundedAsync(db.ModuleRooms.AsNoTracking()
             .Where(item => relevantModuleIds.Contains(item.ModuleId))
             .OrderBy(item => item.ModuleId)
             .ThenBy(item => item.RoomId)
@@ -291,10 +280,9 @@ internal static class TeacherDraftsAutogenInputFingerprint
             {
                 item.ModuleId,
                 item.RoomId
-            })
-            .ToListAsync(cancellationToken));
+            }), rowBudget, cancellationToken));
 
-        Append(hash, "module-buildings", await db.ModuleBuildings.AsNoTracking()
+        Append(hash, "module-buildings", await LoadBoundedAsync(db.ModuleBuildings.AsNoTracking()
             .Where(item => relevantModuleIds.Contains(item.ModuleId))
             .OrderBy(item => item.ModuleId)
             .ThenBy(item => item.BuildingId)
@@ -302,10 +290,9 @@ internal static class TeacherDraftsAutogenInputFingerprint
             {
                 item.ModuleId,
                 item.BuildingId
-            })
-            .ToListAsync(cancellationToken));
+            }), rowBudget, cancellationToken));
 
-        Append(hash, "preferred-first-slot-limits", await db.PreferredFirstSlotLimitConfigs.AsNoTracking()
+        Append(hash, "preferred-first-slot-limits", await LoadBoundedAsync(db.PreferredFirstSlotLimitConfigs.AsNoTracking()
             .Where(item => item.CourseId == null || item.CourseId == courseId)
             .OrderBy(item => item.Id)
             .Select(item => new
@@ -313,10 +300,9 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.Id,
                 item.CourseId,
                 item.MaxSlotOrder
-            })
-            .ToListAsync(cancellationToken));
+            }), rowBudget, cancellationToken));
 
-        Append(hash, "time-slots", await db.TimeSlots.AsNoTracking()
+        Append(hash, "time-slots", await LoadBoundedAsync(db.TimeSlots.AsNoTracking()
             .Where(item => item.CourseId == null || item.CourseId == courseId)
             .OrderBy(item => item.Id)
             .Select(item => new
@@ -328,10 +314,9 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.End,
                 item.SortOrder,
                 item.IsActive
-            })
-            .ToListAsync(cancellationToken));
+            }), rowBudget, cancellationToken));
 
-        Append(hash, "lunch-configs", await db.LunchConfigs.AsNoTracking()
+        Append(hash, "lunch-configs", await LoadBoundedAsync(db.LunchConfigs.AsNoTracking()
             .Where(item => item.CourseId == null || item.CourseId == courseId)
             .OrderBy(item => item.Id)
             .Select(item => new
@@ -340,10 +325,9 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.CourseId,
                 item.Start,
                 item.End
-            })
-            .ToListAsync(cancellationToken));
+            }), rowBudget, cancellationToken));
 
-        Append(hash, "calendar-exceptions", await db.CalendarExceptions.AsNoTracking()
+        Append(hash, "calendar-exceptions", await LoadBoundedAsync(db.CalendarExceptions.AsNoTracking()
             .Where(item => item.Date >= request.FromDate
                            && item.Date <= request.ToDate
                            && (item.CourseId == null || item.CourseId == courseId)
@@ -360,10 +344,9 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.Name,
                 item.CourseId,
                 item.GroupId
-            })
-            .ToListAsync(cancellationToken));
+            }), rowBudget, cancellationToken));
 
-        Append(hash, "module-sequence", await db.ModuleSequenceItems.AsNoTracking()
+        Append(hash, "module-sequence", await LoadBoundedAsync(db.ModuleSequenceItems.AsNoTracking()
             .Where(item => item.CourseId == courseId && relevantModuleIds.Contains(item.ModuleId))
             .OrderBy(item => item.Order)
             .ThenBy(item => item.GroupOrder)
@@ -375,10 +358,9 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.ModuleId,
                 item.Order,
                 item.GroupOrder
-            })
-            .ToListAsync(cancellationToken));
+            }), rowBudget, cancellationToken));
 
-        Append(hash, "module-fillers", await db.ModuleFillers.AsNoTracking()
+        Append(hash, "module-fillers", await LoadBoundedAsync(db.ModuleFillers.AsNoTracking()
             .Where(item => item.CourseId == courseId && relevantModuleIds.Contains(item.ModuleId))
             .OrderBy(item => item.ModuleId)
             .ThenBy(item => item.Id)
@@ -387,13 +369,12 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.Id,
                 item.CourseId,
                 item.ModuleId
-            })
-            .ToListAsync(cancellationToken));
+            }), rowBudget, cancellationToken));
 
         var historyStartDate = request.FromDate.AddMonths(-12);
         var planningEndDateExclusive = DateHelpers.StartOfWeek(request.ToDate).AddDays(7);
 
-        Append(hash, "schedule-usage-and-occupancy", await db.ScheduleItems.AsNoTracking()
+        Append(hash, "schedule-usage-and-occupancy", await LoadBoundedAsync(db.ScheduleItems.AsNoTracking()
             .Where(item =>
                 (item.Group.CourseId == courseId
                  && (academicPeriodStartDate == null || item.Date >= academicPeriodStartDate.Value)
@@ -428,10 +409,9 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.BatchKey,
                 item.IsLocked,
                 item.IsSelfStudy
-            })
-            .ToListAsync(cancellationToken));
+            }), rowBudget, cancellationToken));
 
-        Append(hash, "draft-usage-and-occupancy", await db.TeacherDraftItems.AsNoTracking()
+        Append(hash, "draft-usage-and-occupancy", await LoadBoundedAsync(db.TeacherDraftItems.AsNoTracking()
             .Where(item =>
                 (item.Group.CourseId == courseId
                  && (academicPeriodStartDate == null || item.Date >= academicPeriodStartDate.Value)
@@ -468,10 +448,32 @@ internal static class TeacherDraftsAutogenInputFingerprint
                 item.BatchKey,
                 item.IsLocked,
                 item.IsSelfStudy
-            })
-            .ToListAsync(cancellationToken));
+            }), rowBudget, cancellationToken));
 
         return Convert.ToHexString(hash.GetHashAndReset());
+    }
+
+    private static async Task<List<T>> LoadBoundedAsync<T>(
+        IQueryable<T> query,
+        FingerprintRowBudget rowBudget,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var rowLimit = Math.Min(MaxRowsPerFingerprintSection, rowBudget.RemainingRows);
+        var rows = await query
+            .Take(rowLimit + 1)
+            .ToListAsync(cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (rows.Count > rowLimit)
+        {
+            throw new AutoGenPlanCapacityException(
+                rowBudget.RemainingRows < MaxRowsPerFingerprintSection
+                    ? $"Сукупний обсяг вхідних даних автогенерації перевищує безпечний ліміт {MaxTotalFingerprintRows} рядків. Зменште обсяг даних і повторіть спробу."
+                    : $"Один із наборів вхідних даних автогенерації перевищує безпечний ліміт {MaxRowsPerFingerprintSection} рядків. Зменште обсяг даних і повторіть спробу.");
+        }
+
+        rowBudget.Consume(rows.Count);
+        return rows;
     }
 
     private static void Append<T>(IncrementalHash hash, string name, IReadOnlyCollection<T> rows)
@@ -480,5 +482,15 @@ internal static class TeacherDraftsAutogenInputFingerprint
         hash.AppendData(ChunkSeparator);
         hash.AppendData(JsonSerializer.SerializeToUtf8Bytes(rows, JsonOptions));
         hash.AppendData(ChunkSeparator);
+    }
+
+    // Обмежує як кожен SQL-набір, так і сукупний відбиток; Take(limit + 1)
+    // дає змогу відхилити завеликий набір без його повного завантаження.
+    private sealed class FingerprintRowBudget
+    {
+        public int RemainingRows { get; private set; } = MaxTotalFingerprintRows;
+
+        public void Consume(int count)
+            => RemainingRows -= count;
     }
 }

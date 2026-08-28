@@ -1,3 +1,4 @@
+using System.Data.Common;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Admin;
@@ -7,6 +8,7 @@ using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 
@@ -169,6 +171,313 @@ public sealed class TeacherDraftBatchAtomicityTests
 
         var failure = Assert.IsType<ObjectResult>(result.Result);
         Assert.Equal(409, failure.StatusCode);
+        Assert.Equal(1, BatchFailureItemIndex(failure));
+        var remainingIds = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .OrderBy(item => item.Id)
+            .Select(item => item.Id)
+            .ToListAsync();
+        Assert.Equal(new[] { model.FirstDraftId, model.SecondDraftId }, remainingIds);
+    }
+
+    [Fact]
+    public async Task DeleteBatch_read_queries_and_save_changes_calls_do_not_grow_with_batch_size()
+    {
+        var commandCounter = new DatabaseOperationCountingInterceptor();
+        var saveChangesCounter = new SaveChangesCountingInterceptor();
+        await using var fixture = await TestDatabase.CreateAsync(commandCounter, saveChangesCounter);
+        var model = await fixture.SeedAsync(secondDraftLocked: false);
+        var revisions = await fixture.SeedDeleteBatchAsync(model, count: 25);
+        fixture.Db.ChangeTracker.Clear();
+        commandCounter.Reset();
+        saveChangesCounter.Reset();
+        var controller = CreateController(fixture.Db);
+
+        var result = await controller.DeleteBatch(
+            new TeacherDraftBatchDeleteRequest(
+                revisions.Keys.OrderBy(id => id).ToList(),
+                ExpectedRevisions: revisions),
+            confirm: true);
+
+        var response = Assert.IsType<OkObjectResult>(result.Result);
+        Assert.Equal(25, Assert.IsType<TeacherDraftBatchDeleteResult>(response.Value).Deleted);
+        Assert.Equal(2, commandCounter.SelectCommandCount);
+        // SQLite виконує один DELETE DbCommand на рядок; окремо фіксуємо цю
+        // provider-форму й не називаємо один SaveChanges одним round trip.
+        Assert.Equal(revisions.Count + 2, commandCounter.TotalCommandCount);
+        Assert.Equal(1, saveChangesCounter.Count);
+    }
+
+    [Fact]
+    public async Task DeleteBatch_legacy_signature_query_materializes_only_exact_crossed_rows()
+    {
+        const int signatureCount = 20;
+        var commandCounter = new DatabaseOperationCountingInterceptor();
+        await using var fixture = await TestDatabase.CreateAsync(commandCounter);
+        var model = await fixture.SeedAsync(secondDraftLocked: false);
+        var crossed = await fixture.SeedCrossedLegacyDeleteBatchAsync(model, signatureCount);
+        fixture.Db.ChangeTracker.Clear();
+        commandCounter.Reset();
+        var controller = CreateController(fixture.Db);
+
+        var result = await controller.DeleteBatch(
+            new TeacherDraftBatchDeleteRequest(
+                crossed.ExpectedRevisions.Keys.OrderBy(id => id).ToList(),
+                ExpectedRevisions: crossed.ExpectedRevisions),
+            confirm: true);
+
+        var response = Assert.IsType<OkObjectResult>(result.Result);
+        Assert.Equal(signatureCount, Assert.IsType<TeacherDraftBatchDeleteResult>(response.Value).Deleted);
+        Assert.Equal(2, commandCounter.TeacherDraftSelectCount);
+        Assert.Equal(signatureCount * 2, commandCounter.TeacherDraftMaterializedRowCount);
+
+        fixture.Db.ChangeTracker.Clear();
+        var remainingCrossedIds = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => crossed.UnrelatedIds.Contains(item.Id))
+            .Select(item => item.Id)
+            .ToListAsync();
+        Assert.Equal(crossed.UnrelatedIds.Count, remainingCrossedIds.Count);
+    }
+
+    [Fact]
+    public async Task DeleteBatch_rejects_partial_tab_whitespace_legacy_event_in_mixed_batch()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedAsync(secondDraftLocked: false);
+        var controller = CreateController(fixture.Db);
+        var createResult = await controller.UpsertBatch(new TeacherDraftBatchUpsertRequest(
+            new List<DraftUpsertRequest>
+            {
+                CreateLogicalEventRequest(
+                    model,
+                    model.FirstTopicId,
+                    model.FirstTeacherId,
+                    "tab-whitespace-logical-event"),
+                CreateLogicalEventRequest(
+                    model,
+                    model.SecondTopicId,
+                    model.SecondTeacherId,
+                    "tab-whitespace-logical-event")
+            }));
+        var createdResponse = Assert.IsType<OkObjectResult>(createResult.Result);
+        var created = Assert.IsType<TeacherDraftBatchUpsertResult>(createdResponse.Value);
+        var legacyRows = await fixture.Db.TeacherDraftItems
+            .Where(item => created.Ids.Contains(item.Id))
+            .ToListAsync();
+        foreach (var row in legacyRows)
+        {
+            row.BatchKey = "\t";
+        }
+        var explicitRow = await fixture.Db.TeacherDraftItems
+            .SingleAsync(item => item.Id == model.FirstDraftId);
+        explicitRow.BatchKey = "mixed-explicit-event";
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var requestedIds = new List<int> { explicitRow.Id, created.Ids[0] };
+        var revisions = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => requestedIds.Contains(item.Id))
+            .ToDictionaryAsync(item => item.Id, item => item.Revision);
+
+        var result = await controller.DeleteBatch(
+            new TeacherDraftBatchDeleteRequest(requestedIds, ExpectedRevisions: revisions),
+            confirm: true);
+
+        Assert.IsType<ConflictObjectResult>(result.Result);
+        Assert.Equal(3, await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .CountAsync(item => item.Id == explicitRow.Id || created.Ids.Contains(item.Id)));
+    }
+
+    [Fact]
+    public async Task DeleteBatch_exact_legacy_predicate_supports_maximum_batch_size()
+    {
+        const int batchSize = 500;
+        var commandCounter = new DatabaseOperationCountingInterceptor();
+        await using var fixture = await TestDatabase.CreateAsync(commandCounter);
+        var model = await fixture.SeedAsync(secondDraftLocked: false);
+        var revisions = await fixture.SeedLegacyDeleteBatchAsync(model, batchSize);
+        fixture.Db.ChangeTracker.Clear();
+        commandCounter.Reset();
+        var controller = CreateController(fixture.Db);
+
+        var result = await controller.DeleteBatch(
+            new TeacherDraftBatchDeleteRequest(
+                revisions.Keys.OrderBy(id => id).ToList(),
+                ExpectedRevisions: revisions),
+            confirm: true);
+
+        var response = Assert.IsType<OkObjectResult>(result.Result);
+        Assert.Equal(batchSize, Assert.IsType<TeacherDraftBatchDeleteResult>(response.Value).Deleted);
+        Assert.Equal(2, commandCounter.TeacherDraftSelectCount);
+        Assert.Equal(batchSize * 2, commandCounter.TeacherDraftMaterializedRowCount);
+        Assert.Equal(batchSize + 2, commandCounter.TotalCommandCount);
+    }
+
+    [Fact]
+    public async Task DeleteBatch_reports_missing_item_in_request_order_without_deleting_valid_rows()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedAsync(secondDraftLocked: false);
+        var missingId = int.MaxValue;
+        var revisions = model.Revisions();
+        revisions[missingId] = Guid.NewGuid();
+        var controller = CreateController(fixture.Db);
+
+        var result = await controller.DeleteBatch(
+            new TeacherDraftBatchDeleteRequest(
+                new List<int> { model.FirstDraftId, missingId, model.SecondDraftId },
+                ExpectedRevisions: revisions),
+            confirm: true);
+
+        var failure = Assert.IsType<ObjectResult>(result.Result);
+        Assert.Equal(404, failure.StatusCode);
+        Assert.Equal(1, BatchFailureItemIndex(failure));
+        Assert.Equal(2, await fixture.Db.TeacherDraftItems.AsNoTracking().CountAsync());
+    }
+
+    [Fact]
+    public async Task DeleteBatch_reports_first_stale_revision_in_request_order_without_deleting_rows()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedAsync(secondDraftLocked: false);
+        var changed = await fixture.Db.TeacherDraftItems
+            .SingleAsync(item => item.Id == model.SecondDraftId);
+        changed.StartTime = new TimeOnly(11, 0);
+        changed.EndTime = new TimeOnly(12, 0);
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var controller = CreateController(fixture.Db);
+
+        var result = await controller.DeleteBatch(
+            new TeacherDraftBatchDeleteRequest(
+                new List<int> { model.FirstDraftId, model.SecondDraftId },
+                ExpectedRevisions: model.Revisions()),
+            confirm: true);
+
+        var failure = Assert.IsType<ObjectResult>(result.Result);
+        Assert.Equal(409, failure.StatusCode);
+        Assert.Equal(1, BatchFailureItemIndex(failure));
+        Assert.Equal(2, await fixture.Db.TeacherDraftItems.AsNoTracking().CountAsync());
+    }
+
+    [Fact]
+    public async Task DeleteBatch_requires_confirmation_even_when_unrestricted_for_approved_row()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedAsync(secondDraftLocked: false);
+        var approved = await fixture.Db.TeacherDraftItems
+            .SingleAsync(item => item.Id == model.SecondDraftId);
+        approved.Status = DraftStatus.Published;
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var revisions = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .ToDictionaryAsync(item => item.Id, item => item.Revision);
+        var controller = CreateController(fixture.Db);
+
+        var result = await controller.DeleteBatch(
+            new TeacherDraftBatchDeleteRequest(
+                new List<int> { model.FirstDraftId, model.SecondDraftId },
+                Unrestricted: true,
+                ExpectedRevisions: revisions),
+            confirm: false);
+
+        var failure = Assert.IsType<ObjectResult>(result.Result);
+        Assert.Equal(409, failure.StatusCode);
+        Assert.Equal(1, BatchFailureItemIndex(failure));
+        Assert.Equal(2, await fixture.Db.TeacherDraftItems.AsNoTracking().CountAsync());
+    }
+
+    [Fact]
+    public async Task DeleteBatch_deletes_locked_and_approved_rows_with_confirmation_and_unrestricted_mode()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedAsync(secondDraftLocked: true);
+        var approved = await fixture.Db.TeacherDraftItems
+            .SingleAsync(item => item.Id == model.FirstDraftId);
+        approved.Status = DraftStatus.Published;
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        var revisions = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .ToDictionaryAsync(item => item.Id, item => item.Revision);
+        var controller = CreateController(fixture.Db);
+
+        var result = await controller.DeleteBatch(
+            new TeacherDraftBatchDeleteRequest(
+                new List<int> { model.FirstDraftId, model.SecondDraftId },
+                Unrestricted: true,
+                ExpectedRevisions: revisions),
+            confirm: true);
+
+        var response = Assert.IsType<OkObjectResult>(result.Result);
+        Assert.Equal(2, Assert.IsType<TeacherDraftBatchDeleteResult>(response.Value).Deleted);
+        Assert.Empty(await fixture.Db.TeacherDraftItems.AsNoTracking().ToListAsync());
+    }
+
+    [Fact]
+    public async Task DeleteBatch_rejects_duplicate_ids_without_mutation()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedAsync(secondDraftLocked: false);
+        var controller = CreateController(fixture.Db);
+
+        var result = await controller.DeleteBatch(
+            new TeacherDraftBatchDeleteRequest(
+                new List<int> { model.FirstDraftId, model.FirstDraftId },
+                ExpectedRevisions: model.Revisions()),
+            confirm: true);
+
+        Assert.IsType<BadRequestObjectResult>(result.Result);
+        Assert.Equal(2, await fixture.Db.TeacherDraftItems.AsNoTracking().CountAsync());
+    }
+
+    [Fact]
+    public async Task DeleteBatch_returns_concurrency_conflict_when_revision_changes_during_bulk_delete()
+    {
+        var race = new RevisionRaceOnDeleteInterceptor();
+        await using var fixture = await TestDatabase.CreateAsync(race);
+        var model = await fixture.SeedAsync(secondDraftLocked: false);
+        fixture.Db.ChangeTracker.Clear();
+        race.TargetId = model.SecondDraftId;
+        var controller = CreateController(fixture.Db);
+
+        var result = await controller.DeleteBatch(
+            new TeacherDraftBatchDeleteRequest(
+                new List<int> { model.FirstDraftId, model.SecondDraftId },
+                ExpectedRevisions: model.Revisions()),
+            confirm: true);
+
+        var failure = Assert.IsType<ConflictObjectResult>(result.Result);
+        Assert.Contains("пакетного видалення", failure.Value?.ToString(), StringComparison.Ordinal);
+        fixture.Db.ChangeTracker.Clear();
+        var persisted = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .OrderBy(item => item.Id)
+            .ToListAsync();
+        Assert.Equal(2, persisted.Count);
+        Assert.Equal(model.SecondDraftRevision, persisted[1].Revision);
+    }
+
+    [Fact]
+    public async Task DeleteBatch_rolls_back_rows_deleted_before_save_completion_failure()
+    {
+        var failureAfterSave = new ThrowAfterSaveChangesInterceptor();
+        await using var fixture = await TestDatabase.CreateAsync(failureAfterSave);
+        var model = await fixture.SeedAsync(secondDraftLocked: false);
+        fixture.Db.ChangeTracker.Clear();
+        failureAfterSave.Enabled = true;
+        var controller = CreateController(fixture.Db);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => controller.DeleteBatch(
+            new TeacherDraftBatchDeleteRequest(
+                new List<int> { model.FirstDraftId, model.SecondDraftId },
+                ExpectedRevisions: model.Revisions()),
+            confirm: true));
+
+        fixture.Db.ChangeTracker.Clear();
         var remainingIds = await fixture.Db.TeacherDraftItems
             .AsNoTracking()
             .OrderBy(item => item.Id)
@@ -333,6 +642,17 @@ public sealed class TeacherDraftBatchAtomicityTests
 
         Assert.IsType<ConflictObjectResult>(partialUpdate.Result);
         Assert.IsType<ConflictObjectResult>(partialDelete);
+        Assert.Equal(2, await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .CountAsync(item => created.Ids.Contains(item.Id)));
+
+        var partialBatchDelete = await controller.DeleteBatch(
+            new TeacherDraftBatchDeleteRequest(
+                new List<int> { created.Ids[0] },
+                ExpectedRevisions: createdRevisions),
+            confirm: true);
+
+        Assert.IsType<ConflictObjectResult>(partialBatchDelete.Result);
         Assert.Equal(2, await fixture.Db.TeacherDraftItems
             .AsNoTracking()
             .CountAsync(item => created.Ids.Contains(item.Id)));
@@ -928,6 +1248,12 @@ public sealed class TeacherDraftBatchAtomicityTests
             autogenJobService: null!,
             publishService: null!);
 
+    private static int BatchFailureItemIndex(ObjectResult failure)
+    {
+        var payload = Assert.IsAssignableFrom<IReadOnlyDictionary<string, object?>>(failure.Value);
+        return Assert.IsType<int>(payload["itemIndex"]);
+    }
+
     private sealed class TestDatabase : IAsyncDisposable
     {
         private readonly SqliteConnection _connection;
@@ -945,13 +1271,17 @@ public sealed class TeacherDraftBatchAtomicityTests
                 .UseSqlite(_connection)
                 .Options);
 
-        public static async Task<TestDatabase> CreateAsync()
+        public static async Task<TestDatabase> CreateAsync(params IInterceptor[] interceptors)
         {
             var connection = new SqliteConnection("Data Source=:memory:");
             await connection.OpenAsync();
-            var options = new DbContextOptionsBuilder<AppDbContext>()
-                .UseSqlite(connection)
-                .Options;
+            var optionsBuilder = new DbContextOptionsBuilder<AppDbContext>()
+                .UseSqlite(connection);
+            if (interceptors.Length > 0)
+            {
+                optionsBuilder.AddInterceptors(interceptors);
+            }
+            var options = optionsBuilder.Options;
             var db = new AppDbContext(options);
             await db.Database.EnsureCreatedAsync();
             return new TestDatabase(connection, db);
@@ -1031,6 +1361,90 @@ public sealed class TeacherDraftBatchAtomicityTests
                 secondTopic.Id);
         }
 
+        public async Task<Dictionary<int, Guid>> SeedDeleteBatchAsync(SeedModel model, int count)
+        {
+            var drafts = Enumerable.Range(0, count)
+                .Select(_ => CreateDraft(
+                    model.GroupId,
+                    model.ModuleId,
+                    model.LessonTypeId,
+                    new TimeOnly(13, 0),
+                    new TimeOnly(14, 0),
+                    isLocked: false))
+                .ToList();
+            foreach (var draft in drafts)
+            {
+                draft.BatchKey = "delete-batch-round-trip-regression";
+            }
+            Db.TeacherDraftItems.AddRange(drafts);
+            await Db.SaveChangesAsync();
+            return drafts.ToDictionary(draft => draft.Id, draft => draft.Revision);
+        }
+
+        public async Task<CrossedLegacyDeleteSeed> SeedCrossedLegacyDeleteBatchAsync(
+            SeedModel model,
+            int signatureCount)
+        {
+            var drafts = new List<TeacherDraftItem>(signatureCount * signatureCount);
+            var selectedDrafts = new List<TeacherDraftItem>(signatureCount);
+            for (var dateIndex = 0; dateIndex < signatureCount; dateIndex++)
+            {
+                var date = Monday.AddDays(30 + dateIndex);
+                for (var timeIndex = 0; timeIndex < signatureCount; timeIndex++)
+                {
+                    var start = new TimeOnly(13, 0).AddMinutes(timeIndex * 15);
+                    var draft = CreateDraft(
+                        model.GroupId,
+                        model.ModuleId,
+                        model.LessonTypeId,
+                        start,
+                        start.AddMinutes(45),
+                        isLocked: false);
+                    draft.Date = date;
+                    draft.DayOfWeek = date.DayOfWeek;
+                    draft.BatchKey = dateIndex % 2 == 0 ? "\t" : null;
+                    drafts.Add(draft);
+                    if (dateIndex == timeIndex)
+                    {
+                        selectedDrafts.Add(draft);
+                    }
+                }
+            }
+
+            Db.TeacherDraftItems.AddRange(drafts);
+            await Db.SaveChangesAsync();
+            var selectedIdSet = selectedDrafts.Select(draft => draft.Id).ToHashSet();
+            return new CrossedLegacyDeleteSeed(
+                selectedDrafts.ToDictionary(draft => draft.Id, draft => draft.Revision),
+                drafts.Where(draft => !selectedIdSet.Contains(draft.Id))
+                    .Select(draft => draft.Id)
+                    .ToList());
+        }
+
+        public async Task<Dictionary<int, Guid>> SeedLegacyDeleteBatchAsync(SeedModel model, int count)
+        {
+            var drafts = Enumerable.Range(0, count)
+                .Select(index =>
+                {
+                    var start = new TimeOnly(13, 0).AddMinutes(index % 20 * 15);
+                    var draft = CreateDraft(
+                        model.GroupId,
+                        model.ModuleId,
+                        model.LessonTypeId,
+                        start,
+                        start.AddMinutes(45),
+                        isLocked: false);
+                    draft.Date = Monday.AddDays(100 + index);
+                    draft.DayOfWeek = draft.Date.DayOfWeek;
+                    draft.BatchKey = index % 2 == 0 ? "\t" : null;
+                    return draft;
+                })
+                .ToList();
+            Db.TeacherDraftItems.AddRange(drafts);
+            await Db.SaveChangesAsync();
+            return drafts.ToDictionary(draft => draft.Id, draft => draft.Revision);
+        }
+
         private static TeacherDraftItem CreateDraft(
             int groupId,
             int moduleId,
@@ -1078,5 +1492,213 @@ public sealed class TeacherDraftBatchAtomicityTests
                 [FirstDraftId] = FirstDraftRevision,
                 [SecondDraftId] = SecondDraftRevision
             };
+    }
+
+    private sealed record CrossedLegacyDeleteSeed(
+        Dictionary<int, Guid> ExpectedRevisions,
+        IReadOnlyList<int> UnrelatedIds);
+
+    private sealed class DatabaseOperationCountingInterceptor : DbCommandInterceptor
+    {
+        public int SelectCommandCount { get; private set; }
+        public int TeacherDraftSelectCount { get; private set; }
+        public int TeacherDraftReadCount { get; private set; }
+        public int TeacherDraftMaterializedRowCount => TeacherDraftReadCount - TeacherDraftSelectCount;
+        public int ReaderCommandCount { get; private set; }
+        public int NonQueryCommandCount { get; private set; }
+        public int ScalarCommandCount { get; private set; }
+        public int TotalCommandCount => ReaderCommandCount + NonQueryCommandCount + ScalarCommandCount;
+
+        public void Reset()
+        {
+            SelectCommandCount = 0;
+            TeacherDraftSelectCount = 0;
+            TeacherDraftReadCount = 0;
+            ReaderCommandCount = 0;
+            NonQueryCommandCount = 0;
+            ScalarCommandCount = 0;
+        }
+
+        public override InterceptionResult<DbDataReader> ReaderExecuting(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<DbDataReader> result)
+        {
+            ReaderCommandCount++;
+            Count(command);
+            return result;
+        }
+
+        public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            ReaderCommandCount++;
+            Count(command);
+            return ValueTask.FromResult(result);
+        }
+
+        public override InterceptionResult<int> NonQueryExecuting(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<int> result)
+        {
+            NonQueryCommandCount++;
+            return result;
+        }
+
+        public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            NonQueryCommandCount++;
+            return ValueTask.FromResult(result);
+        }
+
+        public override InterceptionResult<object> ScalarExecuting(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<object> result)
+        {
+            ScalarCommandCount++;
+            return result;
+        }
+
+        public override ValueTask<InterceptionResult<object>> ScalarExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<object> result,
+            CancellationToken cancellationToken = default)
+        {
+            ScalarCommandCount++;
+            return ValueTask.FromResult(result);
+        }
+
+        public override InterceptionResult DataReaderDisposing(
+            DbCommand command,
+            DataReaderDisposingEventData eventData,
+            InterceptionResult result)
+        {
+            if (IsTeacherDraftSelect(command))
+            {
+                TeacherDraftReadCount += eventData.ReadCount;
+            }
+
+            return base.DataReaderDisposing(command, eventData, result);
+        }
+
+        private void Count(DbCommand command)
+        {
+            if (command.CommandText.TrimStart().StartsWith("SELECT", StringComparison.OrdinalIgnoreCase))
+            {
+                SelectCommandCount++;
+                if (IsTeacherDraftSelect(command))
+                {
+                    TeacherDraftSelectCount++;
+                }
+            }
+        }
+
+        private static bool IsTeacherDraftSelect(DbCommand command)
+            => command.CommandText.TrimStart().StartsWith("SELECT", StringComparison.OrdinalIgnoreCase)
+               && command.CommandText.Contains("TeacherDraftItems", StringComparison.Ordinal);
+    }
+
+    private sealed class SaveChangesCountingInterceptor : SaveChangesInterceptor
+    {
+        public int Count { get; private set; }
+
+        public void Reset()
+            => Count = 0;
+
+        public override InterceptionResult<int> SavingChanges(
+            DbContextEventData eventData,
+            InterceptionResult<int> result)
+        {
+            Count++;
+            return result;
+        }
+
+        public override ValueTask<InterceptionResult<int>> SavingChangesAsync(
+            DbContextEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            Count++;
+            return ValueTask.FromResult(result);
+        }
+    }
+
+    private sealed class RevisionRaceOnDeleteInterceptor : DbCommandInterceptor
+    {
+        private bool _triggered;
+
+        public int? TargetId { get; set; }
+
+        public override async ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            await IntroduceRaceAsync(command, cancellationToken);
+            return result;
+        }
+
+        public override async ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            await IntroduceRaceAsync(command, cancellationToken);
+            return result;
+        }
+
+        private async Task IntroduceRaceAsync(DbCommand command, CancellationToken cancellationToken)
+        {
+            if (_triggered
+                || TargetId is not int targetId
+                || !command.CommandText.TrimStart().StartsWith("DELETE", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            _triggered = true;
+            await using var update = command.Connection!.CreateCommand();
+            update.Transaction = command.Transaction;
+            update.CommandText = "UPDATE \"TeacherDraftItems\" SET \"Revision\" = $revision WHERE \"Id\" = $id;";
+            var revisionParameter = update.CreateParameter();
+            revisionParameter.ParameterName = "$revision";
+            revisionParameter.Value = Guid.NewGuid().ToString("D");
+            update.Parameters.Add(revisionParameter);
+            var idParameter = update.CreateParameter();
+            idParameter.ParameterName = "$id";
+            idParameter.Value = targetId;
+            update.Parameters.Add(idParameter);
+            await update.ExecuteNonQueryAsync(cancellationToken);
+        }
+    }
+
+    private sealed class ThrowAfterSaveChangesInterceptor : SaveChangesInterceptor
+    {
+        public bool Enabled { get; set; }
+
+        public override ValueTask<int> SavedChangesAsync(
+            SaveChangesCompletedEventData eventData,
+            int result,
+            CancellationToken cancellationToken = default)
+        {
+            if (Enabled)
+            {
+                throw new InvalidOperationException("Імітована помилка після виконання команд видалення.");
+            }
+
+            return ValueTask.FromResult(result);
+        }
     }
 }

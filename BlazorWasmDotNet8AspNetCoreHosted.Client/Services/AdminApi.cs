@@ -8,16 +8,27 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
     // API-клієнт для адміністративних операцій
     public sealed class AdminApi(HttpClient http) : IAdminApi
     {
+        public const long MaxDocxImportFileSizeBytes = 10 * 1024 * 1024;
+        public const string MaxDocxImportFileSizeMessage = "Розмір DOCX-файлу перевищує дозволені 10 МБ";
+
         private readonly HttpClient _http = http;
         // Перевіряє відповідь і кидає виняток з повідомленням сервера.
         private static async Task Ensure(HttpResponseMessage resp)
         {
             await resp.EnsureSuccessWithDetailsAsync();
         }
+        // Перевіряє відповідь операції без тіла та одразу звільняє її ресурси.
+        private static async Task EnsureAndDispose(HttpResponseMessage resp)
+        {
+            using (resp)
+            {
+                await Ensure(resp);
+            }
+        }
         // Надсилає DTO на upsert-endpoint і повертає створений або оновлений id.
         private async Task<int> PostForId<T>(string url, T dto)
         {
-            var resp = await _http.PostAsJsonAsync(url, dto);
+            using var resp = await _http.PostAsJsonAsync(url, dto);
             await Ensure(resp);
             return (await resp.Content.ReadFromJsonAsync<int>())!;
         }
@@ -33,7 +44,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
             => await PostForId("api/admin/config/calendar/upsert", dto);
         // Видаляє календарний виняток.
         public async Task DeleteCalendar(int id)
-            => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/config/calendar/{id}")));
+            => await EnsureAndDispose(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/config/calendar/{id}")));
         // Налаштування обідніх перерв.
         public async Task<List<LunchConfigEditDto>> GetLunch()
             => await _http.GetFromJsonWithDetailsAsync<List<LunchConfigEditDto>>("api/admin/config/lunch") ?? new();
@@ -42,7 +53,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
             => await PostForId("api/admin/config/lunch/upsert", dto);
         // Видаляє обідню перерву.
         public async Task DeleteLunch(int id)
-            => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/config/lunch/{id}")));
+            => await EnsureAndDispose(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/config/lunch/{id}")));
         // Довідник викладачів.
         public async Task<List<TeacherViewDto>> GetTeachers()
             => await _http.GetFromJsonWithDetailsAsync<List<TeacherViewDto>>("api/admin/teachers") ?? new();
@@ -54,7 +65,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
             => await PostForId("api/admin/teachers/upsert", dto);
         // Видаляє викладача.
         public async Task DeleteTeacher(int id)
-            => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/teachers/{id}")));
+            => await EnsureAndDispose(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/teachers/{id}")));
         // Довідник навчальних груп.
         public async Task<List<GroupEditDto>> GetGroups()
             => await _http.GetFromJsonWithDetailsAsync<List<GroupEditDto>>("api/admin/groups") ?? new();
@@ -67,7 +78,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
             var url = force
                 ? ApiClientHelpers.WithConfirm($"api/admin/groups/{id}?force=true")
                 : ApiClientHelpers.WithConfirm($"api/admin/groups/{id}");
-            await Ensure(await _http.DeleteAsync(url));
+            await EnsureAndDispose(await _http.DeleteAsync(url));
         }
         // Довідник модулів.
         public async Task<List<ModuleEditDto>> GetModules()
@@ -77,11 +88,11 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
             => await PostForId("api/admin/modules/upsert", dto);
         // Видаляє модуль.
         public async Task DeleteModule(int id)
-            => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/modules/{id}")));
+            => await EnsureAndDispose(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/modules/{id}")));
         // Перетворює модуль на окремий екземпляр для конкретного курсу.
         public async Task<int> EnsureCourseScopedModule(int moduleId, int courseId)
         {
-            var resp = await _http.PostAsync($"api/admin/modules/{moduleId}/ensure-course-scope?courseId={courseId}", null);
+            using var resp = await _http.PostAsync($"api/admin/modules/{moduleId}/ensure-course-scope?courseId={courseId}", null);
             await Ensure(resp);
             return (await resp.Content.ReadFromJsonAsync<int>())!;
         }
@@ -93,7 +104,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
             => await PostForId($"api/admin/modules/{moduleId}/topics/upsert", dto);
         // Видаляє тему модуля.
         public async Task DeleteModuleTopic(int moduleId, int topicId)
-            => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/modules/{moduleId}/topics/{topicId}")));
+            => await EnsureAndDispose(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/modules/{moduleId}/topics/{topicId}")));
         // Довідник аудиторій.
         public async Task<List<RoomEditDto>> GetRooms()
             => await _http.GetFromJsonWithDetailsAsync<List<RoomEditDto>>("api/admin/rooms") ?? new();
@@ -102,33 +113,30 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
             => await PostForId("api/admin/rooms/upsert", dto);
         // Видаляє аудиторію.
         public async Task DeleteRoom(int id)
-            => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/rooms/{id}")));
-        // Комбінована модель для отримання будівель і переходів.
-        private sealed record BuildingsVm(List<BuildingEditDto> buildings, List<BuildingTravelEditDto> travels);
-        // Читає корпуси та переходи одним запитом без кешування.
-        private async Task<BuildingsVm> GetBuildingsVm()
-            => await _http.GetFromJsonWithDetailsAsync<BuildingsVm>("api/admin/buildings") ?? new(new(), new());
+            => await EnsureAndDispose(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/rooms/{id}")));
+        // Читає узгоджений знімок корпусів і переходів одним запитом без кешування.
+        public async Task<BuildingCatalogDto> GetBuildingCatalog()
+            => await _http.GetFromJsonWithDetailsAsync<BuildingCatalogDto>("api/admin/buildings") ?? new(new(), new());
         // Довідник будівель.
         public async Task<List<BuildingEditDto>> GetBuildings()
-            => (await GetBuildingsVm()).buildings;
+            => (await GetBuildingCatalog()).Buildings;
         // Налаштування переходів між будівлями.
         public async Task<List<BuildingTravelEditDto>> GetBuildingTravels()
-            => (await GetBuildingsVm()).travels;
+            => (await GetBuildingCatalog()).Travels;
         // Створює або оновлює будівлю.
         public async Task<int> UpsertBuilding(BuildingEditDto dto)
             => await PostForId("api/admin/buildings/upsert", dto);
         // Видаляє будівлю.
         public async Task DeleteBuilding(int id)
-            => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/buildings/{id}")));
+            => await EnsureAndDispose(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/buildings/{id}")));
         // Створює або оновлює маршрут між будівлями.
         public async Task UpsertBuildingTravel(BuildingTravelEditDto dto)
         {
-            var resp = await _http.PostAsJsonAsync("api/admin/buildings/travel/upsert", dto);
-            await Ensure(resp);
+            await EnsureAndDispose(await _http.PostAsJsonAsync("api/admin/buildings/travel/upsert", dto));
         }
         // Видаляє маршрут між будівлями.
         public async Task DeleteBuildingTravel(int fromId, int toId)
-            => await Ensure(await _http.PostAsJsonAsync(
+            => await EnsureAndDispose(await _http.PostAsJsonAsync(
                 ApiClientHelpers.WithConfirm("api/admin/buildings/travel/delete"),
                 new BuildingTravelEditDto(fromId, toId, 0)));
         // Довідник курсів.
@@ -143,17 +151,17 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
             var url = force
                 ? ApiClientHelpers.WithConfirm($"api/admin/courses/{id}?force=true")
                 : ApiClientHelpers.WithConfirm($"api/admin/courses/{id}");
-            await Ensure(await _http.DeleteAsync(url));
+            await EnsureAndDispose(await _http.DeleteAsync(url));
         }
         // Довідник типів занять.
         public async Task<List<LessonTypeEditDto>> GetLessonTypes()
             => await _http.GetFromJsonWithDetailsAsync<List<LessonTypeEditDto>>("api/admin/types/lesson") ?? new();
         // Створює або оновлює тип заняття.
         public async Task UpsertLessonType(LessonTypeEditDto dto)
-            => await Ensure(await _http.PostAsJsonAsync("api/admin/types/lesson/upsert", dto));
+            => await EnsureAndDispose(await _http.PostAsJsonAsync("api/admin/types/lesson/upsert", dto));
         // Видаляє тип заняття.
         public async Task DeleteLessonType(int id)
-            => await Ensure(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/types/lesson/{id}")));
+            => await EnsureAndDispose(await _http.DeleteAsync(ApiClientHelpers.WithConfirm($"api/admin/types/lesson/{id}")));
         // Палітра кольорів для типів занять.
         public async Task<List<LessonColorDto>> GetLessonColorPalette()
             => await _http.GetFromJsonWithDetailsAsync<List<LessonColorDto>>("api/admin/types/lesson/palette") ?? new();
@@ -171,7 +179,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
             var url = courseId is int cid && cid > 0
                 ? $"api/admin/plans/module/{moduleId}/upsert?courseId={cid}"
                 : $"api/admin/plans/module/{moduleId}/upsert";
-            await Ensure(await _http.PostAsJsonAsync(url, rows));
+            await EnsureAndDispose(await _http.PostAsJsonAsync(url, rows));
         }
         // Повертає план модуля для курсу з дефолтами.
         public async Task<CourseModulePlanDto> GetCourseModulePlan(int moduleId, int courseId)
@@ -188,18 +196,23 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
             => await _http.GetFromJsonWithDetailsAsync<ModuleSequenceConfigDto>($"api/admin/module-sequence/{courseId}");
         // Зберігає послідовність модулів.
         public async Task SaveModuleSequence(ModuleSequenceSaveRequestDto dto)
-            => await Ensure(await _http.PostAsJsonAsync("api/admin/module-sequence/save", dto));
+            => await EnsureAndDispose(await _http.PostAsJsonAsync("api/admin/module-sequence/save", dto));
         // Імпорт модулів із DOCX з опційним застосуванням змін.
         public async Task<DocxImportResultDto> ImportModulesFromDocx(IBrowserFile file, bool apply, CancellationToken ct = default)
         {
+            if (file.Size > MaxDocxImportFileSizeBytes)
+            {
+                throw new InvalidOperationException(MaxDocxImportFileSizeMessage);
+            }
+
             var url = $"api/admin/modules/import-docx?apply={(apply ? "true" : "false")}";
-            var content = new MultipartFormDataContent();
+            using var content = new MultipartFormDataContent();
             // Ліміт стріму щоб уникнути завантаження надвеликих файлів у пам’ять.
-            var stream = file.OpenReadStream(50 * 1024 * 1024, ct);
+            await using var stream = file.OpenReadStream(MaxDocxImportFileSizeBytes, ct);
             var streamContent = new StreamContent(stream);
             streamContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(file.ContentType ?? "application/octet-stream");
             content.Add(streamContent, "file", file.Name);
-            var resp = await _http.PostAsync(url, content, ct);
+            using var resp = await _http.PostAsync(url, content, ct);
             if (!resp.IsSuccessStatusCode)
             {
                 var body = await resp.Content.ReadAsStringAsync(ct);
@@ -212,8 +225,9 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Client.Services
         // Повністю очищає модулі та їхні плани.
         public async Task ClearModulesAndPlans()
         {
-            var resp = await _http.PostAsync(ApiClientHelpers.WithConfirm("api/admin/modules/clear-all"), null);
-            await Ensure(resp);
+            await EnsureAndDispose(await _http.PostAsync(
+                ApiClientHelpers.WithConfirm("api/admin/modules/clear-all"),
+                null));
         }
     }
 }

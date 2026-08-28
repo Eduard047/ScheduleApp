@@ -1,3 +1,4 @@
+using System.Data.Common;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Admin;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
@@ -6,6 +7,7 @@ using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 
 namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 
@@ -157,6 +159,184 @@ public sealed class AggregateLogicalEventTests
             .Select(load => load.ScheduledHours)
             .ToListAsync();
         Assert.Equal(new[] { 1, 1 }, loads);
+    }
+
+    [Fact]
+    public async Task Scoped_recalculation_reads_and_updates_only_requested_exact_pairs()
+    {
+        var mutationCounter = new AggregateMutationCountingInterceptor();
+        var commandCounter = new AggregateCommandCountingInterceptor();
+        await using var fixture = await AggregateTestDatabase.CreateAsync(mutationCounter, commandCounter);
+
+        var firstCourse = new Course { Name = "Перший курс точної області", DurationWeeks = 52 };
+        var secondCourse = new Course { Name = "Другий курс точної області", DurationWeeks = 52 };
+        var firstGroup = new Group
+        {
+            Name = "Перша група точної області",
+            StudentsCount = 20,
+            Course = firstCourse
+        };
+        var secondGroup = new Group
+        {
+            Name = "Друга група точної області",
+            StudentsCount = 20,
+            Course = secondCourse
+        };
+        var firstModule = new Module
+        {
+            Code = "EXACT-1",
+            Title = "Перший модуль точної області",
+            Credits = 1,
+            Course = firstCourse
+        };
+        var secondModule = new Module
+        {
+            Code = "EXACT-2",
+            Title = "Другий модуль точної області",
+            Credits = 1,
+            Course = secondCourse
+        };
+        var firstTeacher = new Teacher { FullName = "Перший викладач точної області" };
+        var secondTeacher = new Teacher { FullName = "Другий викладач точної області" };
+        var lessonType = new LessonTypeRef
+        {
+            Code = "EXACT",
+            Name = "Заняття точної області",
+            RequiresRoom = false,
+            RequiresTeacher = true,
+            BlocksRoom = false,
+            BlocksTeacher = true,
+            CountInPlan = true,
+            CountInLoad = true
+        };
+        fixture.Db.AddRange(
+            firstCourse,
+            secondCourse,
+            firstGroup,
+            secondGroup,
+            firstModule,
+            secondModule,
+            firstTeacher,
+            secondTeacher,
+            lessonType);
+        await fixture.Db.SaveChangesAsync();
+
+        fixture.Db.ModuleCourses.AddRange(
+            new ModuleCourse { ModuleId = firstModule.Id, CourseId = secondCourse.Id },
+            new ModuleCourse { ModuleId = secondModule.Id, CourseId = firstCourse.Id });
+        foreach (var (courseId, moduleId) in new[]
+                 {
+                     (firstCourse.Id, firstModule.Id),
+                     (firstCourse.Id, secondModule.Id),
+                     (secondCourse.Id, firstModule.Id),
+                     (secondCourse.Id, secondModule.Id)
+                 })
+        {
+            fixture.Db.ModulePlans.Add(new ModulePlan
+            {
+                CourseId = courseId,
+                ModuleId = moduleId,
+                TargetHours = 30,
+                ScheduledHours = 99,
+                IsActive = true
+            });
+        }
+        foreach (var (teacherId, courseId) in new[]
+                 {
+                     (firstTeacher.Id, firstCourse.Id),
+                     (firstTeacher.Id, secondCourse.Id),
+                     (secondTeacher.Id, firstCourse.Id),
+                     (secondTeacher.Id, secondCourse.Id)
+                 })
+        {
+            fixture.Db.TeacherCourseLoads.AddRange(
+                new TeacherCourseLoad
+                {
+                    TeacherId = teacherId,
+                    CourseId = courseId,
+                    ScheduledHours = 99,
+                    IsActive = true
+                },
+                new TeacherCourseLoad
+                {
+                    TeacherId = teacherId,
+                    CourseId = courseId,
+                    ScheduledHours = 99,
+                    IsActive = false
+                });
+        }
+        fixture.Db.ScheduleItems.AddRange(
+            CreateExactScopeScheduleItem(firstGroup.Id, firstModule.Id, firstTeacher.Id, lessonType.Id, 0),
+            CreateExactScopeScheduleItem(firstGroup.Id, secondModule.Id, secondTeacher.Id, lessonType.Id, 1),
+            CreateExactScopeScheduleItem(secondGroup.Id, firstModule.Id, firstTeacher.Id, lessonType.Id, 2),
+            CreateExactScopeScheduleItem(secondGroup.Id, secondModule.Id, secondTeacher.Id, lessonType.Id, 3));
+        await fixture.Db.SaveChangesAsync();
+        fixture.Db.ChangeTracker.Clear();
+        mutationCounter.Reset();
+        commandCounter.Reset();
+
+        var planKeys = new[]
+        {
+            (CourseId: firstCourse.Id, ModuleId: firstModule.Id),
+            (CourseId: secondCourse.Id, ModuleId: secondModule.Id)
+        };
+        var loadKeys = new[]
+        {
+            (TeacherId: firstTeacher.Id, CourseId: firstCourse.Id),
+            (TeacherId: secondTeacher.Id, CourseId: secondCourse.Id)
+        };
+        var baselineCourseIds = planKeys.Select(key => key.CourseId).Distinct().ToList();
+        var baselineModuleIds = planKeys.Select(key => key.ModuleId).Distinct().ToList();
+        _ = await fixture.Db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => baselineCourseIds.Contains(item.Group.CourseId)
+                           && baselineModuleIds.Contains(item.ModuleId))
+            .Select(item => item.Id)
+            .ToListAsync();
+        var baselineTeacherIds = loadKeys.Select(key => key.TeacherId).Distinct().ToList();
+        var baselineLoadCourseIds = loadKeys.Select(key => key.CourseId).Distinct().ToList();
+        _ = await fixture.Db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => item.TeacherId != null
+                           && baselineTeacherIds.Contains(item.TeacherId.Value)
+                           && baselineLoadCourseIds.Contains(item.Group.CourseId))
+            .Select(item => item.Id)
+            .ToListAsync();
+        Assert.Equal(2, commandCounter.ScheduleSelectCount);
+        Assert.Equal(8, commandCounter.ScheduleMaterializedRowCount);
+        commandCounter.Reset();
+
+        await new AggregatesService(fixture.Db).RecalcAsync(
+            planKeys,
+            loadKeys);
+        fixture.Db.ChangeTracker.Clear();
+
+        Assert.Equal(2, commandCounter.ScheduleSelectCount);
+        Assert.Equal(4, commandCounter.ScheduleMaterializedRowCount);
+        Assert.Equal(2, mutationCounter.ModifiedModulePlanCount);
+        Assert.Equal(2, mutationCounter.ModifiedActiveTeacherCourseLoadCount);
+        Assert.Equal(2, commandCounter.InactiveTeacherCourseLoadResetCount);
+        var plans = (await fixture.Db.ModulePlans.AsNoTracking().ToListAsync())
+            .ToDictionary(plan => (plan.CourseId, plan.ModuleId), plan => plan.ScheduledHours);
+        Assert.Equal(1, plans[(firstCourse.Id, firstModule.Id)]);
+        Assert.Equal(1, plans[(secondCourse.Id, secondModule.Id)]);
+        Assert.Equal(99, plans[(firstCourse.Id, secondModule.Id)]);
+        Assert.Equal(99, plans[(secondCourse.Id, firstModule.Id)]);
+        var loadRows = await fixture.Db.TeacherCourseLoads.AsNoTracking().ToListAsync();
+        var activeLoads = loadRows
+            .Where(load => load.IsActive)
+            .ToDictionary(load => (load.TeacherId, load.CourseId), load => load.ScheduledHours);
+        Assert.Equal(1, activeLoads[(firstTeacher.Id, firstCourse.Id)]);
+        Assert.Equal(1, activeLoads[(secondTeacher.Id, secondCourse.Id)]);
+        Assert.Equal(99, activeLoads[(firstTeacher.Id, secondCourse.Id)]);
+        Assert.Equal(99, activeLoads[(secondTeacher.Id, firstCourse.Id)]);
+        var inactiveLoads = loadRows
+            .Where(load => !load.IsActive)
+            .ToDictionary(load => (load.TeacherId, load.CourseId), load => load.ScheduledHours);
+        Assert.Equal(0, inactiveLoads[(firstTeacher.Id, firstCourse.Id)]);
+        Assert.Equal(0, inactiveLoads[(secondTeacher.Id, secondCourse.Id)]);
+        Assert.Equal(99, inactiveLoads[(firstTeacher.Id, secondCourse.Id)]);
+        Assert.Equal(99, inactiveLoads[(secondTeacher.Id, firstCourse.Id)]);
     }
 
     [Fact]
@@ -350,6 +530,24 @@ public sealed class AggregateLogicalEventTests
             BatchKey = batchKey
         };
 
+    private static ScheduleItem CreateExactScopeScheduleItem(
+        int groupId,
+        int moduleId,
+        int teacherId,
+        int lessonTypeId,
+        int dayOffset)
+        => new()
+        {
+            Date = Monday.AddDays(dayOffset),
+            DayOfWeek = Monday.AddDays(dayOffset).DayOfWeek,
+            StartTime = new TimeOnly(8, 0),
+            EndTime = new TimeOnly(9, 0),
+            GroupId = groupId,
+            ModuleId = moduleId,
+            TeacherId = teacherId,
+            LessonTypeId = lessonTypeId
+        };
+
     private sealed record AggregateModel(
         int CourseId,
         int GroupId,
@@ -372,13 +570,17 @@ public sealed class AggregateLogicalEventTests
 
         public AppDbContext Db { get; }
 
-        public static async Task<AggregateTestDatabase> CreateAsync()
+        public static async Task<AggregateTestDatabase> CreateAsync(params IInterceptor[] interceptors)
         {
             var connection = new SqliteConnection("Data Source=:memory:");
             await connection.OpenAsync();
-            var options = new DbContextOptionsBuilder<AppDbContext>()
-                .UseSqlite(connection)
-                .Options;
+            var optionsBuilder = new DbContextOptionsBuilder<AppDbContext>()
+                .UseSqlite(connection);
+            if (interceptors.Length > 0)
+            {
+                optionsBuilder.AddInterceptors(interceptors);
+            }
+            var options = optionsBuilder.Options;
             var db = new AppDbContext(options);
             await db.Database.EnsureCreatedAsync();
             return new AggregateTestDatabase(connection, db);
@@ -459,6 +661,95 @@ public sealed class AggregateLogicalEventTests
         {
             await Db.DisposeAsync();
             await _connection.DisposeAsync();
+        }
+    }
+
+    private sealed class AggregateMutationCountingInterceptor : SaveChangesInterceptor
+    {
+        public int ModifiedModulePlanCount { get; private set; }
+        public int ModifiedActiveTeacherCourseLoadCount { get; private set; }
+
+        public void Reset()
+        {
+            ModifiedModulePlanCount = 0;
+            ModifiedActiveTeacherCourseLoadCount = 0;
+        }
+
+        public override ValueTask<InterceptionResult<int>> SavingChangesAsync(
+            DbContextEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (eventData.Context is { } context)
+            {
+                ModifiedModulePlanCount += context.ChangeTracker
+                    .Entries<ModulePlan>()
+                    .Count(entry => entry.State == EntityState.Modified);
+                ModifiedActiveTeacherCourseLoadCount += context.ChangeTracker
+                    .Entries<TeacherCourseLoad>()
+                    .Count(entry => entry.State == EntityState.Modified && entry.Entity.IsActive);
+            }
+
+            return base.SavingChangesAsync(eventData, result, cancellationToken);
+        }
+    }
+
+    private sealed class AggregateCommandCountingInterceptor : DbCommandInterceptor
+    {
+        public int ScheduleSelectCount { get; private set; }
+        public int ScheduleReadCount { get; private set; }
+        public int InactiveTeacherCourseLoadResetCount { get; private set; }
+        public int ScheduleMaterializedRowCount => ScheduleReadCount - ScheduleSelectCount;
+
+        public void Reset()
+        {
+            ScheduleSelectCount = 0;
+            ScheduleReadCount = 0;
+            InactiveTeacherCourseLoadResetCount = 0;
+        }
+
+        public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (command.CommandText.TrimStart().StartsWith("SELECT", StringComparison.OrdinalIgnoreCase)
+                && command.CommandText.Contains("ScheduleItems", StringComparison.Ordinal))
+            {
+                ScheduleSelectCount++;
+            }
+
+            return base.ReaderExecutingAsync(command, eventData, result, cancellationToken);
+        }
+
+        public override InterceptionResult DataReaderDisposing(
+            DbCommand command,
+            DataReaderDisposingEventData eventData,
+            InterceptionResult result)
+        {
+            if (command.CommandText.TrimStart().StartsWith("SELECT", StringComparison.OrdinalIgnoreCase)
+                && command.CommandText.Contains("ScheduleItems", StringComparison.Ordinal))
+            {
+                ScheduleReadCount += eventData.ReadCount;
+            }
+
+            return base.DataReaderDisposing(command, eventData, result);
+        }
+
+        public override ValueTask<int> NonQueryExecutedAsync(
+            DbCommand command,
+            CommandExecutedEventData eventData,
+            int result,
+            CancellationToken cancellationToken = default)
+        {
+            if (command.CommandText.TrimStart().StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase)
+                && command.CommandText.Contains("TeacherCourseLoads", StringComparison.Ordinal))
+            {
+                InactiveTeacherCourseLoadResetCount += result;
+            }
+
+            return base.NonQueryExecutedAsync(command, eventData, result, cancellationToken);
         }
     }
 }

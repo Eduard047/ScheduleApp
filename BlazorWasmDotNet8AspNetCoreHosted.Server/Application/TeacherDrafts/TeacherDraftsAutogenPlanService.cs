@@ -9,12 +9,12 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 
 public sealed class AutoGenPlanNotFoundException(string message) : Exception(message);
 
-public sealed class AutoGenPlanConflictException(string message) : Exception(message);
+public class AutoGenPlanConflictException(string message) : Exception(message);
 
 public sealed class AutoGenPlanPersistenceException(string message, Exception? innerException = null)
     : Exception(message, innerException);
 
-public sealed class AutoGenPlanCapacityException(string message) : Exception(message);
+public sealed class AutoGenPlanCapacityException(string message) : AutoGenPlanConflictException(message);
 
 public sealed class AutoGenPlanValidationException(string message) : Exception(message);
 
@@ -92,6 +92,7 @@ public sealed class TeacherDraftsAutogenPlanService
     public const int DefaultChangePageSize = 200;
     public const int MaxChangePageSize = 250;
     public const int MaxMutationsPerPlan = 2_000;
+    internal const int MaxScopeRowCount = TeacherDraftsWeekValidationService.MaxAppliedScopeRowCount;
     private const int MaxRetainedPlanCount = 50;
     private const int MaxRetainedMutationCount = 10_000;
     private const int MaxSerializedSnapshotLength = 8_192;
@@ -121,7 +122,7 @@ public sealed class TeacherDraftsAutogenPlanService
         CancellationToken cancellationToken)
     {
         var groupIds = request.GroupIds.Distinct().ToList();
-        return await _db.TeacherDraftItems
+        return await LoadBoundedScopeRowsAsync(_db.TeacherDraftItems
             .AsNoTracking()
             .Where(item => item.Date >= request.FromDate
                            && item.Date <= request.ToDate
@@ -154,8 +155,7 @@ public sealed class TeacherDraftsAutogenPlanService
                 item.UpdatedAt,
                 item.IsLocked,
                 item.IsSelfStudy,
-                item.GenerationJobId))
-            .ToListAsync(cancellationToken);
+                item.GenerationJobId)), cancellationToken);
     }
 
     internal static AutoGenDraftPlanPayload BuildPayload(
@@ -174,12 +174,14 @@ public sealed class TeacherDraftsAutogenPlanService
             if (!afterById.TryGetValue(previous.Id, out var current))
             {
                 unordered.Add((AutoGenPlanOperation.Delete, previous, null));
+                EnsureMutationCapacity(unordered.Count);
                 continue;
             }
 
             if (!HasSameMutableContent(previous, current))
             {
                 unordered.Add((AutoGenPlanOperation.Update, previous, current));
+                EnsureMutationCapacity(unordered.Count);
             }
         }
 
@@ -192,6 +194,7 @@ public sealed class TeacherDraftsAutogenPlanService
                      .ThenBy(item => item.Id))
         {
             unordered.Add((AutoGenPlanOperation.Add, null, current with { Id = 0, Revision = Guid.Empty }));
+            EnsureMutationCapacity(unordered.Count);
         }
 
         var mutations = unordered
@@ -220,6 +223,15 @@ public sealed class TeacherDraftsAutogenPlanService
             now,
             now.Add(PreviewLifetime),
             mutations);
+    }
+
+    private static void EnsureMutationCapacity(int mutationCount)
+    {
+        if (mutationCount > MaxMutationsPerPlan)
+        {
+            throw new AutoGenPlanCapacityException(
+                $"План містить понад {MaxMutationsPerPlan} змін, що перевищує безпечний ліміт.");
+        }
     }
 
     internal static async Task AddReadyPlanAsync(
@@ -847,25 +859,43 @@ public sealed class TeacherDraftsAutogenPlanService
         AutoGenDraftPlan plan,
         IReadOnlyCollection<int> groupIds,
         CancellationToken cancellationToken)
-        => await _db.TeacherDraftItems
+        => await LoadBoundedScopeRowsAsync(_db.TeacherDraftItems
             .Where(item => item.Date >= plan.RangeStartDate
                            && item.Date <= plan.RangeEndDate
                            && groupIds.Contains(item.GroupId))
-            .OrderBy(item => item.Id)
-            .ToListAsync(cancellationToken);
+            .OrderBy(item => item.Id), cancellationToken);
 
     private async Task<List<KeyValuePair<int, Guid>>> LoadScopeRevisionRowsAsync(
         AutoGenDraftPlan plan,
         IReadOnlyCollection<int> groupIds,
         CancellationToken cancellationToken)
-        => await _db.TeacherDraftItems
+        => await LoadBoundedScopeRowsAsync(_db.TeacherDraftItems
             .AsNoTracking()
             .Where(item => item.Date >= plan.RangeStartDate
                            && item.Date <= plan.RangeEndDate
                            && groupIds.Contains(item.GroupId))
             .OrderBy(item => item.Id)
-            .Select(item => new KeyValuePair<int, Guid>(item.Id, item.Revision))
+            .Select(item => new KeyValuePair<int, Guid>(item.Id, item.Revision)), cancellationToken);
+
+    // Матеріалізує не більше cap + 1 записів, щоб Preview/Apply/Rollback
+    // відмовляли без повного завантаження завеликої області чернеток.
+    private static async Task<List<T>> LoadBoundedScopeRowsAsync<T>(
+        IQueryable<T> query,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var rows = await query
+            .Take(MaxScopeRowCount + 1)
             .ToListAsync(cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (rows.Count > MaxScopeRowCount)
+        {
+            throw new AutoGenPlanCapacityException(
+                $"Обсяг чернеток плану автогенерації перевищує безпечний ліміт {MaxScopeRowCount} записів. Створіть новий попередній перегляд для меншого діапазону або меншої кількості груп.");
+        }
+
+        return rows;
+    }
 
     private async Task ValidateReferencesAndHardRulesAsync(
         AutoGenDraftPlan plan,

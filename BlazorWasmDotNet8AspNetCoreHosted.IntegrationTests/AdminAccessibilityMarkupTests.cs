@@ -3,6 +3,36 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 public sealed class AdminAccessibilityMarkupTests
 {
     [Fact]
+    public void Application_shell_exposes_accessible_loading_errors_and_skip_navigation()
+    {
+        var index = ReadClientFile("wwwroot/index.html");
+        var layout = ReadClientFile("Layout/MainLayout.razor");
+        var styles = ReadClientFile("wwwroot/css/app.css");
+
+        Assert.Contains("role=\"status\" aria-live=\"polite\" aria-atomic=\"true\"", index);
+        Assert.Contains("css/app.css?v=20260828-1", index);
+        Assert.Contains("js/schedule-app.js?v=20260828-2", index);
+        Assert.Contains("<span class=\"visually-hidden\">Завантаження застосунку…</span>", index);
+        Assert.Contains("class=\"loading-progress\" aria-hidden=\"true\" focusable=\"false\"", index);
+        Assert.Contains("id=\"blazor-error-ui\" role=\"alert\" aria-live=\"assertive\"", index);
+        Assert.Contains("<button type=\"button\" class=\"dismiss\" aria-label=\"Закрити повідомлення\">", index);
+        Assert.DoesNotContain("<a class=\"dismiss\"", index);
+        Assert.Contains("class=\"skip-link\"", layout);
+        Assert.Contains("href=\"@SkipLinkHref\"", layout);
+        Assert.Contains("@onclick=\"FocusMainContentAsync\"", layout);
+        Assert.Contains("@onclick:preventDefault=\"true\"", layout);
+        Assert.Contains("return $\"{uriWithoutFragment}#main-content\";", layout);
+        Assert.Contains("<main id=\"main-content\" class=\"@MainClass\" tabindex=\"-1\">", layout);
+        Assert.Contains(".skip-link:focus", styles);
+        var script = ReadClientFile("wwwroot/js/schedule-app.js");
+        Assert.Contains("window.scheduleApp.focusMainContent", script);
+        Assert.Contains("document.querySelector(\".app-navbar\")", script);
+        Assert.Contains("window.scrollTo({ top: targetTop", script);
+        Assert.Contains("history.replaceState(history.state", script);
+        Assert.Contains("z-index: 1200", styles);
+    }
+
+    [Fact]
     public void Teachers_table_is_a_named_keyboard_scroll_region()
     {
         var markup = ReadAdminPage("AdminTeachers.razor");
@@ -133,5 +163,25 @@ public sealed class AdminAccessibilityMarkupTests
         }
 
         throw new FileNotFoundException($"Не знайдено Razor-сторінку {fileName} від каталогу тестового процесу.");
+    }
+
+    // Читає файл клієнта від checkout без локальних абсолютних шляхів.
+    private static string ReadClientFile(string relativePath)
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory);
+             directory is not null;
+             directory = directory.Parent)
+        {
+            var candidate = Path.Combine(
+                directory.FullName,
+                "BlazorWasmDotNet8AspNetCoreHosted.Client",
+                relativePath);
+            if (File.Exists(candidate))
+            {
+                return File.ReadAllText(candidate);
+            }
+        }
+
+        throw new FileNotFoundException($"Не знайдено клієнтський файл {relativePath} від каталогу тестового процесу.");
     }
 }

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Data;
 using System.Globalization;
 using System.Linq;
+using System.Linq.Expressions;
 using System.Text.Json;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
@@ -58,13 +59,28 @@ public sealed class TeacherDraftsController : ControllerBase
         [FromQuery] DateOnly weekStart,
         [FromQuery] int? teacherId,
         [FromQuery] int? groupId,
-        [FromQuery] int? roomId)
+        [FromQuery] int? roomId,
+        CancellationToken cancellationToken = default)
     {
         if (!DateHelpers.IsSupportedScheduleDate(weekStart))
         {
             return BadRequest(new { message = DateHelpers.SupportedScheduleDateMessage });
         }
-        return Ok(await _queryService.GetAsync(weekStart, teacherId, groupId, roomId));
+        var rows = await _queryService.GetAsync(
+            weekStart,
+            teacherId,
+            groupId,
+            roomId,
+            cancellationToken,
+            TeacherDraftsWeekValidationService.MaxWeekDraftRowCount + 1);
+        if (rows.Count > TeacherDraftsWeekValidationService.MaxWeekDraftRowCount)
+        {
+            return UnprocessableEntity(new
+            {
+                message = $"За один тиждень можна завантажити не більше {TeacherDraftsWeekValidationService.MaxWeekDraftRowCount} чернеток."
+            });
+        }
+        return Ok(rows);
     }
     [HttpGet("validate-week")]
     [EnableRateLimiting("week-validation")]
@@ -146,8 +162,9 @@ public sealed class TeacherDraftsController : ControllerBase
         [FromQuery] DateOnly weekStart,
         [FromQuery] int? teacherId,
         [FromQuery] int? groupId,
-        [FromQuery] int? roomId)
-        => Get(weekStart, teacherId, groupId, roomId);
+        [FromQuery] int? roomId,
+        CancellationToken cancellationToken = default)
+        => Get(weekStart, teacherId, groupId, roomId, cancellationToken);
     [HttpDelete("{id:int}")]
     // Видаляє чернетку, якщо запис існує та не заблокований.
     public async Task<IActionResult> Delete(
@@ -260,30 +277,58 @@ public sealed class TeacherDraftsController : ControllerBase
         await using var transaction = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         try
         {
-            if (await FindIncompleteLogicalEventMutationAsync(request.Ids) is { } logicalEventConflict)
+            var requestedIdSet = request.Ids.ToHashSet();
+            var targetRows = await _db.TeacherDraftItems
+                .Where(item => requestedIdSet.Contains(item.Id))
+                .ToListAsync();
+            if (await FindIncompleteLogicalEventMutationAsync(request.Ids, targetRows) is { } logicalEventConflict)
             {
                 await transaction.RollbackAsync();
+                _db.ChangeTracker.Clear();
                 return logicalEventConflict;
             }
 
+            var targetRowsById = targetRows.ToDictionary(item => item.Id);
             for (var index = 0; index < request.Ids.Count; index++)
             {
-                var action = await DeleteCoreAsync(
-                    request.Ids[index],
-                    request.ExpectedRevisions[request.Ids[index]],
-                    confirm,
-                    request.Unrestricted,
-                    allowLogicalEventBatchMutation: true);
-                if (action is NoContentResult)
+                var id = request.Ids[index];
+                IActionResult? action = null;
+                if (!targetRowsById.TryGetValue(id, out var item))
+                {
+                    action = NotFound(new { message = $"Чернетку #{id} не знайдено." });
+                }
+                else if (item.Revision != request.ExpectedRevisions[id])
+                {
+                    action = ConcurrencyConflict("видалення");
+                }
+                else if (item.Status != DraftStatus.Draft && !(confirm && request.Unrestricted))
+                {
+                    action = Conflict(new
+                    {
+                        message = "Схвалену чернетку можна видалити лише після явного підтвердження в режимі без обмежень."
+                    });
+                }
+                else if (item.IsLocked && !(confirm && request.Unrestricted))
+                {
+                    action = Conflict(new
+                    {
+                        message = "Чернетка заблокована. Для видалення потрібні підтвердження та режим без обмежень."
+                    });
+                }
+
+                if (action is null)
                 {
                     continue;
                 }
-
                 await transaction.RollbackAsync();
                 _db.ChangeTracker.Clear();
                 return BuildBatchFailure(action, index, "видалення");
             }
 
+            // Усі правила перевірено до першої зміни; EF зберігає маркери версій
+            // для кожного DELETE та виконує пакет одним викликом SaveChanges.
+            _db.TeacherDraftItems.RemoveRange(request.Ids.Select(id => targetRowsById[id]));
+            await _db.SaveChangesAsync();
             await transaction.CommitAsync();
             return Ok(new TeacherDraftBatchDeleteResult(request.Ids.Count));
         }
@@ -364,6 +409,13 @@ public sealed class TeacherDraftsController : ControllerBase
         if (request.BatchKey is { Length: > 64 })
         {
             return BadRequest(new { message = "Ключ пакета чернетки не може перевищувати 64 символи." });
+        }
+        if (request.BatchKey?.StartsWith("rescheduled:", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            return BadRequest(new
+            {
+                message = "Префікс ключа пакета «rescheduled:» зарезервований для системного перенесення занять."
+            });
         }
         if (!allowTransientBatchConflicts
             && request.Id is int existingId
@@ -747,7 +799,8 @@ public sealed class TeacherDraftsController : ControllerBase
     }
     // Забороняє часткову зміну багаторядкового логічного заняття поза атомарним пакетним запитом.
     private async Task<ConflictObjectResult?> FindIncompleteLogicalEventMutationAsync(
-        IReadOnlyCollection<int> mutationIds)
+        IReadOnlyCollection<int> mutationIds,
+        IReadOnlyCollection<TeacherDraftItem>? preloadedSelectedRows = null)
     {
         var mutationIdSet = mutationIds
             .Where(id => id > 0)
@@ -757,21 +810,55 @@ public sealed class TeacherDraftsController : ControllerBase
             return null;
         }
 
-        var selectedRows = await _db.TeacherDraftItems
-            .AsNoTracking()
-            .Where(item => mutationIdSet.Contains(item.Id))
-            .ToListAsync();
+        var selectedRows = preloadedSelectedRows is null
+            ? await _db.TeacherDraftItems
+                .AsNoTracking()
+                .Where(item => mutationIdSet.Contains(item.Id))
+                .ToListAsync()
+            : preloadedSelectedRows
+                .Where(item => mutationIdSet.Contains(item.Id))
+                .ToList();
         var batchKeys = selectedRows
             .Where(item => !string.IsNullOrWhiteSpace(item.BatchKey))
             .Select(item => item.BatchKey!)
             .Distinct(StringComparer.Ordinal)
             .ToList();
-        var candidates = batchKeys.Count == 0
-            ? new List<TeacherDraftItem>()
-            : await _db.TeacherDraftItems
+        var legacySelectedRows = selectedRows
+            .Where(item => string.IsNullOrWhiteSpace(item.BatchKey))
+            .ToList();
+
+        List<TeacherDraftItem> candidates;
+        if (batchKeys.Count > 0 && legacySelectedRows.Count > 0)
+        {
+            Expression<Func<TeacherDraftItem, bool>> batchPredicate = item =>
+                item.BatchKey != null && batchKeys.Contains(item.BatchKey);
+            var candidatePredicate = CombineWithOr(
+                batchPredicate,
+                BuildLegacyLogicalEventCandidatePredicate(legacySelectedRows));
+            candidates = await _db.TeacherDraftItems
+                .AsNoTracking()
+                .Where(candidatePredicate)
+                .ToListAsync();
+        }
+        else if (batchKeys.Count > 0)
+        {
+            candidates = await _db.TeacherDraftItems
                 .AsNoTracking()
                 .Where(item => item.BatchKey != null && batchKeys.Contains(item.BatchKey))
                 .ToListAsync();
+        }
+        else if (legacySelectedRows.Count > 0)
+        {
+            var candidatePredicate = BuildLegacyLogicalEventCandidatePredicate(legacySelectedRows);
+            candidates = await _db.TeacherDraftItems
+                .AsNoTracking()
+                .Where(candidatePredicate)
+                .ToListAsync();
+        }
+        else
+        {
+            candidates = new List<TeacherDraftItem>();
+        }
         foreach (var logicalEvent in selectedRows
                      .Where(item => !string.IsNullOrWhiteSpace(item.BatchKey))
                      .GroupBy(item => new
@@ -814,8 +901,7 @@ public sealed class TeacherDraftsController : ControllerBase
 
         // Legacy-рядки без BatchKey теж утворюють одну подію, якщо однакова сигнатура
         // розкладена за різними темами або співвикладачами.
-        foreach (var logicalEvent in selectedRows
-                     .Where(item => string.IsNullOrWhiteSpace(item.BatchKey))
+        foreach (var logicalEvent in legacySelectedRows
                      .GroupBy(item => new
                      {
                          item.Date,
@@ -826,17 +912,14 @@ public sealed class TeacherDraftsController : ControllerBase
                          item.LessonTypeId
                      }))
         {
-            var signatureRows = await _db.TeacherDraftItems
-                .AsNoTracking()
-                .Where(candidate => candidate.Date == logicalEvent.Key.Date
+            var legacyRows = candidates
+                .Where(candidate => string.IsNullOrWhiteSpace(candidate.BatchKey)
+                                    && candidate.Date == logicalEvent.Key.Date
                                     && candidate.StartTime == logicalEvent.Key.StartTime
                                     && candidate.EndTime == logicalEvent.Key.EndTime
                                     && candidate.GroupId == logicalEvent.Key.GroupId
                                     && candidate.ModuleId == logicalEvent.Key.ModuleId
                                     && candidate.LessonTypeId == logicalEvent.Key.LessonTypeId)
-                .ToListAsync();
-            var legacyRows = signatureRows
-                .Where(candidate => string.IsNullOrWhiteSpace(candidate.BatchKey))
                 .ToList();
             var isLogicalEvent = legacyRows.Count > 1
                                  && legacyRows
@@ -872,6 +955,119 @@ public sealed class TeacherDraftsController : ControllerBase
 
         return null;
     }
+
+    // Формує точну диз'юнкцію legacy-сигнатур, щоб незалежні IN-набори
+    // не матеріалізували декартові комбінації дат, слотів і навчальних вимірів.
+    private static Expression<Func<TeacherDraftItem, bool>> BuildLegacyLogicalEventCandidatePredicate(
+        IReadOnlyCollection<TeacherDraftItem> selectedRows)
+    {
+        var signatures = selectedRows
+            .Select(item => new LegacyLogicalEventSignature(
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                item.GroupId,
+                item.ModuleId,
+                item.LessonTypeId))
+            .Distinct()
+            .ToList();
+        var candidate = Expression.Parameter(typeof(TeacherDraftItem), "candidate");
+        var scopeMatches = new List<Expression>();
+        foreach (var scope in signatures.GroupBy(signature => new
+                 {
+                     signature.Date,
+                     signature.GroupId,
+                     signature.ModuleId,
+                     signature.LessonTypeId
+                 }))
+        {
+            var timeMatches = new List<Expression>();
+            foreach (var signature in scope)
+            {
+                var timeMatch = Expression.AndAlso(
+                    EqualProperty(candidate, nameof(TeacherDraftItem.StartTime), signature.StartTime),
+                    EqualProperty(candidate, nameof(TeacherDraftItem.EndTime), signature.EndTime));
+                timeMatches.Add(timeMatch);
+            }
+
+            var scopeMatch = Expression.AndAlso(
+                EqualProperty(candidate, nameof(TeacherDraftItem.Date), scope.Key.Date),
+                Expression.AndAlso(
+                    EqualProperty(candidate, nameof(TeacherDraftItem.GroupId), scope.Key.GroupId),
+                    Expression.AndAlso(
+                        EqualProperty(candidate, nameof(TeacherDraftItem.ModuleId), scope.Key.ModuleId),
+                        Expression.AndAlso(
+                            EqualProperty(
+                                candidate,
+                                nameof(TeacherDraftItem.LessonTypeId),
+                                scope.Key.LessonTypeId),
+                            CombineBalancedOr(timeMatches)))));
+            scopeMatches.Add(scopeMatch);
+        }
+
+        // Перевірку whitespace у BatchKey залишаємо в пам'яті: SQL TRIM у різних
+        // провайдерів не охоплює всі символи, які розпізнає .NET IsNullOrWhiteSpace.
+        return Expression.Lambda<Func<TeacherDraftItem, bool>>(
+            CombineBalancedOr(scopeMatches),
+            candidate);
+    }
+
+    private static Expression CombineBalancedOr(IReadOnlyList<Expression> expressions)
+    {
+        if (expressions.Count == 0)
+        {
+            return Expression.Constant(false);
+        }
+
+        var level = expressions.ToList();
+        while (level.Count > 1)
+        {
+            var nextLevel = new List<Expression>((level.Count + 1) / 2);
+            for (var index = 0; index < level.Count; index += 2)
+            {
+                nextLevel.Add(index + 1 < level.Count
+                    ? Expression.OrElse(level[index], level[index + 1])
+                    : level[index]);
+            }
+            level = nextLevel;
+        }
+
+        return level[0];
+    }
+
+    private static BinaryExpression EqualProperty<T>(
+        ParameterExpression parameter,
+        string propertyName,
+        T value)
+        => Expression.Equal(
+            Expression.Property(parameter, propertyName),
+            Expression.Constant(value, typeof(T)));
+
+    private static Expression<Func<T, bool>> CombineWithOr<T>(
+        Expression<Func<T, bool>> left,
+        Expression<Func<T, bool>> right)
+    {
+        var parameter = Expression.Parameter(typeof(T), "candidate");
+        var leftBody = new ParameterReplacementVisitor(left.Parameters[0], parameter).Visit(left.Body)!;
+        var rightBody = new ParameterReplacementVisitor(right.Parameters[0], parameter).Visit(right.Body)!;
+        return Expression.Lambda<Func<T, bool>>(Expression.OrElse(leftBody, rightBody), parameter);
+    }
+
+    private sealed class ParameterReplacementVisitor(
+        ParameterExpression source,
+        ParameterExpression target) : ExpressionVisitor
+    {
+        protected override Expression VisitParameter(ParameterExpression node)
+            => node == source ? target : base.VisitParameter(node);
+    }
+
+    private readonly record struct LegacyLogicalEventSignature(
+        DateOnly Date,
+        TimeOnly StartTime,
+        TimeOnly EndTime,
+        int GroupId,
+        int ModuleId,
+        int LessonTypeId);
 
     private ConflictObjectResult ConcurrencyConflict(string operation)
         => Conflict(new
@@ -1441,12 +1637,45 @@ public sealed class TeacherDraftsController : ControllerBase
         }
     }
     [HttpPost("approve-week")]
+    [EnableRateLimiting("week-validation")]
     // Позначає чернетки викладача за тиждень як затверджені.
-    public async Task<IActionResult> ApproveWeek([FromBody] ApproveWeekRequest r)
-        => await _publishService.ApproveWeekAsync(r);
+    public async Task<IActionResult> ApproveWeek(
+        [FromBody] ApproveWeekRequest r,
+        CancellationToken cancellationToken = default)
+    {
+        if (r.ExpectedScopeRevision is not Guid expectedScopeRevision
+            || expectedScopeRevision == Guid.Empty)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status428PreconditionRequired,
+                title: "Потрібна актуальна версія тижня",
+                detail: "Перед схваленням оновіть тиждень і передайте його актуальну версію.");
+        }
+        try
+        {
+            return await _publishService.ApproveWeekAsync(r, cancellationToken);
+        }
+        catch (DraftValidationCapacityException ex)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status422UnprocessableEntity,
+                title: "Обсяг тижня перевищує безпечний ліміт",
+                detail: ex.Message);
+        }
+        catch (DraftValidationTimeoutException ex)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status503ServiceUnavailable,
+                title: "Схвалення тижня перевищило безпечний час",
+                detail: ex.Message);
+        }
+    }
     [HttpPost("publish-week")]
+    [EnableRateLimiting("week-validation")]
     // Публікує всі чернетки вибраного тижня у розклад після атомарної пакетної перевірки.
-    public async Task<ActionResult<PublishWeekResults>> PublishWeek([FromBody] PublishWeekRequest r)
+    public async Task<ActionResult<PublishWeekResults>> PublishWeek(
+        [FromBody] PublishWeekRequest r,
+        CancellationToken cancellationToken = default)
     {
         if (r.ExpectedScopeRevision is not Guid expectedScopeRevision
             || expectedScopeRevision == Guid.Empty)
@@ -1458,13 +1687,20 @@ public sealed class TeacherDraftsController : ControllerBase
         }
         try
         {
-            return await _publishService.PublishWeekAsync(r);
+            return await _publishService.PublishWeekAsync(r, cancellationToken);
         }
         catch (DraftValidationCapacityException ex)
         {
             return Problem(
                 statusCode: StatusCodes.Status422UnprocessableEntity,
                 title: "Обсяг тижня перевищує безпечний ліміт",
+                detail: ex.Message);
+        }
+        catch (DraftValidationTimeoutException ex)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status503ServiceUnavailable,
+                title: "Публікація тижня перевищила безпечний час",
                 detail: ex.Message);
         }
     }

@@ -1,4 +1,6 @@
 using System.Collections;
+using System.Net;
+using System.Net.Http.Json;
 using System.Reflection;
 using BlazorWasmDotNet8AspNetCoreHosted.Client.Services;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
@@ -16,6 +18,46 @@ public sealed class AdminModulesReliabilityTests
         "BlazorWasmDotNet8AspNetCoreHosted.Client.Pages.AdminModuleSequence";
     private static readonly BindingFlags InstanceMembers =
         BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+    [Fact]
+    public async Task Docx_client_rejects_oversized_file_before_opening_stream_or_sending_request()
+    {
+        using var handler = new RecordingHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK));
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://schedule.test/") };
+        var api = new AdminApi(http);
+        var file = new TestBrowserFile(AdminApi.MaxDocxImportFileSizeBytes + 1);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => api.ImportModulesFromDocx(file, apply: false));
+
+        Assert.Equal(AdminApi.MaxDocxImportFileSizeMessage, exception.Message);
+        Assert.Equal(0, file.OpenReadCalls);
+        Assert.Equal(0, handler.RequestCount);
+    }
+
+    [Fact]
+    public async Task Docx_client_preserves_upload_at_exact_size_limit()
+    {
+        using var handler = new RecordingHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = JsonContent.Create(new DocxImportResultDto(
+                string.Empty,
+                null,
+                false,
+                new(),
+                new(),
+                null))
+        });
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://schedule.test/") };
+        var api = new AdminApi(http);
+        var file = new TestBrowserFile(AdminApi.MaxDocxImportFileSizeBytes);
+
+        await api.ImportModulesFromDocx(file, apply: false);
+
+        Assert.Equal(1, file.OpenReadCalls);
+        Assert.Equal(AdminApi.MaxDocxImportFileSizeBytes, file.LastMaxAllowedSize);
+        Assert.Equal(1, handler.RequestCount);
+    }
 
     [Fact]
     public async Task Sequence_failed_load_blocks_direct_save_and_preserves_server_state()
@@ -580,13 +622,33 @@ public sealed class AdminModulesReliabilityTests
         }
     }
 
-    private sealed class TestBrowserFile : IBrowserFile
+    private sealed class TestBrowserFile(long size = 8) : IBrowserFile
     {
         public string Name => "modules.docx";
         public DateTimeOffset LastModified => DateTimeOffset.UtcNow;
-        public long Size => 8;
+        public long Size { get; } = size;
         public string ContentType => "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        public int OpenReadCalls { get; private set; }
+        public long? LastMaxAllowedSize { get; private set; }
         public Stream OpenReadStream(long maxAllowedSize = 512_000, CancellationToken cancellationToken = default)
-            => new MemoryStream(new byte[8], writable: false);
+        {
+            OpenReadCalls++;
+            LastMaxAllowedSize = maxAllowedSize;
+            return new MemoryStream(new byte[8], writable: false);
+        }
+    }
+
+    private sealed class RecordingHttpMessageHandler(
+        Func<HttpRequestMessage, HttpResponseMessage> responseFactory) : HttpMessageHandler
+    {
+        public int RequestCount { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            RequestCount++;
+            return Task.FromResult(responseFactory(request));
+        }
     }
 }

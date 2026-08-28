@@ -672,7 +672,18 @@ private string plansModuleCode = "";
     private async Task OnImportFileChange(InputFileChangeEventArgs e)
     {
         if (IsPageInteractionBlocked) return;
-        importFile = e.FileCount > 0 ? e.File : null;
+        var selectedFile = e.FileCount > 0 ? e.File : null;
+        if (selectedFile is not null && selectedFile.Size > AdminApi.MaxDocxImportFileSizeBytes)
+        {
+            importFile = null;
+            importResult = null;
+            importOk = null;
+            importError = AdminApi.MaxDocxImportFileSizeMessage;
+            await InvokeAsync(StateHasChanged);
+            return;
+        }
+
+        importFile = selectedFile;
         importResult = null;
         importError = null;
         importOk = null;

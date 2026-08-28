@@ -51,8 +51,6 @@ public class TimeSlotsApi
     private sealed record EffectiveSlotsResponse(int? courseId, bool usingCourseSpecific, List<TimeSlotDto> slots);
     // Відповідь сирих слотів.
     private sealed record RawSlotsResponse(List<TimeSlotDto> course, List<TimeSlotDto> global);
-    // Запит на збереження слотів.
-    private sealed record BulkSaveReq(int? CourseId, int? DayOfWeek, List<TimeSlotDto> Slots);
     // Повертає ефективні слоти для курсу або глобальні.
     public async Task<List<TimeSlotDto>> GetEffectiveAsync(int? courseId, int? dayOfWeek = null, bool includeDayOverrides = false)
     {
@@ -74,7 +72,6 @@ public class TimeSlotsApi
         var res = await _http.GetFromJsonWithDetailsAsync<RawSlotsResponse>(url);
         return (courseId is null) ? (res?.global ?? new()) : (res?.course ?? new());
     }
-    // Зберігає список слотів.
     // Повертає ліміт слота для типу з прапорцем "Бажано першим у тижні".
     public async Task<PreferredFirstSlotLimitConfigEditDto> GetPreferredFirstSlotLimitAsync(int? courseId)
     {
@@ -86,13 +83,7 @@ public class TimeSlotsApi
     public async Task SavePreferredFirstSlotLimitAsync(int? courseId, int maxSlotOrder)
     {
         var payload = new PreferredFirstSlotLimitConfigEditDto(null, courseId, maxSlotOrder);
-        var resp = await _http.PostAsJsonAsync("api/admin/config/preferred-first-slot-limit/upsert", payload);
-        await resp.EnsureSuccessWithDetailsAsync();
-    }
-    public async Task SaveAsync(int? courseId, List<TimeSlotDto> slots, int? dayOfWeek = null)
-    {
-        var payload = new BulkSaveReq(courseId, dayOfWeek, slots);
-        var resp = await _http.PostAsJsonAsync("api/admin/config/slots/upsert-bulk", payload);
+        using var resp = await _http.PostAsJsonAsync("api/admin/config/preferred-first-slot-limit/upsert", payload);
         await resp.EnsureSuccessWithDetailsAsync();
     }
 }

@@ -10,6 +10,22 @@ a, .btn-link {
     color: #0071c1;
 }
 
+.skip-link {
+    position: fixed;
+    top: .5rem;
+    left: .5rem;
+    z-index: 1200;
+    padding: .5rem .75rem;
+    color: #fff;
+    background: #1b1b1b;
+    border-radius: .25rem;
+    transform: translateY(calc(-100% - 1rem));
+}
+
+.skip-link:focus {
+    transform: translateY(0);
+}
+
 .btn-primary {
     color: #fff;
     background-color: #1b6ec2;
@@ -49,6 +65,10 @@ a, .btn-link {
 }
 
     #blazor-error-ui .dismiss {
+        padding: 0;
+        border: 0;
+        color: inherit;
+        background: transparent;
         cursor: pointer;
         position: absolute;
         right: 0.75rem;
