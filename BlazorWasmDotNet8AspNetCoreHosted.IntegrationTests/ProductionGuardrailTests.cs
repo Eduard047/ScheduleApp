@@ -2613,6 +2613,7 @@ public sealed class ProductionGuardrailTests
         fixture.Db.AutoGenJobRuns.Add(new AutoGenJobRun
         {
             JobId = clientJobId,
+            ClientPartitionKey = "local",
             Kind = (int)AutoGenJobKind.Generate,
             State = (int)AutoGenJobState.Succeeded,
             Title = "Завершене завдання",
@@ -2901,6 +2902,7 @@ public sealed class ProductionGuardrailTests
         legacyRun.OwnerInstanceId = null;
         legacyRun.Attempt = 0;
         legacyRun.Version = 11;
+        legacyRun.ClientPartitionKey = "legacy";
         await using (var db = fixture.CreateContext())
         {
             db.AutoGenJobRuns.Add(legacyRun);
@@ -2910,13 +2912,14 @@ public sealed class ProductionGuardrailTests
         var service = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
 
         var readOnlyStatus = await service.GetAsync(legacyRequest.ClientJobId!);
-        var sameId = service.Start(legacyRequest with { Title = "Повтор legacy-запиту" });
+        var sameId = Assert.Throws<AutoGenJobConflictException>(() =>
+            service.Start(legacyRequest with { Title = "Повтор legacy-запиту" }));
         var blocked = Assert.Throws<AutoGenJobPersistenceException>(() => service.Start(
             CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") }));
 
         Assert.NotNull(readOnlyStatus);
         Assert.Equal(AutoGenJobState.Running, readOnlyStatus.State);
-        Assert.Equal(AutoGenJobState.Running, sameId.Status.State);
+        Assert.Contains("вже використано", sameId.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("попередньої версії", blocked.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Empty(GetInMemoryAutogenJobStatuses(service));
         await using var verificationDb = fixture.CreateContext();
@@ -3584,6 +3587,7 @@ public sealed class ProductionGuardrailTests
         return new AutoGenJobRun
         {
             JobId = jobId,
+            ClientPartitionKey = "local",
             OwnerInstanceId = "test-owner",
             Attempt = 1,
             LeaseExpiresAtUtc = leaseExpiresAtUtc,

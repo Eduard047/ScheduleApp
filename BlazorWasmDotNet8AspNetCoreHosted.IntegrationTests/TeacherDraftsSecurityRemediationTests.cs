@@ -445,6 +445,36 @@ public sealed class TeacherDraftsSecurityRemediationTests
             service.ExportAsync(Monday, null, null, null, cancellation.Token));
     }
 
+    [Theory]
+    [InlineData("=1+1")]
+    [InlineData("+SUM(1,1)")]
+    [InlineData("-1+2")]
+    [InlineData("@SUM(1,1)")]
+    [InlineData("\t=1+1")]
+    [InlineData("\r=1+1")]
+    public async Task Export_writes_formula_leading_group_names_as_plain_text(string groupName)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        await fixture.SeedDraftModelAsync(groupCount: 1, draftCount: 1);
+        var group = await fixture.Db.Groups.SingleAsync();
+        group.Name = groupName;
+        await fixture.Db.SaveChangesAsync();
+        var service = new TeacherDraftsExportService(
+            fixture.Db,
+            new TeacherDraftsQueryService(fixture.Db));
+
+        var file = await service.ExportAsync(Monday, null, null, null);
+
+        await using (file.FileStream)
+        using (var workbook = new XLWorkbook(file.FileStream))
+        {
+            var groupHeader = workbook.Worksheet("Розклад").Cell(4, 3);
+            Assert.Equal(XLDataType.Text, groupHeader.DataType);
+            Assert.False(groupHeader.HasFormula);
+            Assert.Equal(group.Name.Replace('\r', '\n'), groupHeader.GetString());
+        }
+    }
+
     private static void AssertReachesPersistence(AutoGenJobRequest request)
     {
         var scopeFactory = new CountingThrowingScopeFactory();

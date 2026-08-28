@@ -13,6 +13,9 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 
 public sealed class TeacherDraftsAutogenJobServiceSecurityTests
 {
+    private const string OwnerPartition = "partition-a";
+    private const string ForeignPartition = "partition-b";
+
     [Fact]
     public async Task Plan_handoff_gate_rejects_waiters_above_the_global_limit_without_queueing()
     {
@@ -102,6 +105,80 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
         finally
         {
             gate.Release();
+        }
+    }
+
+    [Fact]
+    public async Task Persisted_job_status_and_cancellation_are_scoped_to_client_partition()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync();
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(fixture.Options));
+        await using var provider = services.BuildServiceProvider();
+        var service = new TeacherDraftsAutogenJobService(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+        long versionBefore;
+        await using (var db = new AppDbContext(fixture.Options))
+        {
+            versionBefore = await db.AutoGenJobRuns
+                .Where(item => item.JobId == fixture.PlanId)
+                .Select(item => item.Version)
+                .SingleAsync();
+        }
+
+        Assert.Null(await service.GetAsync(fixture.PlanId, ForeignPartition));
+        Assert.Null(await service.CancelAsync(fixture.PlanId, ForeignPartition));
+        Assert.NotNull(await service.GetAsync(fixture.PlanId, OwnerPartition));
+
+        await using var verification = new AppDbContext(fixture.Options);
+        var persisted = await verification.AutoGenJobRuns
+            .AsNoTracking()
+            .SingleAsync(item => item.JobId == fixture.PlanId);
+        Assert.Equal(versionBefore, persisted.Version);
+        Assert.False(persisted.CancellationRequested);
+    }
+
+    [Fact]
+    public async Task Foreign_partition_does_not_wait_for_or_observe_running_job()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        await using (var db = new AppDbContext(options))
+        {
+            await db.Database.EnsureCreatedAsync();
+            db.Courses.Add(new Course
+            {
+                Id = 1,
+                Name = "Курс перевірки partition",
+                DurationWeeks = 52,
+                AcademicPeriodStartDate = new DateOnly(2026, 1, 1)
+            });
+            await db.SaveChangesAsync();
+        }
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(options));
+        await using var provider = services.BuildServiceProvider();
+        var service = new TeacherDraftsAutogenJobService(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+        var executionGate = await HoldGateAsync(service, "_executionGate");
+        var started = service.Start(CreateValidRequest(), OwnerPartition);
+
+        try
+        {
+            await service.PreparePlanReadAsync(started.JobId, ForeignPartition)
+                .WaitAsync(TimeSpan.FromSeconds(1));
+            await Assert.ThrowsAsync<AutoGenPlanConflictException>(() =>
+                service.PreparePlanReadAsync(started.JobId, OwnerPartition));
+        }
+        finally
+        {
+            executionGate.Release();
+            await service.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
         }
     }
 
@@ -573,6 +650,62 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
                 fixture.PlanId,
                 new AutoGenPlanActionRequest(applied.Summary.Version));
             Assert.Equal(rolledBack.Summary.Version, repeatedRollback.Summary.Version);
+        }
+    }
+
+    [Fact]
+    public async Task Persisted_plan_read_latest_apply_and_rollback_are_scoped_to_client_partition()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Add);
+        await using (var db = new AppDbContext(fixture.Options))
+        {
+            var service = new TeacherDraftsAutogenPlanService(db);
+            Assert.Equal(
+                fixture.PlanId,
+                (await service.GetDetailsAsync(fixture.PlanId, OwnerPartition)).Summary.PlanId);
+            await Assert.ThrowsAsync<AutoGenPlanNotFoundException>(() =>
+                service.GetDetailsAsync(fixture.PlanId, ForeignPartition));
+            await Assert.ThrowsAsync<AutoGenPlanNotFoundException>(() =>
+                service.ApplyAsync(
+                    fixture.PlanId,
+                    new AutoGenPlanActionRequest(1),
+                    ForeignPartition));
+        }
+        await using (var verification = new AppDbContext(fixture.Options))
+        {
+            var untouched = await verification.AutoGenDraftPlans.AsNoTracking().SingleAsync();
+            Assert.Equal((int)AutoGenPlanState.Ready, untouched.State);
+            Assert.Equal(1, untouched.Version);
+            Assert.Empty(await verification.TeacherDraftItems.AsNoTracking().ToListAsync());
+        }
+
+        AutoGenPlanDetailsDto applied;
+        await using (var db = new AppDbContext(fixture.Options))
+        {
+            applied = await new TeacherDraftsAutogenPlanService(db).ApplyAsync(
+                fixture.PlanId,
+                new AutoGenPlanActionRequest(1),
+                OwnerPartition);
+        }
+        await using (var db = new AppDbContext(fixture.Options))
+        {
+            var service = new TeacherDraftsAutogenPlanService(db);
+            Assert.Null(await service.GetLatestRollbackableAsync(1, ForeignPartition));
+            Assert.Equal(
+                fixture.PlanId,
+                (await service.GetLatestRollbackableAsync(1, OwnerPartition))?.Summary.PlanId);
+            await Assert.ThrowsAsync<AutoGenPlanNotFoundException>(() =>
+                service.RollbackAsync(
+                    fixture.PlanId,
+                    new AutoGenPlanActionRequest(applied.Summary.Version),
+                    ForeignPartition));
+        }
+        await using (var verification = new AppDbContext(fixture.Options))
+        {
+            var untouched = await verification.AutoGenDraftPlans.AsNoTracking().SingleAsync();
+            Assert.Equal((int)AutoGenPlanState.Applied, untouched.State);
+            Assert.Equal(applied.Summary.Version, untouched.Version);
+            Assert.Single(await verification.TeacherDraftItems.AsNoTracking().ToListAsync());
         }
     }
 
@@ -1703,6 +1836,7 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
             var run = new AutoGenJobRun
             {
                 JobId = planId,
+                ClientPartitionKey = OwnerPartition,
                 RequestHash = new string('a', 64),
                 Version = 1,
                 Kind = (int)AutoGenJobKind.Generate,

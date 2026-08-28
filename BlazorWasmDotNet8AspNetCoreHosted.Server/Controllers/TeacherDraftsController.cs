@@ -1343,6 +1343,7 @@ public sealed class TeacherDraftsController : ControllerBase
         {
             return await _autogenJobService.GetAsync(
                        parsedJobId.ToString("N"),
+                       ClientPartitionKey.Resolve(HttpContext),
                        cancellationToken) is { } status
                 ? Ok(status)
                 : NotFound(new { message = "Завдання автогенерації не знайдено." });
@@ -1382,6 +1383,7 @@ public sealed class TeacherDraftsController : ControllerBase
         {
             return await _autogenJobService.CancelAsync(
                        parsedJobId.ToString("N"),
+                       ClientPartitionKey.Resolve(HttpContext),
                        cancellationToken) is { } status
                 ? Ok(status)
                 : NotFound(new { message = "Завдання автогенерації не знайдено." });
@@ -1428,7 +1430,10 @@ public sealed class TeacherDraftsController : ControllerBase
             }
             try
             {
-                await _autogenJobService.PreparePlanReadAsync(jobId, cancellationToken);
+                await _autogenJobService.PreparePlanReadAsync(
+                    jobId,
+                    ClientPartitionKey.Resolve(HttpContext),
+                    cancellationToken);
             }
             catch (AutoGenPlanConflictException ex)
             {
@@ -1454,6 +1459,7 @@ public sealed class TeacherDraftsController : ControllerBase
         {
             var plan = await _autogenJobService.GetPlanPageAsync(
                 jobId,
+                ClientPartitionKey.Resolve(HttpContext),
                 changeOffset,
                 resolvedChangeLimit,
                 cancellationToken);
@@ -1524,6 +1530,7 @@ public sealed class TeacherDraftsController : ControllerBase
         {
             var plan = await _autogenJobService.GetLatestRollbackablePlanPageAsync(
                 courseId,
+                ClientPartitionKey.Resolve(HttpContext),
                 changeOffset,
                 resolvedChangeLimit,
                 cancellationToken);
@@ -1553,7 +1560,12 @@ public sealed class TeacherDraftsController : ControllerBase
         CancellationToken cancellationToken)
         => await ExecuteAutoGenPlanActionAsync(
             jobId,
-            () => _autogenJobService.ApplyPlanAsync(jobId, request, cancellationToken),
+            ClientPartitionKey.Resolve(HttpContext),
+            clientPartitionKey => _autogenJobService.ApplyPlanAsync(
+                jobId,
+                request,
+                clientPartitionKey,
+                cancellationToken),
             operationGate,
             cancellationToken);
     [HttpPost("autogen/jobs/{jobId}/rollback")]
@@ -1565,13 +1577,19 @@ public sealed class TeacherDraftsController : ControllerBase
         CancellationToken cancellationToken)
         => await ExecuteAutoGenPlanActionAsync(
             jobId,
-            () => _autogenJobService.RollbackPlanAsync(jobId, request, cancellationToken),
+            ClientPartitionKey.Resolve(HttpContext),
+            clientPartitionKey => _autogenJobService.RollbackPlanAsync(
+                jobId,
+                request,
+                clientPartitionKey,
+                cancellationToken),
             operationGate,
             cancellationToken);
 
     private async Task<ActionResult<AutoGenPlanDetailsDto>> ExecuteAutoGenPlanActionAsync(
         string jobId,
-        Func<Task<AutoGenPlanDetailsDto>> action,
+        string clientPartitionKey,
+        Func<string, Task<AutoGenPlanDetailsDto>> action,
         ExpensiveOperationGate operationGate,
         CancellationToken cancellationToken)
     {
@@ -1588,7 +1606,10 @@ public sealed class TeacherDraftsController : ControllerBase
             }
             try
             {
-                await _autogenJobService.PreparePlanReadAsync(jobId, cancellationToken);
+                await _autogenJobService.PreparePlanReadAsync(
+                    jobId,
+                    clientPartitionKey,
+                    cancellationToken);
             }
             catch (AutoGenPlanConflictException ex)
             {
@@ -1612,7 +1633,7 @@ public sealed class TeacherDraftsController : ControllerBase
 
         try
         {
-            return Ok(await action());
+            return Ok(await action(clientPartitionKey));
         }
         catch (AutoGenPlanNotFoundException ex)
         {
