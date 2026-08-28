@@ -83,7 +83,8 @@ public sealed class AdminControllerGuardrailTests
                 new(model.Module.Id, 2),
                 new(model.Module.Id, 7)
             },
-            new List<int> { model.Module.Id, model.Module.Id });
+            new List<int> { model.Module.Id, model.Module.Id },
+            ModuleSequenceRevisionToken.Create([], []));
 
         var result = await new AdminModuleSequenceController(fixture.Db).Save(
             request,
@@ -114,12 +115,79 @@ public sealed class AdminControllerGuardrailTests
             new ModuleSequenceSaveRequestDto(
                 model.Course.Id,
                 [new ModuleSequenceSaveItemDto(model.Module.Id, 1)],
-                []),
+                [],
+                ModuleSequenceRevisionToken.Create([], [])),
             operationGate,
             CancellationToken.None);
 
         Assert.IsType<NoContentResult>(result);
         Assert.Equal(IsolationLevel.Serializable, interceptor.ObservedIsolationLevel);
+    }
+
+    [Fact]
+    public async Task Module_sequence_save_requires_loaded_revision()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedRoomModelAsync(20, 20, 40);
+        fixture.Db.ModuleCourses.Add(new ModuleCourse
+        {
+            CourseId = model.Course.Id,
+            ModuleId = model.Module.Id
+        });
+        await fixture.Db.SaveChangesAsync();
+        using var operationGate = new ExpensiveOperationGate();
+
+        var result = await new AdminModuleSequenceController(fixture.Db).Save(
+            new ModuleSequenceSaveRequestDto(
+                model.Course.Id,
+                [new ModuleSequenceSaveItemDto(model.Module.Id, 1)],
+                []),
+            operationGate,
+            CancellationToken.None);
+
+        var problem = Assert.IsType<ObjectResult>(result);
+        Assert.Equal(StatusCodes.Status428PreconditionRequired, problem.StatusCode);
+        Assert.Empty(await fixture.Db.ModuleSequenceItems.AsNoTracking().ToListAsync());
+    }
+
+    [Fact]
+    public async Task Module_sequence_save_rejects_stale_snapshot_without_overwriting_newer_change()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedRoomModelAsync(20, 20, 40);
+        fixture.Db.ModuleCourses.Add(new ModuleCourse
+        {
+            CourseId = model.Course.Id,
+            ModuleId = model.Module.Id
+        });
+        await fixture.Db.SaveChangesAsync();
+        using var operationGate = new ExpensiveOperationGate();
+        var controller = new AdminModuleSequenceController(fixture.Db);
+        var staleRevision = ModuleSequenceRevisionToken.Create([], []);
+
+        var firstResult = await controller.Save(
+            new ModuleSequenceSaveRequestDto(
+                model.Course.Id,
+                [new ModuleSequenceSaveItemDto(model.Module.Id, 3)],
+                [],
+                staleRevision),
+            operationGate,
+            CancellationToken.None);
+        var staleResult = await controller.Save(
+            new ModuleSequenceSaveRequestDto(
+                model.Course.Id,
+                [],
+                [model.Module.Id],
+                staleRevision),
+            operationGate,
+            CancellationToken.None);
+
+        Assert.IsType<NoContentResult>(firstResult);
+        Assert.IsType<ConflictObjectResult>(staleResult);
+        var persisted = Assert.Single(await fixture.Db.ModuleSequenceItems.AsNoTracking().ToListAsync());
+        Assert.Equal(model.Module.Id, persisted.ModuleId);
+        Assert.Equal(3, persisted.GroupOrder);
+        Assert.Empty(await fixture.Db.ModuleFillers.AsNoTracking().ToListAsync());
     }
     [Fact]
     public async Task Department_upsert_rejects_name_longer_than_database_limit()

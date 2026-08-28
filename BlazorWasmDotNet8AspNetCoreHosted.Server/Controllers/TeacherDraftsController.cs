@@ -1177,7 +1177,34 @@ public sealed class TeacherDraftsController : ControllerBase
             .ThenBy(x => x.StartTime)
             .ThenBy(x => x.GroupId)
             .ThenBy(x => x.Id)
+            .Take(TeacherDraftsWeekValidationService.MaxWeekDraftRowCount + 1)
             .ToListAsync();
+        if (scopedRows.Count > TeacherDraftsWeekValidationService.MaxWeekDraftRowCount)
+        {
+            await transaction.RollbackAsync();
+            return Problem(
+                statusCode: StatusCodes.Status422UnprocessableEntity,
+                title: "Забагато чернеток для очищення",
+                detail: $"За одну операцію можна очистити не більше {TeacherDraftsWeekValidationService.MaxWeekDraftRowCount} чернеток.");
+        }
+        if (r.ExpectedScopeRevision is not Guid expectedScopeRevision)
+        {
+            await transaction.RollbackAsync();
+            return Problem(
+                statusCode: StatusCodes.Status428PreconditionRequired,
+                title: "Потрібна версія тижня",
+                detail: "Оновіть чернетки тижня перед очищенням.");
+        }
+        var actualScopeRevision = LogicalRevisionToken.Combine(scopedRows.Select(item =>
+            new KeyValuePair<int, Guid>(item.Id, item.Revision)));
+        if (actualScopeRevision != expectedScopeRevision)
+        {
+            await transaction.RollbackAsync();
+            return Conflict(new
+            {
+                message = "Чернетки тижня змінилися після завантаження. Оновіть сторінку та повторіть очищення."
+            });
+        }
         var deletionIds = scopedRows
             .Where(x => x.Status == DraftStatus.Draft && !x.IsLocked)
             .Select(x => x.Id)

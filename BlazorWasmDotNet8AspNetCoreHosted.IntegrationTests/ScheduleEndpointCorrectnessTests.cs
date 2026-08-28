@@ -592,9 +592,13 @@ public sealed class ScheduleEndpointCorrectnessTests
         var model = await fixture.SeedScheduleAsync();
         await fixture.AddFailingModulePlanUpdateTriggerAsync();
         var controller = CreateController(fixture.Db);
+        var expectedScopeRevision = await GetScheduleScopeRevisionAsync(fixture.Db, model.CourseId);
 
         await Assert.ThrowsAsync<DbUpdateException>(() => controller.ClearWeek(
-            new ClearWeekRequest(Monday, CourseId: model.CourseId)));
+            new ClearWeekRequest(
+                Monday,
+                CourseId: model.CourseId,
+                ExpectedScopeRevision: expectedScopeRevision)));
 
         fixture.Db.ChangeTracker.Clear();
         Assert.True(await fixture.Db.ScheduleItems.AnyAsync(item => item.Id == model.ScheduleItemId));
@@ -604,6 +608,44 @@ public sealed class ScheduleEndpointCorrectnessTests
                 .Where(plan => plan.ModuleId == model.OldModuleId)
                 .Select(plan => plan.ScheduledHours)
                 .SingleAsync());
+    }
+
+    [Fact]
+    public async Task ClearWeek_rejects_stale_scope_without_deleting_newer_schedule_state()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedScheduleAsync();
+        var staleRevision = await GetScheduleScopeRevisionAsync(fixture.Db, model.CourseId);
+        var changed = await fixture.Db.ScheduleItems
+            .SingleAsync(item => item.Id == model.ScheduleItemId);
+        changed.StartTime = new TimeOnly(8, 15);
+        changed.EndTime = new TimeOnly(9, 15);
+        await fixture.Db.SaveChangesAsync();
+        var controller = CreateController(fixture.Db);
+
+        var result = await controller.ClearWeek(new ClearWeekRequest(
+            Monday,
+            CourseId: model.CourseId,
+            ExpectedScopeRevision: staleRevision));
+
+        Assert.IsType<ConflictObjectResult>(result.Result);
+        fixture.Db.ChangeTracker.Clear();
+        var persisted = await fixture.Db.ScheduleItems.AsNoTracking().SingleAsync();
+        Assert.Equal(new TimeOnly(8, 15), persisted.StartTime);
+    }
+
+    [Fact]
+    public async Task ClearWeek_requires_scope_revision_before_deleting_schedule()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedScheduleAsync();
+
+        var result = await CreateController(fixture.Db).ClearWeek(
+            new ClearWeekRequest(Monday, CourseId: model.CourseId));
+
+        var problem = Assert.IsType<ObjectResult>(result.Result);
+        Assert.Equal(StatusCodes.Status428PreconditionRequired, problem.StatusCode);
+        Assert.True(await fixture.Db.ScheduleItems.AnyAsync(item => item.Id == model.ScheduleItemId));
     }
 
     [Theory]
@@ -624,7 +666,10 @@ public sealed class ScheduleEndpointCorrectnessTests
         var controller = CreateController(fixture.Db);
 
         var result = await controller.ClearWeek(
-            new ClearWeekRequest(Monday, CourseId: model.CourseId));
+            new ClearWeekRequest(
+                Monday,
+                CourseId: model.CourseId,
+                ExpectedScopeRevision: await GetScheduleScopeRevisionAsync(fixture.Db, model.CourseId)));
 
         Assert.IsType<ConflictObjectResult>(result.Result);
         fixture.Db.ChangeTracker.Clear();
@@ -1520,6 +1565,19 @@ public sealed class ScheduleEndpointCorrectnessTests
 
     private static ScheduleController CreateController(AppDbContext db)
         => new(db, new RulesService(db), new AggregatesService(db));
+
+    private static async Task<Guid> GetScheduleScopeRevisionAsync(AppDbContext db, int courseId)
+    {
+        var rows = await db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => item.Date >= Monday
+                           && item.Date < Monday.AddDays(7)
+                           && item.Group.CourseId == courseId)
+            .Select(item => new { item.Id, item.Revision })
+            .ToListAsync();
+        return LogicalRevisionToken.Combine(rows.Select(item =>
+            new KeyValuePair<int, Guid>(item.Id, item.Revision)));
+    }
 
     private static async Task<Guid> GetScheduleItemRevisionAsync(AppDbContext db, int id)
     {

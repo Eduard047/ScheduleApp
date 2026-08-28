@@ -183,6 +183,111 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
     }
 
     [Fact]
+    public async Task Remote_instance_rejects_plan_read_and_apply_while_persisted_job_is_running()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        var jobId = Guid.NewGuid().ToString("N");
+        await using (var db = new AppDbContext(options))
+        {
+            await db.Database.EnsureCreatedAsync();
+            db.AutoGenJobRuns.Add(new AutoGenJobRun
+            {
+                JobId = jobId,
+                ClientPartitionKey = OwnerPartition,
+                RequestHash = new string('a', 64),
+                OwnerInstanceId = "remote-owner",
+                Attempt = 1,
+                LeaseExpiresAtUtc = DateTime.UtcNow.AddMinutes(5),
+                Version = 1,
+                Kind = (int)AutoGenJobKind.Generate,
+                State = (int)AutoGenJobState.Running,
+                Title = "Міжсерверна перевірка",
+                CurrentStage = "Формування плану",
+                CreatedAtUtc = DateTime.UtcNow,
+                StartedAtUtc = DateTime.UtcNow,
+                RangeStartDate = new DateOnly(2026, 1, 1),
+                RangeEndDate = new DateOnly(2026, 1, 1),
+                RequestJson = "{}",
+                StatusJson = "{}",
+                UpdatedAtUtc = DateTime.UtcNow
+            });
+            await db.SaveChangesAsync();
+        }
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(options));
+        services.AddScoped<TeacherDraftsAutogenPlanService>();
+        await using var provider = services.BuildServiceProvider();
+        var observer = new TeacherDraftsAutogenJobService(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+
+        await Assert.ThrowsAsync<AutoGenPlanConflictException>(() =>
+            observer.PreparePlanReadAsync(jobId, OwnerPartition));
+        await Assert.ThrowsAsync<AutoGenPlanConflictException>(() =>
+            observer.ApplyPlanAsync(
+                jobId,
+                new AutoGenPlanActionRequest(1),
+                OwnerPartition));
+        await observer.PreparePlanReadAsync(jobId, ForeignPartition);
+    }
+
+    [Fact]
+    public async Task Remote_plan_read_expires_a_running_job_after_its_owner_lease_elapsed()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        var jobId = Guid.NewGuid().ToString("N");
+        await using (var db = new AppDbContext(options))
+        {
+            await db.Database.EnsureCreatedAsync();
+            db.AutoGenJobRuns.Add(new AutoGenJobRun
+            {
+                JobId = jobId,
+                ClientPartitionKey = OwnerPartition,
+                RequestHash = new string('a', 64),
+                OwnerInstanceId = "stopped-owner",
+                Attempt = 1,
+                LeaseExpiresAtUtc = DateTime.UtcNow.AddMinutes(-5),
+                Version = 1,
+                Kind = (int)AutoGenJobKind.Generate,
+                State = (int)AutoGenJobState.Running,
+                Title = "Завдання з простроченим lease",
+                CurrentStage = "Формування плану",
+                CreatedAtUtc = DateTime.UtcNow.AddMinutes(-10),
+                StartedAtUtc = DateTime.UtcNow.AddMinutes(-9),
+                RangeStartDate = new DateOnly(2026, 1, 1),
+                RangeEndDate = new DateOnly(2026, 1, 1),
+                RequestJson = "{}",
+                StatusJson = "{}",
+                UpdatedAtUtc = DateTime.UtcNow.AddMinutes(-5)
+            });
+            await db.SaveChangesAsync();
+        }
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(options));
+        services.AddScoped<TeacherDraftsAutogenPlanService>();
+        await using var provider = services.BuildServiceProvider();
+        var observer = new TeacherDraftsAutogenJobService(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+
+        await observer.PreparePlanReadAsync(jobId, OwnerPartition);
+
+        await using var verification = new AppDbContext(options);
+        var persisted = await verification.AutoGenJobRuns.AsNoTracking().SingleAsync();
+        Assert.Equal((int)AutoGenJobState.Failed, persisted.State);
+        Assert.Null(persisted.LeaseExpiresAtUtc);
+        Assert.Contains("Lease", persisted.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task GetAsync_rejects_oversized_persisted_status_before_json_deserialization()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");

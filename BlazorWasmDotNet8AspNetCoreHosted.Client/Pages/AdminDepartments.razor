@@ -53,28 +53,31 @@
                 </tr>
             </thead>
             <tbody>
-                @if (items.Count == 0)
+                @if (!loading && !loadFailed && !SortedAndFiltered.Any())
                 {
                     <tr>
-                        <td colspan="4" class="text-muted text-center">Немає записів.</td>
+                        <td colspan="4" class="text-muted text-center py-3">
+                            <span class="admin-table-empty-state" role="status">
+                                @(items.Count == 0
+                                    ? "Поки що немає кафедр."
+                                    : "За вашим пошуком кафедр не знайдено.")
+                            </span>
+                        </td>
                     </tr>
                 }
-                else
+                @foreach (var d in SortedAndFiltered)
                 {
-                    @foreach (var d in SortedAndFiltered)
-                    {
-                        <tr>
-                            <td>@d.Id</td>
-                            <td>@d.Name</td>
-                            <td>
-                                <input type="checkbox" class="form-check-input" checked="@d.IsActive" disabled />
-                            </td>
-                            <td class="text-end text-nowrap">
-                                <button class="btn btn-sm btn-outline-primary me-2" @onclick="() => OpenEdit(d)">Редагувати</button>
-                                <button class="btn btn-sm btn-outline-danger" @onclick="() => Delete(d.Id!.Value)">Видалити</button>
-                            </td>
-                        </tr>
-                    }
+                    <tr>
+                        <td>@d.Id</td>
+                        <td>@d.Name</td>
+                        <td>
+                            <input type="checkbox" class="form-check-input" checked="@d.IsActive" disabled />
+                        </td>
+                        <td class="text-end text-nowrap">
+                            <button class="btn btn-sm btn-outline-primary me-2" @onclick="() => OpenEdit(d)">Редагувати</button>
+                            <button class="btn btn-sm btn-outline-danger" @onclick="() => Delete(d.Id!.Value)">Видалити</button>
+                        </td>
+                    </tr>
                 }
             </tbody>
         </table>

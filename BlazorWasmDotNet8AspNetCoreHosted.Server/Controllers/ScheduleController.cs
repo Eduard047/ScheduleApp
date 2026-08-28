@@ -3,6 +3,7 @@ using System.Data;
 using System.Globalization;
 using System.Linq;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
@@ -925,7 +926,34 @@ public class ScheduleController : ControllerBase
             .ThenBy(x => x.StartTime)
             .ThenBy(x => x.GroupId)
             .ThenBy(x => x.Id)
+            .Take(TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount + 1)
             .ToListAsync();
+        if (scopedRows.Count > TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount)
+        {
+            await tx.RollbackAsync();
+            return Problem(
+                statusCode: StatusCodes.Status422UnprocessableEntity,
+                title: "Забагато записів для очищення",
+                detail: $"За одну операцію можна очистити не більше {TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount} записів розкладу.");
+        }
+        if (r.ExpectedScopeRevision is not Guid expectedScopeRevision)
+        {
+            await tx.RollbackAsync();
+            return Problem(
+                statusCode: StatusCodes.Status428PreconditionRequired,
+                title: "Потрібна версія тижня",
+                detail: "Оновіть опублікований розклад перед очищенням.");
+        }
+        var actualScopeRevision = LogicalRevisionToken.Combine(scopedRows.Select(item =>
+            new KeyValuePair<int, Guid>(item.Id, item.Revision)));
+        if (actualScopeRevision != expectedScopeRevision)
+        {
+            await tx.RollbackAsync();
+            return Conflict(new
+            {
+                message = "Опублікований розклад змінився після завантаження. Оновіть сторінку та повторіть очищення."
+            });
+        }
         var logicalEvents = scopedRows
             .Where(x => !string.IsNullOrWhiteSpace(x.BatchKey))
             .GroupBy(x => new

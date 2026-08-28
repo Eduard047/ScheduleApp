@@ -110,7 +110,7 @@
                 else if (SlotsLoadFailed || _staleData)
                 {
                     <button type="button" class="btn btn-sm btn-outline-danger mt-2" @onclick="RefreshAsync" disabled="@AreContextControlsDisabled">
-                        Оновити дані
+                        @RefreshButtonLabel
                     </button>
                 }
             </div>
@@ -598,6 +598,11 @@
     private bool CanApplyPreview => CanMutateSlotEditor
                                     && _preview is { CanApply: true, NoChanges: false }
                                     && !string.IsNullOrWhiteSpace(_preview.PreviewToken);
+    private const string ContextLoadFailureMessage =
+        "Не вдалося завантажити графік через тимчасову помилку. Перевірте з’єднання та повторіть спробу.";
+    private string RefreshButtonLabel => _staleData
+        ? "Відкинути правки й оновити"
+        : "Оновити дані";
 
     protected override async Task OnInitializedAsync() => await InitializeAsync();
 
@@ -606,7 +611,7 @@
         if (_initializing) return;
         _initializing = true;
         _initialLoadFailed = false;
-        _metaLoadSucceeded = true;
+        _metaLoadSucceeded = false;
         try
         {
             await LoadContextAsync();
@@ -724,17 +729,20 @@
             _removeDayOverrideRequested = false;
             _clearRequested = false;
             _slotsLoadSucceeded = true;
+            _metaLoadSucceeded = true;
         }
         catch (ApiErrorException ex)
         {
             if (!IsStillCurrent()) return;
-            _error = $"Не вдалося завантажити графік: {GetApiMessage(ex)}";
+            _error = (int)ex.StatusCode >= 500
+                ? ContextLoadFailureMessage
+                : $"Не вдалося завантажити графік: {GetApiMessage(ex)}";
             ClearFailedContext();
         }
-        catch (Exception ex)
+        catch (Exception)
         {
             if (!IsStillCurrent()) return;
-            _error = $"Не вдалося завантажити графік: {ex.Message}";
+            _error = ContextLoadFailureMessage;
             ClearFailedContext();
         }
         finally
@@ -1352,7 +1360,7 @@
         if (string.Equals(ex.Code, "Stale", StringComparison.OrdinalIgnoreCase))
         {
             _staleData = true;
-            _error = "Налаштування змінилися в іншому вікні. Ваші правки збережено в редакторі — оновіть дані та повторіть перевірку.";
+            _error = "Налаштування змінилися в іншому вікні. Поточні правки залишаться в редакторі, доки ви не оновите дані. Оновлення відкине їх і завантажить актуальний графік.";
             return;
         }
         _staleData = false;

@@ -120,6 +120,44 @@ public sealed class AdminModulesReliabilityTests
     }
 
     [Fact]
+    public async Task Sequence_initial_reference_failure_can_retry_without_page_reload()
+    {
+        var courseCalls = 0;
+        var api = DispatchProxy.Create<IAdminApi, RecordingAdminApiProxy>();
+        var proxy = (RecordingAdminApiProxy)(object)api;
+        proxy.Handler = (method, _) => method.Name switch
+        {
+            nameof(IAdminApi.GetCourses) when ++courseCalls == 1 =>
+                Task.FromException<List<CourseEditDto>>(new HttpRequestException("тимчасова помилка")),
+            nameof(IAdminApi.GetCourses) => Task.FromResult(new List<CourseEditDto>
+            {
+                new(1, "Курс 1", 16, new DateOnly(2026, 9, 1))
+            }),
+            nameof(IAdminApi.GetModules) => Task.FromResult(new List<ModuleEditDto>
+            {
+                Module(11, 1)
+            }),
+            nameof(IAdminApi.GetModuleSequence) =>
+                Task.FromResult<ModuleSequenceConfigDto?>(Sequence(1, 11)),
+            _ => throw new NotSupportedException(method.Name)
+        };
+        var component = CreateSequenceComponent(api);
+
+        await InvokeAsync(component, "OnInitializedAsync");
+
+        Assert.False(GetField<bool>(component, "_referenceLoadSucceeded"));
+        Assert.Equal(0, GetField<int>(component, "_selectedCourseId"));
+
+        await InvokeAsync(component, "RetryInitialLoadAsync");
+
+        Assert.True(GetField<bool>(component, "_referenceLoadSucceeded"));
+        Assert.True(GetField<bool>(component, "_sequenceLoadSucceeded"));
+        Assert.Equal(1, GetField<int>(component, "_selectedCourseId"));
+        Assert.Equal(new[] { 11 }, GetMainModuleIds(component));
+        Assert.Null(GetField<string?>(component, "error"));
+    }
+
+    [Fact]
     public async Task Sequence_stale_course_response_cannot_overwrite_newer_course()
     {
         var firstStarted = NewSignal();
@@ -184,6 +222,7 @@ public sealed class AdminModulesReliabilityTests
         Assert.Equal(1, GetField<int>(component, "_selectedCourseId"));
         var payload = Assert.IsType<ModuleSequenceSaveRequestDto>(proxy.LastSequencePayload);
         Assert.Equal(1, payload.CourseId);
+        Assert.NotNull(payload.ExpectedRevision);
         Assert.Equal(new[] { 11 }, payload.MainModules.Select(item => item.ModuleId));
         Assert.Equal(new[] { 12 }, payload.FillerModuleIds);
 
@@ -192,6 +231,35 @@ public sealed class AdminModulesReliabilityTests
 
         Assert.False(GetField<bool>(component, "isSaving"));
         Assert.Equal("Збережено.", GetField<string>(component, "ok"));
+    }
+
+    [Fact]
+    public async Task Sequence_dirty_course_switch_can_be_canceled_without_losing_changes()
+    {
+        var api = DispatchProxy.Create<IAdminApi, RecordingAdminApiProxy>();
+        var proxy = (RecordingAdminApiProxy)(object)api;
+        proxy.Handler = (method, args) => method.Name switch
+        {
+            nameof(IAdminApi.GetModuleSequence) when (int)args![0]! == 1 =>
+                Task.FromResult<ModuleSequenceConfigDto?>(Sequence(1, 11)),
+            nameof(IAdminApi.GetModuleSequence) when (int)args![0]! == 2 =>
+                Task.FromResult<ModuleSequenceConfigDto?>(Sequence(2, 22)),
+            _ => throw new NotSupportedException(method.Name)
+        };
+        var component = CreateSequenceComponent(api, Module(11, 1), Module(22, 2));
+        var js = new RecordingJsRuntime(confirmResult: false);
+        component.GetType().GetProperty("JS", InstanceMembers)!.SetValue(component, js);
+        SetField(component, "_selectedCourseId", 1);
+        await InvokeAsync(component, "LoadSequence", 1);
+        InvokeVoid(component, "ClearMain");
+
+        await InvokeAsync(component, "OnCourseChanged", new ChangeEventArgs { Value = "2" });
+
+        Assert.True(GetProperty<bool>(component, "HasUnsavedChanges"));
+        Assert.Equal(1, GetField<int>(component, "_selectedCourseId"));
+        Assert.Empty(GetMainModuleIds(component));
+        Assert.Equal(1, proxy.GetModuleSequenceCalls);
+        Assert.Equal(1, js.InvocationCount);
     }
 
     [Fact]
@@ -468,13 +536,17 @@ public sealed class AdminModulesReliabilityTests
         => new(id, $"М-{id ?? 0}", $"Модуль {id ?? 0}", courseId, credits: 1m);
 
     private static ModuleSequenceConfigDto Sequence(int courseId, int mainId, int? fillerId = null)
-        => new(
-            courseId,
-            new List<ModuleSequenceItemDto>
-            {
-                new(1, mainId, $"М-{mainId}", $"Модуль {mainId}", 1, 1)
-            },
-            fillerId.HasValue ? new List<int> { fillerId.Value } : new List<int>());
+    {
+        var main = new List<ModuleSequenceItemDto>
+        {
+            new(1, mainId, $"М-{mainId}", $"Модуль {mainId}", 1, 1)
+        };
+        var fillers = fillerId.HasValue ? new List<int> { fillerId.Value } : new List<int>();
+        var revision = ModuleSequenceRevisionToken.Create(
+            main.Select(item => new ModuleSequenceSaveItemDto(item.ModuleId, item.GroupOrder)),
+            fillers);
+        return new ModuleSequenceConfigDto(courseId, main, fillers, revision);
+    }
 
     private static MetaResponseDto EmptyMeta()
         => new(new(), new(), new(), new(), new(), new(), new())
@@ -604,7 +676,7 @@ public sealed class AdminModulesReliabilityTests
         }
     }
 
-    private sealed class RecordingJsRuntime : IJSRuntime
+    private sealed class RecordingJsRuntime(bool confirmResult = true) : IJSRuntime
     {
         public int InvocationCount { get; private set; }
 
@@ -617,7 +689,7 @@ public sealed class AdminModulesReliabilityTests
             object?[]? args)
         {
             InvocationCount++;
-            object? value = identifier == "prompt" ? "ВИДАЛИТИ" : true;
+            object? value = identifier == "prompt" ? "ВИДАЛИТИ" : confirmResult;
             return ValueTask.FromResult((TValue)value!);
         }
     }

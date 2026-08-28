@@ -1,17 +1,30 @@
 @* Сторінка налаштування послідовностей модулів *@
 @page "/admin/module-sequence"
 @using System.Linq
+@using Microsoft.AspNetCore.Components.Routing
 @using BlazorWasmDotNet8AspNetCoreHosted.Client.Services
 @using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
 @inject BlazorWasmDotNet8AspNetCoreHosted.Client.Services.IAdminApi Admin
+@inject IJSRuntime JS
 
 <PageTitle>Адмін · Послідовності</PageTitle>
+
+<NavigationLock ConfirmExternalNavigation="@HasUnsavedChanges"
+                OnBeforeInternalNavigation="HandleBeforeInternalNavigation" />
 
 <h1 class="h3 mb-3">Послідовності модулів</h1>
 
 @if (!string.IsNullOrWhiteSpace(error))
 {
-    <div class="alert alert-danger" role="alert">@error</div>
+    <div class="alert alert-danger" role="alert">
+        <div>@error</div>
+        @if (!_referenceLoadSucceeded && !isLoading)
+        {
+            <button type="button" class="btn btn-outline-danger btn-sm mt-2" @onclick="RetryInitialLoadAsync">
+                Повторити завантаження
+            </button>
+        }
+    </div>
 }
 @if (!string.IsNullOrWhiteSpace(ok))
 {
@@ -34,7 +47,7 @@
             <div class="form-label">Швидкі дії</div>
             <div class="d-flex gap-2">
                 <button class="btn btn-outline-secondary" @onclick="RefreshCurrent" disabled="@(IsSequenceBusy || _selectedCourseId == 0)">
-                    <span class="oi oi-loop-circular me-1"></span>Оновити
+                    Оновити
                 </button>
                 <button class="btn btn-primary" @onclick="SaveAsync" disabled="@(!CanSaveSequence)">
                     @if (isSaving)
@@ -131,14 +144,14 @@ else
                                             </div>
                                         </div>
                                         <div class="btn-group btn-group-sm">
-                                            <button class="btn btn-outline-secondary" title="Вгору" @onclick="@(() => MoveUp(index))" disabled="@(!CanEditSequence || index == 0)">
-                                                <span class="oi oi-chevron-top"></span>
+                                            <button class="btn btn-outline-secondary" title="Вгору" aria-label="Перемістити модуль вгору" @onclick="@(() => MoveUp(index))" disabled="@(!CanEditSequence || index == 0)">
+                                                Вгору
                                             </button>
-                                            <button class="btn btn-outline-secondary" title="Вниз" @onclick="@(() => MoveDown(index))" disabled="@(!CanEditSequence || index == mainModules.Count - 1)">
-                                                <span class="oi oi-chevron-bottom"></span>
+                                            <button class="btn btn-outline-secondary" title="Вниз" aria-label="Перемістити модуль вниз" @onclick="@(() => MoveDown(index))" disabled="@(!CanEditSequence || index == mainModules.Count - 1)">
+                                                Вниз
                                             </button>
-                                            <button class="btn btn-outline-danger" title="Прибрати" @onclick="@(() => RemoveFromMain(index))" disabled="@(!CanEditSequence)">
-                                                <span class="oi oi-x"></span>
+                                            <button class="btn btn-outline-danger" title="Прибрати" aria-label="Прибрати модуль з основної послідовності" @onclick="@(() => RemoveFromMain(index))" disabled="@(!CanEditSequence)">
+                                                Прибрати
                                             </button>
                                         </div>
                                     </li>
@@ -187,7 +200,7 @@ else
                                             </td>
                                             <td class="text-end">
                                                 <button class="btn btn-outline-primary btn-sm" @onclick="@(() => AddToMain(mid))" disabled="@(!CanEditSequence || inMain)">
-                                                    <span class="oi oi-plus me-1"></span>Додати
+                                                    Додати
                                                 </button>
                                             </td>
                                             <td class="text-center">
@@ -218,6 +231,8 @@ else
     private Dictionary<int, ModuleEditDto> moduleLookup = new();
     private readonly List<MainModuleEntry> mainModules = new();
     private HashSet<int> fillerIds = new();
+    private readonly List<MainModuleEntry> _loadedMainModules = new();
+    private HashSet<int> _loadedFillerIds = new();
     private readonly LatestAsyncRequestGuard _sequenceLoadGuard = new();
     private int _selectedCourseId;
     private bool isLoading;
@@ -225,16 +240,54 @@ else
     private bool isSaving;
     private bool _referenceLoadSucceeded;
     private bool _sequenceLoadSucceeded;
+    private Guid _loadedRevision;
     private string? ok;
     private string? error;
     private bool IsSequenceBusy => isLoading || isCourseLoading || isSaving;
     private bool CanEditSequence
         => !IsSequenceBusy && _referenceLoadSucceeded && _sequenceLoadSucceeded && _selectedCourseId > 0;
-    private bool CanSaveSequence => CanEditSequence;
+    private bool CanSaveSequence => CanEditSequence && _loadedRevision != Guid.Empty;
+    private bool HasUnsavedChanges
+    {
+        get
+        {
+            if (!_sequenceLoadSucceeded
+                || mainModules.Count != _loadedMainModules.Count
+                || !fillerIds.SetEquals(_loadedFillerIds))
+            {
+                return _sequenceLoadSucceeded;
+            }
+            for (var index = 0; index < mainModules.Count; index++)
+            {
+                if (mainModules[index].ModuleId != _loadedMainModules[index].ModuleId
+                    || mainModules[index].JoinPreviousGroup != _loadedMainModules[index].JoinPreviousGroup)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
     // Початкове завантаження курсів, модулів і послідовності.
     protected override async Task OnInitializedAsync()
+        => await LoadReferencesAsync();
+
+    private async Task RetryInitialLoadAsync()
+    {
+        if (IsSequenceBusy)
+        {
+            return;
+        }
+        await LoadReferencesAsync();
+    }
+
+    private async Task LoadReferencesAsync()
     {
         isLoading = true;
+        _sequenceLoadGuard.Invalidate();
+        _referenceLoadSucceeded = false;
+        _sequenceLoadSucceeded = false;
+        _loadedRevision = Guid.Empty;
         ok = error = null;
         try
         {
@@ -268,6 +321,8 @@ else
             _selectedCourseId = 0;
             mainModules.Clear();
             fillerIds.Clear();
+            ClearLoadedState();
+            _loadedRevision = Guid.Empty;
             error = $"Не вдалося завантажити довідники курсів і модулів: {ex.Message}";
         }
         finally
@@ -280,19 +335,26 @@ else
     {
         if (IsSequenceBusy || !_referenceLoadSucceeded) return;
 
+        var nextCourseId = int.TryParse(args.Value?.ToString(), out var parsedCourseId)
+            ? parsedCourseId
+            : 0;
+        if (nextCourseId == _selectedCourseId)
+        {
+            return;
+        }
+        if (!await ConfirmDiscardChangesAsync())
+        {
+            return;
+        }
+
         ok = null;
         error = null;
-        if (int.TryParse(args.Value?.ToString(), out var cid))
-        {
-            _selectedCourseId = cid;
-        }
-        else
-        {
-            _selectedCourseId = 0;
-        }
+        _selectedCourseId = nextCourseId;
         _sequenceLoadSucceeded = false;
+        _loadedRevision = Guid.Empty;
         mainModules.Clear();
         fillerIds.Clear();
+        ClearLoadedState();
         if (_selectedCourseId > 0)
         {
             await LoadSequence(_selectedCourseId);
@@ -306,6 +368,7 @@ else
     private async Task RefreshCurrent()
     {
         if (IsSequenceBusy || !_referenceLoadSucceeded || _selectedCourseId <= 0) return;
+        if (!await ConfirmDiscardChangesAsync()) return;
         ok = null;
         error = null;
         await LoadSequence(_selectedCourseId);
@@ -353,6 +416,11 @@ else
                     .ToHashSet();
             }
 
+            if (cfg is null || cfg.Revision == Guid.Empty)
+            {
+                throw new InvalidOperationException("Сервер не повернув версію конфігурації.");
+            }
+
             loadedFillerIds.ExceptWith(loadedMainModules.Select(entry => entry.ModuleId));
             if (!_sequenceLoadGuard.IsCurrent(requestVersion) || _selectedCourseId != courseId)
             {
@@ -362,7 +430,9 @@ else
             mainModules.Clear();
             mainModules.AddRange(loadedMainModules);
             fillerIds = loadedFillerIds;
+            _loadedRevision = cfg.Revision;
             EnsureFirstMainGroup();
+            CaptureLoadedState();
             _sequenceLoadSucceeded = true;
             error = null;
         }
@@ -578,10 +648,15 @@ else
                 mainItems,
                 fillerSnapshot
                     .Where(id => moduleLookup.TryGetValue(id, out var module) && ModuleBelongsToCourse(module, courseId))
-                    .ToList());
+                    .ToList(),
+                _loadedRevision);
             await Admin.SaveModuleSequence(payload);
             if (_selectedCourseId == courseId && _sequenceLoadSucceeded)
             {
+                _loadedRevision = ModuleSequenceRevisionToken.Create(
+                    payload.MainModules,
+                    payload.FillerModuleIds);
+                CaptureLoadedState();
                 ok = "Збережено.";
             }
         }
@@ -593,6 +668,33 @@ else
         {
             isSaving = false;
         }
+    }
+    private async Task HandleBeforeInternalNavigation(LocationChangingContext context)
+    {
+        if (HasUnsavedChanges
+            && !await JS.InvokeAsync<bool>(
+                "confirm",
+                "У послідовності модулів є незбережені зміни. Залишити сторінку та відкинути їх?"))
+        {
+            context.PreventNavigation();
+        }
+    }
+    private async Task<bool> ConfirmDiscardChangesAsync()
+        => !HasUnsavedChanges
+           || await JS.InvokeAsync<bool>(
+               "confirm",
+               "У послідовності модулів є незбережені зміни. Відкинути їх і завантажити іншу конфігурацію?");
+    private void CaptureLoadedState()
+    {
+        _loadedMainModules.Clear();
+        _loadedMainModules.AddRange(mainModules.Select(entry =>
+            new MainModuleEntry(entry.ModuleId, entry.JoinPreviousGroup)));
+        _loadedFillerIds = fillerIds.ToHashSet();
+    }
+    private void ClearLoadedState()
+    {
+        _loadedMainModules.Clear();
+        _loadedFillerIds.Clear();
     }
     private sealed class MainModuleEntry
     {

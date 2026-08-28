@@ -576,11 +576,66 @@ public sealed class AdminTimeSlotSequenceEditorTests
         Assert.Equal(HttpMethod.Get, request.Method);
         Assert.EndsWith("/api/admin/config/slots/editor-context", request.RequestUri!.AbsolutePath, StringComparison.Ordinal);
         Assert.Contains("targetMode=AllCourses", request.RequestUri.Query, StringComparison.Ordinal);
+        Assert.True(GetField<bool>(component, "_metaLoadSucceeded"));
         Assert.True(GetField<bool>(component, "_slotsLoadSucceeded"));
         Assert.Equal("09:00", Assert.Single(GetField<List<TimeSlotDto>>(component, "_rows")).Start);
         Assert.Equal(4, GetField<int>(component, "_preferredFirstMaxSlotOrder"));
         Assert.Equal("revision-1", GetField<string>(component, "_currentRevision"));
         Assert.Equal(TimeSlotLunchMutationMode.Unchanged, GetField<TimeSlotLunchMutationMode>(component, "_lunchMutation"));
+    }
+
+    [Fact]
+    public async Task Failed_initial_load_keeps_context_controls_disabled_until_retry_succeeds()
+    {
+        var handler = new SequenceHandler(
+            JsonResponse(
+                HttpStatusCode.ServiceUnavailable,
+                """{ "detail": "EnableRetryOnFailure internal provider guidance" }""",
+                "application/problem+json"),
+            EditorContextResponse("10:00", preferredLimit: 3));
+        var component = CreateComponent(handler);
+
+        await InvokeAsync(component, "InitializeAsync");
+
+        Assert.False(GetField<bool>(component, "_metaLoadSucceeded"));
+        Assert.False(GetField<bool>(component, "_slotsLoadSucceeded"));
+        Assert.True(GetField<bool>(component, "_initialLoadFailed"));
+        Assert.True(GetProperty<bool>(component, "AreContextControlsDisabled"));
+        var initialError = GetField<string>(component, "_error");
+        Assert.Contains("тимчасову помилку", initialError, StringComparison.Ordinal);
+        Assert.DoesNotContain("EnableRetryOnFailure", initialError, StringComparison.Ordinal);
+
+        await InvokeAsync(component, "SelectTargetAsync", TimeSlotEditorTargetMode.Course);
+
+        Assert.Single(handler.Requests);
+        Assert.Equal(TimeSlotEditorTargetMode.AllCourses, GetField<TimeSlotEditorTargetMode>(component, "_targetMode"));
+        Assert.Equal(initialError, GetField<string>(component, "_error"));
+
+        await InvokeAsync(component, "InitializeAsync");
+
+        Assert.Equal(2, handler.Requests.Count);
+        Assert.True(GetField<bool>(component, "_metaLoadSucceeded"));
+        Assert.True(GetField<bool>(component, "_slotsLoadSucceeded"));
+        Assert.False(GetField<bool>(component, "_initialLoadFailed"));
+        Assert.False(GetProperty<bool>(component, "AreContextControlsDisabled"));
+        Assert.Null(GetField<string?>(component, "_error"));
+        Assert.Equal("10:00", Assert.Single(GetField<List<TimeSlotDto>>(component, "_rows")).Start);
+    }
+
+    [Fact]
+    public async Task Transport_failure_shows_recoverable_message_without_internal_exception_details()
+    {
+        const string internalDetails = "EnableRetryOnFailure internal provider guidance";
+        var component = CreateComponent(new ThrowingHandler(new HttpRequestException(internalDetails)));
+
+        await InvokeAsync(component, "InitializeAsync");
+
+        var error = GetField<string>(component, "_error");
+        Assert.Contains("тимчасову помилку", error, StringComparison.Ordinal);
+        Assert.Contains("повторіть спробу", error, StringComparison.Ordinal);
+        Assert.DoesNotContain(internalDetails, error, StringComparison.Ordinal);
+        Assert.True(GetField<bool>(component, "_initialLoadFailed"));
+        Assert.True(GetProperty<bool>(component, "AreContextControlsDisabled"));
     }
 
     [Fact]
@@ -1068,7 +1123,7 @@ public sealed class AdminTimeSlotSequenceEditorTests
     }
 
     [Fact]
-    public async Task Machine_readable_stale_response_preserves_draft_and_requests_reload()
+    public async Task Machine_readable_stale_response_preserves_draft_until_explicit_discard_refresh()
     {
         var handler = new SequenceHandler(JsonResponse(
             HttpStatusCode.Conflict,
@@ -1081,7 +1136,11 @@ public sealed class AdminTimeSlotSequenceEditorTests
 
         Assert.Equal("10:00", Assert.Single(GetField<List<TimeSlotDto>>(component, "_rows")).Start);
         Assert.True(GetField<bool>(component, "_staleData"));
-        Assert.Contains("Ваші правки збережено", GetField<string>(component, "_error"), StringComparison.Ordinal);
+        var staleError = GetField<string>(component, "_error");
+        Assert.Contains("Поточні правки залишаться в редакторі", staleError, StringComparison.Ordinal);
+        Assert.Contains("Оновлення відкине їх", staleError, StringComparison.Ordinal);
+        Assert.DoesNotContain("Ваші правки збережено", staleError, StringComparison.Ordinal);
+        Assert.Equal("Відкинути правки й оновити", GetProperty<string>(component, "RefreshButtonLabel"));
         Assert.Null(GetField<TimeSlotSequencePreviewDto?>(component, "_preview"));
     }
 
@@ -1251,7 +1310,6 @@ public sealed class AdminTimeSlotSequenceEditorTests
         var component = Activator.CreateInstance(componentType)!;
         var client = new HttpClient(handler) { BaseAddress = new Uri("https://schedule.test/") };
         componentType.GetProperty("Api", InstanceMembers)!.SetValue(component, new TimeSlotsApi(client));
-        SetField(component, "_metaLoadSucceeded", true);
         return component;
     }
 
@@ -1342,6 +1400,14 @@ public sealed class AdminTimeSlotSequenceEditorTests
             Assert.NotEmpty(_responses);
             return Task.FromResult(_responses.Dequeue());
         }
+    }
+
+    private sealed class ThrowingHandler(Exception exception) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+            => Task.FromException<HttpResponseMessage>(exception);
     }
 
     private sealed class DelayedContextHandler : HttpMessageHandler
@@ -1494,6 +1560,36 @@ public sealed class AdminScheduleLogServiceTests
         await Assert.ThrowsAsync<JSException>(() => service.LoadAsync());
 
         Assert.Equal("{not-json", js.StoredValue);
+    }
+
+    [Fact]
+    public async Task Add_js_failure_is_reported_instead_of_silent_log_loss()
+    {
+        var service = new AdminScheduleLogService(
+            new LocalStorageJsRuntime(null, failingIdentifier: "localStorage.setItem"));
+        var entry = new AdminScheduleLogEntry(
+            Id: "entry-1",
+            Timestamp: DateTimeOffset.UtcNow,
+            ActionCode: "delete",
+            ActionLabel: "Видалення",
+            Summary: "Зміну застосовано",
+            Success: true,
+            Error: null,
+            WeekStart: null,
+            WeekEnd: null,
+            DaysPreset: null,
+            AllowDaysOff: null,
+            CourseId: null,
+            CourseName: null,
+            ModuleHours: new(),
+            Warnings: new(),
+            GapDetails: new(),
+            Lessons: new(),
+            LessonsTrimmed: false);
+
+        var exception = await Assert.ThrowsAsync<JSException>(() => service.AddAsync(entry));
+
+        Assert.Contains("localStorage.setItem", exception.Message, StringComparison.Ordinal);
     }
 
     private sealed class LocalStorageJsRuntime(string? storedValue, string? failingIdentifier = null) : IJSRuntime
@@ -1943,5 +2039,216 @@ public sealed class AdminScheduleLogsPageReliabilityTests
             CancellationToken cancellationToken,
             object?[]? args)
             => ValueTask.FromResult((TValue)(object)true);
+    }
+}
+
+public sealed class AdminScheduleActiveJobStorageTests
+{
+    private const BindingFlags InstanceMembers =
+        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+    private const string ActiveJobStorageKey = "adminSchedule.activeAutoGenJob.v1";
+
+    [Fact]
+    public async Task Active_autogen_job_persistence_fails_closed_and_cleans_partial_context()
+    {
+        var componentType = typeof(AdminApi).Assembly.GetType(
+            "BlazorWasmDotNet8AspNetCoreHosted.Client.Pages.AdminSchedule",
+            throwOnError: true)!;
+        var component = Activator.CreateInstance(componentType)!;
+        var js = new FailingSetStorageJsRuntime();
+        componentType.GetProperty("JS", InstanceMembers)!.SetValue(component, js);
+        var method = componentType.GetMethod("PersistActiveAutoGenJobIdAsync", InstanceMembers)!;
+
+        var persisted = await Assert.IsType<Task<bool>>(method.Invoke(
+            component,
+            [Guid.NewGuid().ToString("N"), 1, new DateOnly(2026, 8, 24)]));
+
+        Assert.False(persisted);
+        Assert.Contains("localStorage.setItem", js.Invocations);
+        Assert.Equal(2, js.Invocations.Count(call => call == "localStorage.removeItem"));
+    }
+
+    [Fact]
+    public async Task Confirmed_job_is_restored_after_another_tab_removes_the_preflight_id()
+    {
+        var componentType = typeof(AdminApi).Assembly.GetType(
+            "BlazorWasmDotNet8AspNetCoreHosted.Client.Pages.AdminSchedule",
+            throwOnError: true)!;
+        var shared = new SharedLocalStorage();
+        var firstTabJs = new SharedStorageJsRuntime(shared);
+        var secondTabJs = new SharedStorageJsRuntime(shared);
+        var firstTab = CreateComponent(componentType, firstTabJs);
+        var secondTab = CreateComponent(componentType, secondTabJs);
+        var jobId = Guid.NewGuid().ToString("N");
+        var persist = componentType.GetMethod("PersistActiveAutoGenJobIdAsync", InstanceMembers)!;
+        var remove = componentType.GetMethod("RemoveActiveAutoGenJobIdAsync", InstanceMembers)!;
+        var confirm = componentType.GetMethod("ConfirmActiveAutoGenJobPersistenceAsync", InstanceMembers)!;
+
+        Assert.True(await Assert.IsType<Task<bool>>(persist.Invoke(
+            firstTab,
+            [jobId, 1, new DateOnly(2026, 8, 24)])));
+
+        await Assert.IsAssignableFrom<Task>(remove.Invoke(secondTab, [jobId]));
+        Assert.Null(shared.Values.GetValueOrDefault(ActiveJobStorageKey));
+
+        var confirmed = await Assert.IsType<Task<bool>>(confirm.Invoke(
+            firstTab,
+            [jobId, jobId, 1, new DateOnly(2026, 8, 24)]));
+
+        Assert.True(confirmed);
+        Assert.Equal(jobId, shared.Values[ActiveJobStorageKey]);
+        Assert.Equal(jobId, firstTabJs.SessionValues[ActiveJobStorageKey]);
+    }
+
+    [Fact]
+    public async Task Confirmation_keeps_a_newer_shared_job_and_tracks_the_current_job_per_tab()
+    {
+        var componentType = typeof(AdminApi).Assembly.GetType(
+            "BlazorWasmDotNet8AspNetCoreHosted.Client.Pages.AdminSchedule",
+            throwOnError: true)!;
+        var shared = new SharedLocalStorage();
+        var firstTabJs = new SharedStorageJsRuntime(shared);
+        var secondTabJs = new SharedStorageJsRuntime(shared);
+        var firstTab = CreateComponent(componentType, firstTabJs);
+        var secondTab = CreateComponent(componentType, secondTabJs);
+        var firstJobId = Guid.NewGuid().ToString("N");
+        var secondJobId = Guid.NewGuid().ToString("N");
+        var persist = componentType.GetMethod("PersistActiveAutoGenJobIdAsync", InstanceMembers)!;
+        var confirm = componentType.GetMethod("ConfirmActiveAutoGenJobPersistenceAsync", InstanceMembers)!;
+
+        Assert.True(await Assert.IsType<Task<bool>>(persist.Invoke(
+            firstTab,
+            [firstJobId, 1, new DateOnly(2026, 8, 24)])));
+        Assert.True(await Assert.IsType<Task<bool>>(persist.Invoke(
+            secondTab,
+            [secondJobId, 2, new DateOnly(2026, 8, 31)])));
+
+        var confirmed = await Assert.IsType<Task<bool>>(confirm.Invoke(
+            firstTab,
+            [firstJobId, firstJobId, 1, new DateOnly(2026, 8, 24)]));
+
+        Assert.True(confirmed);
+        Assert.Equal(secondJobId, shared.Values[ActiveJobStorageKey]);
+        Assert.Equal(firstJobId, firstTabJs.SessionValues[ActiveJobStorageKey]);
+        Assert.Equal(secondJobId, secondTabJs.SessionValues[ActiveJobStorageKey]);
+    }
+
+    private static object CreateComponent(Type componentType, IJSRuntime js)
+    {
+        var component = Activator.CreateInstance(componentType)!;
+        componentType.GetProperty("JS", InstanceMembers)!.SetValue(component, js);
+        return component;
+    }
+
+    private sealed class FailingSetStorageJsRuntime : IJSRuntime
+    {
+        public List<string> Invocations { get; } = new();
+
+        public ValueTask<TValue> InvokeAsync<TValue>(string identifier, object?[]? args)
+            => InvokeAsync<TValue>(identifier, CancellationToken.None, args);
+
+        public ValueTask<TValue> InvokeAsync<TValue>(
+            string identifier,
+            CancellationToken cancellationToken,
+            object?[]? args)
+        {
+            Invocations.Add(identifier);
+            if (identifier == "localStorage.setItem")
+            {
+                throw new JSException("localStorage.setItem недоступний");
+            }
+            return ValueTask.FromResult(default(TValue)!);
+        }
+    }
+
+    private sealed class SharedLocalStorage
+    {
+        public Dictionary<string, string?> Values { get; } = new(StringComparer.Ordinal);
+    }
+
+    private sealed class SharedStorageJsRuntime(SharedLocalStorage shared) : IJSRuntime
+    {
+        public Dictionary<string, string?> SessionValues { get; } = new(StringComparer.Ordinal);
+
+        public ValueTask<TValue> InvokeAsync<TValue>(string identifier, object?[]? args)
+            => InvokeAsync<TValue>(identifier, CancellationToken.None, args);
+
+        public ValueTask<TValue> InvokeAsync<TValue>(
+            string identifier,
+            CancellationToken cancellationToken,
+            object?[]? args)
+        {
+            var values = identifier.StartsWith("localStorage", StringComparison.Ordinal)
+                ? shared.Values
+                : SessionValues;
+            var key = Assert.IsType<string>(args![0]);
+            if (identifier.EndsWith(".getItem", StringComparison.Ordinal))
+            {
+                values.TryGetValue(key, out var value);
+                return ValueTask.FromResult((TValue)(object?)value!);
+            }
+            if (identifier.EndsWith(".setItem", StringComparison.Ordinal))
+            {
+                values[key] = Assert.IsType<string>(args[1]);
+            }
+            else if (identifier.EndsWith(".removeItem", StringComparison.Ordinal))
+            {
+                values.Remove(key);
+            }
+            return ValueTask.FromResult(default(TValue)!);
+        }
+    }
+}
+
+public sealed class AdminScheduleDraftPolicyTests
+{
+    private const BindingFlags InstanceMembers =
+        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+    [Theory]
+    [InlineData(DraftStatusDto.Draft, false)]
+    [InlineData(DraftStatusDto.Published, true)]
+    public void Approved_unlocked_draft_requires_unrestricted_delete(
+        DraftStatusDto status,
+        bool expected)
+    {
+        var componentType = typeof(AdminApi).Assembly.GetType(
+            "BlazorWasmDotNet8AspNetCoreHosted.Client.Pages.AdminSchedule",
+            throwOnError: true)!;
+        var component = Activator.CreateInstance(componentType)!;
+        var draft = new TeacherDraftItemDto(
+            Id: 1,
+            Date: new DateOnly(2026, 8, 24),
+            TimeStart: "09:00",
+            TimeEnd: "10:00",
+            DayNumber: 1,
+            Group: "Група 1",
+            GroupId: 1,
+            Module: "Модуль 1",
+            ModuleId: 1,
+            TopicCode: null,
+            ModuleTopicId: null,
+            Teacher: "Викладач",
+            TeacherId: 1,
+            Room: "101",
+            RoomId: 1,
+            RequiresRoom: true,
+            MissingTeacherAssignment: false,
+            MissingRoomAssignment: false,
+            LessonTypeId: 1,
+            LessonTypeCode: "LECTURE",
+            LessonTypeName: "Лекція",
+            Status: status,
+            PublishedItemId: null,
+            Warnings: null,
+            IsLocked: false,
+            Revision: Guid.NewGuid());
+
+        var item = componentType.GetMethod("CreateTableItemFromDraft", InstanceMembers)!
+            .Invoke(component, [draft])!;
+        var requiresUnrestricted = Assert.IsType<bool>(
+            item.GetType().GetProperty("RequiresUnrestricted", InstanceMembers)!.GetValue(item));
+
+        Assert.Equal(expected, requiresUnrestricted);
     }
 }

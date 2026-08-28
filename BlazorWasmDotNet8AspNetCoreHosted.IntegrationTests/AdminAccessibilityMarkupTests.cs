@@ -91,6 +91,56 @@ public sealed class AdminAccessibilityMarkupTests
     }
 
     [Theory]
+    [InlineData(
+        "AdminCourses.razor",
+        "SortedAndFilteredItems",
+        "items",
+        "Поки що немає курсів.",
+        "За вашим пошуком курсів не знайдено.")]
+    [InlineData(
+        "AdminBuildings.razor",
+        "SortedBuildings",
+        "buildings",
+        "Поки що немає корпусів.",
+        "За вашим пошуком корпусів не знайдено.")]
+    [InlineData(
+        "AdminBuildings.razor",
+        "SortedTravels",
+        "travels",
+        "Поки що немає маршрутів між корпусами.",
+        "За вашим пошуком маршрутів не знайдено.")]
+    [InlineData(
+        "AdminGroups.razor",
+        "SortedAndFiltered",
+        "items",
+        "Поки що немає груп.",
+        "За вашим пошуком груп не знайдено.")]
+    [InlineData(
+        "AdminDepartments.razor",
+        "SortedAndFiltered",
+        "items",
+        "Поки що немає кафедр.",
+        "За вашим пошуком кафедр не знайдено.")]
+    public void Admin_reference_tables_distinguish_empty_data_from_no_search_results(
+        string fileName,
+        string filteredCollection,
+        string sourceCollection,
+        string emptyMessage,
+        string noResultsMessage)
+    {
+        var markup = ReadAdminPage(fileName);
+
+        Assert.Contains(
+            $"@if (!loading && !loadFailed && !{filteredCollection}.Any())",
+            markup,
+            StringComparison.Ordinal);
+        Assert.Contains($"@({sourceCollection}.Count == 0", markup, StringComparison.Ordinal);
+        Assert.Contains("class=\"admin-table-empty-state\" role=\"status\"", markup, StringComparison.Ordinal);
+        Assert.Contains(emptyMessage, markup, StringComparison.Ordinal);
+        Assert.Contains(noResultsMessage, markup, StringComparison.Ordinal);
+    }
+
+    [Theory]
     [InlineData("AdminBuildings.razor", 2)]
     [InlineData("AdminRooms.razor", 1)]
     [InlineData("AdminDepartments.razor", 1)]

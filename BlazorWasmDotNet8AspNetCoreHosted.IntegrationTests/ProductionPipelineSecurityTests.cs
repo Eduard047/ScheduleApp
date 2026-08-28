@@ -1,6 +1,5 @@
 using System.Net;
 using System.Net.Http.Json;
-using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure.Seed;
 using Microsoft.AspNetCore.Hosting;
@@ -78,6 +77,7 @@ public sealed class ProductionPipelineSecurityTests
         });
 
         HttpResponseMessage? lastResponse = null;
+        var statuses = new List<HttpStatusCode>();
         try
         {
             for (var attempt = 0; attempt < 5; attempt++)
@@ -89,9 +89,13 @@ public sealed class ProductionPipelineSecurityTests
                 request.Headers.Host = "schedule.example.test";
                 request.Content = JsonContent.Create(new { });
                 lastResponse = await client.SendAsync(request);
+                statuses.Add(lastResponse.StatusCode);
             }
 
             Assert.NotNull(lastResponse);
+            Assert.Equal(
+                Enumerable.Repeat(HttpStatusCode.BadRequest, 4),
+                statuses.Take(4));
             Assert.Equal(HttpStatusCode.TooManyRequests, lastResponse.StatusCode);
             Assert.Equal("application/problem+json", lastResponse.Content.Headers.ContentType?.MediaType);
         }
@@ -114,7 +118,6 @@ public sealed class ProductionPipelineSecurityTests
             {
                 // Для HTTP-контракту не запускаємо фонові служби, що потребують робочої БД.
                 services.RemoveAll<IHostedService>();
-                services.RemoveAll<TeacherDraftsAutogenJobService>();
                 services.RemoveAll<DefaultLessonTypesSeederHostedService>();
             });
         }

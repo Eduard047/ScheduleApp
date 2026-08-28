@@ -383,36 +383,39 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         CancellationToken cancellationToken)
     {
         var normalized = NormalizeJobId(jobId);
-        if (normalized is null
-            || !_runningTasks.TryGetValue(normalized, out var runningTask))
+        if (normalized is null)
         {
             return;
         }
 
-        if (!_jobs.TryGetValue(normalized, out var job)
-            || !PartitionMatches(job.ClientPartitionKey, requiredClientPartitionKey)
-            || !IsTerminalState(job.ToDto().State))
+        if (_runningTasks.TryGetValue(normalized, out var runningTask)
+            && _jobs.TryGetValue(normalized, out var job)
+            && PartitionMatches(job.ClientPartitionKey, requiredClientPartitionKey))
         {
-            if (job is not null
-                && PartitionMatches(job.ClientPartitionKey, requiredClientPartitionKey))
+            if (!IsTerminalState(job.ToDto().State))
             {
                 throw new AutoGenPlanConflictException(
                     "План автогенерації ще формується. Дочекайтеся завершення завдання та повторіть запит.");
             }
-            return;
+
+            try
+            {
+                await runningTask.WaitAsync(
+                    PlanReadPersistenceHandoffTimeout,
+                    cancellationToken);
+                return;
+            }
+            catch (TimeoutException)
+            {
+                throw new AutoGenPlanConflictException(
+                    "Завершення плану ще зберігається. Повторіть запит через кілька секунд.");
+            }
         }
 
-        try
-        {
-            await runningTask.WaitAsync(
-                PlanReadPersistenceHandoffTimeout,
-                cancellationToken);
-        }
-        catch (TimeoutException)
-        {
-            throw new AutoGenPlanConflictException(
-                "Завершення плану ще зберігається. Повторіть запит через кілька секунд.");
-        }
+        await ThrowIfPersistedJobIsStillRunningAsync(
+            normalized,
+            requiredClientPartitionKey,
+            cancellationToken);
     }
 
     internal async Task<AutoGenPlanDetailsDto> GetPlanPageAsync(
@@ -659,12 +662,40 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         string? requiredClientPartitionKey,
         CancellationToken cancellationToken)
     {
-        if (_runningTasks.TryGetValue(jobId, out var runningTask)
+        var normalized = NormalizeJobId(jobId);
+        if (normalized is null)
+        {
+            return;
+        }
+        if (_runningTasks.TryGetValue(normalized, out var runningTask)
             && (requiredClientPartitionKey is null
-                || _jobs.TryGetValue(jobId, out var job)
+                || _jobs.TryGetValue(normalized, out var job)
                 && PartitionMatches(job.ClientPartitionKey, requiredClientPartitionKey)))
         {
             await runningTask.WaitAsync(cancellationToken);
+        }
+        await ThrowIfPersistedJobIsStillRunningAsync(
+            normalized,
+            requiredClientPartitionKey,
+            cancellationToken);
+    }
+
+    private async Task ThrowIfPersistedJobIsStillRunningAsync(
+        string jobId,
+        string? requiredClientPartitionKey,
+        CancellationToken cancellationToken)
+    {
+        // Авторитетне читання також переводить задачу з простроченим lease у Failed.
+        // Без цього віддалений екземпляр міг нескінченно повертати 409 після загибелі власника.
+        var persistedStatus = await ReadPersistedStatusAsync(
+            jobId,
+            requiredClientPartitionKey,
+            cancellationToken);
+        if (persistedStatus is not null
+            && !IsTerminalState(persistedStatus.State))
+        {
+            throw new AutoGenPlanConflictException(
+                "План автогенерації ще формується. Дочекайтеся завершення завдання та повторіть запит.");
         }
     }
 

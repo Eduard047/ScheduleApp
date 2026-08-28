@@ -5,6 +5,7 @@ using BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Admin;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
@@ -1050,13 +1051,58 @@ public sealed class TeacherDraftBatchAtomicityTests
         await fixture.Db.SaveChangesAsync();
         var controller = CreateController(fixture.Db);
 
-        var result = await controller.ClearWeek(new ClearWeekRequest(Monday, GroupId: model.GroupId));
+        var result = await controller.ClearWeek(new ClearWeekRequest(
+            Monday,
+            GroupId: model.GroupId,
+            ExpectedScopeRevision: await GetDraftScopeRevisionAsync(fixture.Db, model.GroupId)));
 
         var response = Assert.IsType<OkObjectResult>(result.Result);
         Assert.Equal(1, Assert.IsType<ClearWeekResult>(response.Value).Deleted);
         var remaining = await fixture.Db.TeacherDraftItems.AsNoTracking().SingleAsync();
         Assert.Equal(model.FirstDraftId, remaining.Id);
         Assert.Equal(DraftStatus.Published, remaining.Status);
+    }
+
+    [Fact]
+    public async Task ClearWeek_rejects_stale_scope_without_deleting_newer_draft_state()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedAsync(secondDraftLocked: false);
+        var staleRevision = await GetDraftScopeRevisionAsync(fixture.Db, model.GroupId);
+        var changed = await fixture.Db.TeacherDraftItems
+            .SingleAsync(item => item.Id == model.FirstDraftId);
+        changed.ValidationWarnings = "Зміна з іншої вкладки";
+        await fixture.Db.SaveChangesAsync();
+        var controller = CreateController(fixture.Db);
+
+        var result = await controller.ClearWeek(new ClearWeekRequest(
+            Monday,
+            GroupId: model.GroupId,
+            ExpectedScopeRevision: staleRevision));
+
+        Assert.IsType<ConflictObjectResult>(result.Result);
+        fixture.Db.ChangeTracker.Clear();
+        Assert.Equal(2, await fixture.Db.TeacherDraftItems.AsNoTracking().CountAsync());
+        Assert.Equal(
+            "Зміна з іншої вкладки",
+            await fixture.Db.TeacherDraftItems
+                .Where(item => item.Id == model.FirstDraftId)
+                .Select(item => item.ValidationWarnings)
+                .SingleAsync());
+    }
+
+    [Fact]
+    public async Task ClearWeek_requires_scope_revision_before_deleting_drafts()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var model = await fixture.SeedAsync(secondDraftLocked: false);
+
+        var result = await CreateController(fixture.Db).ClearWeek(
+            new ClearWeekRequest(Monday, GroupId: model.GroupId));
+
+        var problem = Assert.IsType<ObjectResult>(result.Result);
+        Assert.Equal(StatusCodes.Status428PreconditionRequired, problem.StatusCode);
+        Assert.Equal(2, await fixture.Db.TeacherDraftItems.AsNoTracking().CountAsync());
     }
 
     [Fact]
@@ -1081,7 +1127,10 @@ public sealed class TeacherDraftBatchAtomicityTests
         var createResponse = Assert.IsType<OkObjectResult>(createResult.Result);
         var created = Assert.IsType<TeacherDraftBatchUpsertResult>(createResponse.Value);
 
-        var result = await controller.ClearWeek(new ClearWeekRequest(Monday, GroupId: model.GroupId));
+        var result = await controller.ClearWeek(new ClearWeekRequest(
+            Monday,
+            GroupId: model.GroupId,
+            ExpectedScopeRevision: await GetDraftScopeRevisionAsync(fixture.Db, model.GroupId)));
 
         var response = Assert.IsType<OkObjectResult>(result.Result);
         Assert.Equal(2, Assert.IsType<ClearWeekResult>(response.Value).Deleted);
@@ -1130,7 +1179,10 @@ public sealed class TeacherDraftBatchAtomicityTests
         publishedSibling.Status = DraftStatus.Published;
         await fixture.Db.SaveChangesAsync();
 
-        var result = await controller.ClearWeek(new ClearWeekRequest(Monday, GroupId: model.GroupId));
+        var result = await controller.ClearWeek(new ClearWeekRequest(
+            Monday,
+            GroupId: model.GroupId,
+            ExpectedScopeRevision: await GetDraftScopeRevisionAsync(fixture.Db, model.GroupId)));
 
         var conflict = Assert.IsType<ConflictObjectResult>(result.Result);
         Assert.Contains("змішані статуси", conflict.Value?.ToString(), StringComparison.OrdinalIgnoreCase);
@@ -1247,6 +1299,19 @@ public sealed class TeacherDraftBatchAtomicityTests
             autogenService: null!,
             autogenJobService: null!,
             publishService: null!);
+
+    private static async Task<Guid> GetDraftScopeRevisionAsync(AppDbContext db, int groupId)
+    {
+        var rows = await db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => item.Date >= Monday
+                           && item.Date < Monday.AddDays(7)
+                           && item.GroupId == groupId)
+            .Select(item => new { item.Id, item.Revision })
+            .ToListAsync();
+        return LogicalRevisionToken.Combine(rows.Select(item =>
+            new KeyValuePair<int, Guid>(item.Id, item.Revision)));
+    }
 
     private static int BatchFailureItemIndex(ObjectResult failure)
     {

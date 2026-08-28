@@ -43,7 +43,10 @@ public sealed class AdminModuleSequenceController(AppDbContext db) : ControllerB
             .Where(x => x.CourseId == courseId)
             .Select(x => x.ModuleId)
             .ToListAsync();
-        return new ModuleSequenceConfigDto(courseId, main, fillers);
+        var revision = ModuleSequenceRevisionToken.Create(
+            main.Select(item => new ModuleSequenceSaveItemDto(item.ModuleId, item.GroupOrder)),
+            fillers);
+        return new ModuleSequenceConfigDto(courseId, main, fillers, revision);
     }
     [HttpPost("save")]
     [RequestSizeLimit(131_072)]
@@ -65,6 +68,13 @@ public sealed class AdminModuleSequenceController(AppDbContext db) : ControllerB
             {
                 message = $"Послідовність може містити не більше {CurriculumInputLimits.ModuleAssociationCountMax} основних і {CurriculumInputLimits.ModuleAssociationCountMax} заповнювальних модулів."
             });
+        }
+        if (dto.ExpectedRevision is not Guid expectedRevision)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status428PreconditionRequired,
+                title: "Потрібна версія послідовності",
+                detail: "Оновіть конфігурацію модулів перед збереженням.");
         }
 
         var orderedMain = new List<ModuleSequenceSaveItemDto>(dto.MainModules.Count);
@@ -123,6 +133,25 @@ public sealed class AdminModuleSequenceController(AppDbContext db) : ControllerB
         if (moduleIds.Count != requestedModuleIds.Count)
         {
             return BadRequest(new { message = "Є модулі, що не належать до вибраного курсу." });
+        }
+        var currentMain = await db.ModuleSequenceItems
+            .AsNoTracking()
+            .Where(x => x.CourseId == dto.CourseId)
+            .OrderBy(x => x.Order)
+            .Select(x => new ModuleSequenceSaveItemDto(x.ModuleId, x.GroupOrder))
+            .ToListAsync(cancellationToken);
+        var currentFillers = await db.ModuleFillers
+            .AsNoTracking()
+            .Where(x => x.CourseId == dto.CourseId)
+            .Select(x => x.ModuleId)
+            .ToListAsync(cancellationToken);
+        var currentRevision = ModuleSequenceRevisionToken.Create(currentMain, currentFillers);
+        if (currentRevision != expectedRevision)
+        {
+            return Conflict(new
+            {
+                message = "Послідовність модулів змінилася після завантаження. Оновіть сторінку та повторіть зміни."
+            });
         }
         await db.ModuleSequenceItems
             .Where(x => x.CourseId == dto.CourseId)

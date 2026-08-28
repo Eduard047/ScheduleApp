@@ -778,6 +778,14 @@ else
         {
             <div class="alert alert-danger mt-3" role="alert">@error</div>
         }
+        @if (!string.IsNullOrWhiteSpace(_localLogWarning))
+        {
+            <div class="alert alert-warning mt-3" role="status">@_localLogWarning</div>
+        }
+        @if (!string.IsNullOrWhiteSpace(_activeAutoGenStorageWarning))
+        {
+            <div class="alert alert-warning mt-3" role="alert">@_activeAutoGenStorageWarning</div>
+        }
         <div class="schedule-table-header mt-4 pt-3 border-top">
             <div>
                 <h2 class="h6 mb-1">Таблиця тижня</h2>
@@ -1085,6 +1093,8 @@ else
     private string? _roomCatalogError;
     private string? ok;
     private string? error;
+    private string? _localLogWarning;
+    private string? _activeAutoGenStorageWarning;
     private List<string> okWarnings = new();
     private List<AutoGenWarningDetail> _latestWarningDetails = new();
     private bool okWarningsExpanded;
@@ -1332,7 +1342,7 @@ else
         if (!string.Equals(GetQueryContextKey(), queryContextKey, StringComparison.Ordinal))
         {
             _queryContextApplyPending = true;
-            _ = InvokeAsync(ApplyPendingQueryContextAsync);
+            QueuePendingQueryContextApply();
             return;
         }
         _queryContextApplyPending = false;
@@ -1515,7 +1525,26 @@ else
         _autoGenActionStarting = false;
         if (_queryContextApplyPending)
         {
-            _ = InvokeAsync(ApplyPendingQueryContextAsync);
+            QueuePendingQueryContextApply();
+        }
+    }
+    private void QueuePendingQueryContextApply()
+        => _ = InvokeAsync(ApplyPendingQueryContextSafelyAsync);
+
+    private async Task ApplyPendingQueryContextSafelyAsync()
+    {
+        try
+        {
+            await ApplyPendingQueryContextAsync();
+        }
+        catch (OperationCanceledException) when (_componentLifetimeCts.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _queryContextApplyPending = true;
+            _weekContextLoadError = $"Не вдалося застосувати новий контекст сторінки: {ex.Message}";
+            StateHasChanged();
         }
     }
     private async Task ApplyPendingQueryContextAsync()
@@ -2961,38 +2990,121 @@ else
     private ValueTask RemoveStorageAsync(string key, bool useLocal)
         => JS.InvokeVoidAsync(useLocal ? "localStorage.removeItem" : "sessionStorage.removeItem", key);
     // Зберігає активну задачу разом із курсом, щоб результат не залежав від іншого останнього вводу.
-    private async Task PersistActiveAutoGenJobIdAsync(
+    private async Task<bool> PersistActiveAutoGenJobIdAsync(
         string jobId,
         int? courseId = null,
         DateOnly? rangeStartDate = null)
     {
         if (string.IsNullOrWhiteSpace(jobId))
         {
-            return;
+            return false;
         }
         try
         {
             var normalizedJobId = jobId.Trim();
-            await SetStorageAsync(ActiveAutoGenJobStorageKey, normalizedJobId, useLocal: true);
-            if (courseId is int persistedCourseId && rangeStartDate is DateOnly persistedRangeStartDate)
+            await PersistActiveAutoGenJobStorageAsync(
+                normalizedJobId,
+                courseId,
+                rangeStartDate,
+                useLocal: true);
+            try
             {
-                var context = new ActiveAutoGenJobContext(
+                // Окрема копія вкладки не дає іншій вкладці втратити відновлення цієї задачі.
+                await PersistActiveAutoGenJobStorageAsync(
                     normalizedJobId,
-                    persistedCourseId,
-                    persistedRangeStartDate);
-                await SetStorageAsync(
-                    ActiveAutoGenJobContextStorageKey,
-                    JsonSerializer.Serialize(context, AutoGenStatusJsonOptions),
-                    useLocal: true);
+                    courseId,
+                    rangeStartDate,
+                    useLocal: false);
+            }
+            catch (JSException)
+            {
+                // localStorage залишається авторитетним спільним сховищем.
+            }
+            return true;
+        }
+        catch (JSException)
+        {
+            try
+            {
+                await RemoveStorageAsync(ActiveAutoGenJobStorageKey, useLocal: true);
+                await RemoveStorageAsync(ActiveAutoGenJobContextStorageKey, useLocal: true);
+            }
+            catch (JSException)
+            {
+            }
+            return false;
+        }
+    }
+    private async Task PersistActiveAutoGenJobStorageAsync(
+        string normalizedJobId,
+        int? courseId,
+        DateOnly? rangeStartDate,
+        bool useLocal)
+    {
+        await SetStorageAsync(ActiveAutoGenJobStorageKey, normalizedJobId, useLocal);
+        if (courseId is int persistedCourseId && rangeStartDate is DateOnly persistedRangeStartDate)
+        {
+            var context = new ActiveAutoGenJobContext(
+                normalizedJobId,
+                persistedCourseId,
+                persistedRangeStartDate);
+            await SetStorageAsync(
+                ActiveAutoGenJobContextStorageKey,
+                JsonSerializer.Serialize(context, AutoGenStatusJsonOptions),
+                useLocal);
+        }
+    }
+    // Після відповіді сервера відновлює запис, який інша вкладка могла прибрати під час короткого 404 до реєстрації задачі.
+    // Новіший ідентифікатор іншої вкладки не перезаписується.
+    private async Task<bool> ConfirmActiveAutoGenJobPersistenceAsync(
+        string expectedClientJobId,
+        string confirmedJobId,
+        int courseId,
+        DateOnly rangeStartDate)
+    {
+        if (string.IsNullOrWhiteSpace(expectedClientJobId)
+            || string.IsNullOrWhiteSpace(confirmedJobId))
+        {
+            return false;
+        }
+        try
+        {
+            var current = (await ReadStorageAsync(ActiveAutoGenJobStorageKey, useLocal: true))?.Trim();
+            if (!string.IsNullOrWhiteSpace(current)
+                && !string.Equals(current, expectedClientJobId, StringComparison.Ordinal)
+                && !string.Equals(current, confirmedJobId, StringComparison.Ordinal))
+            {
+                await PersistActiveAutoGenJobStorageAsync(
+                    confirmedJobId.Trim(),
+                    courseId,
+                    rangeStartDate,
+                    useLocal: false);
+                return true;
+            }
+            return await PersistActiveAutoGenJobIdAsync(
+                confirmedJobId,
+                courseId,
+                rangeStartDate);
+        }
+        catch (JSException)
+        {
+            return false;
+        }
+    }
+    // Читає валідний ідентифікатор спочатку для поточної вкладки, потім зі спільного сховища.
+    private async Task<string?> ReadActiveAutoGenJobIdAsync()
+    {
+        try
+        {
+            var value = (await ReadStorageAsync(ActiveAutoGenJobStorageKey, useLocal: false))?.Trim();
+            if (Guid.TryParseExact(value, "N", out _))
+            {
+                return value;
             }
         }
         catch (JSException)
         {
         }
-    }
-    // Читає з localStorage лише валідний ідентифікатор задачі.
-    private async Task<string?> ReadActiveAutoGenJobIdAsync()
-    {
         try
         {
             var value = (await ReadStorageAsync(ActiveAutoGenJobStorageKey, useLocal: true))?.Trim();
@@ -3008,18 +3120,23 @@ else
     {
         try
         {
-            var stored = await ReadStorageAsync(ActiveAutoGenJobContextStorageKey, useLocal: true);
-            if (string.IsNullOrWhiteSpace(stored))
+            var stored = await ReadStorageAsync(ActiveAutoGenJobContextStorageKey, useLocal: false);
+            var context = DeserializeActiveAutoGenJobContext(stored, expectedJobId);
+            if (context is not null)
             {
-                return null;
+                return context;
             }
-            var context = JsonSerializer.Deserialize<ActiveAutoGenJobContext>(
-                stored,
-                AutoGenStatusJsonOptions);
-            return context is not null
-                   && string.Equals(context.JobId, expectedJobId, StringComparison.Ordinal)
-                ? context
-                : null;
+        }
+        catch (JSException)
+        {
+        }
+        catch (JsonException)
+        {
+        }
+        try
+        {
+            var stored = await ReadStorageAsync(ActiveAutoGenJobContextStorageKey, useLocal: true);
+            return DeserializeActiveAutoGenJobContext(stored, expectedJobId);
         }
         catch (JSException)
         {
@@ -3030,12 +3147,40 @@ else
             return null;
         }
     }
+    private static ActiveAutoGenJobContext? DeserializeActiveAutoGenJobContext(
+        string? stored,
+        string expectedJobId)
+    {
+        if (string.IsNullOrWhiteSpace(stored))
+        {
+            return null;
+        }
+        var context = JsonSerializer.Deserialize<ActiveAutoGenJobContext>(
+            stored,
+            AutoGenStatusJsonOptions);
+        return context is not null
+               && string.Equals(context.JobId, expectedJobId, StringComparison.Ordinal)
+            ? context
+            : null;
+    }
     // Видаляє активний ідентифікатор, не зачіпаючи новішу задачу з іншої вкладки.
     private async Task RemoveActiveAutoGenJobIdAsync(string? expectedJobId = null)
     {
         if (string.IsNullOrWhiteSpace(expectedJobId))
         {
             return;
+        }
+        try
+        {
+            var currentSession = (await ReadStorageAsync(ActiveAutoGenJobStorageKey, useLocal: false))?.Trim();
+            if (string.Equals(currentSession, expectedJobId, StringComparison.Ordinal))
+            {
+                await RemoveStorageAsync(ActiveAutoGenJobStorageKey, useLocal: false);
+                await RemoveStorageAsync(ActiveAutoGenJobContextStorageKey, useLocal: false);
+            }
+        }
+        catch (JSException)
+        {
         }
         try
         {
@@ -3890,7 +4035,11 @@ else
             ClientJobId: clientJobId,
             PreviewOnly: previewOnly
         );
-        await PersistActiveAutoGenJobIdAsync(clientJobId, courseId, fromDate);
+        if (!await PersistActiveAutoGenJobIdAsync(clientJobId, courseId, fromDate))
+        {
+            throw new InvalidOperationException(
+                "Не вдалося зберегти ідентифікатор задачі у браузері. Автогенерацію не запущено, щоб після оновлення сторінки не втратити її прогрес і можливість скасування.");
+        }
         AutoGenJobStatus status;
         try
         {
@@ -3920,11 +4069,24 @@ else
             await RemoveActiveAutoGenJobIdAsync(clientJobId);
             throw;
         }
-        await PersistActiveAutoGenJobIdAsync(status.JobId, courseId, fromDate);
+        if (await ConfirmActiveAutoGenJobPersistenceAsync(
+                clientJobId,
+                status.JobId,
+                courseId,
+                fromDate))
+        {
+            _activeAutoGenStorageWarning = null;
+        }
+        else
+        {
+            _activeAutoGenStorageWarning =
+                "Сервер запустив автогенерацію, але браузер не зміг зберегти її ідентифікатор. Не оновлюйте й не закривайте цю сторінку до завершення задачі.";
+        }
         ApplyAutoGenJobStatus(status);
         await InvokeAsync(StateHasChanged);
         status = await WaitForAutoGenJobTerminalAsync(status);
         await RemoveActiveAutoGenJobIdAsync(status.JobId);
+        _activeAutoGenStorageWarning = null;
         return (BuildAutoGenJobResult(status), fromDate, toDate, weekStarts.Count, status);
     }
     // Створює точний план без змін у БД, щоб користувач окремо переглянув деталі та попередження.
@@ -4339,11 +4501,16 @@ else
                 monday,
                 sunday,
                 AutoGenProgressKind.ClearDrafts);
+            var courseGroupIds = GetGroupIdsForCourse(courseId);
             var deleted = await Drafts.ClearWeek(new ClearWeekRequest(
                 WeekStart: monday,
-                CourseId: courseId
+                CourseId: courseId,
+                ExpectedScopeRevision: LogicalRevisionToken.Combine(draftItems
+                    .Where(item => item.Date >= monday
+                                   && item.Date < monday.AddDays(7)
+                                   && courseGroupIds.Contains(item.GroupId))
+                    .Select(item => new KeyValuePair<int, Guid>(item.Id, item.Revision)))
             ));
-            var courseGroupIds = GetGroupIdsForCourse(courseId);
             var rangeRefreshWarning = await RemoveItemsFromStateAsync(
                 TableItemSource.Draft,
                 item => !item.IsLocked && courseGroupIds.Contains(item.GroupId));
@@ -4394,11 +4561,16 @@ else
                 monday,
                 sunday,
                 AutoGenProgressKind.ClearSchedule);
+            var courseGroupIds = GetGroupIdsForCourse(courseId);
             var deleted = await Api.ClearWeek(new ClearWeekRequest(
                 WeekStart: monday,
-                CourseId: courseId
+                CourseId: courseId,
+                ExpectedScopeRevision: LogicalRevisionToken.Combine(publishedItems
+                    .Where(item => item.Date >= monday
+                                   && item.Date < monday.AddDays(7)
+                                   && courseGroupIds.Contains(item.GroupId))
+                    .Select(item => new KeyValuePair<int, Guid>(item.Id, item.Revision)))
             ));
-            var courseGroupIds = GetGroupIdsForCourse(courseId);
             var rangeRefreshWarning = await RemoveItemsFromStateAsync(
                 TableItemSource.Published,
                 item => !item.IsLocked && courseGroupIds.Contains(item.GroupId));
@@ -4898,9 +5070,11 @@ else
         try
         {
             await LogService.AddAsync(entry);
+            _localLogWarning = null;
         }
         catch (Exception)
         {
+            _localLogWarning = "Зміну застосовано, але локальний журнал не вдалося зберегти у цьому браузері.";
         }
     }
     private List<AdminScheduleLogLesson> BuildDraftLessonSnapshot(out bool trimmed)
@@ -4998,9 +5172,11 @@ else
         var confirmText = current.Source == TableItemSource.Draft
             ? $"Видалити чернетку #{current.Id}? Дію не можна скасувати."
             : $"Видалити запис розкладу #{current.Id}? Дію не можна скасувати.";
-        if (current.Source == TableItemSource.Draft && current.IsLocked)
+        if (current.Source == TableItemSource.Draft && current.RequiresUnrestricted)
         {
-            confirmText = $"Чернетка #{current.Id} заблокована. Видалити її попри блокування?";
+            confirmText = current.IsLocked
+                ? $"Чернетка #{current.Id} заблокована. Видалити її попри блокування?"
+                : $"Чернетка #{current.Id} вже схвалена. Видалити її в режимі без обмежень?";
         }
         var confirmed = await JS.InvokeAsync<bool>("confirm", confirmText);
         if (!confirmed)
@@ -5014,7 +5190,11 @@ else
         {
             if (current.Source == TableItemSource.Draft)
             {
-                await Drafts.Delete(current.Id, current.Revision, confirm: true, unrestricted: current.IsLocked);
+                await Drafts.Delete(
+                    current.Id,
+                    current.Revision,
+                    confirm: true,
+                    unrestricted: current.RequiresUnrestricted);
             }
             else
             {
@@ -5043,7 +5223,7 @@ else
             _editDeleting = false;
             if (_queryContextApplyPending)
             {
-                _ = InvokeAsync(ApplyPendingQueryContextAsync);
+                QueuePendingQueryContextApply();
             }
         }
     }
@@ -5229,7 +5409,8 @@ else
             draft.IsLocked,
             draft.Revision,
             draft.MissingTeacherAssignment,
-            draft.MissingRoomAssignment
+            draft.MissingRoomAssignment,
+            draft.Status
         );
     // Перетворює опублікований запис у рядок таблиці.
     private TableItem CreateTableItemFromPublished(ScheduleItemDto item)
@@ -5434,10 +5615,14 @@ else
         bool IsLocked,
         Guid Revision,
         bool MissingTeacherAssignment = false,
-        bool MissingRoomAssignment = false
+        bool MissingRoomAssignment = false,
+        DraftStatusDto? DraftStatus = null
     )
     {
         public bool NeedsManualAssignment => MissingTeacherAssignment || MissingRoomAssignment;
+        public bool RequiresUnrestricted
+            => Source == TableItemSource.Draft
+               && (IsLocked || DraftStatus != DraftStatusDto.Draft);
         public string MissingAssignmentSummary =>
             MissingTeacherAssignment && MissingRoomAssignment
                 ? "викладача та аудиторію"

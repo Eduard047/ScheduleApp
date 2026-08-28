@@ -914,6 +914,50 @@ public sealed class TeacherDraftsAutogenService
                     }
                 }
 
+                // Legacy-рядки без BatchKey також можуть бути частинами одного заняття.
+                // Очищення має або охопити всю таку подію, або не змінювати її взагалі.
+                foreach (var logicalEvent in scopedRows
+                             .Where(x => string.IsNullOrWhiteSpace(x.BatchKey))
+                             .GroupBy(x => new
+                             {
+                                 x.Date,
+                                 x.StartTime,
+                                 x.EndTime,
+                                 x.GroupId,
+                                 x.ModuleId,
+                                 x.LessonTypeId
+                             })
+                             .Where(group => group
+                                 .Select(x => new { x.ModuleTopicId, x.TeacherId })
+                                 .Distinct()
+                                 .Skip(1)
+                                 .Any()))
+                {
+                    var rows = logicalEvent.ToList();
+                    if (!rows.Any(x => deletionIds.Contains(x.Id)))
+                    {
+                        continue;
+                    }
+                    if (rows.Any(x => x.Status != DraftStatus.Draft || x.IsLocked))
+                    {
+                        if (ownedTransaction is not null)
+                        {
+                            await transaction.RollbackAsync(cancellationToken);
+                        }
+                        return Conflict(new
+                        {
+                            message = "Автогенерація не може частково очистити логічне заняття зі схваленими або заблокованими рядками. Повторно схваліть чи розблокуйте всю подію перед очищенням.",
+                            batchKey = rows[0].BatchKey,
+                            itemIds = rows.Select(x => x.Id).OrderBy(id => id).ToList()
+                        });
+                    }
+
+                    foreach (var row in rows)
+                    {
+                        deletionIds.Add(row.Id);
+                    }
+                }
+
                 if (deletionIds.Count > 0)
                 {
                     await _db.TeacherDraftItems

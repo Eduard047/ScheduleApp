@@ -51,6 +51,18 @@ else
                     </tr>
                 </thead>
                 <tbody>
+                    @if (!loading && !loadFailed && !SortedBuildings.Any())
+                    {
+                        <tr>
+                            <td colspan="4" class="text-muted text-center py-3">
+                                <span class="admin-table-empty-state" role="status">
+                                    @(buildings.Count == 0
+                                        ? "Поки що немає корпусів."
+                                        : "За вашим пошуком корпусів не знайдено.")
+                                </span>
+                            </td>
+                        </tr>
+                    }
                     @foreach (var b in SortedBuildings)
                     {
                         <tr>
@@ -85,6 +97,18 @@ else
                     </tr>
                 </thead>
                 <tbody>
+                    @if (!loading && !loadFailed && !SortedTravels.Any())
+                    {
+                        <tr>
+                            <td colspan="4" class="text-muted text-center py-3">
+                                <span class="admin-table-empty-state" role="status">
+                                    @(travels.Count == 0
+                                        ? "Поки що немає маршрутів між корпусами."
+                                        : "За вашим пошуком маршрутів не знайдено.")
+                                </span>
+                            </td>
+                        </tr>
+                    }
                     @foreach (var t in SortedTravels)
                     {
                         <tr>
