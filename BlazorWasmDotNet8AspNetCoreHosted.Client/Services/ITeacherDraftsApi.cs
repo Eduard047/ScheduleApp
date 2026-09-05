@@ -22,6 +22,10 @@ public interface ITeacherDraftsApi
     Task<AutoGenJobStartResult> StartAutogenJob(
         AutoGenJobRequest req,
         CancellationToken cancellationToken = default);
+    Task<AutoGenCapacityDto> GetAutogenCapacity(AutoGenJobRequest request, CancellationToken cancellationToken = default)
+        => throw new NotSupportedException("Перевірка місткості недоступна.");
+    Task<AutoGenCoverageDto> GetAutogenCoverage(AutoGenJobRequest request, CancellationToken cancellationToken = default)
+        => throw new NotSupportedException("Перевірка повноти недоступна.");
     Task<AutoGenJobStatus> GetAutogenJob(string jobId, CancellationToken cancellationToken = default);
     Task<AutoGenJobStatus> CancelAutogenJob(
         string jobId,

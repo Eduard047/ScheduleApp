@@ -35,6 +35,18 @@ public sealed class TeacherDraftsAutogenService
 
     // Контекст БД для читання довідників та запису чернеток.
     private readonly AppDbContext _db;
+    // Після явної фіксації стану EF знімки не потребують повторного сканування графа для кожного рядка.
+    private sealed class ExplicitDraftTrackingScope(AppDbContext db) : IDisposable
+    {
+        private readonly bool _previous = Suspend(db);
+        private static bool Suspend(AppDbContext db)
+        {
+            var previous = db.ChangeTracker.AutoDetectChangesEnabled;
+            db.ChangeTracker.AutoDetectChangesEnabled = false;
+            return previous;
+        }
+        public void Dispose() => db.ChangeTracker.AutoDetectChangesEnabled = _previous;
+    }
     public TeacherDraftsAutogenService(AppDbContext db)
     {
         // Зберігаємо залежність для подальших запитів.
@@ -2193,9 +2205,17 @@ public sealed class TeacherDraftsAutogenService
                         .Select(property => property.Metadata.Name)
                         .ToHashSet(StringComparer.Ordinal));
             }
+            Dictionary<TeacherDraftItem, MovableDraftTrialState> CaptureAllMovableDraftTrialStates()
+            {
+                // Прямі зміни полів мають потрапити до знімка разом зі станом відстеження.
+                _db.ChangeTracker.DetectChanges();
+                using var trackingScope = new ExplicitDraftTrackingScope(_db);
+                return movableDrafts.Distinct().ToDictionary(draft => draft, CaptureMovableDraftTrialState);
+            }
             // Повертає чернетку до стану перед пробним проходом без втрати стану відстеження EF.
             void RestoreMovableDraftTrialState(TeacherDraftItem draft, MovableDraftTrialState snapshot)
             {
+                using var restoreScope = new ExplicitDraftTrackingScope(_db);
                 var entry = _db.Entry(draft);
                 if (snapshot.EntityState is not EntityState.Added and not EntityState.Detached)
                 {
@@ -3870,6 +3890,10 @@ public sealed class TeacherDraftsAutogenService
             List<AutoGenPreflightItem> BuildAutoGenPreflight()
             {
                 var items = new List<AutoGenPreflightItem>();
+                var jointTeacherDemands = new List<ResourceTimeDemand>();
+                var jointTeacherSlots = new Dictionary<(int TeacherId, DateOnly Date, TimeOnly Start, TimeOnly End), int>();
+                var jointEdges = 0;
+                var jointDomainsComplete = true;
                 void AddItem(string code, string title, int count, string recommendation, string example)
                 {
                     items.Add(new AutoGenPreflightItem(
@@ -4162,6 +4186,52 @@ public sealed class TeacherDraftsAutogenService
                     }
                 }
 
+                // Окремі модулі можуть бачити той самий вільний час одного викладача.
+                // Для незалежних занять перевіряємо спільний попит, не множачи місткість потоку.
+                if (r.ClearExisting && remainingByGroupModule.Count <= 200)
+                {
+                    foreach (var entry in remainingByGroupModule.Where(entry => entry.Value > 0)
+                                 .OrderBy(entry => entry.Key.GroupId).ThenBy(entry => entry.Key.ModuleId))
+                    {
+                        if (!selectedGroupsById.TryGetValue(entry.Key.GroupId, out var demandGroup)
+                            || !topicsByModule.TryGetValue(entry.Key.ModuleId, out var demandTopics)
+                            || demandTopics.Count == 0
+                            || demandTopics.Any(topic => !typeById.TryGetValue(topic.LessonTypeId, out var type)
+                                || !type.RequiresTeacher || !type.BlocksTeacher || CanShareAcrossGroups(type.Id) || topic.SelfStudyHours > 0)) continue;
+                        var domain = new HashSet<int>();
+                        var teacherPool = teachersForModule.Where(link => link.ModuleId == entry.Key.ModuleId)
+                            .Select(link => link.TeacherId).Distinct().OrderBy(id => id).ToList();
+                        foreach (var candidateDate in rangeDates.Where(candidateDate => IsWorking(candidateDate, demandGroup)))
+                        {
+                            foreach (var slot in SharedSlotsForDate(demandGroup.CourseId, candidateDate))
+                            {
+                                if (HasGroupOverlap(demandGroup.Id, candidateDate, slot.Start, slot.End)) continue;
+                                foreach (var teacherId in teacherPool)
+                                {
+                                    if (!TeacherFitsWorkingHours(teacherId, candidateDate, slot.Start, slot.End)
+                                        || HasTeacherOverlap(teacherId, demandTopics[0].LessonTypeId, candidateDate, slot.Start, slot.End)) continue;
+                                    var key = (teacherId, candidateDate, slot.Start, slot.End);
+                                    if (!jointTeacherSlots.TryGetValue(key, out var resourceId))
+                                        jointTeacherSlots[key] = resourceId = jointTeacherSlots.Count;
+                                    if (domain.Add(resourceId)) jointEdges++;
+                                    if (jointEdges > 250_000) { jointDomainsComplete = false; break; }
+                                }
+                                if (!jointDomainsComplete) break;
+                            }
+                            if (!jointDomainsComplete) break;
+                        }
+                        if (!jointDomainsComplete) break;
+                        jointTeacherDemands.Add(new ResourceTimeDemand(entry.Value, domain));
+                    }
+                    if (jointDomainsComplete && jointTeacherDemands.Count > 1)
+                    {
+                        var capacity = ResourceDemandCapacityAnalyzer.Analyze(jointTeacherDemands, cancellationToken);
+                        if (capacity.ProvenShortfall is > 0)
+                            AddItem("shared-teacher-capacity", "Групи потребують той самий час викладачів", capacity.ProvenShortfall.Value,
+                                "Додайте доступних викладачів або навчальний час: вільні години спільних викладачів не можна одночасно використати для незалежних занять різних груп чи модулів.",
+                                $"Для незалежних занять потрібно {capacity.Required} викладацьких слотів; спільна місткість — щонайбільше {capacity.Matched}.");
+                    }
+                }
                 return MergeAutoGenPreflight(items);
             }
 
@@ -5925,6 +5995,29 @@ public sealed class TeacherDraftsAutogenService
                 return Math.Max(0, placed - RemoveUnsafeSharedLectureBoundaries());
             }
 
+            // Завершений діапазон не потребує повторного перебору і перестановок під час Fill.
+            // Незалежна перевірка не дозволяє цій оптимізації приховати неповні чи некоректні заняття.
+            if (!r.ClearExisting && hasRequestedModuleHourOverrides
+                && remainingByGroupModule.Values.All(value => value <= 0))
+            {
+                var existingCoverage = await new TeacherDraftsAutogenCoverageService(_db).MeasureAsync(
+                    selectedGroupsById.Keys.ToArray(), rangeStartDate, rangeEndDate, r.Days, r.ModuleHours, false, cancellationToken);
+                if (existingCoverage.MissingLessons == 0 && existingCoverage.OverplannedLessons == 0
+                    && existingCoverage.IncompleteLessons == 0)
+                {
+                    var errors = new List<string>();
+                    foreach (var courseGroups in selectedGroupsByCourse)
+                    {
+                        var validation = await new TeacherDraftsAutogenHardRuleValidator(_db).ValidateAsync(
+                            new TeacherDraftsAutogenHardRuleValidationRequest(courseGroups.Key,
+                                courseGroups.Value.Select(group => group.Id).ToList(), rangeStartDate, rangeEndDate, r.Days,
+                                MaxParallelGroupsPerModuleInSlot: maxParallelGroupsPerModuleInSlot), cancellationToken);
+                        errors.AddRange(validation.Violations);
+                    }
+                    if (errors.Count == 0)
+                        return Ok(new AutoGenResult(0, 0, new(), new(), new(), new(), Coverage: existingCoverage));
+                }
+            }
             var preflightItems = BuildAutoGenPreflight();
             if (preflightItems.Count > 0)
             {
@@ -11871,9 +11964,8 @@ public sealed class TeacherDraftsAutogenService
                                 return false;
                             }
 
-                            const int maxDepth = 3;
                             const int beamWidth = 10;
-                            const int trialLimit = 120;
+                            var trialLimit = 120;
                             var gapCountBefore = CountDayGaps();
                             var trialCount = 0;
                             var movedDrafts = new HashSet<TeacherDraftItem>();
@@ -11930,7 +12022,8 @@ public sealed class TeacherDraftsAutogenService
 
                                 foreach (var candidateEntry in candidates)
                                 {
-                                    if (trialCount++ >= trialLimit)
+                                    cancellationToken.ThrowIfCancellationRequested();
+                                    if (trialCount++ >= trialLimit || !wholeOperationSearchBudget.TryVisitNode())
                                     {
                                         break;
                                     }
@@ -12001,9 +12094,22 @@ public sealed class TeacherDraftsAutogenService
                                 return false;
                             }
 
-                            return await TryRepairGapByMoveChainAsync(targetGap, maxDepth)
-                                   || await TryTargetedRepairGapAsync(targetGap)
-                                   || await TryReleaseExternalBlockerAndFillGapAsync(targetGap);
+                            if (await TryRepairGapByMoveChainAsync(targetGap, 3)
+                                || await TryTargetedRepairGapAsync(targetGap)
+                                || await TryReleaseExternalBlockerAndFillGapAsync(targetGap)) return true;
+
+                            // Розширюємо пошук лише для невирішеного вузла; усі глибини ділять загальний бюджет.
+                            // Порядок кандидатів і межі залишаються детермінованими.
+                            for (var depth = 4; depth <= Math.Min(8, slots.Count); depth++)
+                            {
+                                trialLimit = Math.Min(4_000, trialLimit * 2);
+                                if (!wholeOperationSearchBudget.CanStartSearch()) break;
+                                if (await TryRepairGapByMoveChainAsync(targetGap, depth)) return true;
+                            }
+                            if (wholeOperationSearchBudget.SearchLimitReached)
+                                RecordSearchLimit(grp.Id, date, "move-chain", wholeOperationSearchBudget.VisitedNodes,
+                                    wholeOperationSearchBudget.MaxNodes, wholeOperationSearchBudget.EmergencyLimitReached);
+                            return false;
                         }
                         bool TryRepairLectureOrder()
                         {
@@ -17236,12 +17342,10 @@ public sealed class TeacherDraftsAutogenService
                             // Частина локальних оптимізаторів змінює поля сутності напряму.
                             // Перед знімком фіксуємо ці зміни у ChangeTracker, щоб відновлення
                             // не перетворило реальне перенесення на стан Unchanged.
-                            _db.ChangeTracker.DetectChanges();
+                            var draftSnapshot = CaptureAllMovableDraftTrialStates();
                             return new(
                                 allCreatedDrafts.ToHashSet(),
-                                movableDrafts
-                                    .Distinct()
-                                    .ToDictionary(draft => draft, CaptureMovableDraftTrialState),
+                                draftSnapshot,
                                 busy.ToList(),
                                 topicOrderSlots.ToList(),
                                 topicAssignments.ToDictionary(
@@ -17692,6 +17796,7 @@ public sealed class TeacherDraftsAutogenService
                         var bestGapCount = int.MaxValue;
                         var bestFilledSlots = -1;
                         var bestRemainingNeed = int.MaxValue;
+                        var retainedCompleteSingleModulePass = false;
                         foreach (var passMode in passModes)
                         {
                             // Пробні проходи не витрачають спільний бюджет пошуку: після відновлення стану
@@ -17715,6 +17820,16 @@ public sealed class TeacherDraftsAutogenService
                                 bestFilledSlots = filledSlots;
                                 bestRemainingNeed = remainingNeed;
                             }
+                            // Для одного модуля повний день без неповних призначень уже не потребує
+                            // перебору порядку модулів і повторного створення тих самих пар.
+                            // Спільна фінальна оптимізація та перевірка з відкотом залишаються нижче.
+                            if (orderedModulesForDay.Count == 1 && bestMode == passMode
+                                && gapCount == 0 && filledSlots >= maxPerDay
+                                && incompleteDraftsCreated == trialSnapshot.IncompleteDraftCount)
+                            {
+                                retainedCompleteSingleModulePass = true;
+                                break;
+                            }
                             RestoreTrialState(trialSnapshot);
                             if (bestGapCount == 0 && bestScore > 0)
                             {
@@ -17722,7 +17837,15 @@ public sealed class TeacherDraftsAutogenService
                             }
                         }
 
-                        await RunDayGenerationPassAsync(bestMode, enableBoundedSearch: true);
+                        if (retainedCompleteSingleModulePass)
+                        {
+                            boundedSearchEnabledForCurrentPass = true;
+                            await RunFinalGapOptimizationAsync();
+                        }
+                        else
+                        {
+                            await RunDayGenerationPassAsync(bestMode, enableBoundedSearch: true);
+                        }
                         if (bestMode != 0)
                         {
                             warnings.Add($"[{date:yyyy-MM-dd}] {grp.Name}: оптимізатор перебудував день зі стратегією #{bestMode}, щоб зменшити прогалини та дефіцит модулів.");
@@ -20186,9 +20309,7 @@ public sealed class TeacherDraftsAutogenService
                     .ToDictionary(group => group.Key, group => group.Count());
 
             var rotationIncompleteBefore = CountRequiredIncompleteDraftsByDate();
-            var rotationDraftSnapshot = movableDrafts
-                .Distinct()
-                .ToDictionary(draft => draft, CaptureMovableDraftTrialState);
+            var rotationDraftSnapshot = CaptureAllMovableDraftTrialStates();
             var rotationBusySnapshot = busy.ToList();
             var rotationTopicOrderSnapshot = topicOrderSlots.ToList();
             var rotationRoomUsageSnapshot = roomUsageByGroup.ToDictionary(
@@ -20830,6 +20951,10 @@ public sealed class TeacherDraftsAutogenService
                 warnings.Add("Зміни автогенерації повністю відкочено, тому жодної нової чернетки не збережено.");
                 return BadRequest(new AutoGenResult(0, skipped, warnings, gapDetails, BuildAutoGenGapSummary(gapDetails), preflightItems));
             }
+            var coverage = await new TeacherDraftsAutogenCoverageService(_db).MeasureAsync(
+                selectedGroupsById.Keys.ToArray(), rangeStartDate, rangeEndDate, r.Days,
+                r.ModuleHours, wholeOperationSearchBudget.SearchLimitReached || searchLimitedGroupDates.Count > 0,
+                cancellationToken);
             if (r.PreflightOnly)
             {
                 warnings.Add("Пробну генерацію завершено без збереження чернеток.");
@@ -20841,7 +20966,7 @@ public sealed class TeacherDraftsAutogenService
                 {
                     await _db.SaveChangesAsync(cancellationToken);
                 }
-                return Ok(new AutoGenResult(0, skipped, warnings, gapDetails, BuildAutoGenGapSummary(gapDetails), preflightItems));
+                return Ok(new AutoGenResult(0, skipped, warnings, gapDetails, BuildAutoGenGapSummary(gapDetails), preflightItems, Coverage: coverage));
             }
 
             cancellationToken.ThrowIfCancellationRequested();
@@ -20850,7 +20975,7 @@ public sealed class TeacherDraftsAutogenService
             {
                 await transaction.CommitAsync(cancellationToken);
             }
-            return Ok(new AutoGenResult(created, skipped, warnings, gapDetails, BuildAutoGenGapSummary(gapDetails), preflightItems));
+            return Ok(new AutoGenResult(created, skipped, warnings, gapDetails, BuildAutoGenGapSummary(gapDetails), preflightItems, Coverage: coverage));
         }
         finally
         {

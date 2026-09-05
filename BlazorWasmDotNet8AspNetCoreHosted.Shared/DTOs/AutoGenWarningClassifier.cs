@@ -35,6 +35,7 @@ public static class AutoGenWarningCodes
     public const string TopicReused = "topic-reused";
     public const string ResourceUnavailable = "resource-unavailable";
     public const string OptimizationApplied = "optimization-applied";
+    public const string SchedulingChoice = "scheduling-choice";
     public const string Recommendation = "recommendation";
     public const string DiagnosticSummary = "diagnostic-summary";
     public const string IncompleteDrafts = "incomplete-drafts";
@@ -312,11 +313,36 @@ public static class AutoGenWarningClassifier
                 message);
         }
 
+        if (IsRoutineSchedulingChoice(message))
+            return Detail(AutoGenWarningCodes.SchedulingChoice, AutoGenWarningSeverities.Info,
+                AutoGenWarningCategories.Optimization, message);
+
         return Detail(
             AutoGenWarningCodes.General,
             AutoGenWarningSeverities.Warning,
             AutoGenWarningCategories.General,
             message);
+    }
+
+    private static readonly HashSet<string> RoutineSchedulingChoices = new(StringComparer.Ordinal)
+    {
+        "Продовжено суцільний блок модуля",
+        "Дозволено повторення модуля у сусідні дні",
+        "Повтор того ж часу в інші дні",
+        "Повтор тієї самої теми поставлено не суміжним блоком",
+        "Модуль розподілено між слотами для збереження дефіцитного пулу викладачів"
+    };
+
+    private static bool IsRoutineSchedulingChoice(string message)
+    {
+        if (!message.StartsWith('[')) return false;
+        var timestampEnd = message.IndexOf("] ", StringComparison.Ordinal);
+        if (timestampEnd < 0) return false;
+        var groupEnd = message.IndexOf(": ", timestampEnd + 2, StringComparison.Ordinal);
+        if (groupEnd < 0) return false;
+        // Невідома частина повідомлення не може знизити рівень реального попередження.
+        var choices = message[(groupEnd + 2)..].Split(';', StringSplitOptions.TrimEntries);
+        return choices.Length > 0 && choices.All(RoutineSchedulingChoices.Contains);
     }
 
     public static List<AutoGenWarningDetail> ClassifyMany(IEnumerable<string>? warnings)

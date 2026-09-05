@@ -91,10 +91,10 @@ public sealed class TeacherDraftsAutogenPlanService
 {
     public const int DefaultChangePageSize = 200;
     public const int MaxChangePageSize = 250;
-    public const int MaxMutationsPerPlan = 2_000;
+    public const int MaxMutationsPerPlan = AutoGenWorkloadLimits.MaxPlanChanges;
     internal const int MaxScopeRowCount = TeacherDraftsWeekValidationService.MaxAppliedScopeRowCount;
     private const int MaxRetainedPlanCount = 50;
-    private const int MaxRetainedMutationCount = 10_000;
+    private const int MaxRetainedMutationCount = 2 * MaxMutationsPerPlan;
     private const int MaxSerializedSnapshotLength = 8_192;
     private const int MaxGroupIdsJsonLength = 4_096;
     internal const int CleanupPlanBatchSize = 50;
@@ -279,10 +279,14 @@ public sealed class TeacherDraftsAutogenPlanService
             CreatedAtUtc = payload.CreatedAtUtc,
             ExpiresAtUtc = payload.ExpiresAtUtc
         };
+        long snapshotCharacters = 0;
         foreach (var mutation in payload.Mutations)
         {
             var beforeJson = SerializeSnapshot(mutation.Before);
             var afterJson = SerializeSnapshot(mutation.After);
+            snapshotCharacters += (beforeJson?.Length ?? 0) + (afterJson?.Length ?? 0);
+            if (snapshotCharacters > AutoGenWorkloadLimits.MaxPlanSnapshotCharacters)
+                throw new AutoGenPlanCapacityException("План перевищує безпечний обсяг знімків. Зменште кількість груп або діапазон.");
             if ((beforeJson?.Length ?? 0) > MaxSerializedSnapshotLength
                 || (afterJson?.Length ?? 0) > MaxSerializedSnapshotLength)
             {

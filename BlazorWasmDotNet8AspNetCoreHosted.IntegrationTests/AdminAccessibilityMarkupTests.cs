@@ -10,7 +10,7 @@ public sealed class AdminAccessibilityMarkupTests
         var styles = ReadClientFile("wwwroot/css/app.css");
 
         Assert.Contains("role=\"status\" aria-live=\"polite\" aria-atomic=\"true\"", index);
-        Assert.Contains("css/app.css?v=20260828-1", index);
+        Assert.Contains("css/app.css?v=20260905-1", index);
         Assert.Contains("js/schedule-app.js?v=20260828-2", index);
         Assert.Contains("<span class=\"visually-hidden\">Завантаження застосунку…</span>", index);
         Assert.Contains("class=\"loading-progress\" aria-hidden=\"true\" focusable=\"false\"", index);

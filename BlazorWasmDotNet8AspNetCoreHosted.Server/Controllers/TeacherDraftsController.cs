@@ -1299,6 +1299,50 @@ public sealed class TeacherDraftsController : ControllerBase
     // Застарілий синхронний маршрут вимкнено, щоб усі запуски проходили через контрольовану чергу.
     public ActionResult<AutoGenResult> DraftAutoGen([FromBody] DraftAutoGenRequest r)
         => LegacyAutogenEndpointDisabled();
+    [HttpPost("autogen/capacity")]
+    [EnableRateLimiting("week-validation")]
+    public async Task<ActionResult<AutoGenCapacityDto>> GetAutoGenCapacity(
+        [FromBody] AutoGenJobRequest request,
+        [FromServices] ExpensiveOperationGate operationGate,
+        CancellationToken cancellationToken)
+    {
+        using var lease = await operationGate.TryEnterAsync(ExpensiveOperationKind.WeekValidation, cancellationToken);
+        if (lease is null)
+            return Problem(statusCode: 429, title: "Триває інша перевірка", detail: "Повторіть оцінку після завершення поточної перевірки.");
+        try
+        {
+            var normalized = TeacherDraftsAutogenJobService.NormalizeRequest(request);
+            return Ok(await AutogenCalendarWorkload.MeasureAsync(_db, normalized, cancellationToken));
+        }
+        catch (AutoGenJobValidationException ex)
+        {
+            return Problem(statusCode: 400, title: "Перевірте параметри періоду", detail: ex.Message);
+        }
+    }
+
+    [HttpPost("autogen/coverage")]
+    [EnableRateLimiting("autogen-plan-read")]
+    public async Task<ActionResult<AutoGenCoverageDto>> GetAutoGenCoverage(
+        [FromBody] AutoGenJobRequest request,
+        [FromServices] ExpensiveOperationGate operationGate,
+        CancellationToken cancellationToken)
+    {
+        using var lease = await operationGate.TryEnterAsync(ExpensiveOperationKind.WeekValidation, cancellationToken);
+        if (lease is null)
+            return Problem(statusCode: 429, title: "Триває інша перевірка", detail: "Повторіть перевірку повноти за мить.");
+        try
+        {
+            var normalized = TeacherDraftsAutogenJobService.NormalizeRequest(request);
+            await AutogenCalendarWorkload.MeasureAsync(_db, normalized, cancellationToken);
+            return Ok(await new TeacherDraftsAutogenCoverageService(_db).MeasureAsync(normalized.GroupIds,
+                normalized.FromDate, normalized.ToDate, normalized.Days, normalized.ModuleHours, false, cancellationToken));
+        }
+        catch (AutoGenJobValidationException ex)
+        {
+            return Problem(statusCode: 400, title: "Перевірте параметри періоду", detail: ex.Message);
+        }
+    }
+
     [HttpPost("autogen/jobs")]
     [EnableRateLimiting("autogen-start")]
     public ActionResult<AutoGenJobStartResult> StartAutoGenJob([FromBody] AutoGenJobRequest r)

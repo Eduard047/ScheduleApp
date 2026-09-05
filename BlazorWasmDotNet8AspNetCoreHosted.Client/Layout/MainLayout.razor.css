@@ -41,9 +41,9 @@
 
 .layout-main--work-area ::deep .table th {
     color: #475569;
-    font-size: .8rem;
+    font-size: .875rem;
     font-weight: 700;
-    text-transform: uppercase;
+    text-transform: none;
 }
 
 .layout-main--work-area ::deep .btn {

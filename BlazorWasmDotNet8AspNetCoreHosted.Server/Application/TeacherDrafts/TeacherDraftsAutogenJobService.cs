@@ -5,7 +5,9 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Unicode;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
@@ -29,13 +31,12 @@ public sealed class AutoGenJobCommitOutcomeUnknownException(string message, Exce
 
 public sealed class TeacherDraftsAutogenJobService : IHostedService
 {
-    private const int MaxRangeDays = 370;
+    private const int MaxRangeDays = AutoGenWorkloadLimits.MaxRangeDays;
     private const int MaxGroupCount = 200;
-    private const int MaxFullRangeGroupCount = 32;
     private const int MaxModuleHourEntryCount = 200;
-    private const int MaxHoursPerModulePerRange = 500;
-    private const long MaxGroupDayBudget = 4_000;
-    private const long MaxGroupRequestedModuleHours = 25_000;
+    private const int MaxHoursPerModulePerRange = AutoGenWorkloadLimits.MaxRequestedLessons;
+    private const long MaxGroupDayBudget = AutoGenWorkloadLimits.MaxGroupDays;
+    private const long MaxGroupRequestedModuleHours = AutoGenWorkloadLimits.MaxRequestedLessons;
     private const int MaxPreferredRoomCountPerGroup = 500;
     private const int MaxPreferredFirstSlotOrderOverride = 64;
     private const int MaxRecentRepeatWindowDays = 31;
@@ -95,9 +96,11 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
     private readonly SemaphoreSlim _persistenceGate = new(1, 1);
     private int _stopping;
     private static readonly TimeSpan CompletedJobTtl = TimeSpan.FromHours(6);
+    private static readonly JsonSerializerOptions FingerprintJsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly JsonSerializerOptions PersistenceJsonOptions = new(JsonSerializerDefaults.Web)
     {
-        WriteIndented = false
+        WriteIndented = false,
+        Encoder = JavaScriptEncoder.Create(UnicodeRanges.BasicLatin, UnicodeRanges.Cyrillic)
     };
 
     public TeacherDraftsAutogenJobService(
@@ -1786,7 +1789,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             request.SoftOptions,
             request.PreferredFirstMaxSlotOrderOverride
         };
-        var json = JsonSerializer.Serialize(canonicalPayload, PersistenceJsonOptions);
+        var json = JsonSerializer.Serialize(canonicalPayload, FingerprintJsonOptions);
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(json))).ToLowerInvariant();
     }
 
@@ -1823,7 +1826,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             JsonSerializer.Serialize(request, PersistenceJsonOptions),
             "запиту");
         run.StatusJson = EnsurePersistedPayloadWithinLimit(
-            JsonSerializer.Serialize(status, PersistenceJsonOptions),
+            JsonSerializer.Serialize(status with { Result = null, Report = null }, PersistenceJsonOptions),
             "статусу");
         run.ResultJson = status.Result is null
             ? null
@@ -1857,7 +1860,11 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                 var status = JsonSerializer.Deserialize<AutoGenJobStatus>(run.StatusJson, PersistenceJsonOptions);
                 if (status is not null)
                 {
-                    return status;
+                    return status with
+                    {
+                        Result = status.Result ?? TryDeserializePayload<AutoGenResult>(run.ResultJson, run.JobId, "результату"),
+                        Report = status.Report ?? TryDeserializePayload<AutoGenRunReport>(run.ReportJson, run.JobId, "звіту")
+                    };
                 }
             }
             catch (JsonException ex)
@@ -1944,7 +1951,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
     private static string? LimitOptional(string? value, int maxLength)
         => string.IsNullOrEmpty(value) || value.Length <= maxLength ? value : value[..maxLength];
 
-    private static AutoGenJobRequest NormalizeRequest(AutoGenJobRequest request)
+    internal static AutoGenJobRequest NormalizeRequest(AutoGenJobRequest request)
     {
         if (!Enum.IsDefined(request.Kind))
         {
@@ -2205,6 +2212,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         var executionRolledBack = false;
         var executionCommitted = false;
         AutoGenDraftPlanPayload? planPayload = null;
+        AutoGenCoverageDto? coverage = null;
         var weekStarts = BuildWeekStarts(job.Request.FromDate, job.Request.ToDate);
         var ownsExecutionGate = false;
         using var heartbeatStop = new CancellationTokenSource();
@@ -2247,6 +2255,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                     try
                     {
                         await ValidateAcademicPeriodAsync(executionDb, job.Request, job.Token);
+                        await AutogenCalendarWorkload.MeasureAsync(executionDb, job.Request, job.Token);
                         var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
                         var previewInputFingerprint = job.Request.PreviewOnly
                             ? await plans.CaptureInputFingerprintAsync(job.Request, job.Token)
@@ -2432,6 +2441,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                             }
 
                             created += rangeResult.Created;
+                            coverage = rangeSucceeded ? rangeResult.Coverage : null;
                             skipped += rangeResult.Skipped;
                             warnings.AddRange(rangeResult.Warnings);
                             if (rangeResult.GapDetails is { Count: > 0 })
@@ -2443,7 +2453,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                                 preflight.AddRange(rangeResult.Preflight);
                             }
 
-                            var partialResult = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight);
+                            var partialResult = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight, coverage);
                             job.CompleteWeek(weekStarts.Count - 1, runRange.RangeStartDate, runRange.RangeEndDate, rangeResult, partialResult);
                             if (persistIntermediateProgress)
                             {
@@ -2552,7 +2562,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             {
                 job.Token.ThrowIfCancellationRequested();
             }
-            var result = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight);
+            var result = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight, failed ? null : coverage);
             var report = TeacherDraftsAutogenReportBuilder.BuildReport(job.Request.FromDate, job.Request.ToDate, weekStarts.Count, result);
             if (failed)
             {
@@ -2885,7 +2895,8 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             fillResult.GapDetails,
             fillResult.GapSummary,
             preflight,
-            AutoGenWarningClassifier.ClassifyMany(warnings));
+            AutoGenWarningClassifier.ClassifyMany(warnings),
+            fillResult.Coverage);
     }
 
     private static DraftAutoGenSoftOptions? MapSoftOptions(AutoGenSoftOptionsDto? dto)

@@ -6,7 +6,7 @@ using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 // API-клієнт для роботи з викладацькими чернетками
 public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
 {
-    private const int MaxAutogenPlanChanges = 2_000;
+    private const int MaxAutogenPlanChanges = AutoGenWorkloadLimits.MaxPlanChanges;
 
     // Завантажує чернетки тижня для викладача.
     public async Task<List<TeacherDraftItemDto>> GetWeek(DateOnly weekStart, int? teacherId)
@@ -57,6 +57,22 @@ public sealed class TeacherDraftsApi(HttpClient http) : ITeacherDraftsApi
         await res.EnsureSuccessWithDetailsAsync(cancellationToken);
         return (await res.Content.ReadFromJsonAsync<AutoGenJobStartResult>(
             cancellationToken: cancellationToken))!;
+    }
+
+    public async Task<AutoGenCapacityDto> GetAutogenCapacity(AutoGenJobRequest request, CancellationToken cancellationToken = default)
+    {
+        using var response = await http.PostAsJsonAsync("api/teacher-drafts/autogen/capacity", request, cancellationToken);
+        await response.EnsureSuccessWithDetailsAsync(cancellationToken);
+        return await response.Content.ReadFromJsonAsync<AutoGenCapacityDto>(cancellationToken: cancellationToken)
+            ?? throw new InvalidOperationException("Сервер не повернув оцінку місткості періоду.");
+    }
+
+    public async Task<AutoGenCoverageDto> GetAutogenCoverage(AutoGenJobRequest request, CancellationToken cancellationToken = default)
+    {
+        using var response = await http.PostAsJsonAsync("api/teacher-drafts/autogen/coverage", request, cancellationToken);
+        await response.EnsureSuccessWithDetailsAsync(cancellationToken);
+        return await response.Content.ReadFromJsonAsync<AutoGenCoverageDto>(cancellationToken: cancellationToken)
+            ?? throw new InvalidOperationException("Сервер не повернув оцінку повноти періоду.");
     }
 
     public async Task<AutoGenJobStatus> GetAutogenJob(

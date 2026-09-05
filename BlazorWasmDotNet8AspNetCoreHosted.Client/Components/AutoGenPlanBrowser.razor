@@ -1,0 +1,76 @@
+@using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
+
+<section class="plan-browser" aria-labelledby="plan-browser-title">
+    <h2 id="plan-browser-title">Усі зміни плану</h2>
+    <div class="plan-browser__filters">
+        <label>Пошук<input class="form-control" type="search" placeholder="Група, модуль, викладач, аудиторія" @bind="_search" @bind:event="oninput" @bind:after="ResetPage" /></label>
+        <label>Дія<select class="form-select" @bind="_operation" @bind:after="ResetPage"><option value="">Усі дії</option><option value="Add">Додати</option><option value="Update">Змінити</option><option value="Delete">Видалити</option></select></label>
+        <label>Від дати<input class="form-control" type="date" @bind="_from" @bind:after="ResetPage" /></label>
+        <label>До дати<input class="form-control" type="date" @bind="_to" @bind:after="ResetPage" /></label>
+    </div>
+    @{
+        var filtered = FilteredChanges;
+        var pages = Math.Max(1, (filtered.Count + PageSize - 1) / PageSize);
+        var current = Math.Min(_page, pages - 1);
+    }
+    <div class="plan-browser__paging" role="status" aria-live="polite">
+        <span>Знайдено @filtered.Count із @Changes.Count змін. Сторінка @(current + 1) із @pages.</span>
+        <div class="d-flex gap-2">
+            <button type="button" class="btn btn-outline-secondary btn-sm" disabled="@(current == 0)" @onclick="() => _page = current - 1">Попередня</button>
+            <button type="button" class="btn btn-outline-secondary btn-sm" disabled="@(current + 1 >= pages)" @onclick="() => _page = current + 1">Наступна</button>
+        </div>
+    </div>
+    <div class="table-responsive" tabindex="0" role="region" aria-label="Зміни плану автогенерації">
+        <table class="table table-sm align-middle">
+            <thead><tr><th scope="col">Дія</th><th scope="col">Дата і час</th><th scope="col">Група</th><th scope="col">Заняття</th><th scope="col">Призначення</th></tr></thead>
+            <tbody>
+                @foreach (var change in filtered.Skip(current * PageSize).Take(PageSize))
+                {
+                    var lesson = change.After ?? change.Before;
+                    if (lesson is null) { continue; }
+                    <tr @key="change.Ordinal">
+                        <td><span class="@(change.Operation == AutoGenPlanOperation.Delete ? "text-danger fw-semibold" : "fw-semibold")">@OperationText(change.Operation)</span></td>
+                        <td class="text-nowrap">@lesson.Date.ToString("dd.MM.yyyy")<br />@lesson.TimeStart–@lesson.TimeEnd</td>
+                        <td>@lesson.GroupName</td>
+                        <td>@lesson.ModuleName<br /><span class="text-muted">@lesson.TopicCode · @lesson.LessonTypeName</span>
+                            @if (change.Before is { } before && change.Operation == AutoGenPlanOperation.Update)
+                            {
+                                <details><summary>До зміни</summary>@before.Date.ToString("dd.MM.yyyy") @before.TimeStart–@before.TimeEnd · @before.ModuleName · @before.TeacherName · @before.RoomName</details>
+                            }
+                        </td>
+                        <td>@(lesson.TeacherName ?? "Без викладача")<br />@(lesson.RoomName ?? "Без аудиторії")</td>
+                    </tr>
+                }
+                @if (filtered.Count == 0) { <tr><td colspan="5">За цими фільтрами змін не знайдено.</td></tr> }
+            </tbody>
+        </table>
+    </div>
+</section>
+
+@code {
+    [Parameter, EditorRequired] public IReadOnlyList<AutoGenPlanChangeDto> Changes { get; set; } = Array.Empty<AutoGenPlanChangeDto>();
+    private const int PageSize = 50;
+    private string _search = "";
+    private string _operation = "";
+    private DateOnly? _from;
+    private DateOnly? _to;
+    private int _page;
+    private IReadOnlyList<AutoGenPlanChangeDto>? _previousChanges;
+    protected override void OnParametersSet()
+    {
+        if (!ReferenceEquals(Changes, _previousChanges)) { _page = 0; _previousChanges = Changes; }
+    }
+    private void ResetPage() => _page = 0;
+    private List<AutoGenPlanChangeDto> FilteredChanges => Changes
+        .Where(change => string.IsNullOrEmpty(_operation) || change.Operation.ToString() == _operation)
+        .Where(change => (change.After ?? change.Before) is { } lesson
+            && (_from is null || lesson.Date >= _from) && (_to is null || lesson.Date <= _to)
+            && (string.IsNullOrWhiteSpace(_search) || SearchText(change).Contains(_search.Trim(), StringComparison.OrdinalIgnoreCase)))
+        .OrderBy(change => change.Operation == AutoGenPlanOperation.Delete ? 0 : change.Operation == AutoGenPlanOperation.Update ? 1 : 2)
+        .ThenBy(change => (change.After ?? change.Before)?.Date).ThenBy(change => change.Ordinal).ToList();
+    private static string SearchText(AutoGenPlanChangeDto change)
+        => string.Join(" ", new[] { change.Before, change.After }.OfType<AutoGenPlanDraftDto>()
+            .Select(d => $"{d.GroupName} {d.ModuleName} {d.TopicCode} {d.TeacherName} {d.RoomName}"));
+    private static string OperationText(AutoGenPlanOperation operation) => operation switch
+    { AutoGenPlanOperation.Delete => "Видалити", AutoGenPlanOperation.Update => "Змінити", _ => "Додати" };
+}

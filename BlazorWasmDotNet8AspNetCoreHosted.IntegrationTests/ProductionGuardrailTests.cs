@@ -1874,14 +1874,14 @@ public sealed class ProductionGuardrailTests
             valid with { ToDate = new DateOnly(2100, 12, 25) },
             valid with { FromDate = new DateOnly(9999, 12, 24), ToDate = new DateOnly(9999, 12, 24) },
             valid with { FromDate = valid.ToDate.AddDays(1) },
-            valid with { ToDate = valid.FromDate.AddDays(370) },
+            valid with { ToDate = valid.FromDate.AddDays(AutoGenWorkloadLimits.MaxRangeDays) },
             valid with { GroupIds = Enumerable.Range(1, 201).ToList() },
             valid with { GroupIds = new List<int>() },
             valid with { GroupIds = new List<int> { 0 } },
             valid with { ModuleHours = Enumerable.Range(1, 201).ToDictionary(id => id, _ => 1) },
             valid with { ModuleHours = new Dictionary<int, int>() },
             valid with { ModuleHours = new Dictionary<int, int> { [0] = 1 } },
-            valid with { ModuleHours = new Dictionary<int, int> { [1] = 501 } },
+            valid with { ModuleHours = new Dictionary<int, int> { [1] = AutoGenWorkloadLimits.MaxRequestedLessons + 1 } },
             valid with { Title = new string('x', 257) },
             valid with { ClientJobId = "not-a-guid" }
         };

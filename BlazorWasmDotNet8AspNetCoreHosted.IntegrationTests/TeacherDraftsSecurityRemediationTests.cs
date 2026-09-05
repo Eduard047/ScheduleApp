@@ -308,14 +308,14 @@ public sealed class TeacherDraftsSecurityRemediationTests
     {
         var fullRangeBoundary = CreateValidJobRequest() with
         {
-            ToDate = new DateOnly(2026, 1, 1).AddDays(99),
+            ToDate = new DateOnly(2026, 1, 1).AddDays(AutoGenWorkloadLimits.MaxGroupDays / 40 - 1),
             GroupIds = Enumerable.Range(1, 40).ToList()
         };
         AssertReachesPersistence(fullRangeBoundary);
         var requestedHoursBoundary = CreateValidJobRequest() with
         {
             GroupIds = Enumerable.Range(1, 50).ToList(),
-            ModuleHours = new Dictionary<int, int> { [1] = 500 }
+            ModuleHours = new Dictionary<int, int> { [1] = AutoGenWorkloadLimits.MaxRequestedLessons / 50 }
         };
         AssertReachesPersistence(requestedHoursBoundary);
 

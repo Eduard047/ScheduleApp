@@ -99,7 +99,8 @@ public record AutoGenResult(
     List<AutoGenGapDetail>? GapDetails = null,
     List<AutoGenGapSummaryItem>? GapSummary = null,
     List<AutoGenPreflightItem>? Preflight = null,
-    List<AutoGenWarningDetail>? WarningDetails = null
+    List<AutoGenWarningDetail>? WarningDetails = null,
+    AutoGenCoverageDto? Coverage = null
 );
 
 public enum AutoGenJobKind
@@ -246,7 +247,8 @@ public record AutoGenRunReport(
     List<AutoGenPreflightItem> Preflight,
     List<AutoGenRunReportGroupItem> WorstGroups,
     List<AutoGenRunReportModuleItem> WorstModules,
-    List<string> Recommendations
+    List<string> Recommendations,
+    AutoGenCoverageDto? Coverage = null
 );
 
 public record AutoGenJobStatus(
