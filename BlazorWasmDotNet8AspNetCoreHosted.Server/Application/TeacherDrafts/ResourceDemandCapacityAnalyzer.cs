@@ -4,6 +4,7 @@ public sealed record ResourceTimeDemand(int Required, IReadOnlyCollection<int> A
 public sealed record ResourceCapacityAnalysis(int Required, int Matched, bool SearchComplete)
 {
     public int? ProvenShortfall => SearchComplete ? Required - Matched : null;
+    public IReadOnlyList<int> BottleneckDemandIndexes { get; init; } = Array.Empty<int>();
 }
 
 // Верхня межа спільної місткості: один ресурсний слот не можна порахувати для двох незалежних занять.
@@ -35,36 +36,67 @@ public static class ResourceDemandCapacityAnalyzer
         foreach (var node in resourceNodes.Values) AddEdge(node, sink, 1);
         var visits = 0;
         var matched = 0;
+        var levels = new int[graph.Length];
+        var nextEdges = new int[graph.Length];
+        var limitReached = false;
+        bool Visit()
+        {
+            if ((++visits & 1023) == 0) cancellationToken.ThrowIfCancellationRequested();
+            return !(limitReached = visits > maxEdgeVisits);
+        }
+        bool BuildLevels()
+        {
+            Array.Fill(levels, -1);
+            var queue = new Queue<int>();
+            levels[0] = 0;
+            queue.Enqueue(0);
+            while (queue.TryDequeue(out var node))
+                foreach (var edge in graph[node])
+                {
+                    if (!Visit()) return false;
+                    if (edge.Capacity <= 0 || levels[edge.To] >= 0) continue;
+                    levels[edge.To] = levels[node] + 1;
+                    queue.Enqueue(edge.To);
+                }
+            return levels[sink] >= 0;
+        }
+        int Send(int node, int available)
+        {
+            if (node == sink) return available;
+            for (; nextEdges[node] < graph[node].Count; nextEdges[node]++)
+            {
+                if (!Visit()) return 0;
+                var edge = graph[node][nextEdges[node]];
+                if (edge.Capacity <= 0 || levels[edge.To] != levels[node] + 1) continue;
+                var sent = Send(edge.To, Math.Min(available, edge.Capacity));
+                if (limitReached) return 0;
+                if (sent == 0) continue;
+                edge.Capacity -= sent;
+                graph[edge.To][edge.Reverse].Capacity += sent;
+                return sent;
+            }
+            return 0;
+        }
+        // Один шаруватий прохід обслуговує багато пар без нового BFS та масивів для кожної пари.
         while (matched < required)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var parentNode = Enumerable.Repeat(-1, graph.Length).ToArray();
-            var parentEdge = new int[graph.Length];
-            var queue = new Queue<int>();
-            parentNode[0] = 0;
-            queue.Enqueue(0);
-            while (queue.Count > 0 && parentNode[sink] < 0)
+            if (!BuildLevels())
             {
-                var node = queue.Dequeue();
-                for (var i = 0; i < graph[node].Count; i++)
+                return new(required, matched, !limitReached)
                 {
-                    if (++visits > maxEdgeVisits) return new(required, matched, false);
-                    if ((visits & 1023) == 0) cancellationToken.ThrowIfCancellationRequested();
-                    var edge = graph[node][i];
-                    if (edge.Capacity == 0 || parentNode[edge.To] >= 0) continue;
-                    parentNode[edge.To] = node;
-                    parentEdge[edge.To] = i;
-                    queue.Enqueue(edge.To);
-                }
+                    BottleneckDemandIndexes = limitReached ? Array.Empty<int>()
+                        : Enumerable.Range(0, demands.Count).Where(i => levels[i + 1] >= 0).ToArray()
+                };
             }
-            if (parentNode[sink] < 0) return new(required, matched, true);
-            for (var node = sink; node != 0; node = parentNode[node])
+            Array.Clear(nextEdges);
+            while (matched < required)
             {
-                var edge = graph[parentNode[node]][parentEdge[node]];
-                edge.Capacity--;
-                graph[node][edge.Reverse].Capacity++;
+                var sent = Send(0, required - matched);
+                if (limitReached) return new(required, matched, false);
+                if (sent == 0) break;
+                matched += sent;
             }
-            matched++;
         }
         return new(required, matched, true);
     }

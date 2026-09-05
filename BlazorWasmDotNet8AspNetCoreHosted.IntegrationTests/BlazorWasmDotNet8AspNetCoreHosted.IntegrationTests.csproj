@@ -53,6 +53,7 @@
     <Compile Include="AutogenLecturePackingTests.cs" />
     <Compile Include="AutogenQualityMatrixTests.cs" />
     <Compile Include="AutogenUniversalRangeTests.cs" />
+    <Compile Include="AutogenConstraintSearchTests.cs" />
     <Compile Include="AutogenSeededStressTests.cs" />
     <Compile Include="ClientHttpContractTests.cs" />
     <Compile Include="DeterministicResidualOptimizerOracleTests.cs" />
