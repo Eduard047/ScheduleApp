@@ -210,8 +210,8 @@ else
             @if (_autoGenProgress is not null)
             {
                 var progress = _autoGenProgress;
-                var progressPercent = GetAutoGenProgressPercent(progress);
-                <div class="autogen-progress mt-3" role="status" aria-live="polite" aria-busy="true">
+                <BlockingProgressDialog Label="@progress.Title">
+                <div class="autogen-progress" role="status" aria-live="polite" aria-busy="true">
                     <div class="autogen-progress__head">
                         <div>
                             <div class="autogen-progress__title">
@@ -221,7 +221,7 @@ else
                             <div class="autogen-progress__subtitle">@progress.CurrentMessage</div>
                         </div>
                         <div class="autogen-progress__actions">
-                            <div class="autogen-progress__badge">@progressPercent%</div>
+                            <div class="autogen-progress__badge">Триває</div>
                             @if (!string.IsNullOrWhiteSpace(progress.JobId))
                             {
                                 <button type="button"
@@ -233,20 +233,14 @@ else
                             }
                         </div>
                     </div>
-                    <div class="progress autogen-progress__bar" aria-label="Прогрес автогенерації">
-                        <div class="progress-bar progress-bar-striped progress-bar-animated"
-                             role="progressbar"
-                             style="width: @progressPercent%;"
-                             aria-valuenow="@progressPercent"
-                             aria-valuemin="0"
-                             aria-valuemax="100">
-                        </div>
+                    <div class="progress autogen-progress__bar" role="progressbar" aria-label="Операція виконується">
+                        <div class="autogen-progress__indeterminate"></div>
                     </div>
                     <div class="autogen-progress__meta">
                         <span>@GetAutoGenProgressStepLabel(progress)</span>
                         <span>@GetAutoGenProgressCompletedLabel(progress)</span>
                         <span>Минуло: @FormatDuration(GetAutoGenElapsed(progress))</span>
-                        <span>Залишилось: @GetAutoGenRemainingLabel(progress)</span>
+                        <span>Точний час завершення поки невідомий</span>
                     </div>
                     <div class="autogen-progress__range">
                         Діапазон: @progress.RangeStartDate.ToString("dd.MM.yyyy") – @progress.RangeEndDate.ToString("dd.MM.yyyy")
@@ -256,6 +250,7 @@ else
                         <div class="autogen-progress__last">@progress.LastCompletedMessage</div>
                     }
                 </div>
+                </BlockingProgressDialog>
             }
             @if (_selectedCourseId is int)
             {
@@ -2012,7 +2007,7 @@ else
             CurrentStepStartedAt = now,
             LastUpdatedAt = now,
             CurrentMessage = message,
-            Percent = 15
+            Percent = -1
         };
         StartAutoGenProgressTimer();
         await InvokeAsync(StateHasChanged);
@@ -2321,72 +2316,6 @@ else
     }
     private static TimeSpan GetAutoGenElapsed(AutoGenProgressState progress)
         => progress.LastUpdatedAt - progress.StartedAt;
-    private static int GetAutoGenProgressPercent(AutoGenProgressState progress)
-        => progress.Percent >= 0
-            ? Math.Clamp(progress.Percent, 0, 100)
-            : (int)Math.Round(GetAutoGenProgressRatio(progress) * 100, MidpointRounding.AwayFromZero);
-    private static double GetAutoGenProgressRatio(AutoGenProgressState progress)
-    {
-        if (progress.Percent >= 0)
-        {
-            return Math.Clamp(progress.Percent / 100d, 0d, 1d);
-        }
-        var totalSteps = Math.Max(1, progress.TotalSteps);
-        var completedSteps = Math.Clamp(progress.CompletedSteps, 0, totalSteps);
-        if (completedSteps >= totalSteps)
-        {
-            return 1.0;
-        }
-        var stepSeconds = Math.Max(1, GetAutoGenExpectedStepSeconds(progress.Kind));
-        var stepElapsed = Math.Max(0, (progress.LastUpdatedAt - progress.CurrentStepStartedAt).TotalSeconds);
-        var currentStepEstimate = Math.Clamp(stepElapsed / stepSeconds, 0.05, 0.88);
-        return Math.Clamp((completedSteps + currentStepEstimate) / totalSteps, 0.01, 0.99);
-    }
-    private static double GetAutoGenExpectedStepSeconds(AutoGenProgressKind kind)
-        => kind switch
-        {
-            AutoGenProgressKind.Preflight => 6,
-            AutoGenProgressKind.Fill => 24,
-            AutoGenProgressKind.ClearDrafts or AutoGenProgressKind.ClearSchedule => 8,
-            _ => 28
-        };
-    private static string GetAutoGenRemainingLabel(AutoGenProgressState progress)
-    {
-        if (progress.CompletedSteps >= progress.TotalSteps)
-        {
-            return "0 с";
-        }
-        if (progress.CompletedSteps <= 0
-            || progress.AverageCompletedStepSeconds is not double averageStepSeconds
-            || averageStepSeconds <= 0)
-        {
-            return "рахуємо...";
-        }
-
-        var remainingSteps = Math.Max(0, progress.TotalSteps - progress.CompletedSteps);
-        var currentStepIsRunning = progress.CurrentStepNumber > progress.CompletedSteps
-                                   && remainingSteps > 0;
-        var futureFullSteps = currentStepIsRunning
-            ? Math.Max(0, remainingSteps - 1)
-            : remainingSteps;
-        var remainingSeconds = futureFullSteps * averageStepSeconds;
-        if (currentStepIsRunning)
-        {
-            var currentStepElapsedSeconds = Math.Max(
-                0,
-                (progress.LastUpdatedAt - progress.CurrentStepStartedAt).TotalSeconds);
-            // Якщо поточний крок уже довший за середній, не показуємо хибний нуль:
-            // оцінка адаптується до фактичної тривалості цього кроку.
-            var estimatedCurrentStepSeconds = Math.Max(
-                averageStepSeconds,
-                currentStepElapsedSeconds * 1.15);
-            remainingSeconds += Math.Max(
-                1,
-                estimatedCurrentStepSeconds - currentStepElapsedSeconds);
-        }
-        var remaining = TimeSpan.FromSeconds(Math.Max(0, remainingSeconds));
-        return $"приблизно {FormatDuration(remaining)}";
-    }
     private static string FormatDuration(TimeSpan duration)
     {
         if (duration < TimeSpan.Zero)

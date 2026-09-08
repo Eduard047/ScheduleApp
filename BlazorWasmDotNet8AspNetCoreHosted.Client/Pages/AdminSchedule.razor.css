@@ -648,3 +648,24 @@
             grid-template-columns: minmax(240px, 1fr) minmax(210px, 280px);
         }
     }
+
+.autogen-progress__indeterminate {
+    width: 35%;
+    height: 100%;
+    background: #2563eb;
+    border-radius: inherit;
+    animation: progress-travel 1.6s ease-in-out infinite;
+}
+
+@keyframes progress-travel {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(290%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .autogen-progress__indeterminate {
+        width: 100%;
+        animation: none;
+        background: repeating-linear-gradient(135deg, #2563eb 0 12px, #93c5fd 12px 24px);
+    }
+}

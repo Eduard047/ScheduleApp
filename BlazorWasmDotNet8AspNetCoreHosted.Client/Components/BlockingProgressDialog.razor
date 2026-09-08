@@ -1,0 +1,37 @@
+@implements IAsyncDisposable
+@inject IJSRuntime JS
+
+<NavigationLock OnBeforeInternalNavigation="BlockNavigation" />
+<dialog @ref="_dialog" aria-label="@Label" aria-modal="true" tabindex="-1">
+    @ChildContent
+</dialog>
+
+@code {
+    [Parameter] public string Label { get; set; } = "Операція виконується";
+    [Parameter] public RenderFragment? ChildContent { get; set; }
+    private ElementReference _dialog;
+    private IJSObjectReference? _module;
+    private bool _disposed;
+
+    private void BlockNavigation(LocationChangingContext context) => context.PreventNavigation();
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+        _module = await JS.InvokeAsync<IJSObjectReference>("import", "./js/blocking-progress.js");
+        if (_disposed)
+        {
+            await _module.DisposeAsync();
+            return;
+        }
+        await _module.InvokeVoidAsync("show", _dialog);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _disposed = true;
+        if (_module is null) return;
+        await _module.InvokeVoidAsync("close", _dialog);
+        await _module.DisposeAsync();
+    }
+}
