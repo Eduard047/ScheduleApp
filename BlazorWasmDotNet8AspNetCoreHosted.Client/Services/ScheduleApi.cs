@@ -13,7 +13,7 @@ public sealed class ScheduleApi(HttpClient http) : IScheduleApi
         var url = weekStart is DateOnly d
             ? ApiClientHelpers.WithQuery("api/meta", ("weekStart", d.ToString("yyyy-MM-dd")))
             : "api/meta";
-        var res = await http.GetAsync(url);
+        using var res = await http.GetAsync(url);
         await res.EnsureSuccessWithDetailsAsync();
         return await res.Content.ReadFromJsonAsync<MetaResponseDto>() ?? ApiClientHelpers.EmptyMeta();
     }
@@ -27,14 +27,14 @@ public sealed class ScheduleApi(HttpClient http) : IScheduleApi
             ("groupId", groupId?.ToString()),
             ("teacherId", teacherId?.ToString()),
             ("roomId", roomId?.ToString()));
-        var res = await http.GetAsync(url);
+        using var res = await http.GetAsync(url);
         await res.EnsureSuccessWithDetailsAsync();
         return await res.Content.ReadFromJsonAsync<List<ScheduleItemDto>>() ?? new();
     }
     // Створює або оновлює пару в розкладі.
     public async Task<int> Upsert(UpsertScheduleItemRequest request)
     {
-        var res = await http.PostAsJsonAsync("api/schedule/upsert", request);
+        using var res = await http.PostAsJsonAsync("api/schedule/upsert", request);
         await res.EnsureSuccessWithDetailsAsync();
         return await res.Content.ReadFromJsonAsync<int>();
     }
@@ -44,13 +44,13 @@ public sealed class ScheduleApi(HttpClient http) : IScheduleApi
         var url = ApiClientHelpers.WithQuery(
             ApiClientHelpers.WithConfirm($"api/schedule/{id}"),
             ("expectedRevision", expectedRevision.ToString("D")));
-        var res = await http.DeleteAsync(url);
+        using var res = await http.DeleteAsync(url);
         await res.EnsureSuccessWithDetailsAsync();
     }
     // Очищає розклад за тиждень і повертає кількість видалених.
     public async Task<int> ClearWeek(ClearWeekRequest req)
     {
-        var res = await http.PostAsJsonAsync(ApiClientHelpers.WithConfirm("api/schedule/clear"), req);
+        using var res = await http.PostAsJsonAsync(ApiClientHelpers.WithConfirm("api/schedule/clear"), req);
         await res.EnsureSuccessWithDetailsAsync();
         var dto = await res.Content.ReadFromJsonAsync<ClearWeekResult>();
         return dto?.Deleted ?? 0;

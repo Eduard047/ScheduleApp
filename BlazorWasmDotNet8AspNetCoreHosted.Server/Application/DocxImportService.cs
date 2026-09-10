@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Data;
+using System.Buffers.Binary;
 using System.Text;
 using System.Text.RegularExpressions;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
@@ -16,6 +17,9 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 public sealed class DocxImportService
 {
     private const long MaxFileSizeBytes = 10 * 1024 * 1024;
+    private const int MaxPackageEntryCount = 2_048;
+    private const long MaxPackageEntryUncompressedSizeBytes = 16 * 1024 * 1024;
+    private const long MaxPackageTotalUncompressedSizeBytes = 64 * 1024 * 1024;
     private const long MaxCharactersPerPart = 2_000_000;
     private const int MaxTableCount = CurriculumInputLimits.ImportTableCountMax;
     private const int MaxRowCount = 20_000;
@@ -115,6 +119,10 @@ public sealed class DocxImportService
             }
         }
         buffer.Position = 0;
+        if (!HasSafePackageMetadata(buffer, ct))
+        {
+            return CreateUnsafePackageResult();
+        }
         WordprocessingDocument openedDocument;
         try
         {
@@ -300,6 +308,133 @@ public sealed class DocxImportService
             throw;
         }
         return result;
+    }
+
+    // Перевіряє центральний каталог ZIP до відкриття OPC-пакета, не розпаковуючи його вміст.
+    private static bool HasSafePackageMetadata(Stream package, CancellationToken ct)
+    {
+        const uint endOfCentralDirectorySignature = 0x06054b50;
+        const uint centralDirectoryEntrySignature = 0x02014b50;
+        const int endOfCentralDirectorySize = 22;
+        const int centralDirectoryEntrySize = 46;
+        const int maximumZipCommentLength = ushort.MaxValue;
+
+        try
+        {
+            if (!package.CanSeek || package.Length < endOfCentralDirectorySize)
+            {
+                return false;
+            }
+
+            var tailLength = (int)Math.Min(
+                package.Length,
+                endOfCentralDirectorySize + (long)maximumZipCommentLength);
+            var tail = new byte[tailLength];
+            package.Position = package.Length - tailLength;
+            package.ReadExactly(tail);
+
+            var endRecordOffsetInTail = -1;
+            for (var index = tail.Length - endOfCentralDirectorySize; index >= 0; index--)
+            {
+                if (BinaryPrimitives.ReadUInt32LittleEndian(tail.AsSpan(index, sizeof(uint)))
+                    != endOfCentralDirectorySignature)
+                {
+                    continue;
+                }
+
+                var commentLength = BinaryPrimitives.ReadUInt16LittleEndian(tail.AsSpan(index + 20, sizeof(ushort)));
+                if (index + endOfCentralDirectorySize + commentLength == tail.Length)
+                {
+                    endRecordOffsetInTail = index;
+                    break;
+                }
+            }
+
+            if (endRecordOffsetInTail < 0)
+            {
+                return false;
+            }
+
+            var endRecord = tail.AsSpan(endRecordOffsetInTail, endOfCentralDirectorySize);
+            var diskNumber = BinaryPrimitives.ReadUInt16LittleEndian(endRecord[4..]);
+            var centralDirectoryDiskNumber = BinaryPrimitives.ReadUInt16LittleEndian(endRecord[6..]);
+            var entriesOnDisk = BinaryPrimitives.ReadUInt16LittleEndian(endRecord[8..]);
+            var entryCount = BinaryPrimitives.ReadUInt16LittleEndian(endRecord[10..]);
+            var centralDirectorySize = BinaryPrimitives.ReadUInt32LittleEndian(endRecord[12..]);
+            var centralDirectoryOffset = BinaryPrimitives.ReadUInt32LittleEndian(endRecord[16..]);
+            if (diskNumber != 0
+                || centralDirectoryDiskNumber != 0
+                || entriesOnDisk != entryCount
+                || entryCount is 0 or ushort.MaxValue
+                || entryCount > MaxPackageEntryCount
+                || centralDirectorySize == uint.MaxValue
+                || centralDirectoryOffset == uint.MaxValue)
+            {
+                return false;
+            }
+
+            var endRecordOffset = package.Length - tailLength + endRecordOffsetInTail;
+            var centralDirectoryEnd = (long)centralDirectoryOffset + centralDirectorySize;
+            if (centralDirectoryEnd > endRecordOffset || centralDirectoryEnd > package.Length)
+            {
+                return false;
+            }
+
+            package.Position = centralDirectoryOffset;
+            long totalUncompressedSize = 0;
+            Span<byte> entryHeader = stackalloc byte[centralDirectoryEntrySize];
+            for (var index = 0; index < entryCount; index++)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (centralDirectoryEnd - package.Position < centralDirectoryEntrySize)
+                {
+                    return false;
+                }
+
+                package.ReadExactly(entryHeader);
+                if (BinaryPrimitives.ReadUInt32LittleEndian(entryHeader) != centralDirectoryEntrySignature)
+                {
+                    return false;
+                }
+
+                var uncompressedSize = BinaryPrimitives.ReadUInt32LittleEndian(entryHeader[24..]);
+                if (uncompressedSize == uint.MaxValue
+                    || uncompressedSize > MaxPackageEntryUncompressedSizeBytes
+                    || totalUncompressedSize > MaxPackageTotalUncompressedSizeBytes - uncompressedSize)
+                {
+                    return false;
+                }
+                totalUncompressedSize += uncompressedSize;
+
+                var fileNameLength = BinaryPrimitives.ReadUInt16LittleEndian(entryHeader[28..]);
+                var extraFieldLength = BinaryPrimitives.ReadUInt16LittleEndian(entryHeader[30..]);
+                var commentLength = BinaryPrimitives.ReadUInt16LittleEndian(entryHeader[32..]);
+                var variableMetadataLength = (long)fileNameLength + extraFieldLength + commentLength;
+                if (variableMetadataLength > centralDirectoryEnd - package.Position)
+                {
+                    return false;
+                }
+                package.Position += variableMetadataLength;
+            }
+
+            return package.Position == centralDirectoryEnd;
+        }
+        catch (Exception exception) when (exception is IOException
+                                                   or InvalidDataException
+                                                   or ArgumentOutOfRangeException)
+        {
+            return false;
+        }
+        finally
+        {
+            package.Position = 0;
+        }
+    }
+
+    private static DocxImportResultDto CreateUnsafePackageResult()
+    {
+        const string message = "Файл не є коректним DOCX-документом або ZIP-вміст перевищує безпечні обмеження";
+        return new DocxImportResultDto(string.Empty, null, false, new(), new() { message }, message);
     }
     // Визначає код/назву курсу за назвою файлу або текстом документа.
     private static string? ResolveCourseName(string fileName, IEnumerable<string> docTexts)

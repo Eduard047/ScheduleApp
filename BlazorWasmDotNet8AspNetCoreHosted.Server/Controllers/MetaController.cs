@@ -22,7 +22,8 @@ public class MetaController(AppDbContext db) : ControllerBase
         var courses = await db.Courses.AsNoTracking()
             .Select(x => new LookupDto(x.Id, x.Name)
             {
-                AcademicPeriodStartDate = x.AcademicPeriodStartDate
+                AcademicPeriodStartDate = x.AcademicPeriodStartDate,
+                DurationWeeks = x.DurationWeeks
             })
             .ToListAsync();
         var groups = await db.Groups.AsNoTracking()

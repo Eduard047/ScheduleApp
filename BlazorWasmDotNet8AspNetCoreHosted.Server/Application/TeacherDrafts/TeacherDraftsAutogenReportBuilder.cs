@@ -9,9 +9,19 @@ internal static class TeacherDraftsAutogenReportBuilder
         int skipped,
         IEnumerable<string> warnings,
         IEnumerable<AutoGenGapDetail> gapDetails,
-        IEnumerable<AutoGenPreflightItem> preflight)
+        IEnumerable<AutoGenPreflightItem> preflight,
+        AutoGenCoverageDto? coverage = null)
     {
         var warningDetails = AutoGenWarningClassifier.ClassifyMany(warnings);
+        var choices = warningDetails.Where(detail => detail.Code == AutoGenWarningCodes.SchedulingChoice).ToList();
+        if (choices.Count > 12)
+        {
+            warningDetails.RemoveAll(detail => detail.Code == AutoGenWarningCodes.SchedulingChoice);
+            warningDetails.Add(new AutoGenWarningDetail(AutoGenWarningCodes.SchedulingChoice,
+                AutoGenWarningSeverities.Info, AutoGenWarningCategories.Optimization,
+                $"Дозволені правила розподілу застосовано до {choices.Count} занять. Приклади: {string.Join(" | ", choices.Take(3).Select(detail => detail.Message))}",
+                new() { ["occurrences"] = choices.Count.ToString(System.Globalization.CultureInfo.InvariantCulture) }));
+        }
         var gaps = gapDetails
             .Select(AutoGenGapReasonClassifier.EnsureStructured)
             .ToList();
@@ -23,7 +33,8 @@ internal static class TeacherDraftsAutogenReportBuilder
             gaps,
             BuildGapSummary(gaps),
             preflightItems,
-            warningDetails);
+            warningDetails,
+            coverage);
     }
 
     public static AutoGenRunReport BuildReport(DateOnly fromDate, DateOnly toDate, int totalWeeks, AutoGenResult result)
@@ -75,7 +86,8 @@ internal static class TeacherDraftsAutogenReportBuilder
             preflight,
             worstGroups,
             worstModules,
-            BuildRecommendations(gapSummary, preflight, worstGroups, worstModules));
+            BuildRecommendations(gapSummary, preflight, worstGroups, worstModules),
+            result.Coverage);
     }
 
     private static string FormatGapExample(AutoGenGapDetail gap)

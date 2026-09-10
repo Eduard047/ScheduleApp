@@ -87,6 +87,45 @@ public sealed class AutogenSeededStressTests
     }
 
     [Fact(Timeout = 180_000)]
+    public async Task Unrelated_configuration_volume_does_not_change_generation_result()
+    {
+        const int seed = 50_060;
+        var scenario = StressScenario.CreateFeasible(
+            seed,
+            allowLockedSeed: false,
+            forcedScale: StressScale.Compact);
+
+        // Окремий прогрів прибирає вплив JIT-компіляції з порівняння часу генерації.
+        var warmupSeed = seed + 1;
+        await RunFeasibleScenarioAsync(
+            warmupSeed,
+            reverseInputOrder: false,
+            StressScenario.CreateFeasible(
+                warmupSeed,
+                allowLockedSeed: false,
+                forcedScale: StressScale.Compact));
+
+        var baseline = await RunFeasibleScenarioAsync(
+            seed,
+            reverseInputOrder: false,
+            scenario);
+        var polluted = await RunFeasibleScenarioAsync(
+            seed,
+            reverseInputOrder: false,
+            scenario,
+            unrelatedConfigurationCount: 2_000);
+
+        Console.WriteLine(
+            $"Незалежна конфігурація: baseline={baseline.GenerationRuntime.TotalMilliseconds:F0} мс; " +
+            $"2 000 сторонніх модулів={polluted.GenerationRuntime.TotalMilliseconds:F0} мс.");
+        Assert.Equal(baseline.Fingerprint, polluted.Fingerprint);
+        Assert.Equal(baseline.ShapeFingerprint, polluted.ShapeFingerprint);
+        Assert.True(
+            polluted.GenerationRuntime < TimeSpan.FromSeconds(5),
+            $"Стороння конфігурація сповільнила компактний сценарій до {polluted.GenerationRuntime.TotalSeconds:F1} с.");
+    }
+
+    [Fact(Timeout = 180_000)]
     [Trait("Category", "AutogenQuality")]
     public async Task Seeded_deficit_matrix_reports_each_expected_constraint()
     {
@@ -237,18 +276,21 @@ public sealed class AutogenSeededStressTests
         int seed,
         bool reverseInputOrder,
         StressScenario? scenarioOverride = null,
-        bool addUnusedResources = false)
+        bool addUnusedResources = false,
+        int unrelatedConfigurationCount = 0)
     {
         var requestedScenario = scenarioOverride ?? StressScenario.CreateFeasible(seed);
         await using var database = await StressDatabase.CreateAsync(
             requestedScenario,
             reverseInputOrder,
-            addUnusedResources);
+            addUnusedResources,
+            unrelatedConfigurationCount);
         var scenario = database.Scenario;
         await using var executionDb = new AppDbContext(database.Options);
         var beforeCount = await executionDb.TeacherDraftItems.CountAsync();
         var autogen = new TeacherDraftsAutogenService(executionDb);
         ActionResult<AutoGenResult> action;
+        var generationTimer = Stopwatch.StartNew();
         if (string.Equals(
                 Environment.GetEnvironmentVariable("AUTOGEN_STRESS_AMBIENT"),
                 "1",
@@ -262,6 +304,7 @@ public sealed class AutogenSeededStressTests
         {
             action = await autogen.DraftAutoGen(scenario.Request);
         }
+        generationTimer.Stop();
         var result = ExtractResult(action, seed);
         executionDb.ChangeTracker.Clear();
         var rows = await executionDb.TeacherDraftItems
@@ -342,7 +385,8 @@ public sealed class AutogenSeededStressTests
         return new StressSnapshot(
             result.Created,
             BuildFingerprint(rows),
-            BuildShapeFingerprint(rows, scenario));
+            BuildShapeFingerprint(rows, scenario),
+            generationTimer.Elapsed);
     }
 
     private static async Task<int> RunDeficitMatrixAsync(int firstSeed, int scenarioCount)
@@ -727,7 +771,8 @@ public sealed class AutogenSeededStressTests
     private sealed record StressSnapshot(
         int Created,
         string Fingerprint,
-        string ShapeFingerprint);
+        string ShapeFingerprint,
+        TimeSpan GenerationRuntime);
 
     private enum StressScale
     {
@@ -1002,7 +1047,8 @@ public sealed class AutogenSeededStressTests
         public static async Task<StressDatabase> CreateAsync(
             StressScenario scenario,
             bool reverseInputOrder,
-            bool addUnusedResources = false)
+            bool addUnusedResources = false,
+            int unrelatedConfigurationCount = 0)
         {
             if (reverseInputOrder)
             {
@@ -1036,11 +1082,17 @@ public sealed class AutogenSeededStressTests
             var db = new AppDbContext(options);
             await db.Database.EnsureCreatedAsync();
             var database = new StressDatabase(anchor, options, db, scenario);
-            await database.SeedAsync(reverseInputOrder, addUnusedResources);
+            await database.SeedAsync(
+                reverseInputOrder,
+                addUnusedResources,
+                unrelatedConfigurationCount);
             return database;
         }
 
-        private async Task SeedAsync(bool reverseInputOrder, bool addUnusedResources)
+        private async Task SeedAsync(
+            bool reverseInputOrder,
+            bool addUnusedResources,
+            int unrelatedConfigurationCount)
         {
             var scenario = Scenario;
             var stableGroupIds = scenario.GroupIds.OrderBy(id => id).ToArray();
@@ -1327,6 +1379,71 @@ public sealed class AutogenSeededStressTests
                     Id = scenario.CourseId + 152,
                     FullName = "Невикористаний stress-викладач"
                 });
+            }
+
+            if (unrelatedConfigurationCount > 0)
+            {
+                var unrelatedCourseId = scenario.CourseId + 500_000;
+                var unrelatedBuildingId = scenario.CourseId + 500_001;
+                var unrelatedRoomId = scenario.CourseId + 500_002;
+                Db.Courses.Add(new Course
+                {
+                    Id = unrelatedCourseId,
+                    Name = "Сторонній stress-курс",
+                    DurationWeeks = 12
+                });
+                Db.Buildings.Add(new Building
+                {
+                    Id = unrelatedBuildingId,
+                    Name = "Сторонній stress-корпус"
+                });
+                Db.Rooms.Add(new Room
+                {
+                    Id = unrelatedRoomId,
+                    Name = "Стороння stress-аудиторія",
+                    Capacity = 10_000,
+                    BuildingId = unrelatedBuildingId
+                });
+                for (var index = 0; index < unrelatedConfigurationCount; index++)
+                {
+                    var moduleId = scenario.CourseId + 600_000 + index;
+                    var teacherId = scenario.CourseId + 700_000 + index;
+                    Db.Modules.Add(new BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.Module
+                    {
+                        Id = moduleId,
+                        CourseId = unrelatedCourseId,
+                        Code = $"UNRELATED-{index + 1}",
+                        Title = $"Сторонній модуль {index + 1}",
+                        Credits = 1
+                    });
+                    Db.ModuleRooms.Add(new ModuleRoom
+                    {
+                        ModuleId = moduleId,
+                        RoomId = unrelatedRoomId
+                    });
+                    Db.ModuleBuildings.Add(new ModuleBuilding
+                    {
+                        ModuleId = moduleId,
+                        BuildingId = unrelatedBuildingId
+                    });
+                    Db.Teachers.Add(new Teacher
+                    {
+                        Id = teacherId,
+                        FullName = $"Сторонній викладач {index + 1}"
+                    });
+                    Db.TeacherModules.Add(new TeacherModule
+                    {
+                        TeacherId = teacherId,
+                        ModuleId = moduleId
+                    });
+                    Db.TeacherWorkingHours.Add(new TeacherWorkingHour
+                    {
+                        TeacherId = teacherId,
+                        DayOfWeek = DayOfWeek.Monday,
+                        Start = new TimeOnly(8, 0),
+                        End = new TimeOnly(18, 0)
+                    });
+                }
             }
 
             await Db.SaveChangesAsync();

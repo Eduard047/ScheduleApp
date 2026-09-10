@@ -3,6 +3,19 @@ window.scheduleApp = window.scheduleApp || {};
 window.scheduleApp.navigationEscapeHandlers = window.scheduleApp.navigationEscapeHandlers || new Map();
 window.scheduleApp.navigationEscapeSequence = window.scheduleApp.navigationEscapeSequence || 0;
 
+window.scheduleApp.focusMainContent = () => {
+    const main = document.getElementById("main-content");
+    if (!main) return;
+    const navbar = document.querySelector(".app-navbar");
+    const stickyOffset = navbar instanceof HTMLElement
+        ? navbar.getBoundingClientRect().height + 8
+        : 0;
+    const targetTop = Math.max(0, window.scrollY + main.getBoundingClientRect().top - stickyOffset);
+    main.focus({ preventScroll: true });
+    window.scrollTo({ top: targetTop, behavior: "auto" });
+    history.replaceState(history.state, "", `${location.pathname}${location.search}#main-content`);
+};
+
 window.scheduleApp.registerNavigationEscape = dotNetReference => {
     const listenerId = ++window.scheduleApp.navigationEscapeSequence;
     const handler = event => {

@@ -1,6 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
-using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
+using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure.Seed;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -26,6 +26,24 @@ public sealed class ProductionPipelineSecurityTests
         using var response = await client.SendAsync(request);
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData("192.0.2.44:5285")]
+    [InlineData("schedule.private.example.test:8443")]
+    public async Task Real_entry_point_default_wildcard_accepts_nonempty_ip_and_dns_hosts(string requestHost)
+    {
+        await using var factory = new ProductionPipelineFactory(restrictHosts: false);
+        using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false
+        });
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/health/live");
+        request.Headers.Host = requestHost;
+
+        using var response = await client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
 
     [Fact]
@@ -60,8 +78,11 @@ public sealed class ProductionPipelineSecurityTests
 
         using var response = await client.SendAsync(request);
 
-        Assert.Equal("frame-ancestors 'none'", response.Headers.GetValues("Content-Security-Policy").Single());
+        Assert.Equal(SecurityResponseHeadersMiddleware.ContentSecurityPolicy, response.Headers.GetValues("Content-Security-Policy").Single());
         Assert.Equal("DENY", response.Headers.GetValues("X-Frame-Options").Single());
+        Assert.Equal("nosniff", response.Headers.GetValues("X-Content-Type-Options").Single());
+        Assert.Equal("strict-origin-when-cross-origin", response.Headers.GetValues("Referrer-Policy").Single());
+        Assert.Equal("camera=(), geolocation=(), microphone=()", response.Headers.GetValues("Permissions-Policy").Single());
     }
 
     [Fact]
@@ -74,6 +95,7 @@ public sealed class ProductionPipelineSecurityTests
         });
 
         HttpResponseMessage? lastResponse = null;
+        var statuses = new List<HttpStatusCode>();
         try
         {
             for (var attempt = 0; attempt < 5; attempt++)
@@ -85,9 +107,13 @@ public sealed class ProductionPipelineSecurityTests
                 request.Headers.Host = "schedule.example.test";
                 request.Content = JsonContent.Create(new { });
                 lastResponse = await client.SendAsync(request);
+                statuses.Add(lastResponse.StatusCode);
             }
 
             Assert.NotNull(lastResponse);
+            Assert.Equal(
+                Enumerable.Repeat(HttpStatusCode.BadRequest, 4),
+                statuses.Take(4));
             Assert.Equal(HttpStatusCode.TooManyRequests, lastResponse.StatusCode);
             Assert.Equal("application/problem+json", lastResponse.Content.Headers.ContentType?.MediaType);
         }
@@ -97,12 +123,15 @@ public sealed class ProductionPipelineSecurityTests
         }
     }
 
-    private sealed class ProductionPipelineFactory : WebApplicationFactory<Program>
+    private sealed class ProductionPipelineFactory(bool restrictHosts = true) : WebApplicationFactory<Program>
     {
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             builder.UseEnvironment("Testing");
-            builder.UseSetting("AllowedHosts", "schedule.example.test");
+            if (restrictHosts)
+            {
+                builder.UseSetting("AllowedHosts", "schedule.example.test");
+            }
             builder.UseSetting(
                 "ConnectionStrings:Default",
                 "Server=127.0.0.1;Database=unused;User=unused;Password=unused");
@@ -110,7 +139,6 @@ public sealed class ProductionPipelineSecurityTests
             {
                 // Для HTTP-контракту не запускаємо фонові служби, що потребують робочої БД.
                 services.RemoveAll<IHostedService>();
-                services.RemoveAll<TeacherDraftsAutogenJobService>();
                 services.RemoveAll<DefaultLessonTypesSeederHostedService>();
             });
         }

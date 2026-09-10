@@ -15,17 +15,54 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 // Сервіс публікації чернеток у офіційний розклад.
 public sealed class TeacherDraftsPublishService
 {
+    private static readonly TimeSpan MaxWeekMutationDuration = TimeSpan.FromSeconds(30);
     private readonly AppDbContext _db;
     private readonly RulesService _rules;
     private readonly AggregatesService _aggregates;
-    public TeacherDraftsPublishService(AppDbContext db, RulesService rules, AggregatesService aggregates)
+    private readonly ExpensiveOperationGate? _operationGate;
+    public TeacherDraftsPublishService(
+        AppDbContext db,
+        RulesService rules,
+        AggregatesService aggregates,
+        ExpensiveOperationGate? operationGate = null)
     {
         _db = db;
         _rules = rules;
         _aggregates = aggregates;
+        _operationGate = operationGate;
     }
     // Схвалює вибір викладача разом з усіма рядками кожного логічного заняття.
-    public async Task<IActionResult> ApproveWeekAsync(ApproveWeekRequest r)
+    public async Task<IActionResult> ApproveWeekAsync(
+        ApproveWeekRequest r,
+        CancellationToken cancellationToken = default)
+    {
+        using var lease = _operationGate is null
+            ? null
+            : await _operationGate.TryEnterAsync(
+                ExpensiveOperationKind.WeekMutation,
+                cancellationToken);
+        if (_operationGate is not null && lease is null)
+        {
+            return WeekMutationBusyResult();
+        }
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(MaxWeekMutationDuration);
+        try
+        {
+            return await ApproveWeekCoreAsync(r, deadline.Token);
+        }
+        catch (OperationCanceledException) when (
+            !cancellationToken.IsCancellationRequested
+            && deadline.IsCancellationRequested)
+        {
+            throw new DraftValidationTimeoutException(
+                "Схвалення тижня перевищило безпечний час виконання. Зменште обсяг даних або повторіть пізніше.");
+        }
+    }
+
+    private async Task<IActionResult> ApproveWeekCoreAsync(
+        ApproveWeekRequest r,
+        CancellationToken cancellationToken)
     {
         if (!DateHelpers.IsSupportedScheduleDate(r.WeekStart))
         {
@@ -33,25 +70,82 @@ public sealed class TeacherDraftsPublishService
         }
         var start = r.WeekStart;
         var end = start.AddDays(7);
-        await using var tx = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
+        if (r.ExpectedScopeRevision is not Guid expectedScopeRevision
+            || expectedScopeRevision == Guid.Empty)
+        {
+            return new ObjectResult(new ProblemDetails
+            {
+                Status = StatusCodes.Status428PreconditionRequired,
+                Title = "Потрібна актуальна версія тижня",
+                Detail = "Перед схваленням оновіть тиждень і передайте його актуальну версію."
+            })
+            {
+                StatusCode = StatusCodes.Status428PreconditionRequired
+            };
+        }
+        await using var tx = await _db.Database.BeginTransactionAsync(
+            IsolationLevel.Serializable,
+            cancellationToken);
         var weekDrafts = await _db.TeacherDraftItems
             .Where(x => x.Date >= start && x.Date < end)
             .OrderBy(x => x.Date)
             .ThenBy(x => x.StartTime)
             .ThenBy(x => x.GroupId)
             .ThenBy(x => x.Id)
-            .ToListAsync();
+            .Take(TeacherDraftsWeekValidationService.MaxWeekDraftRowCount + 1)
+            .ToListAsync(cancellationToken);
+        EnsureWeekDraftCapacity(weekDrafts.Count);
+        var actualScopeRevision = LogicalRevisionToken.Combine(weekDrafts.Select(item =>
+            new KeyValuePair<int, Guid>(item.Id, item.Revision)));
+        if (actualScopeRevision != expectedScopeRevision)
+        {
+            await tx.RollbackAsync(cancellationToken);
+            return new ConflictObjectResult(new
+            {
+                message = "Схвалення скасовано: чернетки змінилися після перегляду. Оновіть тиждень і повторіть дію."
+            });
+        }
         var rows = ExpandTeacherPublishSelection(weekDrafts, r.TeacherId);
         foreach (var x in rows)
         {
             x.Status = DraftStatus.Published;
         }
-        await _db.SaveChangesAsync();
-        await tx.CommitAsync();
+        await _db.SaveChangesAsync(cancellationToken);
+        await tx.CommitAsync(cancellationToken);
         return new OkResult();
     }
     // Публікує чернетки тижня в офіційний розклад із валідацією.
-    public async Task<ActionResult<PublishWeekResults>> PublishWeekAsync(PublishWeekRequest r)
+    public async Task<ActionResult<PublishWeekResults>> PublishWeekAsync(
+        PublishWeekRequest r,
+        CancellationToken cancellationToken = default)
+    {
+        using var lease = _operationGate is null
+            ? null
+            : await _operationGate.TryEnterAsync(
+                ExpensiveOperationKind.WeekMutation,
+                cancellationToken);
+        if (_operationGate is not null && lease is null)
+        {
+            return WeekMutationBusyResult();
+        }
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(MaxWeekMutationDuration);
+        try
+        {
+            return await PublishWeekCoreAsync(r, deadline.Token);
+        }
+        catch (OperationCanceledException) when (
+            !cancellationToken.IsCancellationRequested
+            && deadline.IsCancellationRequested)
+        {
+            throw new DraftValidationTimeoutException(
+                "Публікація тижня перевищила безпечний час виконання. Зменште обсяг даних або повторіть пізніше.");
+        }
+    }
+
+    private async Task<ActionResult<PublishWeekResults>> PublishWeekCoreAsync(
+        PublishWeekRequest r,
+        CancellationToken cancellationToken)
     {
         if (!DateHelpers.IsSupportedScheduleDate(r.WeekStart))
         {
@@ -72,7 +166,9 @@ public sealed class TeacherDraftsPublishService
         }
         var start = r.WeekStart;
         var end = start.AddDays(7);
-        await using var tx = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
+        await using var tx = await _db.Database.BeginTransactionAsync(
+            IsolationLevel.Serializable,
+            cancellationToken);
 
         var weekDrafts = await _db.TeacherDraftItems
             .Where(x => x.Date >= start && x.Date < end)
@@ -81,12 +177,14 @@ public sealed class TeacherDraftsPublishService
             .ThenBy(x => x.StartTime)
             .ThenBy(x => x.GroupId)
             .ThenBy(x => x.Id)
-            .ToListAsync();
+            .Take(TeacherDraftsWeekValidationService.MaxWeekDraftRowCount + 1)
+            .ToListAsync(cancellationToken);
+        EnsureWeekDraftCapacity(weekDrafts.Count);
         var actualScopeRevision = LogicalRevisionToken.Combine(weekDrafts.Select(item =>
             new KeyValuePair<int, Guid>(item.Id, item.Revision)));
         if (actualScopeRevision != expectedScopeRevision)
         {
-            await tx.RollbackAsync();
+            await tx.RollbackAsync(cancellationToken);
             return new OkObjectResult(new PublishWeekResults(
                 0,
                 weekDrafts.Count,
@@ -100,7 +198,7 @@ public sealed class TeacherDraftsPublishService
             : weekDrafts;
         if (drafts.Count == 0)
         {
-            await tx.CommitAsync();
+            await tx.CommitAsync(cancellationToken);
             return new OkObjectResult(new PublishWeekResults(0, 0, new List<string>()));
         }
 
@@ -111,7 +209,7 @@ public sealed class TeacherDraftsPublishService
         }
         if (preflightViolations.Count > 0)
         {
-            await tx.RollbackAsync();
+            await tx.RollbackAsync(cancellationToken);
             var warnings = new List<string>
             {
                 "Публікацію скасовано: вибраний пакет не утворює цілісні логічні події."
@@ -125,7 +223,8 @@ public sealed class TeacherDraftsPublishService
             _rules,
             drafts,
             start,
-            end);
+            end,
+            cancellationToken);
         var candidates = candidateValidation.Candidates.ToList();
         var violations = candidateValidation.Violations.ToList();
 
@@ -162,13 +261,14 @@ public sealed class TeacherDraftsPublishService
                     PendingDrafts: pendingDrafts,
                     IncludeStoredDrafts: false,
                     ScopePendingDraftsToCourse: true,
-                    MaxStoredContextRows: TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount));
+                    MaxStoredContextRows: TeacherDraftsWeekValidationService.MaxStoredScheduleRowCount),
+                cancellationToken);
             violations.AddRange(hardRuleResult.Violations);
         }
 
         if (violations.Count > 0)
         {
-            await tx.RollbackAsync();
+            await tx.RollbackAsync(cancellationToken);
             var warnings = new List<string>
             {
                 "Публікацію скасовано: пакет містить порушення обов'язкових правил."
@@ -200,14 +300,15 @@ public sealed class TeacherDraftsPublishService
             scheduleItems.Add(item);
         }
         _db.ScheduleItems.AddRange(scheduleItems);
-        await _db.SaveChangesAsync();
+        await _db.SaveChangesAsync(cancellationToken);
         var publishedIds = drafts.Select(draft => draft.Id).ToList();
         await _db.TeacherDraftItems
             .Where(x => publishedIds.Contains(x.Id))
-            .ExecuteDeleteAsync();
+            .ExecuteDeleteAsync(cancellationToken);
         await TeacherDraftsAutogenPlanService.ExpireAppliedPlansConsumedByPublicationAsync(
             _db,
-            drafts);
+            drafts,
+            cancellationToken);
         var affectedPlans = drafts
             .Select(x => new { x.ModuleId, CourseId = x.Group.CourseId })
             .Distinct()
@@ -217,10 +318,30 @@ public sealed class TeacherDraftsPublishService
             .Select(x => new { TeacherId = x.TeacherId!.Value, CourseId = x.Group.CourseId })
             .Distinct()
             .Select(x => (x.TeacherId, x.CourseId));
-        await _aggregates.RecalcAsync(affectedPlans, affectedLoads);
-        await tx.CommitAsync();
+        await _aggregates.RecalcAsync(affectedPlans, affectedLoads, cancellationToken);
+        await tx.CommitAsync(cancellationToken);
         return new OkObjectResult(new PublishWeekResults(scheduleItems.Count, 0, new List<string>()));
     }
+
+    private static void EnsureWeekDraftCapacity(int rowCount)
+    {
+        if (rowCount > TeacherDraftsWeekValidationService.MaxWeekDraftRowCount)
+        {
+            throw new DraftValidationCapacityException(
+                $"За один тиждень можна обробити не більше {TeacherDraftsWeekValidationService.MaxWeekDraftRowCount} чернеток.");
+        }
+    }
+
+    private static ObjectResult WeekMutationBusyResult()
+        => new(new ProblemDetails
+        {
+            Status = StatusCodes.Status429TooManyRequests,
+            Title = "Інша зміна тижня вже виконується",
+            Detail = "Дочекайтеся завершення поточного схвалення або публікації та повторіть запит."
+        })
+        {
+            StatusCode = StatusCodes.Status429TooManyRequests
+        };
 
     // Повертає структурні помилки пакета, які однаково блокують перевірку та публікацію тижня.
     internal static IReadOnlyList<string> FindWholeWeekPackageViolations(

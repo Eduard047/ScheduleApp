@@ -13,6 +13,9 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 
 public sealed class TeacherDraftsAutogenJobServiceSecurityTests
 {
+    private const string OwnerPartition = "partition-a";
+    private const string ForeignPartition = "partition-b";
+
     [Fact]
     public async Task Plan_handoff_gate_rejects_waiters_above_the_global_limit_without_queueing()
     {
@@ -103,6 +106,185 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
         {
             gate.Release();
         }
+    }
+
+    [Fact]
+    public async Task Persisted_job_status_and_cancellation_are_scoped_to_client_partition()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync();
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(fixture.Options));
+        await using var provider = services.BuildServiceProvider();
+        var service = new TeacherDraftsAutogenJobService(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+        long versionBefore;
+        await using (var db = new AppDbContext(fixture.Options))
+        {
+            versionBefore = await db.AutoGenJobRuns
+                .Where(item => item.JobId == fixture.PlanId)
+                .Select(item => item.Version)
+                .SingleAsync();
+        }
+
+        Assert.Null(await service.GetAsync(fixture.PlanId, ForeignPartition));
+        Assert.Null(await service.CancelAsync(fixture.PlanId, ForeignPartition));
+        Assert.NotNull(await service.GetAsync(fixture.PlanId, OwnerPartition));
+
+        await using var verification = new AppDbContext(fixture.Options);
+        var persisted = await verification.AutoGenJobRuns
+            .AsNoTracking()
+            .SingleAsync(item => item.JobId == fixture.PlanId);
+        Assert.Equal(versionBefore, persisted.Version);
+        Assert.False(persisted.CancellationRequested);
+    }
+
+    [Fact]
+    public async Task Foreign_partition_does_not_wait_for_or_observe_running_job()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        await using (var db = new AppDbContext(options))
+        {
+            await db.Database.EnsureCreatedAsync();
+            db.Courses.Add(new Course
+            {
+                Id = 1,
+                Name = "Курс перевірки partition",
+                DurationWeeks = 52,
+                AcademicPeriodStartDate = new DateOnly(2026, 1, 1)
+            });
+            await db.SaveChangesAsync();
+        }
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(options));
+        await using var provider = services.BuildServiceProvider();
+        var service = new TeacherDraftsAutogenJobService(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+        var executionGate = await HoldGateAsync(service, "_executionGate");
+        var started = service.Start(CreateValidRequest(), OwnerPartition);
+
+        try
+        {
+            await service.PreparePlanReadAsync(started.JobId, ForeignPartition)
+                .WaitAsync(TimeSpan.FromSeconds(1));
+            await Assert.ThrowsAsync<AutoGenPlanConflictException>(() =>
+                service.PreparePlanReadAsync(started.JobId, OwnerPartition));
+        }
+        finally
+        {
+            executionGate.Release();
+            await service.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+        }
+    }
+
+    [Fact]
+    public async Task Remote_instance_rejects_plan_read_and_apply_while_persisted_job_is_running()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        var jobId = Guid.NewGuid().ToString("N");
+        await using (var db = new AppDbContext(options))
+        {
+            await db.Database.EnsureCreatedAsync();
+            db.AutoGenJobRuns.Add(new AutoGenJobRun
+            {
+                JobId = jobId,
+                ClientPartitionKey = OwnerPartition,
+                RequestHash = new string('a', 64),
+                OwnerInstanceId = "remote-owner",
+                Attempt = 1,
+                LeaseExpiresAtUtc = DateTime.UtcNow.AddMinutes(5),
+                Version = 1,
+                Kind = (int)AutoGenJobKind.Generate,
+                State = (int)AutoGenJobState.Running,
+                Title = "Міжсерверна перевірка",
+                CurrentStage = "Формування плану",
+                CreatedAtUtc = DateTime.UtcNow,
+                StartedAtUtc = DateTime.UtcNow,
+                RangeStartDate = new DateOnly(2026, 1, 1),
+                RangeEndDate = new DateOnly(2026, 1, 1),
+                RequestJson = "{}",
+                StatusJson = "{}",
+                UpdatedAtUtc = DateTime.UtcNow
+            });
+            await db.SaveChangesAsync();
+        }
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(options));
+        services.AddScoped<TeacherDraftsAutogenPlanService>();
+        await using var provider = services.BuildServiceProvider();
+        var observer = new TeacherDraftsAutogenJobService(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+
+        await Assert.ThrowsAsync<AutoGenPlanConflictException>(() =>
+            observer.PreparePlanReadAsync(jobId, OwnerPartition));
+        await Assert.ThrowsAsync<AutoGenPlanConflictException>(() =>
+            observer.ApplyPlanAsync(
+                jobId,
+                new AutoGenPlanActionRequest(1),
+                OwnerPartition));
+        await observer.PreparePlanReadAsync(jobId, ForeignPartition);
+    }
+
+    [Fact]
+    public async Task Remote_plan_read_expires_a_running_job_after_its_owner_lease_elapsed()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+        var jobId = Guid.NewGuid().ToString("N");
+        await using (var db = new AppDbContext(options))
+        {
+            await db.Database.EnsureCreatedAsync();
+            db.AutoGenJobRuns.Add(new AutoGenJobRun
+            {
+                JobId = jobId,
+                ClientPartitionKey = OwnerPartition,
+                RequestHash = new string('a', 64),
+                OwnerInstanceId = "stopped-owner",
+                Attempt = 1,
+                LeaseExpiresAtUtc = DateTime.UtcNow.AddMinutes(-5),
+                Version = 1,
+                Kind = (int)AutoGenJobKind.Generate,
+                State = (int)AutoGenJobState.Running,
+                Title = "Завдання з простроченим lease",
+                CurrentStage = "Формування плану",
+                CreatedAtUtc = DateTime.UtcNow.AddMinutes(-10),
+                StartedAtUtc = DateTime.UtcNow.AddMinutes(-9),
+                RangeStartDate = new DateOnly(2026, 1, 1),
+                RangeEndDate = new DateOnly(2026, 1, 1),
+                RequestJson = "{}",
+                StatusJson = "{}",
+                UpdatedAtUtc = DateTime.UtcNow.AddMinutes(-5)
+            });
+            await db.SaveChangesAsync();
+        }
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(options));
+        services.AddScoped<TeacherDraftsAutogenPlanService>();
+        await using var provider = services.BuildServiceProvider();
+        var observer = new TeacherDraftsAutogenJobService(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            new CapturingLogger<TeacherDraftsAutogenJobService>());
+
+        await observer.PreparePlanReadAsync(jobId, OwnerPartition);
+
+        await using var verification = new AppDbContext(options);
+        var persisted = await verification.AutoGenJobRuns.AsNoTracking().SingleAsync();
+        Assert.Equal((int)AutoGenJobState.Failed, persisted.State);
+        Assert.Null(persisted.LeaseExpiresAtUtc);
+        Assert.Contains("Lease", persisted.Error, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -577,6 +759,62 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
     }
 
     [Fact]
+    public async Task Persisted_plan_read_latest_apply_and_rollback_are_scoped_to_client_partition()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Add);
+        await using (var db = new AppDbContext(fixture.Options))
+        {
+            var service = new TeacherDraftsAutogenPlanService(db);
+            Assert.Equal(
+                fixture.PlanId,
+                (await service.GetDetailsAsync(fixture.PlanId, OwnerPartition)).Summary.PlanId);
+            await Assert.ThrowsAsync<AutoGenPlanNotFoundException>(() =>
+                service.GetDetailsAsync(fixture.PlanId, ForeignPartition));
+            await Assert.ThrowsAsync<AutoGenPlanNotFoundException>(() =>
+                service.ApplyAsync(
+                    fixture.PlanId,
+                    new AutoGenPlanActionRequest(1),
+                    ForeignPartition));
+        }
+        await using (var verification = new AppDbContext(fixture.Options))
+        {
+            var untouched = await verification.AutoGenDraftPlans.AsNoTracking().SingleAsync();
+            Assert.Equal((int)AutoGenPlanState.Ready, untouched.State);
+            Assert.Equal(1, untouched.Version);
+            Assert.Empty(await verification.TeacherDraftItems.AsNoTracking().ToListAsync());
+        }
+
+        AutoGenPlanDetailsDto applied;
+        await using (var db = new AppDbContext(fixture.Options))
+        {
+            applied = await new TeacherDraftsAutogenPlanService(db).ApplyAsync(
+                fixture.PlanId,
+                new AutoGenPlanActionRequest(1),
+                OwnerPartition);
+        }
+        await using (var db = new AppDbContext(fixture.Options))
+        {
+            var service = new TeacherDraftsAutogenPlanService(db);
+            Assert.Null(await service.GetLatestRollbackableAsync(1, ForeignPartition));
+            Assert.Equal(
+                fixture.PlanId,
+                (await service.GetLatestRollbackableAsync(1, OwnerPartition))?.Summary.PlanId);
+            await Assert.ThrowsAsync<AutoGenPlanNotFoundException>(() =>
+                service.RollbackAsync(
+                    fixture.PlanId,
+                    new AutoGenPlanActionRequest(applied.Summary.Version),
+                    ForeignPartition));
+        }
+        await using (var verification = new AppDbContext(fixture.Options))
+        {
+            var untouched = await verification.AutoGenDraftPlans.AsNoTracking().SingleAsync();
+            Assert.Equal((int)AutoGenPlanState.Applied, untouched.State);
+            Assert.Equal(applied.Summary.Version, untouched.Version);
+            Assert.Single(await verification.TeacherDraftItems.AsNoTracking().ToListAsync());
+        }
+    }
+
+    [Fact]
     public async Task Persisted_add_plan_applies_and_rolls_back_generated_row()
     {
         await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Add);
@@ -742,6 +980,103 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
             var plan = await verification.AutoGenDraftPlans.AsNoTracking().SingleAsync();
             Assert.Equal((int)AutoGenPlanState.Ready, plan.State);
         }
+    }
+
+    [Fact]
+    public async Task Input_fingerprint_accepts_section_limit_and_rejects_limit_plus_one()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Add);
+        var request = CreatePlanFingerprintRequest();
+        await using var db = new AppDbContext(fixture.Options);
+        await InsertLessonTypesAsync(
+            db,
+            TeacherDraftsAutogenInputFingerprint.MaxRowsPerFingerprintSection - 1,
+            idOffset: 1_000);
+        var service = new TeacherDraftsAutogenPlanService(db);
+
+        var exactLimitFingerprint = await service.CaptureInputFingerprintAsync(request);
+
+        Assert.Equal(64, exactLimitFingerprint.Length);
+        db.LessonTypes.Add(new LessonTypeRef
+        {
+            Code = "CAPACITY-OVERFLOW",
+            Name = "Тип заняття понад ліміт",
+            IsActive = true
+        });
+        await db.SaveChangesAsync();
+
+        var error = await Assert.ThrowsAsync<AutoGenPlanCapacityException>(() =>
+            service.CaptureInputFingerprintAsync(request));
+        Assert.Contains(
+            TeacherDraftsAutogenInputFingerprint.MaxRowsPerFingerprintSection.ToString(),
+            error.Message,
+            StringComparison.Ordinal);
+        Assert.IsAssignableFrom<AutoGenPlanConflictException>(error);
+    }
+
+    [Fact]
+    public async Task Plan_scope_accepts_limit_and_apply_rejects_limit_plus_one_without_changes()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Add);
+        var request = CreatePlanFingerprintRequest();
+        await using var db = new AppDbContext(fixture.Options);
+        await InsertDraftRowsAsync(
+            db,
+            TeacherDraftsAutogenPlanService.MaxScopeRowCount,
+            idOffset: 1_000);
+        var service = new TeacherDraftsAutogenPlanService(db);
+
+        var exactLimitScope = await service.CaptureScopeAsync(request, CancellationToken.None);
+
+        Assert.Equal(TeacherDraftsAutogenPlanService.MaxScopeRowCount, exactLimitScope.Count);
+        await InsertDraftRowsAsync(db, count: 1, idOffset: 100_000);
+        var captureError = await Assert.ThrowsAsync<AutoGenPlanCapacityException>(() =>
+            service.CaptureScopeAsync(request, CancellationToken.None));
+        Assert.Contains(
+            TeacherDraftsAutogenPlanService.MaxScopeRowCount.ToString(),
+            captureError.Message,
+            StringComparison.Ordinal);
+
+        var plan = await db.AutoGenDraftPlans.SingleAsync(item => item.PlanId == fixture.PlanId);
+        plan.InputFingerprint = await service.CaptureInputFingerprintAsync(request);
+        plan.BeforeScopeRevision = LogicalRevisionToken.Combine(await db.TeacherDraftItems
+            .AsNoTracking()
+            .OrderBy(item => item.Id)
+            .Select(item => new KeyValuePair<int, Guid>(item.Id, item.Revision))
+            .ToListAsync());
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        var applyError = await Assert.ThrowsAsync<AutoGenPlanCapacityException>(() =>
+            service.ApplyAsync(fixture.PlanId, new AutoGenPlanActionRequest(1)));
+        Assert.Contains(
+            TeacherDraftsAutogenPlanService.MaxScopeRowCount.ToString(),
+            applyError.Message,
+            StringComparison.Ordinal);
+        Assert.Equal(
+            TeacherDraftsAutogenPlanService.MaxScopeRowCount + 1,
+            await db.TeacherDraftItems.AsNoTracking().CountAsync());
+        Assert.Equal(
+            (int)AutoGenPlanState.Ready,
+            await db.AutoGenDraftPlans.AsNoTracking()
+                .Where(item => item.PlanId == fixture.PlanId)
+                .Select(item => item.State)
+                .SingleAsync());
+    }
+
+    [Fact]
+    public async Task Fingerprint_and_plan_scope_honor_pre_canceled_tokens()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Add);
+        await using var db = new AppDbContext(fixture.Options);
+        var service = new TeacherDraftsAutogenPlanService(db);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            service.CaptureInputFingerprintAsync(CreatePlanFingerprintRequest(), cancellation.Token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            service.CaptureScopeAsync(CreatePlanFingerprintRequest(), cancellation.Token));
     }
 
     [Fact]
@@ -1223,6 +1558,122 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
         await Assert.ThrowsAsync<AutoGenPlanNotFoundException>(() => applyTask);
     }
 
+    private static Task<int> InsertLessonTypesAsync(
+        AppDbContext db,
+        int count,
+        int idOffset)
+        => db.Database.ExecuteSqlInterpolatedAsync($"""
+            WITH digits(value) AS (
+                VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)
+            ),
+            numbers(value) AS (
+                SELECT ones.value
+                     + tens.value * 10
+                     + hundreds.value * 100
+                     + thousands.value * 1000
+                     + ten_thousands.value * 10000
+                FROM digits AS ones
+                CROSS JOIN digits AS tens
+                CROSS JOIN digits AS hundreds
+                CROSS JOIN digits AS thousands
+                CROSS JOIN digits AS ten_thousands
+            )
+            INSERT INTO LessonTypes (
+                Id,
+                Code,
+                Name,
+                IsActive,
+                RequiresRoom,
+                RequiresTeacher,
+                BlocksRoom,
+                BlocksTeacher,
+                CountInPlan,
+                CountInLoad,
+                PreferredFirstInWeek,
+                CssKey)
+            SELECT value + {idOffset},
+                   'CAP-' || (value + {idOffset}),
+                   'Тип заняття для перевірки межі',
+                   1,
+                   0,
+                   0,
+                   0,
+                   0,
+                   1,
+                   1,
+                   0,
+                   NULL
+            FROM numbers
+            WHERE value < {count};
+            """);
+
+    private static Task<int> InsertDraftRowsAsync(
+        AppDbContext db,
+        int count,
+        int idOffset)
+        => db.Database.ExecuteSqlInterpolatedAsync($"""
+            WITH digits(value) AS (
+                VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)
+            ),
+            numbers(value) AS (
+                SELECT ones.value
+                     + tens.value * 10
+                     + hundreds.value * 100
+                     + thousands.value * 1000
+                     + ten_thousands.value * 10000
+                FROM digits AS ones
+                CROSS JOIN digits AS tens
+                CROSS JOIN digits AS hundreds
+                CROSS JOIN digits AS thousands
+                CROSS JOIN digits AS ten_thousands
+            )
+            INSERT INTO TeacherDraftItems (
+                Id,
+                Revision,
+                Date,
+                DayOfWeek,
+                StartTime,
+                EndTime,
+                LessonTypeId,
+                GroupId,
+                ModuleId,
+                ModuleTopicId,
+                TeacherId,
+                RoomId,
+                Status,
+                PublishedItemId,
+                BatchKey,
+                ValidationWarnings,
+                CreatedAt,
+                UpdatedAt,
+                IsLocked,
+                IsSelfStudy,
+                GenerationJobId)
+            SELECT value + {idOffset},
+                   printf('00000000-0000-0000-0000-%012d', value + {idOffset}),
+                   '2026-07-06',
+                   1,
+                   '09:00:00',
+                   '10:00:00',
+                   1,
+                   1,
+                   1,
+                   NULL,
+                   NULL,
+                   NULL,
+                   0,
+                   NULL,
+                   NULL,
+                   NULL,
+                   '2026-07-06 09:00:00',
+                   '2026-07-06 09:00:00',
+                   0,
+                   0,
+                   NULL
+            FROM numbers
+            WHERE value < {count};
+            """);
+
     private static AutoGenJobRequest CreateValidRequest()
         => new(
             Kind: AutoGenJobKind.Generate,
@@ -1490,6 +1941,7 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
             var run = new AutoGenJobRun
             {
                 JobId = planId,
+                ClientPartitionKey = OwnerPartition,
                 RequestHash = new string('a', 64),
                 Version = 1,
                 Kind = (int)AutoGenJobKind.Generate,

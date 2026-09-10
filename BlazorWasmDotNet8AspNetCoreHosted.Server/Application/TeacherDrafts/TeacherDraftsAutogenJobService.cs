@@ -5,7 +5,9 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Unicode;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
@@ -29,13 +31,12 @@ public sealed class AutoGenJobCommitOutcomeUnknownException(string message, Exce
 
 public sealed class TeacherDraftsAutogenJobService : IHostedService
 {
-    private const int MaxRangeDays = 370;
+    private const int MaxRangeDays = AutoGenWorkloadLimits.MaxRangeDays;
     private const int MaxGroupCount = 200;
-    private const int MaxFullRangeGroupCount = 32;
     private const int MaxModuleHourEntryCount = 200;
-    private const int MaxHoursPerModulePerRange = 500;
-    private const long MaxGroupDayBudget = 4_000;
-    private const long MaxGroupRequestedModuleHours = 25_000;
+    private const int MaxHoursPerModulePerRange = AutoGenWorkloadLimits.MaxRequestedLessons;
+    private const long MaxGroupDayBudget = AutoGenWorkloadLimits.MaxGroupDays;
+    private const long MaxGroupRequestedModuleHours = AutoGenWorkloadLimits.MaxRequestedLessons;
     private const int MaxPreferredRoomCountPerGroup = 500;
     private const int MaxPreferredFirstSlotOrderOverride = 64;
     private const int MaxRecentRepeatWindowDays = 31;
@@ -95,9 +96,11 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
     private readonly SemaphoreSlim _persistenceGate = new(1, 1);
     private int _stopping;
     private static readonly TimeSpan CompletedJobTtl = TimeSpan.FromHours(6);
+    private static readonly JsonSerializerOptions FingerprintJsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly JsonSerializerOptions PersistenceJsonOptions = new(JsonSerializerDefaults.Web)
     {
-        WriteIndented = false
+        WriteIndented = false,
+        Encoder = JavaScriptEncoder.Create(UnicodeRanges.BasicLatin, UnicodeRanges.Cyrillic)
     };
 
     public TeacherDraftsAutogenJobService(
@@ -157,7 +160,12 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             CleanupOldJobs();
             if (_jobs.TryGetValue(job.JobId, out var existingJob))
             {
-                EnsureMatchingRequest(job.JobId, job.RequestHash, existingJob.RequestHash);
+                EnsureMatchingRequest(
+                    job.JobId,
+                    job.ClientPartitionKey,
+                    job.RequestHash,
+                    existingJob.ClientPartitionKey,
+                    existingJob.RequestHash);
                 return new AutoGenJobStartResult(job.JobId, existingJob.ToDto());
             }
             var persisted = CreateOrReadPersistedJob(job);
@@ -231,24 +239,60 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         }
     }
 
-    public async Task<AutoGenJobStatus?> GetAsync(
+    internal async Task<AutoGenJobStatus?> GetAsync(
         string jobId,
         CancellationToken cancellationToken = default)
+        => await GetCoreAsync(jobId, requiredClientPartitionKey: null, cancellationToken);
+
+    public async Task<AutoGenJobStatus?> GetAsync(
+        string jobId,
+        string clientPartitionKey,
+        CancellationToken cancellationToken = default)
+        => await GetCoreAsync(
+            jobId,
+            NormalizeClientPartitionKey(clientPartitionKey),
+            cancellationToken);
+
+    private async Task<AutoGenJobStatus?> GetCoreAsync(
+        string jobId,
+        string? requiredClientPartitionKey,
+        CancellationToken cancellationToken)
     {
         var normalized = NormalizeJobId(jobId);
         if (normalized is null)
         {
             return null;
         }
-
-        return _jobs.TryGetValue(normalized, out var job)
-            ? job.ToDto()
-            : await ReadPersistedStatusAsync(normalized, cancellationToken);
+        if (_jobs.TryGetValue(normalized, out var job))
+        {
+            return PartitionMatches(job.ClientPartitionKey, requiredClientPartitionKey)
+                ? job.ToDto()
+                : null;
+        }
+        return await ReadPersistedStatusAsync(
+            normalized,
+            requiredClientPartitionKey,
+            cancellationToken);
     }
+
+    internal async Task<AutoGenJobStatus?> CancelAsync(
+        string jobId,
+        CancellationToken cancellationToken = default)
+        => await CancelCoreAsync(jobId, requiredClientPartitionKey: null, cancellationToken);
 
     public async Task<AutoGenJobStatus?> CancelAsync(
         string jobId,
+        string clientPartitionKey,
         CancellationToken cancellationToken = default)
+        => await CancelCoreAsync(
+            jobId,
+            NormalizeClientPartitionKey(clientPartitionKey),
+            cancellationToken);
+
+    private async Task<AutoGenJobStatus?> CancelCoreAsync(
+        string jobId,
+        string? requiredClientPartitionKey,
+        CancellationToken cancellationToken)
     {
         var normalized = NormalizeJobId(jobId);
         if (normalized is null)
@@ -257,18 +301,23 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         }
 
         if (_sqliteExclusiveExecutions.ContainsKey(normalized)
-            && _jobs.TryGetValue(normalized, out var sqliteLocalJob))
+            && _jobs.TryGetValue(normalized, out var sqliteLocalJob)
+            && PartitionMatches(sqliteLocalJob.ClientPartitionKey, requiredClientPartitionKey))
         {
             sqliteLocalJob.RequestCancellationFor(AutoGenJobCancellationReason.UserRequested);
             return sqliteLocalJob.ToDto();
         }
 
-        var persistedStatus = await RequestPersistedCancellationAsync(normalized, cancellationToken);
+        var persistedStatus = await RequestPersistedCancellationAsync(
+            normalized,
+            requiredClientPartitionKey,
+            cancellationToken);
         if (persistedStatus is null)
         {
             return null;
         }
-        if (_jobs.TryGetValue(normalized, out var job))
+        if (_jobs.TryGetValue(normalized, out var job)
+            && PartitionMatches(job.ClientPartitionKey, requiredClientPartitionKey))
         {
             if (IsTerminalState(persistedStatus.State))
             {
@@ -282,97 +331,258 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         return persistedStatus;
     }
 
-    public async Task<AutoGenPlanDetailsDto> GetPlanAsync(
+    internal async Task<AutoGenPlanDetailsDto> GetPlanAsync(
         string jobId,
         CancellationToken cancellationToken = default)
+        => await GetPlanCoreAsync(jobId, requiredClientPartitionKey: null, cancellationToken);
+
+    public async Task<AutoGenPlanDetailsDto> GetPlanAsync(
+        string jobId,
+        string clientPartitionKey,
+        CancellationToken cancellationToken = default)
+        => await GetPlanCoreAsync(
+            jobId,
+            NormalizeClientPartitionKey(clientPartitionKey),
+            cancellationToken);
+
+    private async Task<AutoGenPlanDetailsDto> GetPlanCoreAsync(
+        string jobId,
+        string? requiredClientPartitionKey,
+        CancellationToken cancellationToken)
     {
-        await AwaitPendingJobPersistenceAsync(jobId, cancellationToken);
+        await AwaitPendingJobPersistenceAsync(
+            jobId,
+            requiredClientPartitionKey,
+            cancellationToken);
         using var scope = _scopeFactory.CreateScope();
         var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
-        var details = await plans.GetDetailsAsync(jobId, cancellationToken);
+        var details = requiredClientPartitionKey is null
+            ? await plans.GetDetailsAsync(jobId, cancellationToken)
+            : await plans.GetDetailsAsync(jobId, requiredClientPartitionKey, cancellationToken);
         UpdateLocalPlanSummary(jobId, details.Summary);
         return details;
     }
 
-    public async Task PreparePlanReadAsync(
+    internal async Task PreparePlanReadAsync(
         string jobId,
         CancellationToken cancellationToken = default)
+        => await PreparePlanReadCoreAsync(
+            jobId,
+            requiredClientPartitionKey: null,
+            cancellationToken);
+
+    public async Task PreparePlanReadAsync(
+        string jobId,
+        string clientPartitionKey,
+        CancellationToken cancellationToken = default)
+        => await PreparePlanReadCoreAsync(
+            jobId,
+            NormalizeClientPartitionKey(clientPartitionKey),
+            cancellationToken);
+
+    private async Task PreparePlanReadCoreAsync(
+        string jobId,
+        string? requiredClientPartitionKey,
+        CancellationToken cancellationToken)
     {
         var normalized = NormalizeJobId(jobId);
-        if (normalized is null
-            || !_runningTasks.TryGetValue(normalized, out var runningTask))
+        if (normalized is null)
         {
             return;
         }
 
-        if (!_jobs.TryGetValue(normalized, out var job)
-            || !IsTerminalState(job.ToDto().State))
+        if (_runningTasks.TryGetValue(normalized, out var runningTask)
+            && _jobs.TryGetValue(normalized, out var job)
+            && PartitionMatches(job.ClientPartitionKey, requiredClientPartitionKey))
         {
-            throw new AutoGenPlanConflictException(
-                "План автогенерації ще формується. Дочекайтеся завершення завдання та повторіть запит.");
+            if (!IsTerminalState(job.ToDto().State))
+            {
+                throw new AutoGenPlanConflictException(
+                    "План автогенерації ще формується. Дочекайтеся завершення завдання та повторіть запит.");
+            }
+
+            try
+            {
+                await runningTask.WaitAsync(
+                    PlanReadPersistenceHandoffTimeout,
+                    cancellationToken);
+                return;
+            }
+            catch (TimeoutException)
+            {
+                throw new AutoGenPlanConflictException(
+                    "Завершення плану ще зберігається. Повторіть запит через кілька секунд.");
+            }
         }
 
-        try
-        {
-            await runningTask.WaitAsync(
-                PlanReadPersistenceHandoffTimeout,
-                cancellationToken);
-        }
-        catch (TimeoutException)
-        {
-            throw new AutoGenPlanConflictException(
-                "Завершення плану ще зберігається. Повторіть запит через кілька секунд.");
-        }
+        await ThrowIfPersistedJobIsStillRunningAsync(
+            normalized,
+            requiredClientPartitionKey,
+            cancellationToken);
     }
 
-    public async Task<AutoGenPlanDetailsDto> GetPlanPageAsync(
+    internal async Task<AutoGenPlanDetailsDto> GetPlanPageAsync(
         string jobId,
         int changeOffset = 0,
         int changeLimit = TeacherDraftsAutogenPlanService.DefaultChangePageSize,
         CancellationToken cancellationToken = default)
-    {
-        await PreparePlanReadAsync(jobId, cancellationToken);
-        using var scope = _scopeFactory.CreateScope();
-        var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
-        var details = await plans.GetDetailsPageAsync(
+        => await GetPlanPageCoreAsync(
             jobId,
+            requiredClientPartitionKey: null,
             changeOffset,
             changeLimit,
             cancellationToken);
+
+    public async Task<AutoGenPlanDetailsDto> GetPlanPageAsync(
+        string jobId,
+        string clientPartitionKey,
+        int changeOffset = 0,
+        int changeLimit = TeacherDraftsAutogenPlanService.DefaultChangePageSize,
+        CancellationToken cancellationToken = default)
+        => await GetPlanPageCoreAsync(
+            jobId,
+            NormalizeClientPartitionKey(clientPartitionKey),
+            changeOffset,
+            changeLimit,
+            cancellationToken);
+
+    private async Task<AutoGenPlanDetailsDto> GetPlanPageCoreAsync(
+        string jobId,
+        string? requiredClientPartitionKey,
+        int changeOffset,
+        int changeLimit,
+        CancellationToken cancellationToken)
+    {
+        await PreparePlanReadCoreAsync(jobId, requiredClientPartitionKey, cancellationToken);
+        using var scope = _scopeFactory.CreateScope();
+        var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
+        var details = requiredClientPartitionKey is null
+            ? await plans.GetDetailsPageAsync(
+                jobId,
+                changeOffset,
+                changeLimit,
+                cancellationToken)
+            : await plans.GetDetailsPageAsync(
+                jobId,
+                requiredClientPartitionKey,
+                changeOffset,
+                changeLimit,
+                cancellationToken);
         UpdateLocalPlanSummary(jobId, details.Summary);
         return details;
     }
 
-    public async Task<AutoGenPlanDetailsDto?> GetLatestRollbackablePlanAsync(
+    internal async Task<AutoGenPlanDetailsDto?> GetLatestRollbackablePlanAsync(
         int? courseId,
         CancellationToken cancellationToken = default)
+        => await GetLatestRollbackablePlanCoreAsync(
+            courseId,
+            requiredClientPartitionKey: null,
+            cancellationToken);
+
+    public async Task<AutoGenPlanDetailsDto?> GetLatestRollbackablePlanAsync(
+        int? courseId,
+        string clientPartitionKey,
+        CancellationToken cancellationToken = default)
+        => await GetLatestRollbackablePlanCoreAsync(
+            courseId,
+            NormalizeClientPartitionKey(clientPartitionKey),
+            cancellationToken);
+
+    private async Task<AutoGenPlanDetailsDto?> GetLatestRollbackablePlanCoreAsync(
+        int? courseId,
+        string? requiredClientPartitionKey,
+        CancellationToken cancellationToken)
     {
         using var scope = _scopeFactory.CreateScope();
         var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
-        return await plans.GetLatestRollbackableAsync(courseId, cancellationToken);
+        return requiredClientPartitionKey is null
+            ? await plans.GetLatestRollbackableAsync(courseId, cancellationToken)
+            : await plans.GetLatestRollbackableAsync(
+                courseId,
+                requiredClientPartitionKey,
+                cancellationToken);
     }
 
-    public async Task<AutoGenPlanDetailsDto?> GetLatestRollbackablePlanPageAsync(
+    internal async Task<AutoGenPlanDetailsDto?> GetLatestRollbackablePlanPageAsync(
         int? courseId,
         int changeOffset = 0,
         int changeLimit = TeacherDraftsAutogenPlanService.DefaultChangePageSize,
         CancellationToken cancellationToken = default)
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
-        return await plans.GetLatestRollbackablePageAsync(
+        => await GetLatestRollbackablePlanPageCoreAsync(
             courseId,
+            requiredClientPartitionKey: null,
             changeOffset,
             changeLimit,
             cancellationToken);
+
+    public async Task<AutoGenPlanDetailsDto?> GetLatestRollbackablePlanPageAsync(
+        int? courseId,
+        string clientPartitionKey,
+        int changeOffset = 0,
+        int changeLimit = TeacherDraftsAutogenPlanService.DefaultChangePageSize,
+        CancellationToken cancellationToken = default)
+        => await GetLatestRollbackablePlanPageCoreAsync(
+            courseId,
+            NormalizeClientPartitionKey(clientPartitionKey),
+            changeOffset,
+            changeLimit,
+            cancellationToken);
+
+    private async Task<AutoGenPlanDetailsDto?> GetLatestRollbackablePlanPageCoreAsync(
+        int? courseId,
+        string? requiredClientPartitionKey,
+        int changeOffset,
+        int changeLimit,
+        CancellationToken cancellationToken)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
+        return requiredClientPartitionKey is null
+            ? await plans.GetLatestRollbackablePageAsync(
+                courseId,
+                changeOffset,
+                changeLimit,
+                cancellationToken)
+            : await plans.GetLatestRollbackablePageAsync(
+                courseId,
+                requiredClientPartitionKey,
+                changeOffset,
+                changeLimit,
+                cancellationToken);
     }
+
+    internal async Task<AutoGenPlanDetailsDto> ApplyPlanAsync(
+        string jobId,
+        AutoGenPlanActionRequest request,
+        CancellationToken cancellationToken = default)
+        => await ApplyPlanCoreAsync(
+            jobId,
+            request,
+            requiredClientPartitionKey: null,
+            cancellationToken);
 
     public async Task<AutoGenPlanDetailsDto> ApplyPlanAsync(
         string jobId,
         AutoGenPlanActionRequest request,
+        string clientPartitionKey,
         CancellationToken cancellationToken = default)
+        => await ApplyPlanCoreAsync(
+            jobId,
+            request,
+            NormalizeClientPartitionKey(clientPartitionKey),
+            cancellationToken);
+
+    private async Task<AutoGenPlanDetailsDto> ApplyPlanCoreAsync(
+        string jobId,
+        AutoGenPlanActionRequest request,
+        string? requiredClientPartitionKey,
+        CancellationToken cancellationToken)
     {
-        await AwaitPendingJobPersistenceAsync(jobId, cancellationToken);
+        await AwaitPendingJobPersistenceAsync(
+            jobId,
+            requiredClientPartitionKey,
+            cancellationToken);
         await _executionGate.WaitAsync(cancellationToken);
         try
         {
@@ -380,7 +590,13 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
             var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
             await using var globalExecutionLock = await AcquireGlobalExecutionLockAsync(db, cancellationToken);
-            var details = await plans.ApplyAsync(jobId, request, cancellationToken);
+            var details = requiredClientPartitionKey is null
+                ? await plans.ApplyAsync(jobId, request, cancellationToken)
+                : await plans.ApplyAsync(
+                    jobId,
+                    request,
+                    requiredClientPartitionKey,
+                    cancellationToken);
             UpdateLocalPlanSummary(jobId, details.Summary);
             return details;
         }
@@ -390,12 +606,37 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         }
     }
 
-    public async Task<AutoGenPlanDetailsDto> RollbackPlanAsync(
+    internal async Task<AutoGenPlanDetailsDto> RollbackPlanAsync(
         string jobId,
         AutoGenPlanActionRequest request,
         CancellationToken cancellationToken = default)
+        => await RollbackPlanCoreAsync(
+            jobId,
+            request,
+            requiredClientPartitionKey: null,
+            cancellationToken);
+
+    public async Task<AutoGenPlanDetailsDto> RollbackPlanAsync(
+        string jobId,
+        AutoGenPlanActionRequest request,
+        string clientPartitionKey,
+        CancellationToken cancellationToken = default)
+        => await RollbackPlanCoreAsync(
+            jobId,
+            request,
+            NormalizeClientPartitionKey(clientPartitionKey),
+            cancellationToken);
+
+    private async Task<AutoGenPlanDetailsDto> RollbackPlanCoreAsync(
+        string jobId,
+        AutoGenPlanActionRequest request,
+        string? requiredClientPartitionKey,
+        CancellationToken cancellationToken)
     {
-        await AwaitPendingJobPersistenceAsync(jobId, cancellationToken);
+        await AwaitPendingJobPersistenceAsync(
+            jobId,
+            requiredClientPartitionKey,
+            cancellationToken);
         await _executionGate.WaitAsync(cancellationToken);
         try
         {
@@ -403,7 +644,13 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
             var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
             await using var globalExecutionLock = await AcquireGlobalExecutionLockAsync(db, cancellationToken);
-            var details = await plans.RollbackAsync(jobId, request, cancellationToken);
+            var details = requiredClientPartitionKey is null
+                ? await plans.RollbackAsync(jobId, request, cancellationToken)
+                : await plans.RollbackAsync(
+                    jobId,
+                    request,
+                    requiredClientPartitionKey,
+                    cancellationToken);
             UpdateLocalPlanSummary(jobId, details.Summary);
             return details;
         }
@@ -415,11 +662,43 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
 
     private async Task AwaitPendingJobPersistenceAsync(
         string jobId,
+        string? requiredClientPartitionKey,
         CancellationToken cancellationToken)
     {
-        if (_runningTasks.TryGetValue(jobId, out var runningTask))
+        var normalized = NormalizeJobId(jobId);
+        if (normalized is null)
+        {
+            return;
+        }
+        if (_runningTasks.TryGetValue(normalized, out var runningTask)
+            && (requiredClientPartitionKey is null
+                || _jobs.TryGetValue(normalized, out var job)
+                && PartitionMatches(job.ClientPartitionKey, requiredClientPartitionKey)))
         {
             await runningTask.WaitAsync(cancellationToken);
+        }
+        await ThrowIfPersistedJobIsStillRunningAsync(
+            normalized,
+            requiredClientPartitionKey,
+            cancellationToken);
+    }
+
+    private async Task ThrowIfPersistedJobIsStillRunningAsync(
+        string jobId,
+        string? requiredClientPartitionKey,
+        CancellationToken cancellationToken)
+    {
+        // Авторитетне читання також переводить задачу з простроченим lease у Failed.
+        // Без цього віддалений екземпляр міг нескінченно повертати 409 після загибелі власника.
+        var persistedStatus = await ReadPersistedStatusAsync(
+            jobId,
+            requiredClientPartitionKey,
+            cancellationToken);
+        if (persistedStatus is not null
+            && !IsTerminalState(persistedStatus.State))
+        {
+            throw new AutoGenPlanConflictException(
+                "План автогенерації ще формується. Дочекайтеся завершення завдання та повторіть запит.");
         }
     }
 
@@ -732,7 +1011,12 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                     var existing = db.AutoGenJobRuns.FirstOrDefault(item => item.JobId == job.JobId);
                     if (existing is not null)
                     {
-                        EnsureMatchingRequest(job.JobId, job.RequestHash, ResolveStoredRequestHash(existing));
+                        EnsureMatchingRequest(
+                            job.JobId,
+                            job.ClientPartitionKey,
+                            job.RequestHash,
+                            existing.ClientPartitionKey,
+                            ResolveStoredRequestHash(existing));
                         var status = IsLegacyNonTerminalRun(existing)
                             ? DeserializeStatusOrFallback(existing)
                             : ExpireIfLeaseElapsed(db, existing, _databaseUtcNow(db));
@@ -1049,6 +1333,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
 
     private async Task<AutoGenJobStatus?> ReadPersistedStatusAsync(
         string jobId,
+        string? requiredClientPartitionKey,
         CancellationToken cancellationToken)
     {
         await _persistenceGate.WaitAsync(cancellationToken);
@@ -1058,7 +1343,11 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             {
                 using var scope = _scopeFactory.CreateScope();
                 var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-                var run = await LoadBoundedStatusRunAsync(db, jobId, cancellationToken);
+                var run = await LoadBoundedStatusRunAsync(
+                    db,
+                    jobId,
+                    requiredClientPartitionKey,
+                    cancellationToken);
                 if (run is null)
                 {
                     return null;
@@ -1104,6 +1393,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
 
     private async Task<AutoGenJobStatus?> RequestPersistedCancellationAsync(
         string jobId,
+        string? requiredClientPartitionKey,
         CancellationToken cancellationToken)
     {
         await _persistenceGate.WaitAsync(cancellationToken);
@@ -1113,7 +1403,11 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             {
                 using var scope = _scopeFactory.CreateScope();
                 var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-                var run = await LoadBoundedStatusRunAsync(db, jobId, cancellationToken);
+                var run = await LoadBoundedStatusRunAsync(
+                    db,
+                    jobId,
+                    requiredClientPartitionKey,
+                    cancellationToken);
                 if (run is null)
                 {
                     return null;
@@ -1170,11 +1464,14 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
     private static async Task<AutoGenJobRun?> LoadBoundedStatusRunAsync(
         AppDbContext db,
         string jobId,
+        string? requiredClientPartitionKey,
         CancellationToken cancellationToken)
     {
         var run = await db.AutoGenJobRuns
             .AsNoTracking()
-            .Where(item => item.JobId == jobId)
+            .Where(item => item.JobId == jobId
+                           && (requiredClientPartitionKey == null
+                               || item.ClientPartitionKey == requiredClientPartitionKey))
             .Select(item => new AutoGenJobRun
             {
                 Id = item.Id,
@@ -1428,15 +1725,33 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         }
     }
 
-    private static void EnsureMatchingRequest(string jobId, string requestedHash, string storedHash)
+    private static void EnsureMatchingRequest(
+        string jobId,
+        string requestedClientPartitionKey,
+        string requestedHash,
+        string storedClientPartitionKey,
+        string storedHash)
     {
-        if (string.Equals(requestedHash, storedHash, StringComparison.Ordinal))
+        if (string.Equals(
+                requestedClientPartitionKey,
+                storedClientPartitionKey,
+                StringComparison.Ordinal)
+            && string.Equals(requestedHash, storedHash, StringComparison.Ordinal))
         {
             return;
         }
         throw new AutoGenJobConflictException(
             $"Ідентифікатор завдання {jobId} вже використано для іншого набору параметрів автогенерації.");
     }
+
+    private static bool PartitionMatches(
+        string storedClientPartitionKey,
+        string? requiredClientPartitionKey)
+        => requiredClientPartitionKey is null
+           || string.Equals(
+               storedClientPartitionKey,
+               requiredClientPartitionKey,
+               StringComparison.Ordinal);
 
     private static string ComputeRequestHash(AutoGenJobRequest request)
     {
@@ -1474,7 +1789,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             request.SoftOptions,
             request.PreferredFirstMaxSlotOrderOverride
         };
-        var json = JsonSerializer.Serialize(canonicalPayload, PersistenceJsonOptions);
+        var json = JsonSerializer.Serialize(canonicalPayload, FingerprintJsonOptions);
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(json))).ToLowerInvariant();
     }
 
@@ -1511,7 +1826,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             JsonSerializer.Serialize(request, PersistenceJsonOptions),
             "запиту");
         run.StatusJson = EnsurePersistedPayloadWithinLimit(
-            JsonSerializer.Serialize(status, PersistenceJsonOptions),
+            JsonSerializer.Serialize(status with { Result = null, Report = null }, PersistenceJsonOptions),
             "статусу");
         run.ResultJson = status.Result is null
             ? null
@@ -1545,7 +1860,11 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                 var status = JsonSerializer.Deserialize<AutoGenJobStatus>(run.StatusJson, PersistenceJsonOptions);
                 if (status is not null)
                 {
-                    return status;
+                    return status with
+                    {
+                        Result = status.Result ?? TryDeserializePayload<AutoGenResult>(run.ResultJson, run.JobId, "результату"),
+                        Report = status.Report ?? TryDeserializePayload<AutoGenRunReport>(run.ReportJson, run.JobId, "звіту")
+                    };
                 }
             }
             catch (JsonException ex)
@@ -1632,7 +1951,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
     private static string? LimitOptional(string? value, int maxLength)
         => string.IsNullOrEmpty(value) || value.Length <= maxLength ? value : value[..maxLength];
 
-    private static AutoGenJobRequest NormalizeRequest(AutoGenJobRequest request)
+    internal static AutoGenJobRequest NormalizeRequest(AutoGenJobRequest request)
     {
         if (!Enum.IsDefined(request.Kind))
         {
@@ -1893,6 +2212,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         var executionRolledBack = false;
         var executionCommitted = false;
         AutoGenDraftPlanPayload? planPayload = null;
+        AutoGenCoverageDto? coverage = null;
         var weekStarts = BuildWeekStarts(job.Request.FromDate, job.Request.ToDate);
         var ownsExecutionGate = false;
         using var heartbeatStop = new CancellationTokenSource();
@@ -1935,6 +2255,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                     try
                     {
                         await ValidateAcademicPeriodAsync(executionDb, job.Request, job.Token);
+                        await AutogenCalendarWorkload.MeasureAsync(executionDb, job.Request, job.Token);
                         var plans = scope.ServiceProvider.GetRequiredService<TeacherDraftsAutogenPlanService>();
                         var previewInputFingerprint = job.Request.PreviewOnly
                             ? await plans.CaptureInputFingerprintAsync(job.Request, job.Token)
@@ -2120,6 +2441,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                             }
 
                             created += rangeResult.Created;
+                            coverage = rangeSucceeded ? rangeResult.Coverage : null;
                             skipped += rangeResult.Skipped;
                             warnings.AddRange(rangeResult.Warnings);
                             if (rangeResult.GapDetails is { Count: > 0 })
@@ -2131,7 +2453,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                                 preflight.AddRange(rangeResult.Preflight);
                             }
 
-                            var partialResult = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight);
+                            var partialResult = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight, coverage);
                             job.CompleteWeek(weekStarts.Count - 1, runRange.RangeStartDate, runRange.RangeEndDate, rangeResult, partialResult);
                             if (persistIntermediateProgress)
                             {
@@ -2240,7 +2562,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             {
                 job.Token.ThrowIfCancellationRequested();
             }
-            var result = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight);
+            var result = TeacherDraftsAutogenReportBuilder.BuildResult(created, skipped, warnings, gapDetails, preflight, failed ? null : coverage);
             var report = TeacherDraftsAutogenReportBuilder.BuildReport(job.Request.FromDate, job.Request.ToDate, weekStarts.Count, result);
             if (failed)
             {
@@ -2573,7 +2895,8 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             fillResult.GapDetails,
             fillResult.GapSummary,
             preflight,
-            AutoGenWarningClassifier.ClassifyMany(warnings));
+            AutoGenWarningClassifier.ClassifyMany(warnings),
+            fillResult.Coverage);
     }
 
     private static DraftAutoGenSoftOptions? MapSoftOptions(AutoGenSoftOptionsDto? dto)

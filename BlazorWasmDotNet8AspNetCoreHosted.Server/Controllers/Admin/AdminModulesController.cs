@@ -21,6 +21,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Controllers.Admin;
 [Route("api/admin/modules")]
 public class AdminModulesController(AppDbContext db) : ControllerBase
 {
+    private const int MaxTopicStatisticsRowCount = 20_000;
 
     [HttpGet]
     // Повертає список модулів із дозволеними аудиторіями та корпусами.
@@ -61,16 +62,18 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
             return BadRequest(new { message = $"Кількість кредитів має бути від 0 до {CurriculumInputLimits.ModuleCreditsMax}." });
         if (!CurriculumInputLimits.HasSupportedModuleCreditScale(dto.Credits))
             return BadRequest(new { message = $"Кількість кредитів може містити не більше {CurriculumInputLimits.ModuleCreditsScale} знаків після коми." });
-        var requestedRoomIds = (dto.AllowedRoomIds ?? new List<int>()).Distinct().ToList();
-        var requestedBuildingIds = (dto.AllowedBuildingIds ?? new List<int>()).Distinct().ToList();
-        if (requestedRoomIds.Count > CurriculumInputLimits.ModuleAssociationCountMax
-            || requestedBuildingIds.Count > CurriculumInputLimits.ModuleAssociationCountMax)
+        var rawRoomIds = dto.AllowedRoomIds ?? new List<int>();
+        var rawBuildingIds = dto.AllowedBuildingIds ?? new List<int>();
+        if (rawRoomIds.Count > CurriculumInputLimits.ModuleAssociationCountMax
+            || rawBuildingIds.Count > CurriculumInputLimits.ModuleAssociationCountMax)
         {
             return BadRequest(new
             {
                 message = $"Для одного модуля можна вибрати не більше {CurriculumInputLimits.ModuleAssociationCountMax} аудиторій або корпусів."
             });
         }
+        var requestedRoomIds = rawRoomIds.Distinct().ToList();
+        var requestedBuildingIds = rawBuildingIds.Distinct().ToList();
         if (requestedRoomIds.Any(id => id <= 0) || requestedBuildingIds.Any(id => id <= 0))
             return BadRequest(new { message = "Ідентифікатори аудиторій і корпусів мають бути додатними числами." });
 
@@ -318,15 +321,20 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
     }
     [HttpGet("{moduleId:int}/topics")]
     // Повертає теми модуля разом із статистикою планування.
-    public async Task<ActionResult<List<ModuleTopicViewDto>>> GetTopics(int moduleId)
+    public async Task<ActionResult<List<ModuleTopicViewDto>>> GetTopics(
+        int moduleId,
+        CancellationToken cancellationToken = default)
     {
-        var module = await db.Modules.AsNoTracking().FirstOrDefaultAsync(m => m.Id == moduleId);
+        var module = await db.Modules
+            .AsNoTracking()
+            .FirstOrDefaultAsync(m => m.Id == moduleId, cancellationToken);
         if (module is null) return NotFound();
         var topics = await db.ModuleTopics
+            .AsNoTracking()
             .Where(t => t.ModuleId == moduleId)
             .Include(t => t.LessonType)
             .Include(t => t.Department)
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
         topics.Sort((a, b) => CompareTopicCodes(a.TopicCode, b.TopicCode));
         var topicIds = topics.Select(t => t.Id).ToList();
         var plannedDict = new Dictionary<int, List<string>>();
@@ -338,10 +346,13 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
             var excludeCompletedCodes = new[] { "CANCELED", "RESCHEDULED" };
             var excludePlannedCodes = new[] { "CANCELED" };
             var draftRows = await db.TeacherDraftItems
+                .AsNoTracking()
                 .Include(di => di.LessonType)
                 .Include(di => di.Group)
-                .Where(di => (di.ModuleTopicId != null && topicIds.Contains(di.ModuleTopicId.Value))
-                             || (di.BatchKey != null && EF.Functions.Like(di.BatchKey, "rescheduled%")))
+                .Where(di => di.ModuleId == moduleId
+                             && ((di.ModuleTopicId != null && topicIds.Contains(di.ModuleTopicId.Value))
+                                 || (di.BatchKey != null && EF.Functions.Like(di.BatchKey, "rescheduled:%"))))
+                .Take(MaxTopicStatisticsRowCount + 1)
                 .Select(di => new
                 {
                     di.Id,
@@ -360,7 +371,14 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
                     LessonTypeCode = di.LessonType != null ? (di.LessonType.Code ?? "") : "",
                     GroupName = di.Group != null ? di.Group.Name : null
                 })
-                .ToListAsync();
+                .ToListAsync(cancellationToken);
+            if (draftRows.Count > MaxTopicStatisticsRowCount)
+            {
+                return UnprocessableEntity(new
+                {
+                    message = $"Статистика тем модуля охоплює понад {MaxTopicStatisticsRowCount} рядків чернеток. Скоротіть історичний діапазон даних."
+                });
+            }
             var reschedSourceIds = draftRows
                 .Select(r => TeacherDraftsHelpers.ParseRescheduleBatchKey(r.BatchKey))
                 .Where(info => info.isRescheduled && info.sourceItemId is int)
@@ -370,9 +388,10 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
             var reschedSourceTopics = reschedSourceIds.Count == 0
                 ? new Dictionary<int, int?>()
                 : await db.ScheduleItems
+                    .AsNoTracking()
                     .Where(si => reschedSourceIds.Contains(si.Id))
                     .Select(si => new { si.Id, si.ModuleTopicId })
-                    .ToDictionaryAsync(x => x.Id, x => x.ModuleTopicId);
+                    .ToDictionaryAsync(x => x.Id, x => x.ModuleTopicId, cancellationToken);
             var plannedTopicRows = new List<CurriculumScheduleRow>();
             var groupNamesById = new Dictionary<int, string>();
             foreach (var row in draftRows)
@@ -441,11 +460,13 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
                 plannedDict[kvp.Key] = kvp.Value.OrderBy(x => x).ToList();
             }
             var completedRows = await db.ScheduleItems
+                .AsNoTracking()
                 .Where(si => si.ModuleTopicId != null && topicIds.Contains(si.ModuleTopicId!.Value))
                 .Include(si => si.LessonType)
                 .Where(si =>
                     si.LessonType != null
                     && !excludeCompletedCodes.Contains((si.LessonType.Code ?? "").ToUpper()))
+                .Take(MaxTopicStatisticsRowCount + 1)
                 .Select(si => new CurriculumScheduleRow(
                     si.Id,
                     si.Group.CourseId,
@@ -460,11 +481,19 @@ public class AdminModulesController(AppDbContext db) : ControllerBase
                     si.TeacherId,
                     si.RoomId,
                     si.IsSelfStudy))
-                .ToListAsync();
+                .ToListAsync(cancellationToken);
+            if (completedRows.Count > MaxTopicStatisticsRowCount)
+            {
+                return UnprocessableEntity(new
+                {
+                    message = $"Статистика тем модуля охоплює понад {MaxTopicStatisticsRowCount} рядків розкладу. Скоротіть історичний діапазон даних."
+                });
+            }
             completedRows = CurriculumScheduleAggregation.CollapseForTopics(completedRows).ToList();
             var completedGroupNames = await db.Groups
+                .AsNoTracking()
                 .Where(group => completedRows.Select(row => row.GroupId).Contains(group.Id))
-                .ToDictionaryAsync(group => group.Id, group => group.Name);
+                .ToDictionaryAsync(group => group.Id, group => group.Name, cancellationToken);
             completedDict = completedRows
                 .Where(row => row.ModuleTopicId is not null && completedGroupNames.ContainsKey(row.GroupId))
                 .DistinctBy(row => new { TopicId = row.ModuleTopicId!.Value, row.GroupId })

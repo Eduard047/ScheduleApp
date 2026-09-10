@@ -51,6 +51,18 @@ else
                     </tr>
                 </thead>
                 <tbody>
+                    @if (!loading && !loadFailed && !SortedBuildings.Any())
+                    {
+                        <tr>
+                            <td colspan="4" class="text-muted text-center py-3">
+                                <span class="admin-table-empty-state" role="status">
+                                    @(buildings.Count == 0
+                                        ? "Поки що немає корпусів."
+                                        : "За вашим пошуком корпусів не знайдено.")
+                                </span>
+                            </td>
+                        </tr>
+                    }
                     @foreach (var b in SortedBuildings)
                     {
                         <tr>
@@ -85,6 +97,18 @@ else
                     </tr>
                 </thead>
                 <tbody>
+                    @if (!loading && !loadFailed && !SortedTravels.Any())
+                    {
+                        <tr>
+                            <td colspan="4" class="text-muted text-center py-3">
+                                <span class="admin-table-empty-state" role="status">
+                                    @(travels.Count == 0
+                                        ? "Поки що немає маршрутів між корпусами."
+                                        : "За вашим пошуком маршрутів не знайдено.")
+                                </span>
+                            </td>
+                        </tr>
+                    }
                     @foreach (var t in SortedTravels)
                     {
                         <tr>
@@ -199,11 +223,6 @@ else
 }
 
 @code {
-    private sealed class BuildingsVm
-    {
-        public List<BuildingEditDto> buildings { get; set; } = new();
-        public List<BuildingTravelEditDto> travels { get; set; } = new();
-    }
     private bool loading, saving, loadFailed, mutationInProgress;
     private bool IsInteractionBlocked => loading || mutationInProgress || loadFailed;
     private Action? pendingRefreshCompletion;
@@ -281,10 +300,9 @@ else
         loadFailed = false;
         try
         {
-            var loadedBuildings = await Admin.GetBuildings();
-            var loadedTravels = await Admin.GetBuildingTravels();
-            buildings = loadedBuildings;
-            travels = loadedTravels;
+            var catalog = await Admin.GetBuildingCatalog();
+            buildings = catalog.Buildings;
+            travels = catalog.Travels;
             return true;
         }
         catch (Exception ex)

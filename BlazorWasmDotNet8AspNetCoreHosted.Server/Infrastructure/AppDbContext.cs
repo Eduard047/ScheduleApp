@@ -287,6 +287,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             e.HasIndex(x => new { x.Date, x.GroupId });
             e.HasIndex(x => new { x.Date, x.TeacherId });
             e.HasIndex(x => new { x.Date, x.RoomId });
+            e.HasIndex(x => x.BatchKey);
             e.HasIndex(x => x.GenerationJobId);
         });
         // Зберігаємо перебіг автогенерації окремо від чернеток, щоб статус можна було переглянути після перезапуску.

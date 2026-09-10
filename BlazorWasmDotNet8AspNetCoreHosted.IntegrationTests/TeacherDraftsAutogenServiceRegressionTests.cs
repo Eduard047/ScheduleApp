@@ -352,6 +352,68 @@ public sealed class TeacherDraftsAutogenServiceRegressionTests
         Assert.Equal(expected.BatchKey, actual.BatchKey);
     }
 
+    [Theory]
+    [InlineData(true, DraftStatus.Draft)]
+    [InlineData(false, DraftStatus.Published)]
+    public async Task ClearExisting_rejects_protected_legacy_logical_event_without_partial_deletion(
+        bool protectedRowLocked,
+        DraftStatus protectedRowStatus)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var data = await fixture.SeedCurriculumProgressScenarioAsync(
+            new DateOnly(2026, 9, 7),
+            academicPeriodStartDate: new DateOnly(2026, 9, 1),
+            targetHours: 1,
+            topicHours: 1);
+        var legacyEvent = await SeedLegacyLogicalEventAsync(
+            fixture.Db,
+            data,
+            protectedRowLocked,
+            protectedRowStatus);
+
+        var action = await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(
+            BuildClearExistingRequest(data));
+
+        var conflict = Assert.IsType<ConflictObjectResult>(action.Result);
+        Assert.Contains("частково очистити логічне заняття", conflict.Value?.ToString(), StringComparison.OrdinalIgnoreCase);
+        fixture.Db.ChangeTracker.Clear();
+        var persisted = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => legacyEvent.Ids.Contains(item.Id))
+            .OrderBy(item => item.Id)
+            .Select(item => new { item.Id, item.Revision, item.Status, item.IsLocked })
+            .ToListAsync();
+        Assert.Equal(2, persisted.Count);
+        Assert.Equal(legacyEvent.Revisions, persisted.ToDictionary(item => item.Id, item => item.Revision));
+        Assert.Contains(persisted, item => item.Status == protectedRowStatus && item.IsLocked == protectedRowLocked);
+    }
+
+    [Fact]
+    public async Task ClearExisting_teacher_filter_removes_complete_legacy_logical_event()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var data = await fixture.SeedCurriculumProgressScenarioAsync(
+            new DateOnly(2026, 9, 7),
+            academicPeriodStartDate: new DateOnly(2026, 9, 1),
+            targetHours: 1,
+            topicHours: 1);
+        var legacyEvent = await SeedLegacyLogicalEventAsync(
+            fixture.Db,
+            data,
+            protectedRowLocked: false,
+            protectedRowStatus: DraftStatus.Draft);
+
+        var action = await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(
+            BuildClearExistingRequest(data) with { TeacherId = data.TeacherId });
+
+        Assert.IsType<OkObjectResult>(action.Result);
+        fixture.Db.ChangeTracker.Clear();
+        Assert.False(await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .AnyAsync(item => item.Id == legacyEvent.SecondId
+                              && item.Revision == legacyEvent.Revisions[legacyEvent.SecondId]));
+    }
+
     [Fact]
     public async Task Academic_period_start_excludes_earlier_rows_from_topic_and_plan_progress()
     {
@@ -1376,6 +1438,68 @@ public sealed class TeacherDraftsAutogenServiceRegressionTests
             RangeEndDate: data.GenerationDate,
             SoftOptions: new DraftAutoGenSoftOptions(RecentRepeatWindowDays: 0));
 
+    private static DraftAutoGenRequest BuildClearExistingRequest(CurriculumProgressSeed data)
+        => BuildCurriculumProgressRequest(data) with
+        {
+            ClearExisting = true,
+            ModuleHours = new Dictionary<int, int> { [data.ModuleId] = 1 },
+            AllowIncompleteDrafts = true
+        };
+
+    private static async Task<LegacyLogicalEventSeed> SeedLegacyLogicalEventAsync(
+        AppDbContext db,
+        CurriculumProgressSeed data,
+        bool protectedRowLocked,
+        DraftStatus protectedRowStatus)
+    {
+        var secondTeacher = new Teacher { FullName = "Другий викладач legacy-події" };
+        db.Teachers.Add(secondTeacher);
+        await db.SaveChangesAsync();
+        var roomId = await db.Rooms.Select(room => room.Id).SingleAsync();
+        var firstRow = new TeacherDraftItem
+        {
+            Date = data.GenerationDate,
+            DayOfWeek = data.GenerationDate.DayOfWeek,
+            StartTime = data.Start,
+            EndTime = data.End,
+            GroupId = data.GroupId,
+            ModuleId = data.ModuleId,
+            ModuleTopicId = data.TopicId,
+            LessonTypeId = data.LessonTypeId,
+            TeacherId = data.TeacherId,
+            RoomId = roomId,
+            Status = DraftStatus.Draft,
+            IsLocked = false,
+            BatchKey = null
+        };
+        var secondRow = new TeacherDraftItem
+        {
+            Date = data.GenerationDate,
+            DayOfWeek = data.GenerationDate.DayOfWeek,
+            StartTime = data.Start,
+            EndTime = data.End,
+            GroupId = data.GroupId,
+            ModuleId = data.ModuleId,
+            ModuleTopicId = data.TopicId,
+            LessonTypeId = data.LessonTypeId,
+            TeacherId = secondTeacher.Id,
+            RoomId = roomId,
+            Status = protectedRowStatus,
+            IsLocked = protectedRowLocked,
+            BatchKey = null
+        };
+        db.TeacherDraftItems.AddRange(firstRow, secondRow);
+        await db.SaveChangesAsync();
+        return new LegacyLogicalEventSeed(
+            new[] { firstRow.Id, secondRow.Id },
+            new Dictionary<int, Guid>
+            {
+                [firstRow.Id] = firstRow.Revision,
+                [secondRow.Id] = secondRow.Revision
+            },
+            secondRow.Id);
+    }
+
     private static async Task<DepartmentFallbackResult> RunDepartmentFallbackScenarioAsync()
     {
         await using var fixture = await TestDatabase.CreateAsync();
@@ -1461,6 +1585,11 @@ public sealed class TeacherDraftsAutogenServiceRegressionTests
         DateOnly GenerationDate,
         TimeOnly Start,
         TimeOnly End);
+
+    private sealed record LegacyLogicalEventSeed(
+        int[] Ids,
+        Dictionary<int, Guid> Revisions,
+        int SecondId);
 
     private sealed record OutOfDepartmentDraft(int DraftId, bool HasExplicitModuleLink);
 

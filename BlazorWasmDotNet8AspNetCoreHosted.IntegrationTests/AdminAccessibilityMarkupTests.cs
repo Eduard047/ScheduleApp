@@ -3,6 +3,36 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests;
 public sealed class AdminAccessibilityMarkupTests
 {
     [Fact]
+    public void Application_shell_exposes_accessible_loading_errors_and_skip_navigation()
+    {
+        var index = ReadClientFile("wwwroot/index.html");
+        var layout = ReadClientFile("Layout/MainLayout.razor");
+        var styles = ReadClientFile("wwwroot/css/app.css");
+
+        Assert.Contains("role=\"status\" aria-live=\"polite\" aria-atomic=\"true\"", index);
+        Assert.Contains("css/app.css?v=20260905-1", index);
+        Assert.Contains("js/schedule-app.js?v=20260828-2", index);
+        Assert.Contains("<span class=\"visually-hidden\">Завантаження застосунку…</span>", index);
+        Assert.Contains("class=\"loading-progress\" aria-hidden=\"true\" focusable=\"false\"", index);
+        Assert.Contains("id=\"blazor-error-ui\" role=\"alert\" aria-live=\"assertive\"", index);
+        Assert.Contains("<button type=\"button\" class=\"dismiss\" aria-label=\"Закрити повідомлення\">", index);
+        Assert.DoesNotContain("<a class=\"dismiss\"", index);
+        Assert.Contains("class=\"skip-link\"", layout);
+        Assert.Contains("href=\"@SkipLinkHref\"", layout);
+        Assert.Contains("@onclick=\"FocusMainContentAsync\"", layout);
+        Assert.Contains("@onclick:preventDefault=\"true\"", layout);
+        Assert.Contains("return $\"{uriWithoutFragment}#main-content\";", layout);
+        Assert.Contains("<main id=\"main-content\" class=\"@MainClass\" tabindex=\"-1\">", layout);
+        Assert.Contains(".skip-link:focus", styles);
+        var script = ReadClientFile("wwwroot/js/schedule-app.js");
+        Assert.Contains("window.scheduleApp.focusMainContent", script);
+        Assert.Contains("document.querySelector(\".app-navbar\")", script);
+        Assert.Contains("window.scrollTo({ top: targetTop", script);
+        Assert.Contains("history.replaceState(history.state", script);
+        Assert.Contains("z-index: 1200", styles);
+    }
+
+    [Fact]
     public void Teachers_table_is_a_named_keyboard_scroll_region()
     {
         var markup = ReadAdminPage("AdminTeachers.razor");
@@ -31,14 +61,83 @@ public sealed class AdminAccessibilityMarkupTests
     }
 
     [Fact]
-    public void Time_slot_loading_status_preserves_table_cell_semantics()
+    public void Time_slot_editor_exposes_visual_sequence_and_keyboard_actions()
     {
         var markup = ReadAdminPage("AdminTimeSlots.razor");
 
+        Assert.Contains("role=\"group\" aria-label=\"Область застосування графіка\"", markup);
+        Assert.Contains("aria-pressed=\"@(_targetMode == TimeSlotEditorTargetMode.Course)\"", markup);
+        Assert.Contains("aria-pressed=\"@(_targetMode == TimeSlotEditorTargetMode.AllCourses)\"", markup);
+        Assert.DoesNotContain("role=\"radio\"", markup);
+        Assert.DoesNotContain("aria-checked", markup);
+        Assert.Contains("<ol class=\"day-timeline\" aria-label=\"Послідовність пар\">", markup);
+        Assert.Contains("aria-label=\"Перемістити пару @(rowIndex + 1) вище\"", markup);
+        Assert.Contains("aria-label=\"Перемістити пару @(rowIndex + 1) нижче\"", markup);
+        Assert.Contains("aria-label=\"Вставити нову пару після пари @(rowIndex + 1)\"", markup);
+        Assert.Contains("aria-label=\"Видалити пару @(rowIndex + 1)\"", markup);
+        Assert.Contains("aria-live=\"polite\" aria-atomic=\"true\"", markup);
+        Assert.Contains("<NavigationLock ConfirmExternalNavigation=\"@HasUnsavedChanges\"", markup);
+        Assert.Contains("Прибрати спільну перерву", markup);
+        Assert.Contains("Прибрати власну перерву й успадковувати спільну", markup);
+        Assert.Contains("Прибрати виняток і повернути основний графік", markup);
+        Assert.Contains("вимкніть «Використовувати в розкладі»", markup);
+        Assert.Contains("disabled=\"@(!CanEditSequence || !row.IsActive || inheritedLunch)\"", markup);
+        Assert.Contains("Успадковано; оберіть іншу активну пару, щоб змінити.", markup);
+        Assert.Contains("Перевірити зміни", markup);
+        Assert.Contains("Застосувати графік", markup);
+        Assert.DoesNotContain("Перевірити й застосувати", markup);
+        Assert.DoesNotContain("<table", markup, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Груп", markup, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(
+        "AdminCourses.razor",
+        "SortedAndFilteredItems",
+        "items",
+        "Поки що немає курсів.",
+        "За вашим пошуком курсів не знайдено.")]
+    [InlineData(
+        "AdminBuildings.razor",
+        "SortedBuildings",
+        "buildings",
+        "Поки що немає корпусів.",
+        "За вашим пошуком корпусів не знайдено.")]
+    [InlineData(
+        "AdminBuildings.razor",
+        "SortedTravels",
+        "travels",
+        "Поки що немає маршрутів між корпусами.",
+        "За вашим пошуком маршрутів не знайдено.")]
+    [InlineData(
+        "AdminGroups.razor",
+        "SortedAndFiltered",
+        "items",
+        "Поки що немає груп.",
+        "За вашим пошуком груп не знайдено.")]
+    [InlineData(
+        "AdminDepartments.razor",
+        "SortedAndFiltered",
+        "items",
+        "Поки що немає кафедр.",
+        "За вашим пошуком кафедр не знайдено.")]
+    public void Admin_reference_tables_distinguish_empty_data_from_no_search_results(
+        string fileName,
+        string filteredCollection,
+        string sourceCollection,
+        string emptyMessage,
+        string noResultsMessage)
+    {
+        var markup = ReadAdminPage(fileName);
+
         Assert.Contains(
-            "<td colspan=\"6\" class=\"text-muted\"><span role=\"status\">Завантаження слотів…</span></td>",
-            markup);
-        Assert.DoesNotContain("<td colspan=\"6\" class=\"text-muted\" role=\"status\">", markup);
+            $"@if (!loading && !loadFailed && !{filteredCollection}.Any())",
+            markup,
+            StringComparison.Ordinal);
+        Assert.Contains($"@({sourceCollection}.Count == 0", markup, StringComparison.Ordinal);
+        Assert.Contains("class=\"admin-table-empty-state\" role=\"status\"", markup, StringComparison.Ordinal);
+        Assert.Contains(emptyMessage, markup, StringComparison.Ordinal);
+        Assert.Contains(noResultsMessage, markup, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -114,5 +213,25 @@ public sealed class AdminAccessibilityMarkupTests
         }
 
         throw new FileNotFoundException($"Не знайдено Razor-сторінку {fileName} від каталогу тестового процесу.");
+    }
+
+    // Читає файл клієнта від checkout без локальних абсолютних шляхів.
+    private static string ReadClientFile(string relativePath)
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory);
+             directory is not null;
+             directory = directory.Parent)
+        {
+            var candidate = Path.Combine(
+                directory.FullName,
+                "BlazorWasmDotNet8AspNetCoreHosted.Client",
+                relativePath);
+            if (File.Exists(candidate))
+            {
+                return File.ReadAllText(candidate);
+            }
+        }
+
+        throw new FileNotFoundException($"Не знайдено клієнтський файл {relativePath} від каталогу тестового процесу.");
     }
 }

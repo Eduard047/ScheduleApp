@@ -330,7 +330,10 @@ public sealed class PublishGuardrailTests
         await fixture.Db.SaveChangesAsync();
         var service = CreateService(fixture.Db);
 
-        var approval = await service.ApproveWeekAsync(new ApproveWeekRequest(Monday, firstTeacher.Id));
+        var approval = await service.ApproveWeekAsync(new ApproveWeekRequest(
+            Monday,
+            firstTeacher.Id,
+            PublishTestScopeRevision.Read(fixture.Db, Monday)));
 
         Assert.IsType<OkResult>(approval);
         var statuses = await fixture.Db.TeacherDraftItems
@@ -392,7 +395,10 @@ public sealed class PublishGuardrailTests
         Assert.Equal(0, await fixture.Db.ScheduleItems.CountAsync());
         Assert.Equal(2, await fixture.Db.TeacherDraftItems.CountAsync());
 
-        var approval = await service.ApproveWeekAsync(new ApproveWeekRequest(Monday, firstTeacher.Id));
+        var approval = await service.ApproveWeekAsync(new ApproveWeekRequest(
+            Monday,
+            firstTeacher.Id,
+            PublishTestScopeRevision.Read(fixture.Db, Monday)));
         Assert.IsType<OkResult>(approval);
 
         var successfulPublish = await service.PublishWeekAsync(new PublishWeekRequest(Monday, firstTeacher.Id, PublishTestScopeRevision.Read(fixture.Db, Monday)));

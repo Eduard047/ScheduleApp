@@ -37,7 +37,8 @@ public sealed record DraftAutoGenRequest(
 
 public sealed record ApproveWeekRequest(
     DateOnly WeekStart, // Дата старту тижня.
-    int TeacherId // Ідентифікатор викладача.
+    int TeacherId, // Ідентифікатор викладача.
+    Guid? ExpectedScopeRevision = null // Версія тижня, який користувач фактично переглянув.
 );
 
 public sealed record PublishWeekResults(

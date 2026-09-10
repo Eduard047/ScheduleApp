@@ -9,12 +9,12 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 
 public sealed class AutoGenPlanNotFoundException(string message) : Exception(message);
 
-public sealed class AutoGenPlanConflictException(string message) : Exception(message);
+public class AutoGenPlanConflictException(string message) : Exception(message);
 
 public sealed class AutoGenPlanPersistenceException(string message, Exception? innerException = null)
     : Exception(message, innerException);
 
-public sealed class AutoGenPlanCapacityException(string message) : Exception(message);
+public sealed class AutoGenPlanCapacityException(string message) : AutoGenPlanConflictException(message);
 
 public sealed class AutoGenPlanValidationException(string message) : Exception(message);
 
@@ -91,9 +91,10 @@ public sealed class TeacherDraftsAutogenPlanService
 {
     public const int DefaultChangePageSize = 200;
     public const int MaxChangePageSize = 250;
-    public const int MaxMutationsPerPlan = 2_000;
+    public const int MaxMutationsPerPlan = AutoGenWorkloadLimits.MaxPlanChanges;
+    internal const int MaxScopeRowCount = TeacherDraftsWeekValidationService.MaxAppliedScopeRowCount;
     private const int MaxRetainedPlanCount = 50;
-    private const int MaxRetainedMutationCount = 10_000;
+    private const int MaxRetainedMutationCount = 2 * MaxMutationsPerPlan;
     private const int MaxSerializedSnapshotLength = 8_192;
     private const int MaxGroupIdsJsonLength = 4_096;
     internal const int CleanupPlanBatchSize = 50;
@@ -121,7 +122,7 @@ public sealed class TeacherDraftsAutogenPlanService
         CancellationToken cancellationToken)
     {
         var groupIds = request.GroupIds.Distinct().ToList();
-        return await _db.TeacherDraftItems
+        return await LoadBoundedScopeRowsAsync(_db.TeacherDraftItems
             .AsNoTracking()
             .Where(item => item.Date >= request.FromDate
                            && item.Date <= request.ToDate
@@ -154,8 +155,7 @@ public sealed class TeacherDraftsAutogenPlanService
                 item.UpdatedAt,
                 item.IsLocked,
                 item.IsSelfStudy,
-                item.GenerationJobId))
-            .ToListAsync(cancellationToken);
+                item.GenerationJobId)), cancellationToken);
     }
 
     internal static AutoGenDraftPlanPayload BuildPayload(
@@ -174,12 +174,14 @@ public sealed class TeacherDraftsAutogenPlanService
             if (!afterById.TryGetValue(previous.Id, out var current))
             {
                 unordered.Add((AutoGenPlanOperation.Delete, previous, null));
+                EnsureMutationCapacity(unordered.Count);
                 continue;
             }
 
             if (!HasSameMutableContent(previous, current))
             {
                 unordered.Add((AutoGenPlanOperation.Update, previous, current));
+                EnsureMutationCapacity(unordered.Count);
             }
         }
 
@@ -192,6 +194,7 @@ public sealed class TeacherDraftsAutogenPlanService
                      .ThenBy(item => item.Id))
         {
             unordered.Add((AutoGenPlanOperation.Add, null, current with { Id = 0, Revision = Guid.Empty }));
+            EnsureMutationCapacity(unordered.Count);
         }
 
         var mutations = unordered
@@ -220,6 +223,15 @@ public sealed class TeacherDraftsAutogenPlanService
             now,
             now.Add(PreviewLifetime),
             mutations);
+    }
+
+    private static void EnsureMutationCapacity(int mutationCount)
+    {
+        if (mutationCount > MaxMutationsPerPlan)
+        {
+            throw new AutoGenPlanCapacityException(
+                $"План містить понад {MaxMutationsPerPlan} змін, що перевищує безпечний ліміт.");
+        }
     }
 
     internal static async Task AddReadyPlanAsync(
@@ -267,10 +279,14 @@ public sealed class TeacherDraftsAutogenPlanService
             CreatedAtUtc = payload.CreatedAtUtc,
             ExpiresAtUtc = payload.ExpiresAtUtc
         };
+        long snapshotCharacters = 0;
         foreach (var mutation in payload.Mutations)
         {
             var beforeJson = SerializeSnapshot(mutation.Before);
             var afterJson = SerializeSnapshot(mutation.After);
+            snapshotCharacters += (beforeJson?.Length ?? 0) + (afterJson?.Length ?? 0);
+            if (snapshotCharacters > AutoGenWorkloadLimits.MaxPlanSnapshotCharacters)
+                throw new AutoGenPlanCapacityException("План перевищує безпечний обсяг знімків. Зменште кількість груп або діапазон.");
             if ((beforeJson?.Length ?? 0) > MaxSerializedSnapshotLength
                 || (afterJson?.Length ?? 0) > MaxSerializedSnapshotLength)
             {
@@ -290,29 +306,75 @@ public sealed class TeacherDraftsAutogenPlanService
         db.AutoGenDraftPlans.Add(plan);
     }
 
-    public async Task<AutoGenPlanDetailsDto> GetDetailsAsync(
+    internal async Task<AutoGenPlanDetailsDto> GetDetailsAsync(
         string planId,
         CancellationToken cancellationToken = default)
+        => await GetDetailsCoreAsync(
+            planId,
+            requiredClientPartitionKey: null,
+            cancellationToken);
+
+    public async Task<AutoGenPlanDetailsDto> GetDetailsAsync(
+        string planId,
+        string clientPartitionKey,
+        CancellationToken cancellationToken = default)
+        => await GetDetailsCoreAsync(
+            planId,
+            RequireClientPartitionKey(clientPartitionKey),
+            cancellationToken);
+
+    private async Task<AutoGenPlanDetailsDto> GetDetailsCoreAsync(
+        string planId,
+        string? requiredClientPartitionKey,
+        CancellationToken cancellationToken)
     {
         await CleanupExpiredPlansAsync(_db, cancellationToken);
         var plan = await LoadPlanAsync(
             planId,
+            requiredClientPartitionKey,
             tracking: false,
             includeMutations: true,
             cancellationToken);
         return BuildDetails(plan, DateTime.UtcNow);
     }
 
-    public async Task<AutoGenPlanDetailsDto> GetDetailsPageAsync(
+    internal async Task<AutoGenPlanDetailsDto> GetDetailsPageAsync(
         string planId,
         int changeOffset = 0,
         int changeLimit = DefaultChangePageSize,
         CancellationToken cancellationToken = default)
+        => await GetDetailsPageCoreAsync(
+            planId,
+            requiredClientPartitionKey: null,
+            changeOffset,
+            changeLimit,
+            cancellationToken);
+
+    public async Task<AutoGenPlanDetailsDto> GetDetailsPageAsync(
+        string planId,
+        string clientPartitionKey,
+        int changeOffset = 0,
+        int changeLimit = DefaultChangePageSize,
+        CancellationToken cancellationToken = default)
+        => await GetDetailsPageCoreAsync(
+            planId,
+            RequireClientPartitionKey(clientPartitionKey),
+            changeOffset,
+            changeLimit,
+            cancellationToken);
+
+    private async Task<AutoGenPlanDetailsDto> GetDetailsPageCoreAsync(
+        string planId,
+        string? requiredClientPartitionKey,
+        int changeOffset,
+        int changeLimit,
+        CancellationToken cancellationToken)
     {
         EnsurePageBounds(changeOffset, changeLimit);
         await CleanupExpiredPlansAsync(_db, cancellationToken);
         var plan = await LoadPlanAsync(
             planId,
+            requiredClientPartitionKey,
             tracking: false,
             includeMutations: false,
             cancellationToken);
@@ -324,16 +386,36 @@ public sealed class TeacherDraftsAutogenPlanService
         return BuildDetails(plan, DateTime.UtcNow, changeOffset, totalChanges);
     }
 
-    public async Task<AutoGenPlanDetailsDto?> GetLatestRollbackableAsync(
+    internal async Task<AutoGenPlanDetailsDto?> GetLatestRollbackableAsync(
         int? courseId,
         CancellationToken cancellationToken = default)
+        => await GetLatestRollbackableCoreAsync(
+            courseId,
+            requiredClientPartitionKey: null,
+            cancellationToken);
+
+    public async Task<AutoGenPlanDetailsDto?> GetLatestRollbackableAsync(
+        int? courseId,
+        string clientPartitionKey,
+        CancellationToken cancellationToken = default)
+        => await GetLatestRollbackableCoreAsync(
+            courseId,
+            RequireClientPartitionKey(clientPartitionKey),
+            cancellationToken);
+
+    private async Task<AutoGenPlanDetailsDto?> GetLatestRollbackableCoreAsync(
+        int? courseId,
+        string? requiredClientPartitionKey,
+        CancellationToken cancellationToken)
     {
         await CleanupExpiredPlansAsync(_db, cancellationToken);
         var nowUtc = DateTime.UtcNow;
         var query = _db.AutoGenDraftPlans
             .AsNoTracking()
             .Where(item => item.State == (int)AutoGenPlanState.Applied
-                           && item.ExpiresAtUtc > nowUtc);
+                           && item.ExpiresAtUtc > nowUtc
+                           && (requiredClientPartitionKey == null
+                               || item.AutoGenJobRun.ClientPartitionKey == requiredClientPartitionKey));
         if (courseId is > 0)
         {
             query = query.Where(item => item.CourseId == courseId.Value);
@@ -350,17 +432,44 @@ public sealed class TeacherDraftsAutogenPlanService
 
         var plan = await LoadPlanAsync(
             planId,
+            requiredClientPartitionKey,
             tracking: false,
             includeMutations: true,
             cancellationToken);
         return BuildDetails(plan, nowUtc);
     }
 
-    public async Task<AutoGenPlanDetailsDto?> GetLatestRollbackablePageAsync(
+    internal async Task<AutoGenPlanDetailsDto?> GetLatestRollbackablePageAsync(
         int? courseId,
         int changeOffset = 0,
         int changeLimit = DefaultChangePageSize,
         CancellationToken cancellationToken = default)
+        => await GetLatestRollbackablePageCoreAsync(
+            courseId,
+            requiredClientPartitionKey: null,
+            changeOffset,
+            changeLimit,
+            cancellationToken);
+
+    public async Task<AutoGenPlanDetailsDto?> GetLatestRollbackablePageAsync(
+        int? courseId,
+        string clientPartitionKey,
+        int changeOffset = 0,
+        int changeLimit = DefaultChangePageSize,
+        CancellationToken cancellationToken = default)
+        => await GetLatestRollbackablePageCoreAsync(
+            courseId,
+            RequireClientPartitionKey(clientPartitionKey),
+            changeOffset,
+            changeLimit,
+            cancellationToken);
+
+    private async Task<AutoGenPlanDetailsDto?> GetLatestRollbackablePageCoreAsync(
+        int? courseId,
+        string? requiredClientPartitionKey,
+        int changeOffset,
+        int changeLimit,
+        CancellationToken cancellationToken)
     {
         EnsurePageBounds(changeOffset, changeLimit);
         await CleanupExpiredPlansAsync(_db, cancellationToken);
@@ -368,7 +477,9 @@ public sealed class TeacherDraftsAutogenPlanService
         var query = _db.AutoGenDraftPlans
             .AsNoTracking()
             .Where(item => item.State == (int)AutoGenPlanState.Applied
-                           && item.ExpiresAtUtc > nowUtc);
+                           && item.ExpiresAtUtc > nowUtc
+                           && (requiredClientPartitionKey == null
+                               || item.AutoGenJobRun.ClientPartitionKey == requiredClientPartitionKey));
         if (courseId is > 0)
         {
             query = query.Where(item => item.CourseId == courseId.Value);
@@ -385,6 +496,7 @@ public sealed class TeacherDraftsAutogenPlanService
 
         var plan = await LoadPlanAsync(
             planId,
+            requiredClientPartitionKey,
             tracking: false,
             includeMutations: false,
             cancellationToken);
@@ -397,10 +509,32 @@ public sealed class TeacherDraftsAutogenPlanService
         return BuildDetails(plan, nowUtc, changeOffset, totalChanges);
     }
 
-    public async Task<AutoGenPlanDetailsDto> ApplyAsync(
+    internal async Task<AutoGenPlanDetailsDto> ApplyAsync(
         string planId,
         AutoGenPlanActionRequest request,
         CancellationToken cancellationToken = default)
+        => await ApplyCoreAsync(
+            planId,
+            request,
+            requiredClientPartitionKey: null,
+            cancellationToken);
+
+    public async Task<AutoGenPlanDetailsDto> ApplyAsync(
+        string planId,
+        AutoGenPlanActionRequest request,
+        string clientPartitionKey,
+        CancellationToken cancellationToken = default)
+        => await ApplyCoreAsync(
+            planId,
+            request,
+            RequireClientPartitionKey(clientPartitionKey),
+            cancellationToken);
+
+    private async Task<AutoGenPlanDetailsDto> ApplyCoreAsync(
+        string planId,
+        AutoGenPlanActionRequest request,
+        string? requiredClientPartitionKey,
+        CancellationToken cancellationToken)
     {
         await using var transaction = await _db.Database.BeginTransactionAsync(
             IsolationLevel.Serializable,
@@ -410,6 +544,7 @@ public sealed class TeacherDraftsAutogenPlanService
             await CleanupExpiredPlansAsync(_db, cancellationToken);
             var plan = await LoadPlanAsync(
                 planId,
+                requiredClientPartitionKey,
                 tracking: true,
                 includeMutations: true,
                 cancellationToken);
@@ -517,10 +652,32 @@ public sealed class TeacherDraftsAutogenPlanService
         }
     }
 
-    public async Task<AutoGenPlanDetailsDto> RollbackAsync(
+    internal async Task<AutoGenPlanDetailsDto> RollbackAsync(
         string planId,
         AutoGenPlanActionRequest request,
         CancellationToken cancellationToken = default)
+        => await RollbackCoreAsync(
+            planId,
+            request,
+            requiredClientPartitionKey: null,
+            cancellationToken);
+
+    public async Task<AutoGenPlanDetailsDto> RollbackAsync(
+        string planId,
+        AutoGenPlanActionRequest request,
+        string clientPartitionKey,
+        CancellationToken cancellationToken = default)
+        => await RollbackCoreAsync(
+            planId,
+            request,
+            RequireClientPartitionKey(clientPartitionKey),
+            cancellationToken);
+
+    private async Task<AutoGenPlanDetailsDto> RollbackCoreAsync(
+        string planId,
+        AutoGenPlanActionRequest request,
+        string? requiredClientPartitionKey,
+        CancellationToken cancellationToken)
     {
         await using var transaction = await _db.Database.BeginTransactionAsync(
             IsolationLevel.Serializable,
@@ -530,6 +687,7 @@ public sealed class TeacherDraftsAutogenPlanService
             await CleanupExpiredPlansAsync(_db, cancellationToken);
             var plan = await LoadPlanAsync(
                 planId,
+                requiredClientPartitionKey,
                 tracking: true,
                 includeMutations: true,
                 cancellationToken);
@@ -626,6 +784,7 @@ public sealed class TeacherDraftsAutogenPlanService
 
     private async Task<AutoGenDraftPlan> LoadPlanAsync(
         string planId,
+        string? requiredClientPartitionKey,
         bool tracking,
         bool includeMutations,
         CancellationToken cancellationToken)
@@ -638,7 +797,9 @@ public sealed class TeacherDraftsAutogenPlanService
 
         var plan = await _db.AutoGenDraftPlans
             .AsNoTracking()
-            .Where(item => item.PlanId == normalized)
+            .Where(item => item.PlanId == normalized
+                           && (requiredClientPartitionKey == null
+                               || item.AutoGenJobRun.ClientPartitionKey == requiredClientPartitionKey))
             .Select(item => new AutoGenDraftPlan
             {
                 Id = item.Id,
@@ -705,6 +866,16 @@ public sealed class TeacherDraftsAutogenPlanService
             cancellationToken);
         ValidateMutationTotals(plan, plan.Mutations.Count);
         return plan;
+    }
+
+    private static string RequireClientPartitionKey(string? clientPartitionKey)
+    {
+        var normalized = clientPartitionKey?.Trim();
+        if (string.IsNullOrWhiteSpace(normalized) || normalized.Length > 64)
+        {
+            throw new AutoGenPlanNotFoundException("План автогенерації не знайдено.");
+        }
+        return normalized;
     }
 
     private static void EnsureBoundedPlanRead(AutoGenDraftPlan plan)
@@ -847,25 +1018,43 @@ public sealed class TeacherDraftsAutogenPlanService
         AutoGenDraftPlan plan,
         IReadOnlyCollection<int> groupIds,
         CancellationToken cancellationToken)
-        => await _db.TeacherDraftItems
+        => await LoadBoundedScopeRowsAsync(_db.TeacherDraftItems
             .Where(item => item.Date >= plan.RangeStartDate
                            && item.Date <= plan.RangeEndDate
                            && groupIds.Contains(item.GroupId))
-            .OrderBy(item => item.Id)
-            .ToListAsync(cancellationToken);
+            .OrderBy(item => item.Id), cancellationToken);
 
     private async Task<List<KeyValuePair<int, Guid>>> LoadScopeRevisionRowsAsync(
         AutoGenDraftPlan plan,
         IReadOnlyCollection<int> groupIds,
         CancellationToken cancellationToken)
-        => await _db.TeacherDraftItems
+        => await LoadBoundedScopeRowsAsync(_db.TeacherDraftItems
             .AsNoTracking()
             .Where(item => item.Date >= plan.RangeStartDate
                            && item.Date <= plan.RangeEndDate
                            && groupIds.Contains(item.GroupId))
             .OrderBy(item => item.Id)
-            .Select(item => new KeyValuePair<int, Guid>(item.Id, item.Revision))
+            .Select(item => new KeyValuePair<int, Guid>(item.Id, item.Revision)), cancellationToken);
+
+    // Матеріалізує не більше cap + 1 записів, щоб Preview/Apply/Rollback
+    // відмовляли без повного завантаження завеликої області чернеток.
+    private static async Task<List<T>> LoadBoundedScopeRowsAsync<T>(
+        IQueryable<T> query,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var rows = await query
+            .Take(MaxScopeRowCount + 1)
             .ToListAsync(cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (rows.Count > MaxScopeRowCount)
+        {
+            throw new AutoGenPlanCapacityException(
+                $"Обсяг чернеток плану автогенерації перевищує безпечний ліміт {MaxScopeRowCount} записів. Створіть новий попередній перегляд для меншого діапазону або меншої кількості груп.");
+        }
+
+        return rows;
+    }
 
     private async Task ValidateReferencesAndHardRulesAsync(
         AutoGenDraftPlan plan,

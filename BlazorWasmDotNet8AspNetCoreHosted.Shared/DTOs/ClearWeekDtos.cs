@@ -5,7 +5,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
 public record ClearWeekRequest(
     DateOnly WeekStart,
     int? CourseId = null,
-    int? GroupId = null
+    int? GroupId = null,
+    Guid? ExpectedScopeRevision = null
 );
 
 // DTO відповіді з кількістю видалених записів.

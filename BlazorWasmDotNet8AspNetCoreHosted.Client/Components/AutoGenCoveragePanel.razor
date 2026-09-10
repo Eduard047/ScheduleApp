@@ -1,0 +1,61 @@
+@using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
+
+<section class="coverage-panel" aria-labelledby="coverage-title">
+    <div class="coverage-panel__heading">
+        <div>
+            <h2 id="coverage-title">Повнота розкладу</h2>
+            <p>@StatusText</p>
+        </div>
+        <strong class="coverage-panel__fraction">@Coverage.OccupiedSlots / @Coverage.AvailableSlots <span>навчальних слотів</span></strong>
+    </div>
+    <dl class="coverage-panel__metrics">
+        <div><dt>Не вистачає за програмою</dt><dd>@(Coverage.DemandKnown ? Coverage.MissingLessons.ToString() : "Не задано")</dd></div>
+        <div><dt>Порожні слоти</dt><dd>@Coverage.EmptySlots</dd></div>
+        <div><dt>Вікна між заняттями</dt><dd>@Coverage.InternalGapSlots</dd></div>
+        <div><dt>Неповні призначення</dt><dd>@Coverage.IncompleteLessons</dd></div>
+    </dl>
+    @if (Coverage.OverplannedLessons > 0)
+    {
+        <p class="text-danger" role="alert">Перевищення плану: @Coverage.OverplannedLessons пар. Перегляньте години модулів і наявні заняття.</p>
+    }
+    @if (Coverage.SearchLimitReached)
+    {
+        <p class="coverage-panel__notice">Пошук досягнув межі. Це не доводить, що повніший розклад неможливий.</p>
+    }
+    <p class="coverage-panel__note">Порожні слоти рахуються в усій доступній сітці, навіть коли програму вже виконано. Вихідні, календарні винятки та обід не входять до сітки.</p>
+    <details>
+        <summary>Переглянути заповнення груп і тижнів</summary>
+        <div class="table-responsive" tabindex="0" role="region" aria-label="Повнота розкладу груп">
+            <table class="table table-sm align-middle">
+                <thead><tr><th scope="col">Група</th><th scope="col">Зайнято / доступно</th><th scope="col">Не вистачає за програмою</th><th scope="col">Порожні</th><th scope="col">Вікна</th></tr></thead>
+                <tbody>
+                    @foreach (var group in Coverage.Groups)
+                    {
+                        <tr><th scope="row">@group.GroupName</th><td>@group.OccupiedSlots / @group.AvailableSlots</td><td>@group.MissingLessons</td><td>@group.EmptySlots</td><td>@group.InternalGapSlots</td></tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+        <div class="coverage-weeks" aria-label="Заповнення за тижнями">
+            @foreach (var week in Coverage.Weeks)
+            {
+                <div class="coverage-week">
+                    <span>@week.WeekStart.ToString("dd.MM.yyyy")</span>
+                    <meter min="0" max="@Math.Max(1, week.AvailableSlots)" value="@week.OccupiedSlots" aria-label="@($"Тиждень {week.WeekStart:dd.MM.yyyy}: {week.OccupiedSlots} із {week.AvailableSlots} слотів")"></meter>
+                    <span>@week.OccupiedSlots / @week.AvailableSlots</span>
+                </div>
+            }
+        </div>
+    </details>
+</section>
+
+@code {
+    [Parameter, EditorRequired] public AutoGenCoverageDto Coverage { get; set; } = default!;
+    private string StatusText => Coverage.Status switch
+    {
+        AutoGenCoverageStatus.FullyOccupied => "Програму виконано, усі навчальні слоти заповнено.",
+        AutoGenCoverageStatus.CurriculumComplete => "Програму виконано. У календарній сітці залишився вільний час.",
+        AutoGenCoverageStatus.SearchLimited => "Знайдено частковий результат; пошук зупинився на межі обчислень.",
+        _ => "Розклад потребує доповнення. Перегляньте невиконані години та призначення."
+    };
+}

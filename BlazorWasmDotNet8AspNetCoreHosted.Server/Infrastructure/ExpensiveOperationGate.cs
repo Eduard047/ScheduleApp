@@ -7,7 +7,9 @@ public enum ExpensiveOperationKind
     AutoGenPlanRead,
     AutoGenPlanAction,
     WeekValidation,
-    ModuleSequenceSave
+    WeekMutation,
+    ModuleSequenceSave,
+    TimeSlotEditorMutation
 }
 
 // Не дозволяє дорогим запитам накопичувати необмежену чергу всередині процесу.
@@ -18,7 +20,9 @@ public sealed class ExpensiveOperationGate : IDisposable
     private readonly SemaphoreSlim _autoGenPlanRead = new(2, 2);
     private readonly SemaphoreSlim _autoGenPlanAction = new(1, 1);
     private readonly SemaphoreSlim _weekValidation = new(2, 2);
+    private readonly SemaphoreSlim _weekMutation = new(1, 1);
     private readonly SemaphoreSlim _moduleSequenceSave = new(2, 2);
+    private readonly SemaphoreSlim _timeSlotEditorMutation = new(1, 1);
 
     public async ValueTask<IDisposable?> TryEnterAsync(
         ExpensiveOperationKind kind,
@@ -37,7 +41,9 @@ public sealed class ExpensiveOperationGate : IDisposable
         _autoGenPlanRead.Dispose();
         _autoGenPlanAction.Dispose();
         _weekValidation.Dispose();
+        _weekMutation.Dispose();
         _moduleSequenceSave.Dispose();
+        _timeSlotEditorMutation.Dispose();
     }
 
     private SemaphoreSlim Resolve(ExpensiveOperationKind kind)
@@ -48,7 +54,9 @@ public sealed class ExpensiveOperationGate : IDisposable
             ExpensiveOperationKind.AutoGenPlanRead => _autoGenPlanRead,
             ExpensiveOperationKind.AutoGenPlanAction => _autoGenPlanAction,
             ExpensiveOperationKind.WeekValidation => _weekValidation,
+            ExpensiveOperationKind.WeekMutation => _weekMutation,
             ExpensiveOperationKind.ModuleSequenceSave => _moduleSequenceSave,
+            ExpensiveOperationKind.TimeSlotEditorMutation => _timeSlotEditorMutation,
             _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, null)
         };
 

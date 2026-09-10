@@ -75,6 +75,70 @@ public sealed class TeacherDraftsSecurityRemediationTests
     }
 
     [Fact]
+    public async Task ApproveWeek_rejects_missing_and_stale_scope_revision_without_mutation()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        await fixture.SeedDraftModelAsync(groupCount: 1, draftCount: 1);
+        var controller = CreateController(fixture.Db);
+
+        var missing = await controller.ApproveWeek(new ApproveWeekRequest(Monday, 1));
+        var missingProblem = Assert.IsType<ObjectResult>(missing);
+        Assert.Equal(428, missingProblem.StatusCode);
+
+        var staleRevision = await ReadScopeRevisionAsync(fixture.Db);
+        var draft = await fixture.Db.TeacherDraftItems.SingleAsync();
+        draft.Revision = Guid.NewGuid();
+        draft.Status = DraftStatus.Draft;
+        await fixture.Db.SaveChangesAsync();
+
+        var stale = await controller.ApproveWeek(new ApproveWeekRequest(
+            Monday,
+            1,
+            staleRevision));
+
+        Assert.IsType<ConflictObjectResult>(stale);
+        Assert.Equal(DraftStatus.Draft, (await fixture.Db.TeacherDraftItems.SingleAsync()).Status);
+    }
+
+    [Fact]
+    public async Task Week_mutations_fail_fast_while_another_week_mutation_is_running()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        using var gate = new ExpensiveOperationGate();
+        using var heldLease = await gate.TryEnterAsync(
+            ExpensiveOperationKind.WeekMutation,
+            CancellationToken.None);
+        Assert.NotNull(heldLease);
+        var service = new TeacherDraftsPublishService(
+            fixture.Db,
+            new RulesService(fixture.Db),
+            new AggregatesService(fixture.Db),
+            gate);
+
+        var approve = await service.ApproveWeekAsync(
+            new ApproveWeekRequest(Monday, 1, Guid.NewGuid()));
+        var publish = await service.PublishWeekAsync(
+            new PublishWeekRequest(Monday, null, Guid.NewGuid()));
+
+        Assert.Equal(429, Assert.IsType<ObjectResult>(approve).StatusCode);
+        Assert.Equal(429, Assert.IsType<ObjectResult>(publish.Result).StatusCode);
+    }
+
+    [Fact]
+    public async Task Week_get_rejects_cap_plus_one_before_returning_the_graph()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        await fixture.SeedDraftModelAsync(
+            groupCount: 1,
+            draftCount: TeacherDraftsWeekValidationService.MaxWeekDraftRowCount + 1);
+
+        var result = await CreateController(fixture.Db)
+            .Get(Monday, null, null, null);
+
+        Assert.IsType<UnprocessableEntityObjectResult>(result.Result);
+    }
+
+    [Fact]
     public async Task Durable_job_cleanup_bounds_only_unreferenced_terminal_history()
     {
         await using var fixture = await TestDatabase.CreateAsync();
@@ -244,14 +308,14 @@ public sealed class TeacherDraftsSecurityRemediationTests
     {
         var fullRangeBoundary = CreateValidJobRequest() with
         {
-            ToDate = new DateOnly(2026, 1, 1).AddDays(99),
+            ToDate = new DateOnly(2026, 1, 1).AddDays(AutoGenWorkloadLimits.MaxGroupDays / 40 - 1),
             GroupIds = Enumerable.Range(1, 40).ToList()
         };
         AssertReachesPersistence(fullRangeBoundary);
         var requestedHoursBoundary = CreateValidJobRequest() with
         {
             GroupIds = Enumerable.Range(1, 50).ToList(),
-            ModuleHours = new Dictionary<int, int> { [1] = 500 }
+            ModuleHours = new Dictionary<int, int> { [1] = AutoGenWorkloadLimits.MaxRequestedLessons / 50 }
         };
         AssertReachesPersistence(requestedHoursBoundary);
 
@@ -379,6 +443,36 @@ public sealed class TeacherDraftsSecurityRemediationTests
         cancellation.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             service.ExportAsync(Monday, null, null, null, cancellation.Token));
+    }
+
+    [Theory]
+    [InlineData("=1+1")]
+    [InlineData("+SUM(1,1)")]
+    [InlineData("-1+2")]
+    [InlineData("@SUM(1,1)")]
+    [InlineData("\t=1+1")]
+    [InlineData("\r=1+1")]
+    public async Task Export_writes_formula_leading_group_names_as_plain_text(string groupName)
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        await fixture.SeedDraftModelAsync(groupCount: 1, draftCount: 1);
+        var group = await fixture.Db.Groups.SingleAsync();
+        group.Name = groupName;
+        await fixture.Db.SaveChangesAsync();
+        var service = new TeacherDraftsExportService(
+            fixture.Db,
+            new TeacherDraftsQueryService(fixture.Db));
+
+        var file = await service.ExportAsync(Monday, null, null, null);
+
+        await using (file.FileStream)
+        using (var workbook = new XLWorkbook(file.FileStream))
+        {
+            var groupHeader = workbook.Worksheet("Розклад").Cell(4, 3);
+            Assert.Equal(XLDataType.Text, groupHeader.DataType);
+            Assert.False(groupHeader.HasFormula);
+            Assert.Equal(group.Name.Replace('\r', '\n'), groupHeader.GetString());
+        }
     }
 
     private static void AssertReachesPersistence(AutoGenJobRequest request)

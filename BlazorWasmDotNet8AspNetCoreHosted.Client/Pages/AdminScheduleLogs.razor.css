@@ -7,8 +7,12 @@
 .log-toolbar-row {
     display: grid;
     gap: .75rem;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
     align-items: end;
+}
+
+.log-toolbar-row > * {
+    min-width: 0;
 }
 
 .log-header {
@@ -18,7 +22,7 @@
 }
 
 .log-meta {
-    font-size: .85rem;
+    font-size: .875rem;
     color: #475569;
 }
 
@@ -43,7 +47,7 @@
 }
 
 .log-entry .badge {
-    font-size: .7rem;
+    font-size: .875rem;
 }
 
 .log-details {
@@ -62,7 +66,7 @@
     color: #1d4ed8;
     border-radius: 999px;
     padding: .15rem .6rem;
-    font-size: .75rem;
+    font-size: .875rem;
 }
 
 .log-list {
@@ -81,13 +85,13 @@
 }
 
 .log-table th {
-    font-size: .75rem;
+    font-size: .875rem;
     text-transform: uppercase;
     letter-spacing: .02em;
 }
 
 .log-compact-note {
-    font-size: .8rem;
+    font-size: .875rem;
     color: #64748b;
 }
 
@@ -110,7 +114,7 @@
 }
 
 .log-issue-badge {
-    font-size: .65rem;
+    font-size: .875rem;
     text-transform: uppercase;
     letter-spacing: .03em;
     padding: .15rem .45rem;
@@ -156,5 +160,5 @@
     border-radius: 999px;
     background: #fff;
     padding: .1rem .4rem;
-    font-size: .75rem;
+    font-size: .875rem;
 }

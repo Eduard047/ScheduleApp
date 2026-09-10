@@ -1874,14 +1874,14 @@ public sealed class ProductionGuardrailTests
             valid with { ToDate = new DateOnly(2100, 12, 25) },
             valid with { FromDate = new DateOnly(9999, 12, 24), ToDate = new DateOnly(9999, 12, 24) },
             valid with { FromDate = valid.ToDate.AddDays(1) },
-            valid with { ToDate = valid.FromDate.AddDays(370) },
+            valid with { ToDate = valid.FromDate.AddDays(AutoGenWorkloadLimits.MaxRangeDays) },
             valid with { GroupIds = Enumerable.Range(1, 201).ToList() },
             valid with { GroupIds = new List<int>() },
             valid with { GroupIds = new List<int> { 0 } },
             valid with { ModuleHours = Enumerable.Range(1, 201).ToDictionary(id => id, _ => 1) },
             valid with { ModuleHours = new Dictionary<int, int>() },
             valid with { ModuleHours = new Dictionary<int, int> { [0] = 1 } },
-            valid with { ModuleHours = new Dictionary<int, int> { [1] = 501 } },
+            valid with { ModuleHours = new Dictionary<int, int> { [1] = AutoGenWorkloadLimits.MaxRequestedLessons + 1 } },
             valid with { Title = new string('x', 257) },
             valid with { ClientJobId = "not-a-guid" }
         };
@@ -2613,6 +2613,7 @@ public sealed class ProductionGuardrailTests
         fixture.Db.AutoGenJobRuns.Add(new AutoGenJobRun
         {
             JobId = clientJobId,
+            ClientPartitionKey = "local",
             Kind = (int)AutoGenJobKind.Generate,
             State = (int)AutoGenJobState.Succeeded,
             Title = "Завершене завдання",
@@ -2901,6 +2902,7 @@ public sealed class ProductionGuardrailTests
         legacyRun.OwnerInstanceId = null;
         legacyRun.Attempt = 0;
         legacyRun.Version = 11;
+        legacyRun.ClientPartitionKey = "legacy";
         await using (var db = fixture.CreateContext())
         {
             db.AutoGenJobRuns.Add(legacyRun);
@@ -2910,13 +2912,14 @@ public sealed class ProductionGuardrailTests
         var service = CreateAutogenJobService(provider.GetRequiredService<IServiceScopeFactory>());
 
         var readOnlyStatus = await service.GetAsync(legacyRequest.ClientJobId!);
-        var sameId = service.Start(legacyRequest with { Title = "Повтор legacy-запиту" });
+        var sameId = Assert.Throws<AutoGenJobConflictException>(() =>
+            service.Start(legacyRequest with { Title = "Повтор legacy-запиту" }));
         var blocked = Assert.Throws<AutoGenJobPersistenceException>(() => service.Start(
             CreateValidAutoGenJobRequest() with { ClientJobId = Guid.NewGuid().ToString("N") }));
 
         Assert.NotNull(readOnlyStatus);
         Assert.Equal(AutoGenJobState.Running, readOnlyStatus.State);
-        Assert.Equal(AutoGenJobState.Running, sameId.Status.State);
+        Assert.Contains("вже використано", sameId.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("попередньої версії", blocked.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Empty(GetInMemoryAutogenJobStatuses(service));
         await using var verificationDb = fixture.CreateContext();
@@ -3584,6 +3587,7 @@ public sealed class ProductionGuardrailTests
         return new AutoGenJobRun
         {
             JobId = jobId,
+            ClientPartitionKey = "local",
             OwnerInstanceId = "test-owner",
             Attempt = 1,
             LeaseExpiresAtUtc = leaseExpiresAtUtc,

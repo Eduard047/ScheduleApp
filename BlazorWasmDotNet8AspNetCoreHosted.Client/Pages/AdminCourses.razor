@@ -51,6 +51,18 @@
                 </tr>
             </thead>
             <tbody>
+                @if (!loading && !loadFailed && !SortedAndFilteredItems.Any())
+                {
+                    <tr>
+                        <td colspan="5" class="text-muted text-center py-3">
+                            <span class="admin-table-empty-state" role="status">
+                                @(items.Count == 0
+                                    ? "Поки що немає курсів."
+                                    : "За вашим пошуком курсів не знайдено.")
+                            </span>
+                        </td>
+                    </tr>
+                }
                 @foreach (var c in SortedAndFilteredItems)
                 {
                     <tr>

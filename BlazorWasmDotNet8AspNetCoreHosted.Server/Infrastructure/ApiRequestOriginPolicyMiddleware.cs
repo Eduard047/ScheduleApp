@@ -8,7 +8,7 @@ public sealed class ApiRequestOriginPolicyMiddleware(RequestDelegate next)
 
     public async Task InvokeAsync(HttpContext context)
     {
-        if (!context.Request.Path.StartsWithSegments("/api") || IsSafeMethod(context.Request.Method))
+        if (!context.Request.Path.StartsWithSegments("/api"))
         {
             await next(context);
             return;
@@ -27,11 +27,6 @@ public sealed class ApiRequestOriginPolicyMiddleware(RequestDelegate next)
 
         await next(context);
     }
-
-    private static bool IsSafeMethod(string method)
-        => HttpMethods.IsGet(method)
-           || HttpMethods.IsHead(method)
-           || HttpMethods.IsOptions(method);
 
     private static bool IsCrossSiteFetch(StringValues values)
         => values

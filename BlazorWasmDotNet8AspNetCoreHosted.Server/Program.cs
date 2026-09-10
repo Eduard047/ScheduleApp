@@ -12,6 +12,10 @@ using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure.Seed;
 // Точка входу для налаштування серверного застосунку
 var builder = WebApplication.CreateBuilder(args);
 
+// Типові JSON-запити значно менші; великі імпорти мають власні явні ліміти на маршруті.
+builder.WebHost.ConfigureKestrel(options =>
+    options.Limits.MaxRequestBodySize = 2 * 1024 * 1024);
+
 builder.Services.AddControllersWithViews();
 builder.Services.AddRazorPages();
 builder.Services.AddEndpointsApiExplorer();
@@ -171,7 +175,7 @@ var app = builder.Build();
 app.UseForwardedHeaders();
 app.UseHostFiltering();
 app.UseMiddleware<SecurityResponseHeadersMiddleware>();
-// Перевіряємо браузерне походження всіх API-запитів, що можуть змінювати стан.
+// Перевіряємо браузерне походження всіх API-запитів, зокрема читання.
 app.UseMiddleware<ApiRequestOriginPolicyMiddleware>();
 app.UseRouting();
 app.UseRateLimiter();

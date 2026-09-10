@@ -1,5 +1,7 @@
 ﻿@* Сторінка адміністрування аудиторій *@
 @page "/admin/rooms"
+@using System.Net
+@using BlazorWasmDotNet8AspNetCoreHosted.Client.Services
 @using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs
 @inject BlazorWasmDotNet8AspNetCoreHosted.Client.Services.IAdminApi Admin
 @inject IJSRuntime JS
@@ -39,7 +41,7 @@
         <AdminSearchBox @bind-Value="filter" Class="ms-auto" Style="max-width:360px;" Placeholder="Id / назва / місткість / корпус" />
         <div class="small text-muted">Показано: @SortedAndFiltered.Count() з @items.Count</div>
     </div>
-    <div class="table-responsive">
+    <div class="table-responsive" role="region" aria-label="Список аудиторій" tabindex="0">
         <table class="table table-sm align-middle">
             <thead>
                 <tr>
@@ -51,6 +53,18 @@
                 </tr>
             </thead>
             <tbody>
+                @if (!loading && !loadFailed && !SortedAndFiltered.Any())
+                {
+                    <tr>
+                        <td colspan="5" class="text-muted text-center py-3">
+                            <span class="admin-table-empty-state" role="status">
+                                @(items.Count == 0
+                                    ? "Поки що немає аудиторій."
+                                    : "За вашим пошуком аудиторій не знайдено.")
+                            </span>
+                        </td>
+                    </tr>
+                }
                 @foreach (var r in SortedAndFiltered)
                 {
                     <tr>
@@ -228,12 +242,34 @@
             var caption = room is null ? $"#{id}" : $"{room.Name} (#{id})";
             var confirmed = await JS.InvokeAsync<bool>("confirm", $"Видалити аудиторію {caption}? Дію не можна скасувати.");
             if (!confirmed) return;
-            await Admin.DeleteRoom(id);
-            await FinishMutationAsync(
-                "Аудиторію видалено",
-                "Видалено.",
-                "повторно видаляти аудиторію не потрібно",
-                editorOpen && form.Id == id ? CloseEditor : null);
+            try
+            {
+                await Admin.DeleteRoom(id);
+                await FinishMutationAsync(
+                    "Аудиторію видалено",
+                    "Видалено.",
+                    "повторно видаляти аудиторію не потрібно",
+                    editorOpen && form.Id == id ? CloseEditor : null);
+                return;
+            }
+            catch (ApiErrorException ex) when (ex.StatusCode == HttpStatusCode.Conflict)
+            {
+                var forceConfirmed = await JS.InvokeAsync<bool>(
+                    "confirm",
+                    "Аудиторія використовується у розкладі або чернетках. Примусово відв’язати її від занять, де аудиторія не є обов’язковою, і видалити? Для обов’язкових занять сервер відхилить операцію.");
+                if (!forceConfirmed)
+                {
+                    error = "Дію скасовано користувачем.";
+                    return;
+                }
+
+                await Admin.DeleteRoom(id, force: true);
+                await FinishMutationAsync(
+                    "Аудиторію видалено, необов’язкові прив’язки очищено",
+                    "Аудиторію видалено; необов’язкові прив’язки очищено.",
+                    "повторно видаляти аудиторію не потрібно",
+                    editorOpen && form.Id == id ? CloseEditor : null);
+            }
         }
         catch (Exception ex) { error = ex.Message; }
         finally { mutationInProgress = false; }

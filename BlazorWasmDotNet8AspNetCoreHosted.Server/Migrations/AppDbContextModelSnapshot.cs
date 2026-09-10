@@ -17,7 +17,7 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
         {
 #pragma warning disable 612, 618
             modelBuilder
-                .HasAnnotation("ProductVersion", "8.0.29")
+                .HasAnnotation("ProductVersion", "8.0.30")
                 .HasAnnotation("Relational:MaxIdentifierLength", 64);
 
             MySqlModelBuilderExtensions.AutoIncrementColumns(modelBuilder);
@@ -1064,6 +1064,8 @@ namespace BlazorWasmDotNet8AspNetCoreHosted.Server.Migrations
                         .HasColumnType("longtext");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("BatchKey");
 
                     b.HasIndex("GenerationJobId");
 

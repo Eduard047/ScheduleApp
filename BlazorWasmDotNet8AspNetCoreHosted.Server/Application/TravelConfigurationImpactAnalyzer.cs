@@ -11,9 +11,14 @@ internal sealed record TravelConfigurationImpact(int Count, IReadOnlyList<string
            + $"Спочатку перенесіть заняття або збільште перерву: {string.Join("; ", Samples)}";
 }
 
+internal sealed class TravelConfigurationCapacityException(string message) : Exception(message);
+
 // Перевіряє вплив зміни маршруту на вже збережені заняття.
 internal static class TravelConfigurationImpactAnalyzer
 {
+    internal const int MaxPlacementRowCount = 50_000;
+    private const int MaxImpactSampleCount = 10;
+
     public static async Task<TravelConfigurationImpact> FindNewViolationsAsync(
         AppDbContext db,
         int firstBuildingId,
@@ -47,7 +52,14 @@ internal static class TravelConfigurationImpactAnalyzer
                 item.LessonType.BlocksTeacher,
                 BuildingId = item.Room!.BuildingId
             })
+            .Take(MaxPlacementRowCount + 1)
             .ToListAsync(cancellationToken);
+        if (scheduleRows.Count > MaxPlacementRowCount)
+        {
+            throw new TravelConfigurationCapacityException(
+                $"Перевірка переходів підтримує не більше {MaxPlacementRowCount} записів розкладу та чернеток разом.");
+        }
+        var remainingDraftCapacity = MaxPlacementRowCount - scheduleRows.Count;
         var draftRows = await db.TeacherDraftItems.AsNoTracking()
             .Where(item => item.RoomId != null)
             .Select(item => new
@@ -68,7 +80,13 @@ internal static class TravelConfigurationImpactAnalyzer
                 item.LessonType.BlocksTeacher,
                 BuildingId = item.Room!.BuildingId
             })
+            .Take(remainingDraftCapacity + 1)
             .ToListAsync(cancellationToken);
+        if (draftRows.Count > remainingDraftCapacity)
+        {
+            throw new TravelConfigurationCapacityException(
+                $"Перевірка переходів підтримує не більше {MaxPlacementRowCount} записів розкладу та чернеток разом.");
+        }
         var placements = scheduleRows
             .Select(item => new TravelPlacement(
                 "розклад",
@@ -108,7 +126,8 @@ internal static class TravelConfigurationImpactAnalyzer
             .ToList();
 
         var targetPair = TravelTimePolicy.NormalizePair(firstBuildingId, secondBuildingId);
-        var impacts = new List<TravelPairImpact>();
+        var impactCount = 0;
+        var samples = new List<string>(MaxImpactSampleCount);
         AddScopeImpacts(
             "групи",
             placements.GroupBy(item => (Id: item.GroupId, Name: item.GroupName)));
@@ -123,11 +142,7 @@ internal static class TravelConfigurationImpactAnalyzer
                         ? $"#{item.TeacherId.Value}"
                         : item.TeacherName!)));
 
-        var samples = impacts
-            .Take(10)
-            .Select(impact => impact.Description)
-            .ToList();
-        return new TravelConfigurationImpact(impacts.Count, samples);
+        return new TravelConfigurationImpact(impactCount, samples);
 
         void AddScopeImpacts(
             string scope,
@@ -135,6 +150,7 @@ internal static class TravelConfigurationImpactAnalyzer
         {
             foreach (var owner in owners)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 foreach (var day in owner.GroupBy(item => item.Date))
                 {
                     var ordered = CollapseLogicalEvents(day)
@@ -159,10 +175,14 @@ internal static class TravelConfigurationImpactAnalyzer
                             continue;
                         }
 
-                        impacts.Add(new TravelPairImpact(
-                            $"{scope} {owner.Key.Name}, {current.Date:yyyy-MM-dd} "
-                            + $"{previous.End:HH\\:mm}→{current.Start:HH\\:mm} "
-                            + $"({previous.Source} #{previous.Id} → {current.Source} #{current.Id})"));
+                        impactCount++;
+                        if (samples.Count < MaxImpactSampleCount)
+                        {
+                            samples.Add(
+                                $"{scope} {owner.Key.Name}, {current.Date:yyyy-MM-dd} "
+                                + $"{previous.End:HH\\:mm}→{current.Start:HH\\:mm} "
+                                + $"({previous.Source} #{previous.Id} → {current.Source} #{current.Id})");
+                        }
                     }
                 }
             }
@@ -212,6 +232,4 @@ internal static class TravelConfigurationImpactAnalyzer
         bool RequiresTeacher,
         bool BlocksTeacher,
         int BuildingId);
-
-    private sealed record TravelPairImpact(string Description);
 }

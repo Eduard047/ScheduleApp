@@ -168,13 +168,14 @@ public sealed class AutoGenWarningClassifierTests
 
         return Assert.IsType<AutoGenResult>(method.Invoke(
             null,
-            new object[]
+            new object?[]
             {
                 1,
                 0,
                 warnings,
                 Array.Empty<AutoGenGapDetail>(),
-                Array.Empty<AutoGenPreflightItem>()
+                Array.Empty<AutoGenPreflightItem>(),
+                null
             }));
     }
 }

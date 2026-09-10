@@ -15,13 +15,13 @@ public static class AllowedHostPolicy
         if (hosts.Length == 0)
         {
             throw new InvalidOperationException(
-                "Параметр 'AllowedHosts' має містити щонайменше одне точне ім'я хоста.");
+                "Параметр 'AllowedHosts' має містити щонайменше одне точне ім'я хоста або значення '*'.");
         }
 
-        if (hosts.Any(IsWildcard))
+        if (hosts.Any(IsDisallowedWildcard))
         {
             throw new InvalidOperationException(
-                "Параметр 'AllowedHosts' не може містити шаблони або значення, що дозволяють будь-який хост.");
+                "Параметр 'AllowedHosts' не може містити шаблони, окрім точного значення '*', або значення '+'.");
         }
 
         return hosts;
@@ -34,7 +34,8 @@ public static class AllowedHostPolicy
         options.IncludeFailureMessage = false;
     }
 
-    private static bool IsWildcard(string host)
-        => host.Contains('*', StringComparison.Ordinal)
-           || string.Equals(host, "+", StringComparison.Ordinal);
+    private static bool IsDisallowedWildcard(string host)
+        => string.Equals(host, "+", StringComparison.Ordinal)
+           || (host.Contains('*', StringComparison.Ordinal)
+               && !string.Equals(host, "*", StringComparison.Ordinal));
 }

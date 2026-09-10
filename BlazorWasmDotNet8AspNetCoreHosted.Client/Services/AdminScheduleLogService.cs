@@ -59,19 +59,13 @@ public sealed class AdminScheduleLogService
 
     public async Task SaveAsync(List<AdminScheduleLogEntry> entries)
     {
-        try
+        if (entries.Count == 0)
         {
-            if (entries.Count == 0)
-            {
-                await _js.InvokeVoidAsync("localStorage.removeItem", StorageKey);
-                return;
-            }
-            var json = JsonSerializer.Serialize(entries, JsonOptions);
-            await _js.InvokeVoidAsync("localStorage.setItem", StorageKey, json);
+            await _js.InvokeVoidAsync("localStorage.removeItem", StorageKey);
+            return;
         }
-        catch (JSException)
-        {
-        }
+        var json = JsonSerializer.Serialize(entries, JsonOptions);
+        await _js.InvokeVoidAsync("localStorage.setItem", StorageKey, json);
     }
 
     public async Task ClearAsync()

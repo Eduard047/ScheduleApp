@@ -1,0 +1,13 @@
+dialog {
+    border: 0;
+    padding: 0;
+    border-radius: 14px;
+    width: min(720px, calc(100vw - 32px));
+    max-height: calc(100dvh - 32px);
+    overflow: auto;
+    box-shadow: 0 24px 80px #0f172a40;
+}
+
+dialog::backdrop {
+    background: rgb(15 23 42 / 55%);
+}

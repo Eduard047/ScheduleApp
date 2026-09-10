@@ -1,4 +1,6 @@
 using System.Collections;
+using System.Net;
+using System.Net.Http.Json;
 using System.Reflection;
 using BlazorWasmDotNet8AspNetCoreHosted.Client.Services;
 using BlazorWasmDotNet8AspNetCoreHosted.Shared.DTOs;
@@ -16,6 +18,46 @@ public sealed class AdminModulesReliabilityTests
         "BlazorWasmDotNet8AspNetCoreHosted.Client.Pages.AdminModuleSequence";
     private static readonly BindingFlags InstanceMembers =
         BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+    [Fact]
+    public async Task Docx_client_rejects_oversized_file_before_opening_stream_or_sending_request()
+    {
+        using var handler = new RecordingHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK));
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://schedule.test/") };
+        var api = new AdminApi(http);
+        var file = new TestBrowserFile(AdminApi.MaxDocxImportFileSizeBytes + 1);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => api.ImportModulesFromDocx(file, apply: false));
+
+        Assert.Equal(AdminApi.MaxDocxImportFileSizeMessage, exception.Message);
+        Assert.Equal(0, file.OpenReadCalls);
+        Assert.Equal(0, handler.RequestCount);
+    }
+
+    [Fact]
+    public async Task Docx_client_preserves_upload_at_exact_size_limit()
+    {
+        using var handler = new RecordingHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = JsonContent.Create(new DocxImportResultDto(
+                string.Empty,
+                null,
+                false,
+                new(),
+                new(),
+                null))
+        });
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://schedule.test/") };
+        var api = new AdminApi(http);
+        var file = new TestBrowserFile(AdminApi.MaxDocxImportFileSizeBytes);
+
+        await api.ImportModulesFromDocx(file, apply: false);
+
+        Assert.Equal(1, file.OpenReadCalls);
+        Assert.Equal(AdminApi.MaxDocxImportFileSizeBytes, file.LastMaxAllowedSize);
+        Assert.Equal(1, handler.RequestCount);
+    }
 
     [Fact]
     public async Task Sequence_failed_load_blocks_direct_save_and_preserves_server_state()
@@ -75,6 +117,44 @@ public sealed class AdminModulesReliabilityTests
         Assert.False(GetProperty<bool>(component, "CanSaveSequence"));
         Assert.Equal(0, proxy.GetModuleSequenceCalls);
         Assert.Equal(0, proxy.SaveSequenceCalls);
+    }
+
+    [Fact]
+    public async Task Sequence_initial_reference_failure_can_retry_without_page_reload()
+    {
+        var courseCalls = 0;
+        var api = DispatchProxy.Create<IAdminApi, RecordingAdminApiProxy>();
+        var proxy = (RecordingAdminApiProxy)(object)api;
+        proxy.Handler = (method, _) => method.Name switch
+        {
+            nameof(IAdminApi.GetCourses) when ++courseCalls == 1 =>
+                Task.FromException<List<CourseEditDto>>(new HttpRequestException("тимчасова помилка")),
+            nameof(IAdminApi.GetCourses) => Task.FromResult(new List<CourseEditDto>
+            {
+                new(1, "Курс 1", 16, new DateOnly(2026, 9, 1))
+            }),
+            nameof(IAdminApi.GetModules) => Task.FromResult(new List<ModuleEditDto>
+            {
+                Module(11, 1)
+            }),
+            nameof(IAdminApi.GetModuleSequence) =>
+                Task.FromResult<ModuleSequenceConfigDto?>(Sequence(1, 11)),
+            _ => throw new NotSupportedException(method.Name)
+        };
+        var component = CreateSequenceComponent(api);
+
+        await InvokeAsync(component, "OnInitializedAsync");
+
+        Assert.False(GetField<bool>(component, "_referenceLoadSucceeded"));
+        Assert.Equal(0, GetField<int>(component, "_selectedCourseId"));
+
+        await InvokeAsync(component, "RetryInitialLoadAsync");
+
+        Assert.True(GetField<bool>(component, "_referenceLoadSucceeded"));
+        Assert.True(GetField<bool>(component, "_sequenceLoadSucceeded"));
+        Assert.Equal(1, GetField<int>(component, "_selectedCourseId"));
+        Assert.Equal(new[] { 11 }, GetMainModuleIds(component));
+        Assert.Null(GetField<string?>(component, "error"));
     }
 
     [Fact]
@@ -142,6 +222,7 @@ public sealed class AdminModulesReliabilityTests
         Assert.Equal(1, GetField<int>(component, "_selectedCourseId"));
         var payload = Assert.IsType<ModuleSequenceSaveRequestDto>(proxy.LastSequencePayload);
         Assert.Equal(1, payload.CourseId);
+        Assert.NotNull(payload.ExpectedRevision);
         Assert.Equal(new[] { 11 }, payload.MainModules.Select(item => item.ModuleId));
         Assert.Equal(new[] { 12 }, payload.FillerModuleIds);
 
@@ -150,6 +231,35 @@ public sealed class AdminModulesReliabilityTests
 
         Assert.False(GetField<bool>(component, "isSaving"));
         Assert.Equal("Збережено.", GetField<string>(component, "ok"));
+    }
+
+    [Fact]
+    public async Task Sequence_dirty_course_switch_can_be_canceled_without_losing_changes()
+    {
+        var api = DispatchProxy.Create<IAdminApi, RecordingAdminApiProxy>();
+        var proxy = (RecordingAdminApiProxy)(object)api;
+        proxy.Handler = (method, args) => method.Name switch
+        {
+            nameof(IAdminApi.GetModuleSequence) when (int)args![0]! == 1 =>
+                Task.FromResult<ModuleSequenceConfigDto?>(Sequence(1, 11)),
+            nameof(IAdminApi.GetModuleSequence) when (int)args![0]! == 2 =>
+                Task.FromResult<ModuleSequenceConfigDto?>(Sequence(2, 22)),
+            _ => throw new NotSupportedException(method.Name)
+        };
+        var component = CreateSequenceComponent(api, Module(11, 1), Module(22, 2));
+        var js = new RecordingJsRuntime(confirmResult: false);
+        component.GetType().GetProperty("JS", InstanceMembers)!.SetValue(component, js);
+        SetField(component, "_selectedCourseId", 1);
+        await InvokeAsync(component, "LoadSequence", 1);
+        InvokeVoid(component, "ClearMain");
+
+        await InvokeAsync(component, "OnCourseChanged", new ChangeEventArgs { Value = "2" });
+
+        Assert.True(GetProperty<bool>(component, "HasUnsavedChanges"));
+        Assert.Equal(1, GetField<int>(component, "_selectedCourseId"));
+        Assert.Empty(GetMainModuleIds(component));
+        Assert.Equal(1, proxy.GetModuleSequenceCalls);
+        Assert.Equal(1, js.InvocationCount);
     }
 
     [Fact]
@@ -202,6 +312,60 @@ public sealed class AdminModulesReliabilityTests
 
         Assert.False(GetField<bool>(component, "_pageMutationInProgress"));
         Assert.Equal(1, proxy.UpsertModuleCalls);
+    }
+
+    [Fact]
+    public async Task Module_dependency_conflict_requires_second_confirmation_before_force_delete()
+    {
+        var api = DispatchProxy.Create<IAdminApi, RecordingAdminApiProxy>();
+        var proxy = (RecordingAdminApiProxy)(object)api;
+        proxy.Handler = (method, args) => method.Name switch
+        {
+            nameof(IAdminApi.DeleteModule) when !(bool)args![1]! =>
+                Task.FromException(new ApiErrorException(
+                    HttpStatusCode.Conflict,
+                    "Модуль використовується.")),
+            nameof(IAdminApi.DeleteModule) => Task.CompletedTask,
+            nameof(IAdminApi.GetModules) => Task.FromResult(new List<ModuleEditDto>()),
+            nameof(IAdminApi.GetMeta) => Task.FromResult(EmptyMeta()),
+            nameof(IAdminApi.GetRooms) => Task.FromResult(new List<RoomEditDto>()),
+            nameof(IAdminApi.GetBuildings) => Task.FromResult(new List<BuildingEditDto>()),
+            _ => throw new NotSupportedException(method.Name)
+        };
+        var js = new RecordingJsRuntime();
+        var component = CreateModulesComponent(api, js);
+        GetField<List<ModuleEditDto>>(component, "items").Add(Module(7, 1));
+
+        await InvokeAsync(component, "Delete", 7);
+
+        Assert.Equal(new[] { false, true }, proxy.DeleteForces);
+        Assert.Equal(2, js.InvocationCount);
+        Assert.Contains("опубліковані заняття та плани видалено", GetField<string>(component, "ok"));
+    }
+
+    [Fact]
+    public async Task Module_draft_conflict_does_not_offer_unsupported_force_delete()
+    {
+        var api = DispatchProxy.Create<IAdminApi, RecordingAdminApiProxy>();
+        var proxy = (RecordingAdminApiProxy)(object)api;
+        proxy.Handler = (method, args) => method.Name switch
+        {
+            nameof(IAdminApi.DeleteModule) when !(bool)args![1]! =>
+                Task.FromException(new ApiErrorException(
+                    HttpStatusCode.Conflict,
+                    "Модуль використовується у чернетках.")),
+            nameof(IAdminApi.DeleteModule) => Task.CompletedTask,
+            _ => throw new NotSupportedException(method.Name)
+        };
+        var js = new RecordingJsRuntime();
+        var component = CreateModulesComponent(api, js);
+        GetField<List<ModuleEditDto>>(component, "items").Add(Module(7, 1));
+
+        await InvokeAsync(component, "Delete", 7);
+
+        Assert.Equal(new[] { false }, proxy.DeleteForces);
+        Assert.Equal(1, js.InvocationCount);
+        Assert.Contains("чернетках", GetField<string>(component, "error"));
     }
 
     [Fact]
@@ -426,13 +590,17 @@ public sealed class AdminModulesReliabilityTests
         => new(id, $"М-{id ?? 0}", $"Модуль {id ?? 0}", courseId, credits: 1m);
 
     private static ModuleSequenceConfigDto Sequence(int courseId, int mainId, int? fillerId = null)
-        => new(
-            courseId,
-            new List<ModuleSequenceItemDto>
-            {
-                new(1, mainId, $"М-{mainId}", $"Модуль {mainId}", 1, 1)
-            },
-            fillerId.HasValue ? new List<int> { fillerId.Value } : new List<int>());
+    {
+        var main = new List<ModuleSequenceItemDto>
+        {
+            new(1, mainId, $"М-{mainId}", $"Модуль {mainId}", 1, 1)
+        };
+        var fillers = fillerId.HasValue ? new List<int> { fillerId.Value } : new List<int>();
+        var revision = ModuleSequenceRevisionToken.Create(
+            main.Select(item => new ModuleSequenceSaveItemDto(item.ModuleId, item.GroupOrder)),
+            fillers);
+        return new ModuleSequenceConfigDto(courseId, main, fillers, revision);
+    }
 
     private static MetaResponseDto EmptyMeta()
         => new(new(), new(), new(), new(), new(), new(), new())
@@ -512,6 +680,7 @@ public sealed class AdminModulesReliabilityTests
         public int SaveSequenceCalls { get; private set; }
         public int UpsertModuleCalls { get; private set; }
         public int DeleteModuleCalls { get; private set; }
+        public List<bool> DeleteForces { get; } = new();
         public int ClearModulesCalls { get; private set; }
         public int ImportCalls { get; private set; }
         public int EnsureScopedModuleCalls { get; private set; }
@@ -535,6 +704,7 @@ public sealed class AdminModulesReliabilityTests
                     break;
                 case nameof(IAdminApi.DeleteModule):
                     DeleteModuleCalls++;
+                    DeleteForces.Add((bool)args![1]!);
                     break;
                 case nameof(IAdminApi.ClearModulesAndPlans):
                     ClearModulesCalls++;
@@ -562,7 +732,7 @@ public sealed class AdminModulesReliabilityTests
         }
     }
 
-    private sealed class RecordingJsRuntime : IJSRuntime
+    private sealed class RecordingJsRuntime(bool confirmResult = true) : IJSRuntime
     {
         public int InvocationCount { get; private set; }
 
@@ -575,18 +745,38 @@ public sealed class AdminModulesReliabilityTests
             object?[]? args)
         {
             InvocationCount++;
-            object? value = identifier == "prompt" ? "ВИДАЛИТИ" : true;
+            object? value = identifier == "prompt" ? "ВИДАЛИТИ" : confirmResult;
             return ValueTask.FromResult((TValue)value!);
         }
     }
 
-    private sealed class TestBrowserFile : IBrowserFile
+    private sealed class TestBrowserFile(long size = 8) : IBrowserFile
     {
         public string Name => "modules.docx";
         public DateTimeOffset LastModified => DateTimeOffset.UtcNow;
-        public long Size => 8;
+        public long Size { get; } = size;
         public string ContentType => "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        public int OpenReadCalls { get; private set; }
+        public long? LastMaxAllowedSize { get; private set; }
         public Stream OpenReadStream(long maxAllowedSize = 512_000, CancellationToken cancellationToken = default)
-            => new MemoryStream(new byte[8], writable: false);
+        {
+            OpenReadCalls++;
+            LastMaxAllowedSize = maxAllowedSize;
+            return new MemoryStream(new byte[8], writable: false);
+        }
+    }
+
+    private sealed class RecordingHttpMessageHandler(
+        Func<HttpRequestMessage, HttpResponseMessage> responseFactory) : HttpMessageHandler
+    {
+        public int RequestCount { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            RequestCount++;
+            return Task.FromResult(responseFactory(request));
+        }
     }
 }

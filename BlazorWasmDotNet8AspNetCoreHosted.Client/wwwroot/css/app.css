@@ -1,5 +1,18 @@
+:root {
+    --app-ink: #162c46;
+    --app-muted: #44637d;
+    --app-action: #1468ad;
+    --app-success: #11756b;
+    --app-warning: #ac5a16;
+    --app-danger: #c63543;
+    --app-surface: #f4f7fb;
+    --app-border: #cbd7e3;
+}
+
 html, body {
-    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    font-family: system-ui, -apple-system, 'Segoe UI', Arial, sans-serif;
+    color: var(--app-ink);
+    line-height: 1.5;
 }
 
 h1:focus {
@@ -8,6 +21,22 @@ h1:focus {
 
 a, .btn-link {
     color: #0071c1;
+}
+
+.skip-link {
+    position: fixed;
+    top: .5rem;
+    left: .5rem;
+    z-index: 1200;
+    padding: .5rem .75rem;
+    color: #fff;
+    background: #1b1b1b;
+    border-radius: .25rem;
+    transform: translateY(calc(-100% - 1rem));
+}
+
+.skip-link:focus {
+    transform: translateY(0);
 }
 
 .btn-primary {
@@ -49,6 +78,10 @@ a, .btn-link {
 }
 
     #blazor-error-ui .dismiss {
+        padding: 0;
+        border: 0;
+        color: inherit;
+        background: transparent;
         cursor: pointer;
         position: absolute;
         right: 0.75rem;
@@ -318,6 +351,65 @@ code {
     margin-top: .1rem;
     font-size: .72rem;
     color: #991b1b;
+}
+
+.layout-main h1, .coverage-panel h2, .plan-browser h2 {
+    font-family: ui-rounded, 'SF Pro Rounded', system-ui, sans-serif;
+    font-weight: 650;
+    letter-spacing: -.015em;
+}
+.layout-main .small, .layout-main small { font-size: .875rem; }
+.layout-main .table { font-size: .9375rem; }
+.layout-main .table th { font-weight: 650; }
+.layout-main input, .layout-main select, .layout-main button { line-height: 1.4; }
+.layout-main .text-muted { color: var(--app-muted) !important; }
+.layout-main .form-label { font-weight: 550; }
+.layout-main .btn { min-height: 2.25rem; }
+.layout-main :is(a, button, input, select, textarea, summary, [tabindex]):not(h1):focus-visible { outline: 2px solid var(--app-action); outline-offset: 3px; }
+.table-responsive { position: relative; max-width: 100%; }
+.autogen-groups { padding: 1rem; border: 1px solid var(--app-border); border-radius: .5rem; background: #fff; }
+.layout-main .module-generated-hours__missing, .layout-main .module-generated-hours__over { font-size: .875rem; }
+.table-responsive:focus-visible { outline-offset: -2px; }
+
+.autogen-capacity { display: flex; align-items: flex-start; gap: .75rem 1.25rem; flex-wrap: wrap; font-size: .9375rem; }
+.autogen-capacity > div { flex: 1 1 24rem; }
+.coverage-panel, .plan-browser { margin-block: 1rem; padding: 1.25rem; background: #fff; border: 1px solid var(--app-border); border-radius: .65rem; font-size: .9375rem; }
+.coverage-panel { border-top: 4px solid var(--app-action); }
+.coverage-panel h2, .plan-browser h2 { font-size: 1.2rem; margin: 0 0 .5rem; }
+.coverage-panel p { margin: 0 0 .75rem; }
+.coverage-panel__heading { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+.coverage-panel__fraction { font-size: 1.35rem; font-variant-numeric: tabular-nums; }
+.coverage-panel__fraction span { display: block; font-size: .875rem; font-weight: 400; color: var(--app-muted); }
+.coverage-panel__metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1rem; margin-block: 1rem; }
+.coverage-panel__metrics > div { padding: .75rem; background: var(--app-surface); border-radius: .3rem; }
+.coverage-panel__metrics dt { font-size: .875rem; font-weight: 500; }
+.coverage-panel__metrics dd { font-size: 1.5rem; font-weight: 650; margin: .25rem 0 0; font-variant-numeric: tabular-nums; }
+.coverage-panel__note { color: var(--app-muted); }
+.coverage-panel__notice { color: #77400e; background: #fff4e2; border-left: 3px solid var(--app-warning); padding: .75rem; }
+.coverage-panel summary, .plan-browser summary { cursor: pointer; padding-block: .45rem; }
+.coverage-weeks { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr)); gap: .5rem 1.5rem; max-height: 22rem; overflow: auto; margin-top: .75rem; }
+.coverage-week { display: grid; grid-template-columns: 6rem 1fr 5rem; align-items: center; gap: .5rem; font-size: .875rem; font-variant-numeric: tabular-nums; }
+.coverage-week meter { width: 100%; height: 1.25rem; accent-color: var(--app-success); }
+.plan-browser__filters { display: grid; grid-template-columns: minmax(12rem, 2fr) repeat(3, minmax(8rem, 1fr)); gap: .75rem; margin-block: 1rem; }
+.plan-browser__filters label { font-size: .875rem; font-weight: 550; }
+.plan-browser__filters input, .plan-browser__filters select { margin-top: .3rem; }
+.plan-browser__paging { display: flex; align-items: center; justify-content: space-between; gap: .75rem; flex-wrap: wrap; margin-block: 1rem; }
+.plan-browser td { vertical-align: top; }
+.coverage-panel .table td:last-child, .coverage-panel .table th:last-child { min-width: 4rem; }
+@media (max-width: 900px) {
+    .coverage-panel__metrics, .plan-browser__filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 480px) {
+    .coverage-panel, .plan-browser { padding: .85rem; }
+    .plan-browser__filters { grid-template-columns: 1fr; }
+    .layout-main .btn { min-height: 2.5rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+}
+@media print {
+    .plan-browser__filters, .plan-browser__paging button, .autogen-capacity { display: none !important; }
+    .coverage-weeks { max-height: none; overflow: visible; }
 }
 
 @media (max-width: 720px) {
