@@ -27,10 +27,22 @@ public sealed class HttpBoundarySecurityTests
     }
 
     [Theory]
+    [InlineData("192.0.2.44:5285")]
+    [InlineData("schedule.private.example.test:8443")]
+    public async Task Top_level_wildcard_accepts_nonempty_ip_and_dns_hosts(string requestHost)
+    {
+        await using var host = await SecurityTestHost.StartAsync("*");
+
+        using var response = await host.SendAsync(HttpMethod.Get, requestHost);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Theory]
     [InlineData("localhost")]
     [InlineData("127.0.0.1")]
     [InlineData("[::1]")]
-    public async Task Default_local_host_entries_are_accepted(string requestHost)
+    public async Task Explicit_loopback_host_entries_are_accepted(string requestHost)
     {
         const string defaultHosts = "localhost;127.0.0.1;[::1]";
         await using var host = await SecurityTestHost.StartAsync(defaultHosts);
@@ -44,12 +56,19 @@ public sealed class HttpBoundarySecurityTests
     [InlineData(null)]
     [InlineData("")]
     [InlineData(" ; ")]
-    [InlineData("*")]
     [InlineData("+")]
     [InlineData("localhost;*.example.test")]
-    public void Host_policy_rejects_empty_or_wildcard_configuration(string? configuredHosts)
+    public void Host_policy_rejects_empty_or_unsafe_wildcard_configuration(string? configuredHosts)
     {
         Assert.Throws<InvalidOperationException>(() => AllowedHostPolicy.Parse(configuredHosts));
+    }
+
+    [Fact]
+    public void Host_policy_accepts_top_level_wildcard()
+    {
+        var hosts = AllowedHostPolicy.Parse("*");
+
+        Assert.Equal(new[] { "*" }, hosts);
     }
 
     [Fact]

@@ -28,6 +28,24 @@ public sealed class ProductionPipelineSecurityTests
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
 
+    [Theory]
+    [InlineData("192.0.2.44:5285")]
+    [InlineData("schedule.private.example.test:8443")]
+    public async Task Real_entry_point_default_wildcard_accepts_nonempty_ip_and_dns_hosts(string requestHost)
+    {
+        await using var factory = new ProductionPipelineFactory(restrictHosts: false);
+        using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false
+        });
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/health/live");
+        request.Headers.Host = requestHost;
+
+        using var response = await client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
     [Fact]
     public async Task Real_entry_point_rejects_cross_origin_unsafe_api_request()
     {
@@ -105,12 +123,15 @@ public sealed class ProductionPipelineSecurityTests
         }
     }
 
-    private sealed class ProductionPipelineFactory : WebApplicationFactory<Program>
+    private sealed class ProductionPipelineFactory(bool restrictHosts = true) : WebApplicationFactory<Program>
     {
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             builder.UseEnvironment("Testing");
-            builder.UseSetting("AllowedHosts", "schedule.example.test");
+            if (restrictHosts)
+            {
+                builder.UseSetting("AllowedHosts", "schedule.example.test");
+            }
             builder.UseSetting(
                 "ConnectionStrings:Default",
                 "Server=127.0.0.1;Database=unused;User=unused;Password=unused");
