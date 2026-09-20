@@ -62,9 +62,11 @@ public sealed class AutogenConstraintSearchTests
                 Enumerable.Range(0, random.Next(1, 5)).Select(index => new ConflictComponentCandidate<(int, int)>(index, 0,
                     (random.Next(5), random.Next(5)))).ToArray())).ToArray();
             static bool Conflict((int Teacher, int Room) a, (int Teacher, int Room) b) => a.Teacher == b.Teacher || a.Room == b.Room;
+            bool Accept(IReadOnlyList<(int Teacher, int Room)> placements)
+                => seed % 2 == 0 || placements.Sum(placement => placement.Room) % 3 == seed % 3;
             bool Oracle(int index, List<(int Teacher, int Room)> assigned)
             {
-                if (index == domains.Length) return true;
+                if (index == domains.Length) return Accept(assigned);
                 foreach (var candidate in domains[index].Candidates)
                 {
                     if (assigned.Any(item => Conflict(item, candidate.Value))) continue;
@@ -75,8 +77,8 @@ public sealed class AutogenConstraintSearchTests
                 return false;
             }
             var before = domains.SelectMany(d => d.Candidates).ToArray();
-            var result = await BoundedConflictComponentSolver.SolveAsync(domains, Conflict, _ => Task.FromResult(true),
-                new DeterministicSearchBudget(100_000, TimeSpan.FromMinutes(1)));
+            var result = await BoundedConflictComponentSolver.SolveAsync(domains, Conflict, values => Task.FromResult(Accept(values)),
+                new DeterministicSearchBudget(100_000, TimeSpan.FromMinutes(1)), maxCompleteChecks: 2_000);
             Assert.False(result.SearchLimitReached);
             Assert.Equal(Oracle(0, []), result.Placements.Count == domains.Length);
             Assert.Equal(before, domains.SelectMany(d => d.Candidates));
@@ -101,6 +103,31 @@ public sealed class AutogenConstraintSearchTests
         using var cancellation = new CancellationTokenSource();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => BoundedConflictComponentSolver.SolveAsync(domains, (a, b) => false,
             _ => { cancellation.Cancel(); return Task.FromResult(true); }, new(10_000, TimeSpan.FromMinutes(1)), cancellation.Token));
+    }
+
+    [Fact]
+    public async Task Component_search_reuses_pruned_domains_to_finish_within_the_same_node_budget()
+    {
+        var domains = Enumerable.Range(0, 8).Select(id => new ConflictComponentDomain<int>(id,
+            Enumerable.Range(0, 16).Select(value => new ConflictComponentCandidate<int>(value, value, value)).ToArray())).ToArray();
+        var result = await BoundedConflictComponentSolver.SolveAsync(domains, (a, b) => a == b,
+            _ => Task.FromResult(true), new(550, TimeSpan.FromMinutes(1)));
+        Assert.False(result.SearchLimitReached);
+        Assert.Equal(Enumerable.Range(0, 8), result.Placements);
+        Assert.InRange(result.VisitedNodes, 1, 550);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Component_search_cancellation_after_the_final_validation_never_returns_a_result(bool accept)
+    {
+        ConflictComponentDomain<int>[] domains = [new(1, [new(1, 0, 1)])];
+        using var cancellation = new CancellationTokenSource();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => BoundedConflictComponentSolver.SolveAsync(
+            domains, (a, b) => false, _ => { cancellation.Cancel(); return Task.FromResult(accept); },
+            new(100, TimeSpan.FromMinutes(1)), cancellation.Token));
+        Assert.Equal(1, Assert.Single(Assert.Single(domains).Candidates).Value);
     }
 
     private sealed record TestPlacement(int Event, int Group, int Day, int Slot, int Teacher, int Room);
@@ -250,6 +277,319 @@ public sealed class AutogenConstraintSearchTests
         Assert.Empty((await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(new(1, [1, 2], fixture.From, fixture.To))).Violations);
         Assert.Equal(0, Extract(await new TeacherDraftsAutogenService(db).DraftAutoGen(request)).Created);
     }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Fill_reorders_module_blocks_and_rematches_day_rooms_without_moving_locked_lessons(bool lockDay)
+    {
+        await using var fixture = await AutogenUniversalRangeTests.RangeFixture.CreateAsync(0, 1, WeekPreset.MonFri, 2, 6);
+        var db = fixture.Db;
+        var request = await SeedReorderDaysAsync(fixture);
+        if (lockDay)
+        {
+            foreach (var row in await db.TeacherDraftItems.Where(d => d.GroupId == 1).ToListAsync())
+                row.IsLocked = true;
+            await db.SaveChangesAsync();
+        }
+        var protectedBefore = await ReadDraftStateAsync(db, lockDay ? null : 2);
+        var result = Extract(await new TeacherDraftsAutogenService(db).DraftAutoGen(request));
+        Assert.Equal(lockDay ? 0 : 1, result.Created);
+        Assert.Equal(lockDay ? 1 : 0, result.Coverage!.MissingLessons);
+        Assert.Equal(lockDay ? 5 : 6, result.Coverage.OccupiedSlots);
+        if (!lockDay)
+        {
+            Assert.Equal(AutoGenCoverageStatus.FullyOccupied, result.Coverage.Status);
+            Assert.Contains(result.Warnings, w => w.Contains("узгодив компоненту", StringComparison.Ordinal));
+            Assert.All(await db.TeacherDraftItems.AsNoTracking().Where(d => d.GroupId == 1).ToListAsync(),
+                draft => Assert.Equal(2, draft.RoomId));
+        }
+        Assert.Equal(protectedBefore, await ReadDraftStateAsync(db, lockDay ? null : 2));
+        Assert.Empty((await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(
+            new(1, [1, 2], fixture.From, fixture.To))).Violations);
+        Assert.Equal(0, Extract(await new TeacherDraftsAutogenService(db).DraftAutoGen(request)).Created);
+    }
+
+    [Theory]
+    [InlineData("locked")]
+    [InlineData("approved")]
+    [InlineData("published")]
+    [InlineData("batch")]
+    public async Task Fill_cannot_reorder_protected_day_even_when_that_would_close_the_gap(string protection)
+    {
+        await using var fixture = await AutogenUniversalRangeTests.RangeFixture.CreateAsync(0, 1, WeekPreset.MonFri, 2, 6);
+        var request = await SeedReorderDaysAsync(fixture);
+        foreach (var row in await fixture.Db.TeacherDraftItems.Where(d => d.GroupId == 1).ToListAsync())
+        {
+            row.IsLocked = protection == "locked";
+            row.Status = protection == "approved" ? DraftStatus.Published : DraftStatus.Draft;
+            row.BatchKey = protection == "batch" ? "protected-day" : null;
+            if (protection == "published")
+            {
+                fixture.Db.ScheduleItems.Add(new ScheduleItem
+                {
+                    Id = 1_000 + row.Id, Date = row.Date, DayOfWeek = row.DayOfWeek,
+                    StartTime = row.StartTime, EndTime = row.EndTime, GroupId = row.GroupId,
+                    ModuleId = row.ModuleId, ModuleTopicId = row.ModuleTopicId, LessonTypeId = row.LessonTypeId,
+                    TeacherId = row.TeacherId, RoomId = row.RoomId
+                });
+                // Публікація переносить заняття до ScheduleItems і видаляє чернетку.
+                fixture.Db.TeacherDraftItems.Remove(row);
+            }
+        }
+        await fixture.Db.SaveChangesAsync();
+        var before = await ReadDraftStateAsync(fixture.Db);
+        var publishedBefore = await ReadPublishedStateAsync(fixture.Db);
+
+        var result = Extract(await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(request));
+
+        Assert.Equal(0, result.Created);
+        Assert.Equal(before, await ReadDraftStateAsync(fixture.Db));
+        Assert.NotEqual(AutoGenCoverageStatus.FullyOccupied, result.Coverage!.Status);
+        Assert.Equal(0, Extract(await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(request)).Created);
+        Assert.Equal(before, await ReadDraftStateAsync(fixture.Db));
+        Assert.Equal(publishedBefore, await ReadPublishedStateAsync(fixture.Db));
+        await AssertReorderHardRulesAsync(fixture);
+    }
+
+    [Theory]
+    [InlineData("room")]
+    [InlineData("teacher")]
+    [InlineData("working-hours")]
+    public async Task Fill_with_no_feasible_resource_assignment_keeps_existing_day_unchanged(string shortage)
+    {
+        await using var fixture = await AutogenUniversalRangeTests.RangeFixture.CreateAsync(0, 1, WeekPreset.MonFri, 2, 6);
+        var request = await SeedReorderDaysAsync(fixture);
+        var db = fixture.Db;
+        if (shortage == "room")
+        {
+            db.ModuleRooms.RemoveRange(await db.ModuleRooms.Where(link => link.RoomId == 2).ToListAsync());
+        }
+        else if (shortage == "teacher")
+        {
+            // Єдиний викладач зайнятий іншою групою в останньому слоті.
+            db.TeacherModules.RemoveRange(await db.TeacherModules.Where(link => link.TeacherId == 2).ToListAsync());
+            (await db.TeacherDraftItems.SingleAsync(d => d.GroupId == 2)).TeacherId = 1;
+        }
+        else
+        {
+            // Викладачі є, але їхній робочий день закінчується до порожнього слоту.
+            var lastStart = await db.TimeSlots.MaxAsync(s => s.Start);
+            foreach (var hours in await db.TeacherWorkingHours.Where(h => h.TeacherId == 1).ToListAsync())
+                hours.End = lastStart;
+            db.TeacherModules.RemoveRange(await db.TeacherModules.Where(link => link.TeacherId == 2 && link.ModuleId != 2).ToListAsync());
+        }
+        await db.SaveChangesAsync();
+        var before = await ReadDraftStateAsync(db);
+
+        var result = Extract(await new TeacherDraftsAutogenService(db).DraftAutoGen(request));
+
+        Assert.Equal(0, result.Created);
+        Assert.Equal(1, result.Coverage!.MissingLessons);
+        Assert.Equal(1, result.Coverage.EmptySlots);
+        Assert.Equal(before, await ReadDraftStateAsync(db));
+        Assert.Equal(0, Extract(await new TeacherDraftsAutogenService(db).DraftAutoGen(request)).Created);
+        Assert.Equal(before, await ReadDraftStateAsync(db));
+        await AssertReorderHardRulesAsync(fixture);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Fill_repairs_two_days_preserves_peer_rows_and_is_idempotent(bool reverseInsertion)
+    {
+        await using var fixture = await AutogenUniversalRangeTests.RangeFixture.CreateAsync(0, 2, WeekPreset.MonFri, 2, 6);
+        var request = await SeedReorderDaysAsync(fixture, reverseInsertion);
+        var peersBefore = await ReadDraftStateAsync(fixture.Db, groupId: 2);
+
+        var result = Extract(await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(request));
+
+        Assert.Equal(2, result.Created);
+        Assert.Equal(AutoGenCoverageStatus.FullyOccupied, result.Coverage!.Status);
+        Assert.Equal(12, result.Coverage.OccupiedSlots);
+        Assert.Equal(0, result.Coverage.MissingLessons);
+        Assert.Equal(0, result.Coverage.EmptySlots);
+        Assert.Equal(0, result.Coverage.InternalGapSlots);
+        var rows = await fixture.Db.TeacherDraftItems.AsNoTracking().Where(d => d.GroupId == 1).ToListAsync();
+        foreach (var date in fixture.TeachingDates)
+        {
+            var day = rows.Where(d => d.Date == date).ToList();
+            Assert.Equal(6, day.Count);
+            Assert.Equal(6, day.Select(d => (d.StartTime, d.EndTime)).Distinct().Count());
+            Assert.All(day, row => Assert.Equal(2, row.RoomId));
+        }
+        foreach (var (module, hours) in request.ModuleHours!)
+            Assert.Equal(hours, rows.Count(d => d.ModuleId == module));
+        Assert.Equal(peersBefore, await ReadDraftStateAsync(fixture.Db, groupId: 2));
+        await AssertReorderHardRulesAsync(fixture);
+        var completed = await ReadDraftStateAsync(fixture.Db);
+        Assert.Equal(0, Extract(await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(request)).Created);
+        Assert.Equal(completed, await ReadDraftStateAsync(fixture.Db));
+    }
+
+    [Fact]
+    public async Task Fill_expands_resource_choices_when_the_only_complete_day_uses_the_tenth_room()
+    {
+        await using var fixture = await AutogenUniversalRangeTests.RangeFixture.CreateAsync(0, 1, WeekPreset.MonFri, 2, 6);
+        var request = await SeedReorderDaysAsync(fixture);
+        var db = fixture.Db;
+        for (var room = 3; room <= 10; room++)
+        {
+            db.Rooms.Add(new Room { Id = room, BuildingId = 1, Name = $"Синтетична аудиторія {room}", Capacity = 30 });
+            db.ModuleRooms.Add(new ModuleRoom { ModuleId = 1, RoomId = room });
+        }
+        db.ModuleRooms.RemoveRange(await db.ModuleRooms.Where(link => link.ModuleId != 1 && link.RoomId == 2).ToListAsync());
+        db.ModuleRooms.AddRange(new ModuleRoom { ModuleId = 2, RoomId = 10 }, new ModuleRoom { ModuleId = 3, RoomId = 10 });
+        await db.SaveChangesAsync();
+        var peerBefore = await ReadDraftStateAsync(db, 2);
+
+        // Перехід між аудиторіями за п'ять хвилин неможливий; 10 — єдина
+        // спільна аудиторія всіх модулів, вільна також в останньому слоті.
+        var result = Extract(await new TeacherDraftsAutogenService(db).DraftAutoGen(request));
+
+        Assert.True(result.Created == 1, string.Join(" | ", result.Warnings));
+        Assert.Equal(AutoGenCoverageStatus.FullyOccupied, result.Coverage!.Status);
+        Assert.Equal(6, result.Coverage.OccupiedSlots);
+        Assert.All(await db.TeacherDraftItems.AsNoTracking().Where(d => d.GroupId == 1).ToListAsync(),
+            row => Assert.Equal(10, row.RoomId));
+        Assert.Equal(peerBefore, await ReadDraftStateAsync(db, 2));
+        await AssertReorderHardRulesAsync(fixture);
+    }
+
+    [Fact]
+    public void Repair_attempts_reserve_a_turn_for_each_pending_group_and_release_unused_reservations()
+    {
+        var budget = new ResidualRepairAttemptBudget(8);
+        int[] pending = [1, 2, 3];
+        for (var i = 0; i < 4; i++) Assert.True(budget.TryStart(1, pending));
+        Assert.False(budget.TryStart(1, pending));
+        Assert.Equal(4, budget.Used);
+        for (var i = 0; i < 2; i++) Assert.True(budget.TryStart(2, pending));
+        Assert.False(budget.TryStart(2, pending));
+        for (var i = 0; i < 2; i++) Assert.True(budget.TryStart(3, pending));
+        Assert.Equal(8, budget.Used);
+        Assert.False(budget.TryStart(3, pending));
+
+        var released = new ResidualRepairAttemptBudget(6);
+        Assert.True(released.TryStart(1, [1, 2, 3]));
+        Assert.True(released.TryStart(1, [1, 2, 3]));
+        Assert.False(released.TryStart(1, [1, 2, 3]));
+        // Друга й третя групи вже заповнені іншим етапом — резерв доступний першій.
+        for (var i = 0; i < 4; i++) Assert.True(released.TryStart(1, [1]));
+        Assert.False(released.TryStart(1, [1]));
+        Assert.False(new ResidualRepairAttemptBudget(4).TryStart(9, [1, 2]));
+    }
+
+    [Fact]
+    public async Task Fill_keeps_room_changes_available_when_the_break_matches_the_travel_time()
+    {
+        await using var fixture = await AutogenUniversalRangeTests.RangeFixture.CreateAsync(0, 1, WeekPreset.MonFri, 2, 6);
+        var request = await SeedReorderDaysAsync(fixture);
+        var db = fixture.Db;
+        var slots = await db.TimeSlots.OrderBy(slot => slot.Start).ToListAsync();
+        var rows = await db.TeacherDraftItems.ToListAsync();
+        for (var index = 0; index < slots.Count; index++)
+        {
+            var oldStart = slots[index].Start;
+            slots[index].Start = new TimeOnly(8 + index, 0);
+            slots[index].End = slots[index].Start.AddMinutes(45);
+            foreach (var row in rows.Where(row => row.StartTime == oldStart).ToArray())
+            {
+                row.StartTime = slots[index].Start;
+                row.EndTime = slots[index].End;
+            }
+        }
+        db.ModuleRooms.RemoveRange(await db.ModuleRooms.Where(link =>
+            link.ModuleId == 2 && link.RoomId == 2 || link.ModuleId == 3 && link.RoomId == 1).ToListAsync());
+        rows.Single(row => row.GroupId == 1 && row.ModuleId == 3).RoomId = 2;
+        await db.SaveChangesAsync();
+        await AssertReorderHardRulesAsync(fixture);
+
+        var result = Extract(await new TeacherDraftsAutogenService(db).DraftAutoGen(request));
+
+        Assert.Equal(1, result.Created);
+        Assert.Equal(AutoGenCoverageStatus.FullyOccupied, result.Coverage!.Status);
+        var saved = await db.TeacherDraftItems.AsNoTracking().Where(row => row.GroupId == 1).ToListAsync();
+        Assert.Contains(saved, row => row.RoomId == 1);
+        Assert.Contains(saved, row => row.RoomId == 2);
+        await AssertReorderHardRulesAsync(fixture);
+    }
+
+    private static async Task<DraftAutoGenRequest> SeedReorderDaysAsync(
+        AutogenUniversalRangeTests.RangeFixture fixture, bool reverseInsertion = false)
+    {
+        var db = fixture.Db;
+        var days = fixture.TeachingDates.Count;
+        var slots = await db.TimeSlots.OrderBy(s => s.SortOrder).ToListAsync();
+        for (var i = 0; i < slots.Count; i++)
+        {
+            slots[i].Start = new TimeOnly(8, 0).AddMinutes(i * 50);
+            slots[i].End = slots[i].Start.AddMinutes(45);
+        }
+        var topic = await db.ModuleTopics.SingleAsync();
+        topic.TotalHours = topic.AuditoriumHours = 4 * days;
+        (await db.ModulePlans.SingleAsync()).TargetHours = 4 * days;
+        foreach (var id in new[] { 2, 3 })
+        {
+            db.Modules.Add(new BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities.Module
+                { Id = id, CourseId = 1, Code = $"M{id}", Title = $"Тестовий модуль {id}" });
+            db.ModuleTopics.Add(new ModuleTopic { Id = id, ModuleId = id, LessonTypeId = 1,
+                Order = 1, TopicCode = $"{id}.1", TotalHours = days, AuditoriumHours = days });
+            db.ModulePlans.Add(new ModulePlan { CourseId = 1, ModuleId = id, TargetHours = days, IsActive = true });
+            db.ModuleSequenceItems.Add(new ModuleSequenceItem { CourseId = 1, ModuleId = id, Order = id, GroupOrder = 1 });
+            db.TeacherModules.AddRange(new TeacherModule { TeacherId = 1, ModuleId = id }, new TeacherModule { TeacherId = 2, ModuleId = id });
+            db.ModuleRooms.AddRange(new ModuleRoom { ModuleId = id, RoomId = 1 }, new ModuleRoom { ModuleId = id, RoomId = 2 });
+        }
+        int[] moduleOrder = [1, 2, 1, 1, 3];
+        // А-Б-А-А-В-порожньо: ще одна А створила б третій сегмент.
+        // За п'ять хвилин між слотами не можна перейти до іншої аудиторії.
+        var rows = new List<TeacherDraftItem>();
+        foreach (var date in fixture.TeachingDates)
+        {
+            rows.AddRange(moduleOrder.Select((module, index) => new TeacherDraftItem
+            {
+                GroupId = 1, ModuleId = module, ModuleTopicId = module, LessonTypeId = 1,
+                Date = date, DayOfWeek = date.DayOfWeek, StartTime = slots[index].Start, EndTime = slots[index].End,
+                TeacherId = 1, RoomId = 1
+            }));
+            rows.Add(new TeacherDraftItem
+            {
+                GroupId = 2, ModuleId = 2, ModuleTopicId = 2, LessonTypeId = 1,
+                Date = date, DayOfWeek = date.DayOfWeek, StartTime = slots[5].Start, EndTime = slots[5].End,
+                TeacherId = 2, RoomId = 1, IsLocked = true
+            });
+        }
+        db.TeacherDraftItems.AddRange(reverseInsertion ? rows.AsEnumerable().Reverse() : rows);
+        await db.SaveChangesAsync();
+        return fixture.Request with { GroupIds = [1], ClearExisting = false,
+            ModuleHours = new() { [1] = 4 * days, [2] = days, [3] = days } };
+    }
+
+    private static async Task<string> ReadDraftStateAsync(AppDbContext db, int? groupId = null)
+    {
+        // Порівнюємо всі збережені поля, включно з ревізіями, а не лише кількість рядків.
+        var rows = await db.TeacherDraftItems.AsNoTracking().Where(d => groupId == null || d.GroupId == groupId)
+            .OrderBy(d => d.Id).Select(d => new
+            {
+                d.Id, d.Revision, d.Date, d.DayOfWeek, d.StartTime, d.EndTime, d.LessonTypeId,
+                d.GroupId, d.ModuleId, d.ModuleTopicId, d.TeacherId, d.RoomId, d.Status, d.PublishedItemId,
+                d.BatchKey, d.ValidationWarnings, d.CreatedAt, d.UpdatedAt, d.IsLocked, d.IsSelfStudy, d.GenerationJobId
+            }).ToListAsync();
+        return System.Text.Json.JsonSerializer.Serialize(rows);
+    }
+
+    private static async Task AssertReorderHardRulesAsync(AutogenUniversalRangeTests.RangeFixture fixture)
+        => Assert.Empty((await new TeacherDraftsAutogenHardRuleValidator(fixture.Db).ValidateAsync(
+            new(1, [1, 2], fixture.From, fixture.To, AllowIncompleteDrafts: false))).Violations);
+
+    private static async Task<string> ReadPublishedStateAsync(AppDbContext db)
+        => System.Text.Json.JsonSerializer.Serialize(await db.ScheduleItems.AsNoTracking().OrderBy(d => d.Id)
+            .Select(d => new
+            {
+                d.Id, d.Revision, d.Date, d.DayOfWeek, d.StartTime, d.EndTime, d.LessonTypeId,
+                d.GroupId, d.ModuleId, d.ModuleTopicId, d.TeacherId, d.RoomId,
+                d.BatchKey, d.IsLocked, d.IsSelfStudy
+            }).ToListAsync());
 
     private sealed class MixedFixture(SqliteConnection connection, AppDbContext db) : IAsyncDisposable
     {

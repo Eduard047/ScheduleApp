@@ -29,6 +29,7 @@ dotnet msbuild "$project_file" \
 # Ці локальні відтворювачі навмисно вмикаються лише через EnableLocalAutogenHarness=true.
 printf '%s\n' \
   'AutogenL3SeptemberTwoWeekScenarioTests.cs' \
+  'AutogenL3SeptemberFirstWeekReproductionTests.cs' \
   'AutogenL3Week18DiagnosticsTests.cs' \
   'Infrastructure/TempDatabaseAndCopy.cs' \
   'Infrastructure/WorkspaceAndConfig.cs' \

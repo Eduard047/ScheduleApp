@@ -37,40 +37,67 @@ public static class BoundedConflictComponentSolver
             nodes++;
             return true;
         }
-        async Task<bool> Search()
+        // Кожна гілка успадковує вже відфільтровані варіанти. Не перевіряємо
+        // заново відкинуті комбінації проти всіх попередніх призначень.
+        async Task<bool> Search(IReadOnlyList<ConflictComponentCandidate<T>>?[] availableDomains)
         {
             if (assigned.Count == ordered.Length)
             {
                 if (checks++ >= maxCompleteChecks) { limited = true; return false; }
                 var proposed = ordered.Select(d => assigned[d.EventId]).ToArray();
-                if (!await acceptComplete(proposed)) return false;
+                var accepted = await acceptComplete(proposed);
                 cancellationToken.ThrowIfCancellationRequested();
+                if (!accepted) return false;
                 solution = proposed;
                 return true;
             }
             ConflictComponentDomain<T>? selected = null;
             List<ConflictComponentCandidate<T>>? choices = null;
-            foreach (var domain in ordered.Where(d => !assigned.ContainsKey(d.EventId)))
+            var selectedIndex = -1;
+            for (var index = 0; index < ordered.Length; index++)
             {
-                var available = new List<ConflictComponentCandidate<T>>();
-                foreach (var candidate in domain.Candidates)
-                {
-                    if (!Visit()) return false;
-                    if (!assigned.Values.Any(value => conflicts(value, candidate.Value))) available.Add(candidate);
-                }
+                var available = availableDomains[index];
+                if (available is null) continue;
                 if (available.Count == 0) return false;
-                if (choices is null || available.Count < choices.Count) { selected = domain; choices = available; }
+                if (choices is null || available.Count < choices.Count)
+                { selected = ordered[index]; selectedIndex = index; choices = available.ToList(); }
             }
             foreach (var candidate in choices!)
             {
+                if (!Visit()) return false;
                 assigned[selected!.EventId] = candidate.Value;
-                try { if (await Search()) return true; }
+                try
+                {
+                    var next = (IReadOnlyList<ConflictComponentCandidate<T>>?[])availableDomains.Clone();
+                    next[selectedIndex] = null;
+                    var feasible = true;
+                    for (var index = 0; index < next.Length; index++)
+                    {
+                        if (next[index] is not { } remaining) continue;
+                        var compatible = new List<ConflictComponentCandidate<T>>(remaining.Count);
+                        foreach (var other in remaining)
+                        {
+                            if (!Visit()) return false;
+                            if (!conflicts(candidate.Value, other.Value)) compatible.Add(other);
+                        }
+                        if (compatible.Count == 0) { feasible = false; break; }
+                        next[index] = compatible;
+                    }
+                    if (feasible && await Search(next)) return true;
+                }
                 finally { assigned.Remove(selected.EventId); }
                 if (limited) return false;
             }
             return false;
         }
-        await Search();
+        var initial = ordered.Select(domain => (IReadOnlyList<ConflictComponentCandidate<T>>?)domain.Candidates).ToArray();
+        foreach (var domain in ordered)
+        {
+            if (domain.Candidates.Count == 0) return new(Array.Empty<T>(), false, nodes);
+            foreach (var _ in domain.Candidates)
+                if (!Visit()) return new(Array.Empty<T>(), true, nodes);
+        }
+        await Search(initial);
         return new(solution, limited, nodes);
     }
 }
