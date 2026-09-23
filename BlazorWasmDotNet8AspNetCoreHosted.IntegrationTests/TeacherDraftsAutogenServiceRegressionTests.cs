@@ -902,6 +902,77 @@ public sealed class TeacherDraftsAutogenServiceRegressionTests
     }
 
     [Fact]
+    public async Task Full_generator_reorders_nonlecture_topics_when_their_resources_require_it()
+    {
+        await using var fixture = await TestDatabase.CreateAsync();
+        var generationDate = new DateOnly(2026, 9, 7);
+        var data = await fixture.SeedCurriculumProgressScenarioAsync(
+            generationDate,
+            academicPeriodStartDate: new DateOnly(2026, 9, 1),
+            targetHours: 2,
+            topicHours: 1);
+        var earlierTopic = await fixture.Db.ModuleTopics.SingleAsync(item => item.Id == data.TopicId);
+        var laterLessonType = new LessonTypeRef
+        {
+            Code = "UNTUTORED",
+            Name = "Заняття без викладача",
+            IsActive = true,
+            RequiresTeacher = false,
+            RequiresRoom = false,
+            BlocksTeacher = false,
+            BlocksRoom = false,
+            CountInPlan = true,
+            CountInLoad = false
+        };
+        fixture.Db.LessonTypes.Add(laterLessonType);
+        await fixture.Db.SaveChangesAsync();
+        var laterTopic = new ModuleTopic
+        {
+            ModuleId = data.ModuleId,
+            Order = 2,
+            TopicCode = "ПЕР-2",
+            LessonTypeId = laterLessonType.Id,
+            TotalHours = 1,
+            AuditoriumHours = 1,
+            SelfStudyHours = 0
+        };
+        fixture.Db.ModuleTopics.Add(laterTopic);
+        var earlierTeacherWorkingHour = await fixture.Db.TeacherWorkingHours
+            .SingleAsync(item => item.TeacherId == data.TeacherId);
+        earlierTeacherWorkingHour.Start = new TimeOnly(9, 0);
+        earlierTeacherWorkingHour.End = new TimeOnly(10, 0);
+        var course = await fixture.Db.Courses.SingleAsync(item => item.Id == data.CourseId);
+        fixture.Db.TimeSlots.Add(new TimeSlot
+        {
+            CourseId = data.CourseId,
+            Course = course,
+            DayOfWeek = generationDate.DayOfWeek,
+            Start = new TimeOnly(9, 0),
+            End = new TimeOnly(10, 0),
+            SortOrder = 2,
+            IsActive = true
+        });
+        await fixture.Db.SaveChangesAsync();
+
+        var action = await new TeacherDraftsAutogenService(fixture.Db).DraftAutoGen(
+            BuildCurriculumProgressRequest(data));
+
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+        Assert.Equal(2, result.Created);
+        var generated = await fixture.Db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => item.Date == generationDate && item.GroupId == data.GroupId)
+            .OrderBy(item => item.StartTime)
+            .ToListAsync();
+        Assert.Equal(2, generated.Count);
+        Assert.Equal(laterTopic.Id, generated[0].ModuleTopicId);
+        Assert.Equal(earlierTopic.Id, generated[1].ModuleTopicId);
+        Assert.Null(generated[0].TeacherId);
+        Assert.Equal(data.TeacherId, generated[1].TeacherId);
+    }
+
+    [Fact]
     public async Task Full_generator_creates_complete_lesson_without_teacher_module_when_type_does_not_require_teacher()
     {
         await using var fixture = await TestDatabase.CreateAsync();

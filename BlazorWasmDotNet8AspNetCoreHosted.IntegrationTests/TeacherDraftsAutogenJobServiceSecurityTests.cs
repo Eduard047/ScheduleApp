@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
@@ -979,6 +980,217 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
             Assert.Empty(await verification.TeacherDraftItems.AsNoTracking().ToListAsync());
             var plan = await verification.AutoGenDraftPlans.AsNoTracking().SingleAsync();
             Assert.Equal((int)AutoGenPlanState.Ready, plan.State);
+        }
+    }
+
+    [Fact]
+    public async Task Apply_rejects_missing_lecture_prerequisite_without_mutating_state()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Add);
+        await using (var db = new AppDbContext(fixture.Options))
+        {
+            var module = await db.Modules.SingleAsync();
+            var course = await db.Courses.SingleAsync();
+            var group = await db.Groups.SingleAsync();
+            var lectureType = new LessonTypeRef
+            {
+                Code = "LECTURE",
+                Name = "Лекція",
+                RequiresRoom = false,
+                RequiresTeacher = false,
+                BlocksRoom = false,
+                BlocksTeacher = false
+            };
+            var practiceType = new LessonTypeRef
+            {
+                Code = "PRACTICE",
+                Name = "Практичне заняття",
+                RequiresRoom = false,
+                RequiresTeacher = false,
+                BlocksRoom = false,
+                BlocksTeacher = false
+            };
+            db.LessonTypes.AddRange(lectureType, practiceType);
+            await db.SaveChangesAsync();
+
+            var lectureTopic = new ModuleTopic
+            {
+                ModuleId = module.Id,
+                Order = 1,
+                TopicCode = "L1",
+                LessonTypeId = lectureType.Id,
+                AuditoriumHours = 2,
+                TotalHours = 2
+            };
+            var practiceTopic = new ModuleTopic
+            {
+                ModuleId = module.Id,
+                Order = 2,
+                TopicCode = "P1",
+                LessonTypeId = practiceType.Id,
+                AuditoriumHours = 1,
+                TotalHours = 1
+            };
+            var futureDate = new DateOnly(2026, 7, 13);
+            db.ModuleTopics.AddRange(lectureTopic, practiceTopic);
+            await db.SaveChangesAsync();
+
+            db.ScheduleItems.Add(new ScheduleItem
+            {
+                Date = futureDate,
+                DayOfWeek = futureDate.DayOfWeek,
+                StartTime = new TimeOnly(9, 0),
+                EndTime = new TimeOnly(10, 0),
+                LessonTypeId = practiceType.Id,
+                GroupId = group.Id,
+                ModuleId = module.Id,
+                ModuleTopicId = practiceTopic.Id
+            });
+            await db.SaveChangesAsync();
+
+            var mutation = await db.AutoGenDraftPlanMutations.SingleAsync();
+            var after = JsonNode.Parse(mutation.AfterJson!)!;
+            after["lessonTypeId"] = lectureType.Id;
+            after["lessonTypeName"] = lectureType.Name;
+            after["moduleTopicId"] = lectureTopic.Id;
+            after["topicCode"] = lectureTopic.TopicCode;
+            mutation.AfterJson = after.ToJsonString(AutoGenPlanFixture.JsonOptions);
+            var plan = await db.AutoGenDraftPlans.SingleAsync();
+            var run = await db.AutoGenJobRuns.SingleAsync();
+            var request = JsonSerializer.Deserialize<AutoGenJobRequest>(
+                run.RequestJson,
+                AutoGenPlanFixture.JsonOptions)!;
+            plan.InputFingerprint = await new TeacherDraftsAutogenPlanService(db)
+                .CaptureInputFingerprintAsync(request);
+            await db.SaveChangesAsync();
+        }
+
+        await using (var db = new AppDbContext(fixture.Options))
+        {
+            var error = await Assert.ThrowsAsync<AutoGenPlanConflictException>(() =>
+                new TeacherDraftsAutogenPlanService(db).ApplyAsync(
+                    fixture.PlanId,
+                    new AutoGenPlanActionRequest(1)));
+            Assert.Contains("лекційної теми", error.Message, StringComparison.OrdinalIgnoreCase);
+        }
+
+        await using (var verification = new AppDbContext(fixture.Options))
+        {
+            Assert.Empty(await verification.TeacherDraftItems.AsNoTracking().ToListAsync());
+            Assert.Single(await verification.ScheduleItems.AsNoTracking().ToListAsync());
+            var plan = await verification.AutoGenDraftPlans.AsNoTracking().SingleAsync();
+            Assert.Equal((int)AutoGenPlanState.Ready, plan.State);
+            Assert.Equal(1, plan.Version);
+        }
+    }
+
+    [Fact]
+    public async Task Apply_rejects_deleting_lecture_needed_by_future_practice_without_mutating_state()
+    {
+        await using var fixture = await AutoGenPlanFixture.CreateAsync(AutoGenPlanOperation.Delete);
+        await using (var db = new AppDbContext(fixture.Options))
+        {
+            var module = await db.Modules.SingleAsync();
+            var course = await db.Courses.SingleAsync();
+            var group = await db.Groups.SingleAsync();
+            var lectureType = new LessonTypeRef
+            {
+                Code = "LECTURE",
+                Name = "Лекція",
+                RequiresRoom = false,
+                RequiresTeacher = false,
+                BlocksRoom = false,
+                BlocksTeacher = false
+            };
+            var practiceType = new LessonTypeRef
+            {
+                Code = "PRACTICE",
+                Name = "Практичне заняття",
+                RequiresRoom = false,
+                RequiresTeacher = false,
+                BlocksRoom = false,
+                BlocksTeacher = false
+            };
+            db.LessonTypes.AddRange(lectureType, practiceType);
+            await db.SaveChangesAsync();
+
+            var lectureTopic = new ModuleTopic
+            {
+                ModuleId = module.Id,
+                Order = 1,
+                TopicCode = "L1",
+                LessonTypeId = lectureType.Id,
+                AuditoriumHours = 1,
+                TotalHours = 1
+            };
+            var practiceTopic = new ModuleTopic
+            {
+                ModuleId = module.Id,
+                Order = 2,
+                TopicCode = "P1",
+                LessonTypeId = practiceType.Id,
+                AuditoriumHours = 1,
+                TotalHours = 1
+            };
+            db.ModuleTopics.AddRange(lectureTopic, practiceTopic);
+            await db.SaveChangesAsync();
+
+            var draft = await db.TeacherDraftItems.SingleAsync();
+            draft.LessonTypeId = lectureType.Id;
+            draft.ModuleTopicId = lectureTopic.Id;
+            await db.SaveChangesAsync();
+
+            var futureDate = new DateOnly(2026, 7, 13);
+            db.ScheduleItems.Add(new ScheduleItem
+            {
+                Date = futureDate,
+                DayOfWeek = futureDate.DayOfWeek,
+                StartTime = new TimeOnly(9, 0),
+                EndTime = new TimeOnly(10, 0),
+                LessonTypeId = practiceType.Id,
+                GroupId = group.Id,
+                ModuleId = module.Id,
+                ModuleTopicId = practiceTopic.Id
+            });
+            await db.SaveChangesAsync();
+
+            var mutation = await db.AutoGenDraftPlanMutations.SingleAsync();
+            mutation.BeforeRevision = draft.Revision;
+            mutation.BeforeJson = AutoGenPlanFixture.SerializeSnapshot(
+                draft,
+                lectureType.Name,
+                group.Name,
+                module.Title);
+            var plan = await db.AutoGenDraftPlans.SingleAsync();
+            plan.BeforeScopeRevision = LogicalRevisionToken.Combine(
+                new[] { new KeyValuePair<int, Guid>(draft.Id, draft.Revision) });
+            var run = await db.AutoGenJobRuns.SingleAsync();
+            var request = JsonSerializer.Deserialize<AutoGenJobRequest>(
+                run.RequestJson,
+                AutoGenPlanFixture.JsonOptions)!;
+            plan.InputFingerprint = await new TeacherDraftsAutogenPlanService(db)
+                .CaptureInputFingerprintAsync(request);
+            await db.SaveChangesAsync();
+        }
+
+        await using (var db = new AppDbContext(fixture.Options))
+        {
+            var error = await Assert.ThrowsAsync<AutoGenPlanConflictException>(() =>
+                new TeacherDraftsAutogenPlanService(db).ApplyAsync(
+                    fixture.PlanId,
+                    new AutoGenPlanActionRequest(1)));
+            Assert.Contains("лекційної теми", error.Message, StringComparison.OrdinalIgnoreCase);
+        }
+
+        await using (var verification = new AppDbContext(fixture.Options))
+        {
+            var draft = await verification.TeacherDraftItems.AsNoTracking().SingleAsync();
+            Assert.Equal("LECTURE", (await verification.LessonTypes.AsNoTracking()
+                .SingleAsync(item => item.Id == draft.LessonTypeId)).Code);
+            Assert.Equal(1, await verification.ScheduleItems.AsNoTracking().CountAsync());
+            var plan = await verification.AutoGenDraftPlans.AsNoTracking().SingleAsync();
+            Assert.Equal((int)AutoGenPlanState.Ready, plan.State);
+            Assert.Equal(1, plan.Version);
         }
     }
 
@@ -2094,6 +2306,15 @@ public sealed class TeacherDraftsAutogenJobServiceSecurityTests
                 draft.IsLocked,
                 draft.IsSelfStudy,
                 draft.GenerationJobId);
+
+        public static string SerializeSnapshot(
+            TeacherDraftItem draft,
+            string lessonTypeName,
+            string groupName,
+            string moduleName)
+            => JsonSerializer.Serialize(
+                CreateSnapshot(draft, lessonTypeName, groupName, moduleName),
+                JsonOptions);
 
         private sealed record FixtureSnapshot(
             int Id,

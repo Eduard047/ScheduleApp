@@ -1,3 +1,4 @@
+using System.Linq.Expressions;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
@@ -48,6 +49,7 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
         var currentDraftRows = activeDraftRows
             .Where(row => row.IsDraft)
             .ToList();
+        var excludedDraftRows = await LoadExcludedDraftRowsAsync(request, groupIds, cancellationToken);
         var coursePeriod = await _db.Courses
             .AsNoTracking()
             .Where(course => course.Id == request.CourseId)
@@ -62,8 +64,18 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             academicPeriodStartDate,
             coursePeriod?.DurationWeeks);
         var scheduleRows = await LoadScheduleRowsAsync(request, groupIds, currentDraftRows, cancellationToken);
-        var modulesWithAuditoriumTopics = await LoadModulesWithAuditoriumTopicsAsync(currentDraftRows, cancellationToken);
         var placements = scheduleRows.Concat(draftRows).ToList();
+        var topicOrderContextRows = await LoadTopicOrderContextRowsAsync(
+            request,
+            placements.Concat(excludedDraftRows).ToList(),
+            academicPeriodStartDate,
+            academicPeriodEndDateExclusive,
+            cancellationToken);
+        var lecturePrerequisiteTopics = await LoadLecturePrerequisiteTopicsAsync(
+            request,
+            placements.Concat(excludedDraftRows).ToList(),
+            cancellationToken);
+        var modulesWithAuditoriumTopics = await LoadModulesWithAuditoriumTopicsAsync(currentDraftRows, cancellationToken);
         var violations = new List<string>();
 
         foreach (var row in currentDraftRows)
@@ -137,6 +149,15 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             academicPeriodEndDateExclusive,
             cancellationToken));
         violations.AddRange(FindModuleTopicPlanViolations(currentDraftRows, modulesWithAuditoriumTopics));
+        violations.AddRange(FindLecturePrerequisiteViolations(
+            placements,
+            topicOrderContextRows,
+            currentDraftRows,
+            excludedDraftRows,
+            lecturePrerequisiteTopics,
+            request.From,
+            request.To,
+            cancellationToken));
         violations.AddRange(FindLectureBlockOrderViolations(placements, cancellationToken));
         violations.AddRange(await FindEmptyCanonicalLectureSlotViolationsAsync(
             request,
@@ -397,6 +418,69 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
         return rows;
     }
 
+    private async Task<IReadOnlyList<PlacementRow>> LoadExcludedDraftRowsAsync(
+        TeacherDraftsAutogenHardRuleValidationRequest request,
+        IReadOnlyCollection<int> groupIds,
+        CancellationToken cancellationToken)
+    {
+        if (request.ExcludedDraftIds is not { Count: > 0 })
+        {
+            return Array.Empty<PlacementRow>();
+        }
+
+        IQueryable<TeacherDraftItem> query = _db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => request.ExcludedDraftIds.Contains(item.Id)
+                           && item.Group.CourseId == request.CourseId
+                           && item.Date >= request.From
+                           && item.Date <= request.To);
+        if (groupIds.Count > 0)
+        {
+            query = query.Where(item => groupIds.Contains(item.GroupId));
+        }
+
+        query = query.OrderBy(item => item.Id);
+        if (request.MaxStoredContextRows is int maxRows)
+        {
+            query = query.Take(maxRows + 1);
+        }
+
+        var rows = await query
+            .Select(item => new PlacementRow(
+                true,
+                item.Date,
+                item.StartTime,
+                item.EndTime,
+                item.GroupId,
+                item.Group.Name,
+                item.Group.CourseId,
+                item.Group.StudentsCount,
+                item.ModuleId,
+                item.LessonTypeId,
+                item.LessonType.Code,
+                item.LessonType.Name,
+                item.LessonType.PreferredFirstInWeek,
+                item.ModuleTopicId,
+                item.ModuleTopic != null ? item.ModuleTopic.Order : null,
+                item.ModuleTopic != null ? item.ModuleTopic.LessonTypeId : null,
+                item.ModuleTopic != null ? item.ModuleTopic.ModuleId : null,
+                item.TeacherId,
+                item.Teacher != null ? item.Teacher.FullName : null,
+                item.RoomId,
+                item.Room != null ? item.Room.Name : null,
+                item.Room != null ? item.Room.Capacity : null,
+                item.Room != null ? (int?)item.Room.BuildingId : null,
+                item.LessonType.RequiresTeacher,
+                item.LessonType.RequiresRoom,
+                item.LessonType.BlocksTeacher,
+                item.LessonType.BlocksRoom,
+                item.IsSelfStudy,
+                item.BatchKey))
+            .ToListAsync(cancellationToken);
+        EnsureStoredContextCapacity(request, rows.Count, "чернеток, вилучених планом");
+        return rows;
+    }
+
     private async Task<IReadOnlyList<PlacementRow>> LoadPendingDraftRowsAsync(
         IReadOnlyCollection<TeacherDraftsAutogenPendingDraft> pendingDrafts,
         int? draftCourseId,
@@ -580,14 +664,12 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             return Array.Empty<PlacementRow>();
         }
 
-        var affectedGroupIds = affectedKeys.Select(key => key.GroupId).Distinct().ToList();
-        var affectedModuleIds = affectedKeys.Select(key => key.ModuleId).Distinct().ToList();
+        var draftScope = BuildGroupModuleScope<TeacherDraftItem>(affectedKeys);
         var draftQuery = _db.TeacherDraftItems
             .AsNoTracking()
             .Where(item => (item.Date < request.From || item.Date > request.To)
-                           && item.ModuleTopicId != null
-                           && affectedGroupIds.Contains(item.GroupId)
-                           && affectedModuleIds.Contains(item.ModuleId));
+                           && item.ModuleTopicId != null)
+            .Where(draftScope);
         if (academicPeriodStartDate is DateOnly draftPeriodStart)
         {
             draftQuery = draftQuery.Where(item => item.Date >= draftPeriodStart);
@@ -601,7 +683,29 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             draftQuery = draftQuery.Where(item => !request.ExcludedDraftIds.Contains(item.Id));
         }
 
-        var draftHistoryRows = await draftQuery
+        var scheduleScope = BuildGroupModuleScope<ScheduleItem>(affectedKeys);
+        var scheduleQuery = _db.ScheduleItems
+            .AsNoTracking()
+            .Where(item => (item.Date < request.From || item.Date > request.To)
+                           && item.ModuleTopicId != null)
+            .Where(scheduleScope);
+        if (academicPeriodStartDate is DateOnly schedulePeriodStart)
+        {
+            scheduleQuery = scheduleQuery.Where(item => item.Date >= schedulePeriodStart);
+        }
+        if (academicPeriodEndDateExclusive is DateOnly schedulePeriodEnd)
+        {
+            scheduleQuery = scheduleQuery.Where(item => item.Date < schedulePeriodEnd);
+        }
+
+        IQueryable<TeacherDraftItem> boundedDraftQuery = draftQuery.OrderBy(item => item.Id);
+        IQueryable<ScheduleItem> boundedScheduleQuery = scheduleQuery.OrderBy(item => item.Id);
+        if (request.MaxStoredContextRows is int maxStoredContextRows)
+        {
+            boundedDraftQuery = boundedDraftQuery.Take(maxStoredContextRows + 1);
+        }
+
+        var draftHistoryRows = await boundedDraftQuery
             .Select(item => new PlacementRow(
                 true,
                 item.Date,
@@ -634,23 +738,19 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
                 item.BatchKey))
             .ToListAsync(cancellationToken);
 
-        cancellationToken.ThrowIfCancellationRequested();
-        var scheduleQuery = _db.ScheduleItems
-            .AsNoTracking()
-            .Where(item => (item.Date < request.From || item.Date > request.To)
-                           && item.ModuleTopicId != null
-                           && affectedGroupIds.Contains(item.GroupId)
-                           && affectedModuleIds.Contains(item.ModuleId));
-        if (academicPeriodStartDate is DateOnly schedulePeriodStart)
+        EnsureStoredContextCapacity(
+            request,
+            draftHistoryRows.Count,
+            "контексту порядку тем у чернетках");
+        if (request.MaxStoredContextRows is int contextLimit)
         {
-            scheduleQuery = scheduleQuery.Where(item => item.Date >= schedulePeriodStart);
-        }
-        if (academicPeriodEndDateExclusive is DateOnly schedulePeriodEnd)
-        {
-            scheduleQuery = scheduleQuery.Where(item => item.Date < schedulePeriodEnd);
+            boundedScheduleQuery = scheduleQuery
+                .OrderBy(item => item.Id)
+                .Take(Math.Max(0, contextLimit - draftHistoryRows.Count) + 1);
         }
 
-        var scheduleHistoryRows = await scheduleQuery
+        cancellationToken.ThrowIfCancellationRequested();
+        var scheduleHistoryRows = await boundedScheduleQuery
             .Select(item => new PlacementRow(
                 false,
                 item.Date,
@@ -684,9 +784,182 @@ public sealed class TeacherDraftsAutogenHardRuleValidator
             .ToListAsync(cancellationToken);
 
         cancellationToken.ThrowIfCancellationRequested();
+        EnsureStoredContextCapacity(
+            request,
+            draftHistoryRows.Count + scheduleHistoryRows.Count,
+            "контексту порядку тем");
         return draftHistoryRows
             .Concat(scheduleHistoryRows)
-            .Where(row => affectedKeys.Contains((row.GroupId, row.ModuleId)))
+            .Where(row => affectedKeys.Contains((row.GroupId, row.ModuleId))
+                          && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(row.LessonTypeCode))
+            .ToList();
+    }
+
+    private async Task<IReadOnlyList<LecturePrerequisitePolicy.Topic>> LoadLecturePrerequisiteTopicsAsync(
+        TeacherDraftsAutogenHardRuleValidationRequest request,
+        IReadOnlyList<PlacementRow> currentDraftRows,
+        CancellationToken cancellationToken)
+    {
+        var moduleIds = currentDraftRows
+            .Where(row => row.ModuleTopicId is not null)
+            .Select(row => row.ModuleId)
+            .Distinct()
+            .ToList();
+        if (moduleIds.Count == 0)
+        {
+            return Array.Empty<LecturePrerequisitePolicy.Topic>();
+        }
+
+        IQueryable<ModuleTopic> topicQuery = _db.ModuleTopics
+            .AsNoTracking()
+            .Where(topic => moduleIds.Contains(topic.ModuleId))
+            .OrderBy(topic => topic.ModuleId)
+            .ThenBy(topic => topic.Order)
+            .ThenBy(topic => topic.Id);
+        if (request.MaxStoredContextRows is int maxTopicRows)
+        {
+            topicQuery = topicQuery.Take(maxTopicRows + 1);
+        }
+
+        var topicRows = await topicQuery
+            .Select(topic => new
+            {
+                topic.Id,
+                topic.ModuleId,
+                topic.Order,
+                topic.AuditoriumHours,
+                LessonTypeCode = topic.LessonType.Code,
+                LessonTypeName = topic.LessonType.Name
+            })
+            .ToListAsync(cancellationToken);
+        EnsureStoredContextCapacity(request, topicRows.Count, "тем модулів для порядку лекцій");
+        return topicRows
+            .Select(topic => new LecturePrerequisitePolicy.Topic(
+                topic.Id,
+                topic.ModuleId,
+                topic.Order,
+                LecturePrerequisitePolicy.IsLecture(topic.LessonTypeCode, topic.LessonTypeName),
+                Math.Max(0, topic.AuditoriumHours)))
+            .ToList();
+    }
+
+    private static Expression<Func<TEntity, bool>> BuildGroupModuleScope<TEntity>(
+        IReadOnlyCollection<(int GroupId, int ModuleId)> affectedKeys)
+    {
+        var row = Expression.Parameter(typeof(TEntity), "row");
+        var groupId = Expression.Property(row, nameof(TeacherDraftItem.GroupId));
+        var moduleId = Expression.Property(row, nameof(TeacherDraftItem.ModuleId));
+        var containsModule = typeof(Enumerable)
+            .GetMethods()
+            .Single(method => method.Name == nameof(Enumerable.Contains)
+                              && method.IsGenericMethodDefinition
+                              && method.GetParameters().Length == 2)
+            .MakeGenericMethod(typeof(int));
+        Expression body = Expression.Constant(false);
+        foreach (var group in affectedKeys.GroupBy(key => key.GroupId))
+        {
+            var moduleIds = group.Select(key => key.ModuleId).Distinct().ToArray();
+            if (moduleIds.Length == 0)
+            {
+                continue;
+            }
+
+            var groupMatches = Expression.Equal(groupId, Expression.Constant(group.Key));
+            var moduleMatches = Expression.Call(
+                containsModule,
+                Expression.Constant(moduleIds),
+                moduleId);
+            body = Expression.OrElse(body, Expression.AndAlso(groupMatches, moduleMatches));
+        }
+
+        return Expression.Lambda<Func<TEntity, bool>>(body, row);
+    }
+
+    private static IEnumerable<string> FindLecturePrerequisiteViolations(
+        IReadOnlyList<PlacementRow> currentPlacements,
+        IEnumerable<PlacementRow> contextRows,
+        IReadOnlyList<PlacementRow> affectedDraftRows,
+        IReadOnlyList<PlacementRow> excludedDraftRows,
+        IReadOnlyList<LecturePrerequisitePolicy.Topic> topics,
+        DateOnly from,
+        DateOnly to,
+        CancellationToken cancellationToken)
+    {
+        if (topics.Count == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        var affectedRows = affectedDraftRows.Concat(excludedDraftRows).ToList();
+        var affectedGroupModuleKeys = affectedRows
+            .Where(row => row.IsDraft
+                          && row.ModuleTopicId is not null
+                          && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(row.LessonTypeCode))
+            .Select(row => (row.GroupId, row.ModuleId))
+            .ToHashSet();
+        if (affectedGroupModuleKeys.Count == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        var lectureTopicKeys = topics
+            .Where(topic => topic.IsLecture && topic.RequiredHours > 0)
+            .Select(topic => (topic.ModuleId, topic.Id))
+            .ToHashSet();
+        var affectedLectureGroupModuleKeys = affectedRows
+            .Where(row => row.IsDraft
+                          && row.ModuleTopicId is int topicId
+                          && !row.IsSelfStudy
+                          && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(row.LessonTypeCode)
+                          && lectureTopicKeys.Contains((row.ModuleId, topicId)))
+            .Select(row => (row.GroupId, row.ModuleId))
+            .ToHashSet();
+
+        var placementRows = currentPlacements
+            .Concat(contextRows)
+            .Where(row => row.ModuleTopicId is not null
+                          && !LessonTypeOccupancyPolicy.IsNonOccupyingMarker(row.LessonTypeCode))
+            .Select(row => new LecturePrerequisitePolicy.Placement(
+                row.GroupId,
+                row.ModuleId,
+                row.ModuleTopicId!.Value,
+                row.Date,
+                row.Start,
+                row.End,
+                row.IsSelfStudy))
+            .ToList();
+        var policyViolations = LecturePrerequisitePolicy.FindViolations(
+            topics,
+            placementRows,
+            cancellationToken);
+        return policyViolations
+            .Where(violation =>
+            {
+                var targetGroupModuleKey = (
+                    violation.Target.GroupId,
+                    violation.Target.ModuleId);
+                return violation.Target.Date >= from
+                       && (violation.Target.Date <= to
+                           ? affectedGroupModuleKeys.Contains(targetGroupModuleKey)
+                           : affectedLectureGroupModuleKeys.Contains(targetGroupModuleKey));
+            })
+            .GroupBy(violation => (
+                violation.Target.GroupId,
+                violation.Target.ModuleId,
+                violation.Target.TopicId,
+                violation.Prerequisite.Id,
+                violation.Target.Date,
+                violation.Target.Start,
+                violation.Target.End))
+            .Select(group =>
+            {
+                var violation = group.First();
+                return $"{violation.Target.Date:yyyy-MM-dd} група #{violation.Target.GroupId} "
+                       + $"тема #{violation.Target.TopicId} модуля #{violation.Target.ModuleId} "
+                       + $"потребує перед собою {violation.RequiredHours} аудиторних годин "
+                       + $"лекційної теми #{violation.Prerequisite.Id} (проведено {violation.CompletedHours}, "
+                       + $"бракує {violation.MissingHours}).";
+            })
             .ToList();
     }
 

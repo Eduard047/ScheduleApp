@@ -3096,6 +3096,156 @@ public sealed class AutogenLecturePackingTests
     }
 
     [Fact]
+    public async Task Draft_autogen_prioritizes_the_feasible_lecture_that_unlocks_more_practice_hours()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(connection)
+            .Options;
+
+        await using var db = new AppDbContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var data = await SeedPreferredFirstLimitScenarioAsync(db);
+        var monday = new DateOnly(2026, 5, 4);
+        var thursday = monday.AddDays(3);
+
+        var workTopic = await db.ModuleTopics.SingleAsync(topic => topic.ModuleId == data.WorkModuleId);
+        workTopic.Order = 2;
+        db.ModuleTopics.AddRange(
+            new ModuleTopic
+            {
+                Id = 3,
+                ModuleId = data.WorkModuleId,
+                Order = 1,
+                TopicCode = "2.1.0.1",
+                LessonTypeId = data.LectureTypeId,
+                TotalHours = 1,
+                AuditoriumHours = 1
+            },
+            new ModuleTopic
+            {
+                Id = 4,
+                ModuleId = data.LectureModuleId,
+                Order = 2,
+                TopicCode = "1.1.0.2",
+                LessonTypeId = data.WorkTypeId,
+                TotalHours = 1,
+                AuditoriumHours = 1
+            });
+
+        var workModuleSequence = await db.ModuleSequenceItems.SingleAsync(
+            item => item.ModuleId == data.WorkModuleId);
+        workModuleSequence.GroupOrder = 1;
+        var workModuleFiller = await db.ModuleFillers.SingleAsync(
+            item => item.ModuleId == data.WorkModuleId);
+        db.ModuleFillers.Remove(workModuleFiller);
+        db.TeacherModules.AddRange(
+            new TeacherModule { TeacherId = 1, ModuleId = data.WorkModuleId },
+            new TeacherModule { TeacherId = 2, ModuleId = data.LectureModuleId });
+
+        var nextSlotId = await db.TimeSlots.MaxAsync(slot => slot.Id) + 1;
+        foreach (var day in new[] { DayOfWeek.Wednesday, DayOfWeek.Thursday })
+        {
+            db.TimeSlots.AddRange(
+                new TimeSlot
+                {
+                    Id = nextSlotId++,
+                    CourseId = data.CourseId,
+                    DayOfWeek = day,
+                    Start = new TimeOnly(8, 0),
+                    End = new TimeOnly(9, 20),
+                    SortOrder = 1,
+                    IsActive = true
+                },
+                new TimeSlot
+                {
+                    Id = nextSlotId++,
+                    CourseId = data.CourseId,
+                    DayOfWeek = day,
+                    Start = new TimeOnly(9, 40),
+                    End = new TimeOnly(11, 0),
+                    SortOrder = 2,
+                    IsActive = true
+                },
+                new TimeSlot
+                {
+                    Id = nextSlotId++,
+                    CourseId = data.CourseId,
+                    DayOfWeek = day,
+                    Start = new TimeOnly(11, 20),
+                    End = new TimeOnly(12, 40),
+                    SortOrder = 3,
+                    IsActive = true
+                });
+        }
+
+        await db.SaveChangesAsync();
+
+        var moduleHours = new Dictionary<int, int>
+        {
+            [data.LectureModuleId] = 5,
+            [data.WorkModuleId] = 3
+        };
+        var action = await new TeacherDraftsAutogenService(db).DraftAutoGen(new DraftAutoGenRequest(
+            WeekStart: monday,
+            ClearExisting: true,
+            CourseId: data.CourseId,
+            GroupIds: data.GroupIds,
+            Days: WeekPreset.MonFri,
+            ModuleHours: moduleHours,
+            RangeStartDate: monday,
+            RangeEndDate: thursday,
+            SoftOptions: new DraftAutoGenSoftOptions(RecentRepeatWindowDays: 0)));
+        var ok = Assert.IsType<OkObjectResult>(action.Result);
+        var result = Assert.IsType<AutoGenResult>(ok.Value);
+
+        var drafts = await db.TeacherDraftItems
+            .AsNoTracking()
+            .Where(item => data.GroupIds.Contains(item.GroupId))
+            .OrderBy(item => item.Date)
+            .ThenBy(item => item.StartTime)
+            .ToListAsync();
+        var firstLecture = Assert.Single(drafts
+            .Where(item => item.LessonTypeId == data.LectureTypeId)
+            .OrderBy(item => item.Date)
+            .ThenBy(item => item.StartTime)
+            .Take(1));
+        var lowerUnlockLecture = drafts
+            .Where(item => item.ModuleId == data.LectureModuleId
+                           && item.LessonTypeId == data.LectureTypeId)
+            .OrderBy(item => item.Date)
+            .ThenBy(item => item.StartTime)
+            .First();
+        var coverage = await new TeacherDraftsAutogenCoverageService(db).MeasureAsync(
+            data.GroupIds,
+            monday,
+            thursday,
+            WeekPreset.MonFri,
+            moduleHours,
+            searchLimitReached: false);
+        var hardRules = await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(
+            new TeacherDraftsAutogenHardRuleValidationRequest(
+                data.CourseId,
+                data.GroupIds,
+                monday,
+                thursday));
+
+        Assert.Equal(16, result.Created);
+        Assert.Equal(16, drafts.Count);
+        Assert.Equal(data.WorkModuleId, firstLecture.ModuleId);
+        Assert.True(
+            firstLecture.Date < lowerUnlockLecture.Date
+            || (firstLecture.Date == lowerUnlockLecture.Date
+                && firstLecture.StartTime < lowerUnlockLecture.StartTime));
+        Assert.Equal(0, coverage.MissingLessons);
+        Assert.Equal(0, coverage.IncompleteLessons);
+        Assert.Empty(result.GapDetails ?? new List<AutoGenGapDetail>());
+        Assert.Empty(hardRules.Violations);
+    }
+
+    [Fact]
     public async Task Draft_autogen_keeps_preferred_first_lessons_within_configured_slot_limit()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:");

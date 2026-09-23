@@ -106,6 +106,69 @@ public sealed class AutogenConstraintSearchTests
     }
 
     [Fact]
+    public async Task Component_search_classifies_domain_local_shared_and_attempt_limits()
+    {
+        var overBoundDomain = new[]
+        {
+            new ConflictComponentDomain<int>(0,
+                Enumerable.Range(0, 2_049).Select(value => new ConflictComponentCandidate<int>(value, value, value)).ToArray())
+        };
+        var domainLimited = await BoundedConflictComponentSolver.SolveAsync(overBoundDomain, (a, b) => false,
+            _ => Task.FromResult(true), new(100_000, TimeSpan.FromMinutes(1)));
+        Assert.Equal(ConflictComponentSearchStopReason.CandidateDomainLimit, domainLimited.StopReason);
+        Assert.Equal("conflict-component-candidate-domain-limit", ConflictComponentSearchDiagnostics.GetScope(domainLimited.StopReason));
+
+        ConflictComponentDomain<int>[] twoCandidates = [new(0, [new(0, 0, 0), new(1, 1, 1)])];
+        var locallyLimited = await BoundedConflictComponentSolver.SolveAsync(twoCandidates, (a, b) => false,
+            _ => Task.FromResult(true), new(100, TimeSpan.FromMinutes(1)), maxNodes: 1);
+        Assert.Equal(ConflictComponentSearchStopReason.LocalNodeLimit, locallyLimited.StopReason);
+        Assert.Equal("conflict-component-local-solver-cap", ConflictComponentSearchDiagnostics.GetScope(locallyLimited.StopReason));
+
+        var sharedBudget = new DeterministicSearchBudget(1, TimeSpan.FromMinutes(1));
+        var sharedLimited = await BoundedConflictComponentSolver.SolveAsync(twoCandidates, (a, b) => false,
+            _ => Task.FromResult(true), sharedBudget, maxNodes: 100);
+        Assert.Equal(ConflictComponentSearchStopReason.SharedBudgetLimit, sharedLimited.StopReason);
+        Assert.Equal("conflict-component-shared-cap", ConflictComponentSearchDiagnostics.GetScope(sharedLimited.StopReason));
+
+        var completeCheckLimited = await BoundedConflictComponentSolver.SolveAsync(twoCandidates, (a, b) => false,
+            _ => Task.FromResult(false), new(100, TimeSpan.FromMinutes(1)), maxCompleteChecks: 1);
+        Assert.Equal(ConflictComponentSearchStopReason.LocalCompleteCheckLimit, completeCheckLimited.StopReason);
+        Assert.Equal("conflict-component-local-solver-cap", ConflictComponentSearchDiagnostics.GetScope(completeCheckLimited.StopReason));
+
+        var attempts = new ResidualRepairAttemptBudget(1);
+        Assert.True(attempts.TryStart(7, [7]));
+        Assert.False(attempts.CanStart(7, [7]));
+        Assert.Equal(1, attempts.Used);
+        Assert.Null(ConflictComponentSearchDiagnostics.GetScope(ConflictComponentSearchStopReason.None));
+    }
+
+    [Fact]
+    public void Candidate_sampler_covers_late_cells_and_resource_variants_deterministically()
+    {
+        IReadOnlyList<IReadOnlyList<int>> cellCandidates = Enumerable.Range(0, 100)
+            .Select(cell => (IReadOnlyList<int>)Enumerable.Range(0, 4).Select(resource => cell * 10 + resource).ToArray())
+            .ToArray();
+
+        var sampled = BoundedConflictComponentSolver.SampleAcrossDomains(cellCandidates, candidateLimit: 16);
+        var replay = BoundedConflictComponentSolver.SampleAcrossDomains(cellCandidates, candidateLimit: 16);
+
+        Assert.Equal(16, sampled.Count);
+        Assert.Equal(sampled, replay);
+        var sampledCells = sampled.Select(candidate => candidate / 10).ToArray();
+        Assert.Equal(16, sampledCells.Distinct().Count());
+        Assert.Contains(0, sampledCells);
+        Assert.Contains(99, sampledCells);
+
+        IReadOnlyList<IReadOnlyList<int>> fewCells = Enumerable.Range(0, 4)
+            .Select(cell => (IReadOnlyList<int>)Enumerable.Range(0, 4).Select(resource => cell * 10 + resource).ToArray())
+            .ToArray();
+        var balancedVariants = BoundedConflictComponentSolver.SampleAcrossDomains(fewCells, candidateLimit: 8);
+        Assert.Equal(8, balancedVariants.Count);
+        Assert.Equal(4, balancedVariants.Select(candidate => candidate / 10).Distinct().Count());
+        Assert.All(balancedVariants.GroupBy(candidate => candidate / 10), cell => Assert.Equal(2, cell.Count()));
+    }
+
+    [Fact]
     public async Task Component_search_reuses_pruned_domains_to_finish_within_the_same_node_budget()
     {
         var domains = Enumerable.Range(0, 8).Select(id => new ConflictComponentDomain<int>(id,
