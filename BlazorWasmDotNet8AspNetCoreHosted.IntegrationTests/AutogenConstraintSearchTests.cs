@@ -106,6 +106,37 @@ public sealed class AutogenConstraintSearchTests
     }
 
     [Fact]
+    public async Task Component_search_prunes_nary_parallel_cap_before_complete_validation()
+    {
+        var domains = Enumerable.Range(1, 5)
+            .Select(groupId => new ConflictComponentDomain<(int GroupId, int ModuleId)>(groupId,
+            [
+                new(0, 0, (groupId, 16)),
+                new(1, 1, (groupId, 17 + groupId))
+            ]))
+            .ToArray();
+        var completeChecks = 0;
+        bool WithinParallelCap(IReadOnlyList<(int GroupId, int ModuleId)> placements)
+            => placements.Where(item => item.ModuleId == 16).Select(item => item.GroupId).Distinct().Count() <= 4;
+
+        var result = await BoundedConflictComponentSolver.SolveAsync(
+            domains,
+            (left, right) => left.GroupId == right.GroupId,
+            placements =>
+            {
+                completeChecks++;
+                return Task.FromResult(WithinParallelCap(placements));
+            },
+            new DeterministicSearchBudget(10_000, TimeSpan.FromMinutes(1)),
+            partialFeasible: WithinParallelCap);
+
+        Assert.False(result.SearchLimitReached);
+        Assert.Equal(domains.Length, result.Placements.Count);
+        Assert.True(WithinParallelCap(result.Placements));
+        Assert.Equal(1, completeChecks);
+    }
+
+    [Fact]
     public async Task Component_search_classifies_domain_local_shared_and_attempt_limits()
     {
         var overBoundDomain = new[]

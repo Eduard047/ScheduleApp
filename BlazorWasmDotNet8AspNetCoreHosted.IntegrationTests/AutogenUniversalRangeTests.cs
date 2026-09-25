@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json.Nodes;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Application.TeacherDrafts;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Domain.Entities;
 using BlazorWasmDotNet8AspNetCoreHosted.Server.Infrastructure;
@@ -227,6 +228,90 @@ public sealed class AutogenUniversalRangeTests
             Assert.Equal(0, await fixture.Db.TeacherDraftItems.AsNoTracking().CountAsync());
         }
         finally { await jobs.StopAsync(CancellationToken.None); }
+    }
+
+    [Fact]
+    public async Task Apply_revalidates_persisted_parallel_module_cap_before_writing_drafts()
+    {
+        await using var fixture = await RangeFixture.CreateAsync(0, 7, WeekPreset.MonFri, 5, 1);
+        var request = fixture.JobRequest with
+        {
+            AllowIncompleteDrafts = true,
+            SoftOptions = new AutoGenSoftOptionsDto(
+                MaxParallelGroupsPerModuleInSlot: 4,
+                RecentRepeatWindowDays: 0)
+        };
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new AppDbContext(fixture.Options));
+        services.AddScoped<TeacherDraftsAutogenService>();
+        services.AddScoped<TeacherDraftsAutogenPlanService>();
+        await using var provider = services.BuildServiceProvider();
+        var jobs = new TeacherDraftsAutogenJobService(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<TeacherDraftsAutogenJobService>.Instance);
+        try
+        {
+            var started = jobs.Start(request);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(1));
+            AutoGenJobStatus? status;
+            do
+            {
+                await Task.Delay(50, timeout.Token);
+                status = await jobs.GetAsync(started.JobId);
+            } while (status?.State is AutoGenJobState.Queued or AutoGenJobState.Running);
+            Assert.Equal(AutoGenJobState.Succeeded, status?.State);
+
+            var ready = await jobs.GetPlanAsync(started.JobId);
+            Assert.True(ready.Summary.AddCount > 0);
+            var storedPlan = await fixture.Db.AutoGenDraftPlans
+                .SingleAsync(item => item.PlanId == ready.Summary.PlanId);
+            var mutations = await fixture.Db.AutoGenDraftPlanMutations
+                .Where(item => item.AutoGenDraftPlanId == storedPlan.Id && item.AfterJson != null)
+                .OrderBy(item => item.Ordinal)
+                .ToListAsync();
+            var plannedRows = mutations.Select(mutation =>
+            {
+                var json = JsonNode.Parse(mutation.AfterJson!)!.AsObject();
+                string ReadString(string property) => json.First(item =>
+                    item.Key.Equals(property, StringComparison.OrdinalIgnoreCase)).Value!.GetValue<string>();
+                int ReadInt(string property) => json.First(item =>
+                    item.Key.Equals(property, StringComparison.OrdinalIgnoreCase)).Value!.GetValue<int>();
+                return (Mutation: mutation, Json: json, GroupId: ReadInt("GroupId"), ModuleId: ReadInt("ModuleId"),
+                    Date: ReadString("Date"), Start: ReadString("StartTime"), End: ReadString("EndTime"));
+            }).ToList();
+            var fourGroupSlot = plannedRows
+                .GroupBy(row => (row.ModuleId, row.Date, row.Start, row.End))
+                .First(group => group.Select(row => row.GroupId).Distinct().Count() == 4);
+            var targetGroups = fourGroupSlot.Select(row => row.GroupId).ToHashSet();
+            var displacedRow = plannedRows.First(row => !targetGroups.Contains(row.GroupId));
+
+            void Copy(string property)
+            {
+                var target = fourGroupSlot.First().Json.First(item =>
+                    item.Key.Equals(property, StringComparison.OrdinalIgnoreCase)).Value!.GetValue<string>();
+                var key = displacedRow.Json.First(item =>
+                    item.Key.Equals(property, StringComparison.OrdinalIgnoreCase)).Key;
+                displacedRow.Json[key] = target;
+            }
+
+            Copy("Date");
+            Copy("StartTime");
+            Copy("EndTime");
+            displacedRow.Mutation.AfterJson = displacedRow.Json.ToJsonString();
+            await fixture.Db.SaveChangesAsync();
+
+            var conflict = await Assert.ThrowsAsync<AutoGenPlanConflictException>(() =>
+                jobs.ApplyPlanAsync(started.JobId, new(ready.Summary.Version)));
+            Assert.Contains("одночасно поставлено", conflict.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(0, await fixture.Db.TeacherDraftItems.AsNoTracking().CountAsync());
+            var unchanged = await jobs.GetPlanAsync(started.JobId);
+            Assert.Equal(AutoGenPlanState.Ready, unchanged.Summary.State);
+            Assert.Equal(ready.Summary.Version, unchanged.Summary.Version);
+        }
+        finally
+        {
+            await jobs.StopAsync(CancellationToken.None);
+        }
     }
 
     private static AutoGenResult Extract(ActionResult<AutoGenResult> action)

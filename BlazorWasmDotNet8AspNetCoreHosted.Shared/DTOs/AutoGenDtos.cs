@@ -279,5 +279,12 @@ public record AutoGenJobStatus(
     AutoGenResult? Result = null,
     AutoGenRunReport? Report = null,
     string? Error = null,
-    AutoGenPlanSummaryDto? Plan = null
+    AutoGenPlanSummaryDto? Plan = null,
+    string SearchPhase = "queued",
+    long SearchNodesVisited = 0,
+    long SearchNodeLimit = 0,
+    bool SearchBudgetReached = false,
+    int SearchTimeLimitSeconds = 0,
+    DateTimeOffset? SearchStartedAt = null,
+    DateTimeOffset? SearchDeadlineAt = null
 );

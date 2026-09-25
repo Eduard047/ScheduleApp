@@ -84,13 +84,34 @@ public sealed class AutogenL3SeptemberFirstWeekReproductionTests(ITestOutputHelp
                 $"searchLimit={coverage.SearchLimitReached}; warnings={result.Warnings.Count}; " +
                 $"elapsed={elapsed.Elapsed.TotalSeconds:F1}s";
             output.WriteLine(summary);
+            foreach (var fallbackDiagnostic in result.Warnings
+                         .Where(warning => warning.StartsWith(
+                             "Діагностика резервного проходу:",
+                             StringComparison.Ordinal)
+                             || warning.StartsWith(
+                                 "Резервний лекційний прохід",
+                                 StringComparison.Ordinal)
+                             || warning.StartsWith(
+                                 "Застосовано резервний режим",
+                                 StringComparison.Ordinal)))
+            {
+                output.WriteLine(fallbackDiagnostic);
+            }
             foreach (var gap in result.GapDetails ?? [])
-                output.WriteLine($"gap: group={gap.GroupName}; date={gap.Date:yyyy-MM-dd}; " +
-                    $"start={gap.Start}; module={(gap.ModuleId is int id ? codes.GetValueOrDefault(id) : "?")}; " +
-                    $"reason={gap.ReasonCode}; constraint={gap.ConstraintCode}");
-            foreach (var group in coverage.Groups)
-                output.WriteLine($"group={names[group.GroupId]}; occupied={group.OccupiedSlots}; " +
-                    $"missing={group.MissingLessons}; empty={group.EmptySlots}; windows={group.InternalGapSlots}");
+            {
+                var scopes = gap.Diagnostics?.GetValueOrDefault("searchScopes") ?? string.Empty;
+                var limitKind = gap.Diagnostics?.GetValueOrDefault("limitKind") ?? string.Empty;
+                output.WriteLine($"gap: group={gap.GroupId}; date={gap.Date:yyyy-MM-dd}; " +
+                    $"slot={gap.Start:HH\\:mm}-{gap.End:HH\\:mm}; module={gap.ModuleId}; " +
+                    $"reason={gap.ReasonCode}; constraint={gap.ConstraintCode}; " +
+                    $"searchScopes={scopes}; limitKind={limitKind}; " +
+                    $"visitedNodes={gap.Diagnostics?.GetValueOrDefault("visitedNodes")}; " +
+                    $"maxNodes={gap.Diagnostics?.GetValueOrDefault("maxNodes")}; " +
+                    $"repairRejections={gap.Diagnostics?.GetValueOrDefault("repairRejections")}");
+            }
+            output.WriteLine($"group totals: count={coverage.Groups.Count}; occupied={coverage.Groups.Sum(group => group.OccupiedSlots)}; " +
+                $"missing={coverage.Groups.Sum(group => group.MissingLessons)}; empty={coverage.Groups.Sum(group => group.EmptySlots)}; " +
+                $"windows={coverage.Groups.Sum(group => group.InternalGapSlots)}");
 
             // Preview має лишити робочі таблиці порожніми навіть за часткового результату.
             Assert.Equal(0, await db.TeacherDraftItems.AsNoTracking().CountAsync());
@@ -101,27 +122,91 @@ public sealed class AutogenL3SeptemberFirstWeekReproductionTests(ITestOutputHelp
             Assert.Equal(0, plan.Summary.UpdateCount);
             Assert.Equal(0, coverage.OverplannedLessons);
             Assert.Equal(0, coverage.IncompleteLessons);
-            // Неповний результат має впасти, а не закріпити 292 як правильну відповідь.
-            Assert.True(coverage.OccupiedSlots == 294 && coverage.MissingLessons == 0
-                && coverage.EmptySlots == 0 && coverage.InternalGapSlots == 0, summary);
-
             // Застосування та повторна перевірка відбуваються лише у тимчасовій копії.
             var applied = await jobs.ApplyPlanAsync(started.JobId, new(plan.Summary.Version));
             db.ChangeTracker.Clear();
+
             var validation = await new TeacherDraftsAutogenHardRuleValidator(db).ValidateAsync(new(
                 course.Id, request.GroupIds, request.FromDate, request.ToDate, request.Days,
                 AllowIncompleteDrafts: false,
                 MaxParallelGroupsPerModuleInSlot: AutoGenRecommendedProfile.MaxParallelGroupsPerModuleInSlot));
-            Assert.False(validation.HasViolations, $"Порушень жорстких правил: {validation.Violations.Count}.");
+            var lecturePrecedenceViolations = validation.Violations
+                .Where(message => message.Contains("потребує перед собою", StringComparison.Ordinal))
+                .ToList();
+            Assert.True(lecturePrecedenceViolations.Count == 0,
+                $"Строгий валідатор знайшов {lecturePrecedenceViolations.Count} порушень передумови лекцій.");
+
+            var moduleIds = hours.Keys.ToArray();
+            var periodStart = course.AcademicPeriodStartDate ?? request.FromDate;
+            var precedenceTopicRows = await db.ModuleTopics.AsNoTracking()
+                .Where(topic => moduleIds.Contains(topic.ModuleId))
+                .Select(topic => new
+                {
+                    topic.Id,
+                    topic.ModuleId,
+                    topic.Order,
+                    topic.AuditoriumHours,
+                    LessonTypeCode = topic.LessonType.Code,
+                    LessonTypeName = topic.LessonType.Name
+                })
+                .ToListAsync();
+            var precedenceTopics = precedenceTopicRows.Select(topic => new LecturePrerequisitePolicy.Topic(
+                topic.Id,
+                topic.ModuleId,
+                topic.Order,
+                LecturePrerequisitePolicy.IsLecture(topic.LessonTypeCode, topic.LessonTypeName),
+                topic.AuditoriumHours)).ToList();
+            Assert.True(precedenceTopics.Any(topic => topic.IsLecture && topic.RequiredHours > 0),
+                "Сценарій має містити лекційні теми для незалежної перевірки.");
+            var schedulePlacements = await db.ScheduleItems.AsNoTracking()
+                .Where(item => request.GroupIds.Contains(item.GroupId)
+                    && moduleIds.Contains(item.ModuleId)
+                    && item.Date >= periodStart)
+                .Select(item => new LecturePrerequisitePolicy.Placement(
+                    item.GroupId,
+                    item.ModuleId,
+                    item.ModuleTopicId ?? 0,
+                    item.Date,
+                    item.StartTime,
+                    item.EndTime,
+                    item.IsSelfStudy))
+                .ToListAsync();
+            var draftPlacements = await db.TeacherDraftItems.AsNoTracking()
+                .Where(item => request.GroupIds.Contains(item.GroupId)
+                    && moduleIds.Contains(item.ModuleId)
+                    && item.Date >= periodStart)
+                .Select(item => new LecturePrerequisitePolicy.Placement(
+                    item.GroupId,
+                    item.ModuleId,
+                    item.ModuleTopicId ?? 0,
+                    item.Date,
+                    item.StartTime,
+                    item.EndTime,
+                    item.IsSelfStudy))
+                .ToListAsync();
+            var precedenceViolations = LecturePrerequisitePolicy.FindViolations(
+                    precedenceTopics,
+                    schedulePlacements.Concat(draftPlacements))
+                .Where(violation => violation.Target.Date >= request.FromDate
+                    && violation.Target.Date <= request.ToDate)
+                .ToList();
+            Assert.True(precedenceViolations.Count == 0,
+                $"Незалежна перевірка знайшла {precedenceViolations.Count} порушень передумови лекцій.");
+            output.WriteLine("independent lecture-prerequisite check: passed");
+
             var persistedCoverage = await new TeacherDraftsAutogenCoverageService(db).MeasureAsync(
                 request.GroupIds, request.FromDate, request.ToDate, request.Days, hours, false);
-            Assert.Equal(AutoGenCoverageStatus.FullyOccupied, persistedCoverage.Status);
-            Assert.Equal(294, persistedCoverage.OccupiedSlots);
-            Assert.Equal(0, persistedCoverage.InternalGapSlots);
-            Assert.All(persistedCoverage.Groups, group => Assert.Equal(42, group.OccupiedSlots));
             await jobs.RollbackPlanAsync(started.JobId, new(applied.Summary.Version));
             Assert.Equal(0, await db.TeacherDraftItems.AsNoTracking().CountAsync());
-            output.WriteLine("apply/validation/rollback: passed; hard-rule violations=0");
+            output.WriteLine($"apply/lecture-precedence-check/rollback: passed; strict-validator-violations={validation.Violations.Count}");
+            Assert.False(validation.HasViolations, $"Порушень жорстких правил: {validation.Violations.Count}.");
+
+            // Залишаємо перевірку 294 слотів після незалежної перевірки передумов.
+            Assert.True(coverage.OccupiedSlots == 294 && coverage.MissingLessons == 0
+                && coverage.EmptySlots == 0 && coverage.InternalGapSlots == 0
+                && persistedCoverage.Status == AutoGenCoverageStatus.FullyOccupied
+                && persistedCoverage.OccupiedSlots == 294 && persistedCoverage.InternalGapSlots == 0
+                && persistedCoverage.Groups.All(group => group.OccupiedSlots == 42), summary);
         }
         finally
         {

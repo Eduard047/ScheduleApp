@@ -94,9 +94,12 @@ public sealed class DeterministicSearchBudget
         _emergencyTimeout = emergencyTimeout;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _startedAt = _timeProvider.GetTimestamp();
+        StartedAt = _timeProvider.GetUtcNow();
     }
 
     public int MaxNodes { get; }
+    public DateTimeOffset StartedAt { get; }
+    public DateTimeOffset DeadlineAt => StartedAt + _emergencyTimeout;
     public int VisitedNodes { get; private set; }
     public bool NodeLimitReached { get; private set; }
     public bool EmergencyLimitReached { get; private set; }

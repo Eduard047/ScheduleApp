@@ -86,10 +86,12 @@ public static class BoundedConflictComponentSolver
         DeterministicSearchBudget budget,
         CancellationToken cancellationToken = default,
         int maxNodes = 40_000,
-        int maxCompleteChecks = 64)
+        int maxCompleteChecks = 64,
+        Func<IReadOnlyList<T>, bool>? partialFeasible = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (maxNodes <= 0 || maxCompleteChecks <= 0) throw new ArgumentOutOfRangeException(nameof(maxNodes));
+        if (maxNodes <= 0) throw new ArgumentOutOfRangeException(nameof(maxNodes));
+        if (maxCompleteChecks <= 0) throw new ArgumentOutOfRangeException(nameof(maxCompleteChecks));
         if (domains.Count == 0) return new(Array.Empty<T>(), false, 0);
         if (domains.Count > 12 || domains.Sum(d => (long)d.Candidates.Count) > 2_048)
             return new(Array.Empty<T>(), true, 0, ConflictComponentSearchStopReason.CandidateDomainLimit);
@@ -156,6 +158,12 @@ public static class BoundedConflictComponentSolver
             foreach (var candidate in choices!)
             {
                 if (!Visit()) return false;
+                var partial = ordered
+                    .Where(domain => assigned.ContainsKey(domain.EventId))
+                    .Select(domain => assigned[domain.EventId])
+                    .Append(candidate.Value)
+                    .ToArray();
+                if (partialFeasible is not null && !partialFeasible(partial)) continue;
                 assigned[selected!.EventId] = candidate.Value;
                 try
                 {
