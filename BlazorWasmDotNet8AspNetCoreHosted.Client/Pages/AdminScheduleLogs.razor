@@ -225,6 +225,8 @@ else if (_error is null || _entries.Count > 0)
                                                         @foreach (var gap in entry.GapDetails)
                                                         {
                                                             var classification = AutoGenGapReasonClassifier.Classify(gap);
+                                                            var explanation = AutoGenGapReasonClassifier.ExplainShortage(gap).Diagnostics!["explanation"];
+                                                            var diagnostics = gap.Diagnostics is null ? null : FormatGapDiagnostics(gap.Diagnostics);
                                                             <li class="log-issue-item issue-gap">
                                                                 <span class="log-issue-badge">Слот</span>
                                                                 <div>
@@ -234,6 +236,7 @@ else if (_error is null || _entries.Count > 0)
                                                                     {
                                                                         <div class="log-issue-muted">Причина: @gap.Reason</div>
                                                                     }
+                                                                    <div class="log-issue-muted">@explanation</div>
                                                                     @if (!string.IsNullOrWhiteSpace(gap.ConstraintCode))
                                                                     {
                                                                         <div class="log-issue-muted">Обмеження: @gap.ConstraintCode</div>
@@ -242,9 +245,9 @@ else if (_error is null || _entries.Count > 0)
                                                                     {
                                                                         <div class="log-issue-muted">Пошук досяг безпечної межі.</div>
                                                                     }
-                                                                    @if (gap.Diagnostics is { Count: > 0 })
+                                                                    @if (!string.IsNullOrEmpty(diagnostics))
                                                                     {
-                                                                        <div class="log-issue-muted">Діагностика: @FormatGapDiagnostics(gap.Diagnostics)</div>
+                                                                        <div class="log-issue-muted">Діагностика: @diagnostics</div>
                                                                     }
                                                                 </div>
                                                             </li>
@@ -611,6 +614,7 @@ else if (_error is null || _entries.Count > 0)
         => string.Join(
             "; ",
             diagnostics
+                .Where(item => item.Key is not ("explanation" or "shortageCategory" or "searchStatus" or "feasibilityStatus"))
                 .OrderBy(item => item.Key, StringComparer.Ordinal)
                 .Take(6)
                 .Select(item => $"{item.Key}={CompactDiagnosticValue(item.Value)}"));

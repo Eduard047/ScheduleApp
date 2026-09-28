@@ -64,6 +64,39 @@ public static class AutoGenGapReasonClassifier
         };
     }
 
+    // Причина відмови в поточному розкладі не є доказом неможливості всього плану.
+    public static AutoGenGapDetail ExplainShortage(AutoGenGapDetail gap)
+    {
+        var structured = EnsureStructured(gap);
+        var category = structured.ReasonCode switch
+        {
+            AutoGenGapReasonCodes.Teacher or AutoGenGapReasonCodes.Room => "resource-availability",
+            AutoGenGapReasonCodes.TopicOrder or AutoGenGapReasonCodes.ModuleBlock
+                or AutoGenGapReasonCodes.SharedFlow => "ordering",
+            AutoGenGapReasonCodes.Travel or AutoGenGapReasonCodes.Limit => "placement-constraint",
+            AutoGenGapReasonCodes.SearchLimit => "search-limit",
+            _ => "unknown"
+        };
+        var explanation = category switch
+        {
+            "resource-availability" => "У поточному розміщенні немає доступного ресурсу. Перевірте робочі години, місткість і зайнятість викладачів та аудиторій.",
+            "ordering" => "Розміщення обмежене порядком або доступними годинами тем, блоками модулів чи готовністю спільного потоку. Перевірте години тем, попередні лекції та послідовність модулів.",
+            "placement-constraint" => "Розміщення обмежене переходами або лімітами занять. Перевірте перерви між корпусами та денні обмеження.",
+            "search-limit" => "Пошук зупинився на встановленій межі; повний розклад ще може існувати.",
+            _ => "Причину недобору не встановлено однозначно; потрібна перевірка доступних варіантів."
+        };
+        if (structured.SearchLimitReached && category != "search-limit")
+            explanation += " Також досягнуто межі пошуку; зазначена причина не доводить неможливість повного розкладу.";
+        var diagnostics = structured.Diagnostics is null
+            ? new Dictionary<string, string>(StringComparer.Ordinal)
+            : new Dictionary<string, string>(structured.Diagnostics, StringComparer.Ordinal);
+        diagnostics["shortageCategory"] = category;
+        diagnostics["searchStatus"] = structured.SearchLimitReached ? "limited" : "no-limit-reported";
+        diagnostics["feasibilityStatus"] = "not-proven";
+        diagnostics["explanation"] = explanation;
+        return structured with { Diagnostics = diagnostics };
+    }
+
     public static string TitleFor(string? code)
         => FromCode(
             ClassifyStructuredCode(code)
@@ -96,6 +129,12 @@ public static class AutoGenGapReasonClassifier
                 "node budget"))
         {
             return FromCode(AutoGenGapReasonCodes.SearchLimit);
+        }
+
+        if (text.Contains("потребує перед собою", StringComparison.Ordinal)
+            && text.Contains("лекційної теми", StringComparison.Ordinal))
+        {
+            return FromCode(AutoGenGapReasonCodes.TopicOrder);
         }
 
         if (ContainsAny(text, "спільн", "поток"))
@@ -211,7 +250,7 @@ public static class AutoGenGapReasonClassifier
             return AutoGenGapReasonCodes.SharedFlow;
         }
 
-        if (ContainsAny(code, "topic-order", "topic-sequence", "chronolog"))
+        if (ContainsAny(code, "topic-order", "topic-sequence", "lecture-prerequisite", "module-sequence", "chronolog"))
         {
             return AutoGenGapReasonCodes.TopicOrder;
         }

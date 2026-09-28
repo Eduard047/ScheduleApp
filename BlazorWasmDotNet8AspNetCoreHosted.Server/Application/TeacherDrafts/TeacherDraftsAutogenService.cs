@@ -13005,7 +13005,8 @@ public sealed class TeacherDraftsAutogenService
                                && CanStartComponentRepair();
                         var lastComponentDomainWasTruncated = false;
                         async Task<bool> TryRepairConnectedComponentAsync(DateOnly gapDate, TimeSlot gapSlot, int moduleId, ModuleTopic topic,
-                            bool localReorder = false, int variantsPerCell = 8, TeacherDraftItem? directDonor = null)
+                            bool localReorder = false, int variantsPerCell = 8, TeacherDraftItem? directDonor = null,
+                            bool includePeerBlockers = false)
                         {
                             const int maxComponentCandidateCount = 2_048;
                             const int maxComponentSearchNodes = 40_000;
@@ -13151,7 +13152,7 @@ public sealed class TeacherDraftsAutogenService
                                             cell.Date,
                                             cell.Slot.Start,
                                             cell.Slot.End)) continue;
-                                    if (localReorder && BusyForDate(cell.Date).Where(b => b.GroupId != draft.GroupId
+                                    if (localReorder && !includePeerBlockers && BusyForDate(cell.Date).Where(b => b.GroupId != draft.GroupId
                                             && b.ModuleId == draft.ModuleId && b.StartTime < cell.Slot.End && b.EndTime > cell.Slot.Start)
                                         .Select(b => b.GroupId).Distinct().Count() >= ResourceBoundedSlotGroupLimitForPlacement(
                                             group.CourseId, draft.ModuleId, draft.LessonTypeId, topicById[draft.ModuleTopicId!.Value], false)) continue;
@@ -13182,7 +13183,7 @@ public sealed class TeacherDraftsAutogenService
                                                     || directDonor is not null && !component.Contains(owner))) continue;
                                             var additions = blockers.Select(occupied => movableByBusy[occupied]).Distinct()
                                                 .Where(blocker => !component.Contains(blocker) && !ReferenceEquals(blocker, draft)).ToArray();
-                                            if (localReorder && additions.Length > 0) continue;
+                                            if (localReorder && !includePeerBlockers && additions.Length > 0) continue;
                                             if (component.Count + additions.Length > 12)
                                             {
                                                 truncated = true;
@@ -13539,6 +13540,16 @@ public sealed class TeacherDraftsAutogenService
                                         if (!CanStartComponentRepair()) yield break;
                                         placed = await TryRepairConnectedComponentAsync(gapDate, gap,
                                             pending.Key.ModuleId, pendingTopic);
+                                        yield return placed;
+                                        if (placed) yield break;
+
+                                        // Пропущений модуль може не мати викладача саме у порожньому слоті.
+                                        // Дозволяємо переставити день групи разом із рухомими заняттями
+                                        // інших груп, що блокують його ресурси; межі компоненти незмінні.
+                                        if (!CanStartComponentRepair()) yield break;
+                                        placed = await TryRepairConnectedComponentAsync(gapDate, gap,
+                                            pending.Key.ModuleId, pendingTopic, localReorder: true,
+                                            includePeerBlockers: true);
                                         yield return placed;
                                         if (placed) yield break;
 
@@ -21503,9 +21514,7 @@ public sealed class TeacherDraftsAutogenService
                         diagnostics["repairRejections"] = string.Join(", ", repairRejections.Select(entry => $"{entry.Key}:{entry.Value}"));
                     }
                     if (!searchLimitedGroupDates.TryGetValue(rejectionKey, out var searchDiagnostics))
-                        return diagnostics is null
-                            ? structuredDetail
-                            : AutoGenGapReasonClassifier.EnsureStructured(structuredDetail with { Diagnostics = diagnostics });
+                        return AutoGenGapReasonClassifier.ExplainShortage(structuredDetail with { Diagnostics = diagnostics });
 
                     diagnostics ??= new Dictionary<string, string>(StringComparer.Ordinal);
                     diagnostics["searchScopes"] = string.Join(",", searchDiagnostics.Scopes);
@@ -21543,7 +21552,7 @@ public sealed class TeacherDraftsAutogenService
                                               && structuredDetail.ReasonCode != AutoGenGapReasonCodes.Unknown
                                               && structuredDetail.ReasonCode != AutoGenGapReasonCodes.Other
                                               && structuredDetail.ReasonCode != AutoGenGapReasonCodes.SearchLimit;
-                    return AutoGenGapReasonClassifier.EnsureStructured(structuredDetail with
+                    return AutoGenGapReasonClassifier.ExplainShortage(structuredDetail with
                     {
                         ReasonCode = hasPreciseRootCause
                             ? structuredDetail.ReasonCode

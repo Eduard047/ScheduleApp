@@ -161,7 +161,7 @@ jobs:
             BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj \
             --configuration Release \
             --no-build \
-            --filter "Category=AutogenQuality" \
+            --filter "Category=AutogenQuality|Category=AutogenConstrained" \
             --results-directory "$quality_results" \
             --logger "console;verbosity=normal" \
             --logger "trx;LogFileName=autogen-quality.trx"
@@ -170,8 +170,8 @@ jobs:
           passed_count=$(grep '<UnitTestResult ' "$quality_trx" 2>/dev/null | grep --count 'outcome="Passed"' || true)
           result_count=${result_count:-0}
           passed_count=${passed_count:-0}
-          if [ "$result_count" -ne 7 ] || [ "$passed_count" -ne 7 ]; then
-            echo "::error::Фільтр Category=AutogenQuality мав завершити 7/7 тестів успішно; отримано всього $result_count, успішних $passed_count."
+          if [ "$result_count" -lt 133 ] || [ "$passed_count" -ne "$result_count" ]; then
+            echo "::error::Фільтр AutogenQuality + AutogenConstrained має виконати щонайменше 133 тестів, усі успішно; отримано всього $result_count, успішних $passed_count."
             grep -o '<Counters[^>]*/>' "$quality_trx" 2>/dev/null || true
             exit 1
           fi
@@ -182,7 +182,7 @@ jobs:
           BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests/BlazorWasmDotNet8AspNetCoreHosted.IntegrationTests.csproj
           --configuration Release
           --no-build
-          --filter "Category!=AutogenQuality"
+          --filter "Category!=AutogenQuality&Category!=AutogenConstrained"
           --logger "console;verbosity=normal"
 
       - name: Report vulnerable NuGet packages
@@ -238,7 +238,7 @@ jobs:
               --configuration Release \
               --no-build \
               --no-restore \
-              --filter "Category=AutogenQuality" \
+              --filter "Category=AutogenQuality|Category=AutogenConstrained" \
               --results-directory "$quality_results" \
               --logger "console;verbosity=normal" \
               --logger "trx;LogFileName=autogen-quality.trx"
@@ -247,8 +247,8 @@ jobs:
             passed_count=$(grep '<UnitTestResult ' "$quality_trx" 2>/dev/null | grep --count 'outcome="Passed"' || true)
             result_count=${result_count:-0}
             passed_count=${passed_count:-0}
-            if [ "$result_count" -ne 7 ] || [ "$passed_count" -ne 7 ]; then
-              echo "::error::Повтор $replay Category=AutogenQuality мав завершити 7/7 тестів успішно; отримано всього $result_count, успішних $passed_count."
+            if [ "$result_count" -lt 133 ] || [ "$passed_count" -ne "$result_count" ]; then
+              echo "::error::Повтор $replay AutogenQuality + AutogenConstrained має виконати щонайменше 133 тестів, усі успішно; отримано всього $result_count, успішних $passed_count."
               grep -o '<Counters[^>]*/>' "$quality_trx" 2>/dev/null || true
               exit 1
             fi
