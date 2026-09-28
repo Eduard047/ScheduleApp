@@ -470,6 +470,10 @@
         background-color: #dbeafe;
         overflow: hidden;
     }
+    .autogen-progress__determinate {
+        background-color: #2563eb;
+        transition: width .4s ease;
+    }
     .autogen-progress__meta {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -667,5 +671,9 @@
         width: 100%;
         animation: none;
         background: repeating-linear-gradient(135deg, #2563eb 0 12px, #93c5fd 12px 24px);
+    }
+
+    .autogen-progress__determinate {
+        transition: none;
     }
 }

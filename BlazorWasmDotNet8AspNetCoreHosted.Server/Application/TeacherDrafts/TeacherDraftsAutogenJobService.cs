@@ -2235,6 +2235,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             var wholeJobSearchBudget = new DeterministicSearchBudget(
                 MaxWholeJobSearchNodes,
                 MaxJobDuration);
+            job.AttachSearchBudget(wholeJobSearchBudget, MaxJobDuration);
             await using var globalExecutionLock = job.IsDurable
                 ? await AcquireGlobalExecutionLockAsync(
                     executionDb,
@@ -2300,7 +2301,8 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                                 request,
                                 wholeJobSearchBudget,
                                 emergencySingletonState,
-                                job.Token);
+                                job.Token,
+                                job.SetSearchPhase);
                             var (rangeSucceeded, rangeResult, fallbackWarning) = ExtractAutoGenResult(action);
                             if (rangeSucceeded
                                 && integratedSoftFill
@@ -2323,7 +2325,8 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                                     },
                                     wholeJobSearchBudget,
                                     emergencySingletonState,
-                                    job.Token);
+                                    job.Token,
+                                    job.SetSearchPhase);
                                 var (fillSucceeded, fillResult, fillFallbackWarning) =
                                     ExtractAutoGenResult(fillAction);
                                 var effectiveFillResult = fillResult;
@@ -2359,7 +2362,8 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                                             },
                                             wholeJobSearchBudget,
                                             emergencySingletonState,
-                                            job.Token);
+                                            job.Token,
+                                            job.SetSearchPhase);
                                         var (relaxedFillSucceeded, relaxedFillResult, _) =
                                             ExtractAutoGenResult(relaxedFillAction);
                                         if (relaxedFillSucceeded)
@@ -3038,6 +3042,11 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         private int _gapCount;
         private int _deficitCount;
         private int _phasePercentFloor;
+        private string _searchPhase = "queued";
+        private DeterministicSearchBudget? _searchBudget;
+        private int _searchTimeLimitSeconds;
+        private DateTimeOffset? _searchStartedAt;
+        private DateTimeOffset? _searchDeadlineAt;
         private string? _lastCompletedMessage;
         private AutoGenResult? _result;
         private AutoGenRunReport? _report;
@@ -3161,10 +3170,32 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             }
         }
 
+        public void AttachSearchBudget(DeterministicSearchBudget budget, TimeSpan timeLimit)
+        {
+            lock (_sync)
+            {
+                _searchBudget = budget;
+                _searchStartedAt = budget.StartedAt;
+                _searchDeadlineAt = budget.DeadlineAt;
+                _searchTimeLimitSeconds = Math.Max(0, (int)Math.Ceiling(timeLimit.TotalSeconds));
+            }
+        }
+
+        public void SetSearchPhase(string phase)
+        {
+            if (phase is not ("primary" or "fill" or "repair" or "finalizing"))
+                throw new ArgumentOutOfRangeException(nameof(phase));
+            lock (_sync)
+            {
+                _searchPhase = phase;
+            }
+        }
+
         public void StartWeek(int weekIndex, DateOnly weekStart, DateOnly rangeStartDate, DateOnly rangeEndDate)
         {
             lock (_sync)
             {
+                _searchPhase = "primary";
                 _currentWeekNumber = weekIndex + 1;
                 _currentWeekStartDate = weekStart;
                 _currentRangeStartDate = rangeStartDate;
@@ -3178,6 +3209,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         {
             lock (_sync)
             {
+                _searchPhase = "fill";
                 _phasePercentFloor = Math.Max(_phasePercentFloor, 50);
                 _currentStage =
                     $"Дозаповнюємо порожні слоти {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}…";
@@ -3188,6 +3220,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
         {
             lock (_sync)
             {
+                _searchPhase = "repair";
                 _phasePercentFloor = Math.Max(_phasePercentFloor, 75);
                 _currentStage =
                     $"Перевіряємо резервне дозаповнення {rangeStartDate:dd.MM.yyyy} – {rangeEndDate:dd.MM.yyyy}…";
@@ -3206,6 +3239,10 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                 _deficitCount = partialResult.Preflight?.Sum(item => item.Count) ?? 0;
                 _result = partialResult;
                 _lastCompletedMessage = BuildCompletedMessage(rangeStartDate, rangeEndDate, weekResult);
+                if (_completedWeeks >= _totalWeeks)
+                {
+                    _searchPhase = "finalizing";
+                }
                 _currentStage = _completedWeeks >= _totalWeeks
                     ? "Формуємо фінальний звіт..."
                     : "Підготовка наступного тижня...";
@@ -3217,6 +3254,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             lock (_sync)
             {
                 _state = AutoGenJobState.Succeeded;
+                _searchPhase = "finalizing";
                 _completedAt = DateTimeOffset.UtcNow;
                 _completedWeeks = _totalWeeks;
                 ApplyFinalResult(result, report);
@@ -3229,6 +3267,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             lock (_sync)
             {
                 _state = AutoGenJobState.Failed;
+                _searchPhase = "finalizing";
                 _completedAt = DateTimeOffset.UtcNow;
                 _error = error;
                 DiscardUnpersistedPlan();
@@ -3242,6 +3281,7 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
             lock (_sync)
             {
                 _state = AutoGenJobState.Canceled;
+                _searchPhase = "finalizing";
                 _completedAt = DateTimeOffset.UtcNow;
                 DiscardUnpersistedPlan();
                 ApplyFinalResult(result, report);
@@ -3285,7 +3325,14 @@ public sealed class TeacherDraftsAutogenJobService : IHostedService
                     _result,
                     _report,
                     _error,
-                    _planSummary);
+                    _planSummary,
+                    _searchPhase,
+                    _searchBudget?.VisitedNodes ?? 0,
+                    _searchBudget?.MaxNodes ?? 0,
+                    _searchBudget?.SearchLimitReached ?? false,
+                    _searchTimeLimitSeconds,
+                    _searchStartedAt,
+                    _searchDeadlineAt);
             }
         }
 

@@ -31,6 +31,43 @@ public sealed record ResidualPlanApplicationResult(
     int CardinalityBefore,
     int CardinalityAfter);
 
+// Резервує короткий початковий пошук для кожної групи з незаповненими годинами.
+public sealed class ResidualRepairAttemptBudget
+{
+    private readonly int _limit;
+    private readonly int _reservedPerGroup;
+    private readonly Dictionary<int, int> _usedByGroup = new();
+    public int Used { get; private set; }
+    public int Limit => _limit;
+
+    public ResidualRepairAttemptBudget(int limit, int reservedPerGroup = 2)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(reservedPerGroup);
+        _limit = limit;
+        _reservedPerGroup = reservedPerGroup;
+    }
+
+    public bool CanStart(int groupId, IEnumerable<int> pendingGroupIds)
+    {
+        if (Used >= _limit) return false;
+        var pending = pendingGroupIds.Distinct().ToArray();
+        if (!pending.Contains(groupId)) return false;
+        // Перші групи не витрачають спроби, зарезервовані для ще не оброблених.
+        var reserved = pending.Where(id => id != groupId)
+            .Sum(id => (long)Math.Max(0, _reservedPerGroup - _usedByGroup.GetValueOrDefault(id)));
+        return _limit - Used > reserved;
+    }
+
+    public bool TryStart(int groupId, IEnumerable<int> pendingGroupIds)
+    {
+        if (!CanStart(groupId, pendingGroupIds)) return false;
+        Used++;
+        _usedByGroup[groupId] = _usedByGroup.GetValueOrDefault(groupId) + 1;
+        return true;
+    }
+}
+
 // Лічильник розгорнутих вершин залишкової мережі є основним детермінованим обмеженням пошуку.
 // Часова межа спрацьовує лише як аварійний захист від патологічно повільної операції.
 public sealed class DeterministicSearchBudget
@@ -57,9 +94,12 @@ public sealed class DeterministicSearchBudget
         _emergencyTimeout = emergencyTimeout;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _startedAt = _timeProvider.GetTimestamp();
+        StartedAt = _timeProvider.GetUtcNow();
     }
 
     public int MaxNodes { get; }
+    public DateTimeOffset StartedAt { get; }
+    public DateTimeOffset DeadlineAt => StartedAt + _emergencyTimeout;
     public int VisitedNodes { get; private set; }
     public bool NodeLimitReached { get; private set; }
     public bool EmergencyLimitReached { get; private set; }

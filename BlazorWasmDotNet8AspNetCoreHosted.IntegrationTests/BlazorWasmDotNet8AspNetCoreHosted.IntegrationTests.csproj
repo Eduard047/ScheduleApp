@@ -54,12 +54,14 @@
     <Compile Include="AutogenQualityMatrixTests.cs" />
     <Compile Include="AutogenUniversalRangeTests.cs" />
     <Compile Include="AutogenConstraintSearchTests.cs" />
+    <Compile Include="AutogenConstrainedScenarioTests.cs" />
     <Compile Include="AutogenSeededStressTests.cs" />
     <Compile Include="ClientHttpContractTests.cs" />
     <Compile Include="DeterministicResidualOptimizerOracleTests.cs" />
     <Compile Include="DeterministicResourceMatcherTests.cs" />
     <Compile Include="DocxImportSecurityTests.cs" />
     <Compile Include="HttpBoundarySecurityTests.cs" />
+    <Compile Include="LecturePrerequisitePolicyTests.cs" />
     <Compile Include="LogicalEventRotationPlannerTests.cs" />
     <Compile Include="ProductionGuardrailTests.cs" />
     <Compile Include="ProductionPipelineSecurityTests.cs" />
@@ -80,6 +82,7 @@
   </ItemGroup>
 
   <ItemGroup Condition="'$(EnableLocalAutogenHarness)' == 'true'">
+    <Compile Include="AutogenL3SeptemberFirstWeekReproductionTests.cs" />
     <Compile Include="AutogenL3SeptemberTwoWeekScenarioTests.cs" />
     <Compile Include="AutogenL3Week18DiagnosticsTests.cs" />
     <Compile Include="Infrastructure\TempDatabaseAndCopy.cs" />

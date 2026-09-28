@@ -1066,6 +1066,7 @@ public sealed class TeacherDraftsAutogenPlanService
     {
         var rows = snapshots.ToList();
         await ValidateReferencesAsync(plan, groupIds, rows, cancellationToken);
+        var persistedRequest = ReadPlanRequest(plan);
         var result = await new TeacherDraftsAutogenHardRuleValidator(_db).ValidateAsync(
             new TeacherDraftsAutogenHardRuleValidationRequest(
                 plan.CourseId,
@@ -1075,7 +1076,9 @@ public sealed class TeacherDraftsAutogenPlanService
                 (WeekPreset)plan.Days,
                 plan.AllowIncompleteDrafts,
                 PendingDrafts: pending,
-                ExcludedDraftIds: excludedIds),
+                ExcludedDraftIds: excludedIds,
+                MaxParallelGroupsPerModuleInSlot:
+                    persistedRequest.SoftOptions?.MaxParallelGroupsPerModuleInSlot),
             cancellationToken);
         if (!result.HasViolations)
         {

@@ -233,14 +233,38 @@ else
                             }
                         </div>
                     </div>
-                    <div class="progress autogen-progress__bar" role="progressbar" aria-label="Операція виконується">
-                        <div class="autogen-progress__indeterminate"></div>
-                    </div>
+                    @if (HasAutoGenSearchProgress(progress))
+                    {
+                        var searchBudgetPercent = GetAutoGenSearchBudgetPercent(progress);
+                        <div class="progress autogen-progress__bar"
+                             role="progressbar"
+                             aria-label="Використано вузлового ліміту пошуку"
+                             aria-valuemin="0"
+                             aria-valuemax="100"
+                             aria-valuenow="@searchBudgetPercent">
+                            <div class="progress-bar autogen-progress__determinate" style="width: @(searchBudgetPercent)%"></div>
+                        </div>
+                    }
+                    else
+                    {
+                        <div class="progress autogen-progress__bar" role="progressbar" aria-label="Операція виконується">
+                            <div class="autogen-progress__indeterminate"></div>
+                        </div>
+                    }
                     <div class="autogen-progress__meta">
                         <span>@GetAutoGenProgressStepLabel(progress)</span>
                         <span>@GetAutoGenProgressCompletedLabel(progress)</span>
                         <span>Минуло: @FormatDuration(GetAutoGenElapsed(progress))</span>
-                        <span>Точний час завершення поки невідомий</span>
+                        @if (HasAutoGenSearchProgress(progress))
+                        {
+                            <span>Етап: @GetAutoGenSearchPhaseLabel(progress.SearchPhase)</span>
+                            <span>@GetAutoGenSearchNodeCountLabel(progress)</span>
+                            <span>@GetAutoGenSearchBudgetEstimateLabel(progress)</span>
+                        }
+                        else
+                        {
+                            <span>Точний час завершення поки невідомий</span>
+                        }
                     </div>
                     <div class="autogen-progress__range">
                         Діапазон: @progress.RangeStartDate.ToString("dd.MM.yyyy") – @progress.RangeEndDate.ToString("dd.MM.yyyy")
@@ -2171,6 +2195,13 @@ else
         _autoGenProgress.GapCount = status.GapCount;
         _autoGenProgress.DeficitCount = status.DeficitCount;
         _autoGenProgress.Percent = Math.Clamp(status.Percent, 0, 100);
+        _autoGenProgress.SearchPhase = status.SearchPhase;
+        _autoGenProgress.SearchNodesVisited = Math.Max(0, status.SearchNodesVisited);
+        _autoGenProgress.SearchNodeLimit = Math.Max(0, status.SearchNodeLimit);
+        _autoGenProgress.SearchBudgetReached = status.SearchBudgetReached;
+        _autoGenProgress.SearchTimeLimitSeconds = Math.Max(0, status.SearchTimeLimitSeconds);
+        _autoGenProgress.SearchStartedAt = status.SearchStartedAt?.ToLocalTime();
+        _autoGenProgress.SearchDeadlineAt = status.SearchDeadlineAt?.ToLocalTime();
         _autoGenProgress.CancellationRequested = status.CancellationRequested || _autoGenCancelRequested;
         if (_autoGenProgress.CompletedSteps > 0
             && (_autoGenProgress.CompletedSteps > previousCompletedSteps
@@ -2295,6 +2326,79 @@ else
                 ? "Очищення завершено"
                 : "Очищення виконується"
             : $"Виконано тижнів: {progress.CompletedSteps}/{progress.TotalSteps}";
+    private static bool HasAutoGenSearchProgress(AutoGenProgressState progress)
+        => progress.SearchNodeLimit > 0
+           || progress.SearchNodesVisited > 0
+           || progress.SearchStartedAt is not null
+           || progress.SearchBudgetReached;
+    private static int GetAutoGenSearchBudgetPercent(AutoGenProgressState progress)
+    {
+        if (progress.SearchNodeLimit <= 0)
+        {
+            return 0;
+        }
+
+        var nodesVisited = Math.Clamp(progress.SearchNodesVisited, 0, progress.SearchNodeLimit);
+        return (int)(100d * nodesVisited / progress.SearchNodeLimit);
+    }
+    private static string GetAutoGenSearchPhaseLabel(string? phase)
+        => phase?.Trim().ToLowerInvariant() switch
+        {
+            "queued" => "Підготовка пошуку",
+            "primary" => "Основний пошук",
+            "fill" => "Дозаповнення",
+            "repair" => "Відновлення розміщення",
+            "finalizing" => "Формування підсумку",
+            _ => "Пошук"
+        };
+    private static string GetAutoGenSearchNodeCountLabel(AutoGenProgressState progress)
+        => $"Вузлів переглянуто: {progress.SearchNodesVisited.ToString("N0", CultureInfo.CurrentCulture)} / {progress.SearchNodeLimit.ToString("N0", CultureInfo.CurrentCulture)} " +
+           $"({GetAutoGenSearchBudgetPercent(progress)}% вузлового ліміту)";
+    private static string GetAutoGenSearchBudgetEstimateLabel(AutoGenProgressState progress)
+    {
+        if (string.Equals(progress.SearchPhase, "finalizing", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Пошук завершено; сервер формує підсумок.";
+        }
+
+        if (progress.SearchBudgetReached)
+        {
+            return "Межу бюджету пошуку досягнуто; очікуємо підсумок.";
+        }
+
+        if (string.Equals(progress.SearchPhase, "queued", StringComparison.OrdinalIgnoreCase)
+            || progress.SearchStartedAt is not DateTimeOffset searchStartedAt)
+        {
+            return "Пошук ще не почався.";
+        }
+
+        var searchElapsedSeconds = Math.Max(0, (progress.LastUpdatedAt - searchStartedAt).TotalSeconds);
+        var nodeSecondsRemaining = (double?)null;
+        if (progress.SearchNodesVisited > 0 && progress.SearchNodeLimit > progress.SearchNodesVisited && searchElapsedSeconds > 0)
+        {
+            var averageNodesPerSecond = progress.SearchNodesVisited / searchElapsedSeconds;
+            if (averageNodesPerSecond > 0)
+            {
+                nodeSecondsRemaining = (progress.SearchNodeLimit - progress.SearchNodesVisited) / averageNodesPerSecond;
+            }
+        }
+
+        var timeSecondsRemaining = progress.SearchDeadlineAt is DateTimeOffset searchDeadlineAt
+            ? Math.Max(0, (searchDeadlineAt - progress.LastUpdatedAt).TotalSeconds)
+            : progress.SearchTimeLimitSeconds > 0
+                ? Math.Max(0, progress.SearchTimeLimitSeconds - searchElapsedSeconds)
+                : (double?)null;
+        if (nodeSecondsRemaining is null && timeSecondsRemaining is null)
+        {
+            return "Залишок бюджету пошуку поки неможливо оцінити.";
+        }
+
+        var nodeLimitIsNearer = nodeSecondsRemaining is not null
+            && (timeSecondsRemaining is null || nodeSecondsRemaining <= timeSecondsRemaining);
+        var secondsRemaining = nodeLimitIsNearer ? nodeSecondsRemaining!.Value : timeSecondsRemaining!.Value;
+        var limitLabel = nodeLimitIsNearer ? "вузлової межі" : "часової межі";
+        return $"До {limitLabel}: орієнтовно {FormatDuration(TimeSpan.FromSeconds(secondsRemaining))}; генерація може завершитися раніше.";
+    }
     private static string BuildAutoGenProgressCompletedMessage(DateOnly rangeStartDate, DateOnly rangeEndDate, AutoGenResult result)
     {
         var parts = new List<string>
@@ -5563,6 +5667,13 @@ else
         public int WarningCount { get; set; }
         public int GapCount { get; set; }
         public int DeficitCount { get; set; }
+        public string SearchPhase { get; set; } = "queued";
+        public long SearchNodesVisited { get; set; }
+        public long SearchNodeLimit { get; set; }
+        public bool SearchBudgetReached { get; set; }
+        public int SearchTimeLimitSeconds { get; set; }
+        public DateTimeOffset? SearchStartedAt { get; set; }
+        public DateTimeOffset? SearchDeadlineAt { get; set; }
     }
     private enum AutoGenProgressKind
     {

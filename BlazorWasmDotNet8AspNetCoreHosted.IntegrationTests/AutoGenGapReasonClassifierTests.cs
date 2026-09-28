@@ -6,6 +6,7 @@ public sealed class AutoGenGapReasonClassifierTests
 {
     [Theory]
     [InlineData(null, AutoGenGapReasonCodes.Unknown)]
+    [InlineData("Тема #2 модуля #1 потребує перед собою 2 аудиторних годин лекційної теми #1 (проведено 1, бракує 1).", AutoGenGapReasonCodes.TopicOrder)]
     [InlineData("Немає викладачів для модулів: #1.", AutoGenGapReasonCodes.Teacher)]
     [InlineData("Не знайдено аудиторій для модуля у цьому слоті.", AutoGenGapReasonCodes.Room)]
     [InlineData("Недостатньо часу на перехід до іншого корпусу: доступно 5 хв.", AutoGenGapReasonCodes.Travel)]
@@ -50,6 +51,17 @@ public sealed class AutoGenGapReasonClassifierTests
         Assert.True(AutoGenGapReasonClassifier.EnsureStructured(preciseSearchLimited).SearchLimitReached);
     }
 
+    [Theory]
+    [InlineData("strict-lecture-prerequisite")]
+    [InlineData("module-sequence")]
+    public void Curriculum_blockers_are_explained_as_ordering_constraints(string constraint)
+    {
+        var gap = AutoGenGapReasonClassifier.ExplainShortage(CreateGap(null, constraintCode: constraint));
+        Assert.Equal(AutoGenGapReasonCodes.TopicOrder, gap.ReasonCode);
+        Assert.Equal("ordering", gap.Diagnostics!["shortageCategory"]);
+        Assert.False(gap.SearchLimitReached);
+    }
+
     [Fact]
     public void Structured_codes_are_normalized_to_public_categories()
     {
@@ -90,6 +102,34 @@ public sealed class AutoGenGapReasonClassifierTests
         var enriched = AutoGenGapReasonClassifier.EnsureStructured(legacy);
         Assert.Equal(AutoGenGapReasonCodes.Teacher, enriched.ReasonCode);
         Assert.False(enriched.SearchLimitReached);
+    }
+
+    [Theory]
+    [InlineData("teacher", false, "resource-availability")]
+    [InlineData("room", true, "resource-availability")]
+    [InlineData("topic-order", false, "ordering")]
+    [InlineData("module-block", true, "ordering")]
+    [InlineData("shared-flow", false, "ordering")]
+    [InlineData("travel", false, "placement-constraint")]
+    [InlineData("limit", false, "placement-constraint")]
+    [InlineData("search-limit", true, "search-limit")]
+    [InlineData("unknown", false, "unknown")]
+    public void Shortage_explanation_separates_observed_blocker_from_search_and_feasibility(
+        string code, bool limited, string category)
+    {
+        var originalDiagnostics = new Dictionary<string, string> { ["visitedNodes"] = "123" };
+        var original = CreateGap("Причина", reasonCode: code, searchLimitReached: limited)
+            with { Diagnostics = originalDiagnostics };
+        var result = AutoGenGapReasonClassifier.ExplainShortage(original);
+        Assert.Equal(code, result.ReasonCode);
+        Assert.Equal(category, result.Diagnostics!["shortageCategory"]);
+        Assert.Equal(limited ? "limited" : "no-limit-reported", result.Diagnostics["searchStatus"]);
+        Assert.Equal("not-proven", result.Diagnostics["feasibilityStatus"]);
+        Assert.Equal("123", result.Diagnostics["visitedNodes"]);
+        Assert.False(string.IsNullOrWhiteSpace(result.Diagnostics["explanation"]));
+        Assert.Single(originalDiagnostics);
+        var twice = AutoGenGapReasonClassifier.ExplainShortage(result);
+        Assert.Equal(result.Diagnostics.OrderBy(pair => pair.Key), twice.Diagnostics!.OrderBy(pair => pair.Key));
     }
 
     private static AutoGenGapDetail CreateGap(
